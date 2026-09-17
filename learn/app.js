@@ -1,6 +1,10 @@
+import { MESSAGE, offlineStatusFromMessage } from '/learn/offline-core.mjs';
+
 const grid = document.querySelector('#course-grid');
 const status = document.querySelector('#library-status');
 const template = document.querySelector('#course-card-template');
+const coursesById = new Map();
+let serviceWorkerRegistration;
 
 function renderCourse(course, index) {
   const fragment = template.content.cloneNode(true);
@@ -17,6 +21,7 @@ function renderCourse(course, index) {
   fragment.querySelector('[data-course-license]').href =
     `${course.route}SOURCE.md`;
   fragment.querySelector('[data-offline-status]').dataset.courseId = course.id;
+  coursesById.set(course.id, course);
   return fragment;
 }
 
@@ -27,6 +32,7 @@ async function loadCourses() {
     const courses = await response.json();
     grid.replaceChildren(...courses.map(renderCourse));
     status.textContent = `已收录 ${courses.length} 门课程`;
+    return courses;
   } catch (error) {
     status.textContent = '课程目录载入失败';
     const notice = document.createElement('p');
@@ -40,7 +46,72 @@ async function loadCourses() {
     notice.append(link, '继续阅读。');
     grid.replaceChildren(notice);
     console.error(error);
+    return null;
   }
 }
 
-loadCourses();
+function statusElement(courseId) {
+  return document.querySelector(`[data-offline-status][data-course-id="${courseId}"]`);
+}
+
+function postCacheRequest(course) {
+  const worker = serviceWorkerRegistration?.active
+    ?? serviceWorkerRegistration?.waiting
+    ?? serviceWorkerRegistration?.installing;
+  worker?.postMessage({
+    type: MESSAGE.cacheCourse,
+    courseId: course.id,
+    manifestUrl: course.offlineManifest,
+  });
+}
+
+function renderOfflineStatus(message) {
+  const element = statusElement(message.courseId);
+  const visible = offlineStatusFromMessage(message);
+  if (!element || !visible) return;
+  element.dataset.state = visible.state;
+  element.replaceChildren(visible.text);
+  if (visible.state === 'error') {
+    const retry = document.createElement('button');
+    retry.type = 'button';
+    retry.className = 'retry-button';
+    retry.textContent = '重试';
+    retry.addEventListener('click', () => {
+      element.replaceChildren('正在重新准备离线内容…');
+      postCacheRequest(coursesById.get(message.courseId));
+    });
+    element.append(' ', retry);
+  }
+}
+
+async function initializeOffline(courses) {
+  if (!('serviceWorker' in navigator)) {
+    for (const course of courses) {
+      const element = statusElement(course.id);
+      element.textContent = '当前浏览器不支持离线缓存，可继续在线阅读';
+      element.dataset.state = 'unsupported';
+    }
+    return;
+  }
+
+  navigator.serviceWorker.addEventListener('message', (event) => {
+    renderOfflineStatus(event.data);
+  });
+
+  try {
+    await navigator.serviceWorker.register('/learn/sw.js', {
+      scope: '/learn/',
+      type: 'module',
+    });
+    serviceWorkerRegistration = await navigator.serviceWorker.ready;
+    for (const course of courses) postCacheRequest(course);
+  } catch (error) {
+    for (const course of courses) {
+      renderOfflineStatus({ type: MESSAGE.error, courseId: course.id });
+    }
+    console.error(error);
+  }
+}
+
+const courses = await loadCourses();
+if (courses) await initializeOffline(courses);
