@@ -26,6 +26,10 @@ test('root page exposes AI 学习 in navigation and the first card', async () =>
   assert.match(html, /<strong>01<\/strong>/);
 });
 
+test('GitHub Pages bypasses Jekyll so generated _astro assets are published', async () => {
+  await access(join(repositoryRoot, '.nojekyll'));
+});
+
 test('course library has accessible PWA and rendering hooks', async () => {
   const html = await read('learn/index.html');
   assert.match(html, /<title>AI 学习 · Serebii Labs<\/title>/);
