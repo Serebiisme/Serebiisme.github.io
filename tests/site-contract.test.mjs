@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile, readdir } from 'node:fs/promises';
+import { access, readFile, readdir } from 'node:fs/promises';
 import { join, relative, resolve, sep } from 'node:path';
 
 const read = (path) =>
@@ -54,6 +54,19 @@ test('generated course includes the complete Chinese reading sequence', async ()
   for (const path of required) {
     await readFile(join(courseRoot, path));
   }
+});
+
+test('generated course contains only Simplified Chinese edition assets', async () => {
+  const topLevel = await readdir(courseRoot);
+  assert.deepEqual(
+    topLevel.filter((entry) => entry.startsWith('book-')),
+    [],
+  );
+  const themedEditions = await readdir(
+    join(courseRoot, 'figures', 'book'),
+  );
+  assert.deepEqual(themedEditions, ['book']);
+  await assert.rejects(access(join(courseRoot, 'figures', 'chapter2-en')));
 });
 
 test('offline manifest includes every generated course file exactly once', async () => {

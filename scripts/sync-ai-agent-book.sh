@@ -32,6 +32,7 @@ original_editions="$sync_root/original-editions.json"
 cp "$checkout/web-astro/src/lib/editions.json" "$original_editions"
 node "$site_root/scripts/prune-ai-agent-book.mjs" \
   "$checkout" \
+  "$checkout/web-astro/public" \
   "$original_editions" \
   "$site_root/overlays/ai-agent-book/editions.json"
 

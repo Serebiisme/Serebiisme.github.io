@@ -23,28 +23,50 @@ async function readEditions(path) {
 
 export async function pruneEditions(
   sourceRootArg,
+  publicRootArg,
   originalEditionsPath,
   selectedEditionsPath,
 ) {
   const sourceRoot = resolve(sourceRootArg);
+  const publicRoot = resolve(publicRootArg);
+  const themedRoot = resolve(publicRoot, 'figures', 'book');
   const original = editionDirectories(await readEditions(originalEditionsPath));
   const selected = editionDirectories(await readEditions(selectedEditionsPath));
 
   for (const directory of original) {
     if (selected.has(directory)) continue;
-    const target = resolve(sourceRoot, directory);
-    if (dirname(target) !== sourceRoot) {
-      throw new Error(`Refusing to remove path outside source root: ${target}`);
+    const targets = [
+      { parent: sourceRoot, target: resolve(sourceRoot, directory) },
+      { parent: publicRoot, target: resolve(publicRoot, directory) },
+      { parent: themedRoot, target: resolve(themedRoot, directory) },
+    ];
+    if (directory === 'book-en') {
+      const figuresRoot = resolve(publicRoot, 'figures');
+      targets.push({
+        parent: figuresRoot,
+        target: resolve(figuresRoot, 'chapter2-en'),
+      });
     }
-    await rm(target, { recursive: true, force: true });
+    for (const { parent, target } of targets) {
+      if (dirname(target) !== parent) {
+        throw new Error(`Refusing to remove path outside expected root: ${target}`);
+      }
+      await rm(target, { recursive: true, force: true });
+    }
   }
 }
 
-const [sourceRoot, originalEditions, selectedEditions] = process.argv.slice(2);
-if (!sourceRoot || !originalEditions || !selectedEditions) {
+const [sourceRoot, publicRoot, originalEditions, selectedEditions] =
+  process.argv.slice(2);
+if (!sourceRoot || !publicRoot || !originalEditions || !selectedEditions) {
   throw new Error(
-    'Usage: node prune-ai-agent-book.mjs SOURCE_ROOT ORIGINAL_EDITIONS SELECTED_EDITIONS',
+    'Usage: node prune-ai-agent-book.mjs SOURCE_ROOT PUBLIC_ROOT ORIGINAL_EDITIONS SELECTED_EDITIONS',
   );
 }
 
-await pruneEditions(sourceRoot, originalEditions, selectedEditions);
+await pruneEditions(
+  sourceRoot,
+  publicRoot,
+  originalEditions,
+  selectedEditions,
+);

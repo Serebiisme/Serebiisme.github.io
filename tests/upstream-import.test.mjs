@@ -99,12 +99,28 @@ test('course header links to the canonical Labs learning area', async () => {
 test('edition pruning removes only unselected configured source directories', async () => {
   const root = await mkdtemp(join(tmpdir(), 'course-prune-'));
   const source = join(root, 'source');
+  const publicRoot = join(root, 'public');
   const originalEditions = join(root, 'original-editions.json');
   const selectedEditions = join(root, 'selected-editions.json');
   await write(join(source, 'book', 'chapter1.md'), '简体中文');
   await write(join(source, 'book-en', 'chapter1.md'), 'English');
   await write(join(source, 'book-ja', 'chapter1.ja.md'), '日本語');
   await write(join(source, 'book-not-an-edition', 'keep.txt'), 'keep me');
+  await write(join(publicRoot, 'book', 'images', 'figure.svg'), 'keep zh');
+  await write(join(publicRoot, 'book-en', 'images', 'figure.svg'), 'remove en');
+  await write(join(publicRoot, 'book-ja', 'images', 'figure.svg'), 'remove ja');
+  await write(
+    join(publicRoot, 'figures', 'book', 'book', 'figure-light.svg'),
+    'keep zh theme',
+  );
+  await write(
+    join(publicRoot, 'figures', 'book', 'book-en', 'figure-light.svg'),
+    'remove en theme',
+  );
+  await write(
+    join(publicRoot, 'figures', 'chapter2-en', 'figure.svg'),
+    'remove en replacement',
+  );
   await write(
     originalEditions,
     JSON.stringify({
@@ -120,7 +136,7 @@ test('edition pruning removes only unselected configured source directories', as
 
   const result = spawnSync(
     process.execPath,
-    [pruner, source, originalEditions, selectedEditions],
+    [pruner, source, publicRoot, originalEditions, selectedEditions],
     { cwd: repositoryRoot, encoding: 'utf8' },
   );
 
@@ -128,6 +144,14 @@ test('edition pruning removes only unselected configured source directories', as
   await access(join(source, 'book', 'chapter1.md'));
   await assert.rejects(access(join(source, 'book-en')));
   await assert.rejects(access(join(source, 'book-ja')));
+  await access(join(publicRoot, 'book', 'images', 'figure.svg'));
+  await access(
+    join(publicRoot, 'figures', 'book', 'book', 'figure-light.svg'),
+  );
+  await assert.rejects(access(join(publicRoot, 'book-en')));
+  await assert.rejects(access(join(publicRoot, 'book-ja')));
+  await assert.rejects(access(join(publicRoot, 'figures', 'book', 'book-en')));
+  await assert.rejects(access(join(publicRoot, 'figures', 'chapter2-en')));
   assert.equal(
     await readFile(join(source, 'book-not-an-edition', 'keep.txt'), 'utf8'),
     'keep me',
