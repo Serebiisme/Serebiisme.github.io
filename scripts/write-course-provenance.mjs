@@ -16,6 +16,7 @@ export function provenanceMarkdown(sourceCommit, sourceDate) {
 - Chinese-only edition configuration: the generated mirror includes the original Simplified Chinese edition only.
 - Added supplemental routes for the unmodified introduction, afterword, and reference answers Markdown sources.
 - Rebased static asset URLs under \`/learn/ai-agent-book/\` and generated an offline resource manifest.
+- Restyled the course cover with Serebii Labs editorial typography, pastel chapter cards, and flat geometric illustrations; original chapter content and reader controls are preserved.
 
 Serebii Labs provides this attributed offline mirror and is not affiliated with, endorsed by, or operated by the original author.
 `;

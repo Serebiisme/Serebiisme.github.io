@@ -230,7 +230,9 @@ test('complete upstream build is imported with provenance and full manifest', as
   const target = join(root, 'course');
   const license = join(root, 'LICENSE');
   for (const page of requiredPages) {
-    await write(join(dist, page), `<html><body>${page}</body></html>`);
+    await write(join(dist, page), page === 'index.html'
+      ? '<html><head></head><body><section class="home-hero">Course</section></body></html>'
+      : `<html><body>${page}</body></html>`);
   }
   await write(join(dist, '_astro', 'reader.css'), 'body{}');
   await write(license, 'Apache License 2.0');
@@ -259,4 +261,11 @@ test('complete upstream build is imported with provenance and full manifest', as
   assert.ok(manifest.assets.includes('/learn/ai-agent-book/LICENSE.txt'));
   assert.ok(manifest.assets.includes('/learn/ai-agent-book/SOURCE.md'));
   assert.ok(manifest.assets.includes('/learn/ai-agent-book/_astro/reader.css'));
+  // A later upstream import must retain the Labs cover and cache its stylesheet.
+  assert.ok(manifest.assets.includes('/learn/ai-agent-book/labs-theme.css'));
+  const cover = await readFile(join(target, 'index.html'), 'utf8');
+  assert.match(cover, /data-labs-theme/);
+  assert.match(cover, /class="labs-course"/);
+  assert.equal(await readFile(join(target, 'book/chapter1/index.html'), 'utf8'),
+    '<html><body>book/chapter1/index.html</body></html>');
 });

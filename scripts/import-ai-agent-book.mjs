@@ -10,6 +10,7 @@ import {
 import { dirname, resolve } from 'node:path';
 import { buildManifest } from './generate-offline-manifest.mjs';
 import { writeProvenance } from './write-course-provenance.mjs';
+import { applyCourseTheme } from './apply-course-theme.mjs';
 
 const requiredPages = [
   'index.html',
@@ -45,6 +46,7 @@ async function importCourse(dist, target, license, sourceCommit, sourceDate) {
   await rm(backup, { recursive: true, force: true });
   await mkdir(dirname(target), { recursive: true });
   await cp(dist, staging, { recursive: true });
+  await applyCourseTheme(staging);
   await copyFile(license, resolve(staging, 'LICENSE.txt'));
   await writeProvenance(
     resolve(staging, 'SOURCE.md'),
