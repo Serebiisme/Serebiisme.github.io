@@ -38,7 +38,8 @@
 
 - 直接使用上游 `web-astro` 的中文静态站点构建结果，以最大限度保留原书排版和阅读能力。
 - 构建时设置 `ASTRO_BASE=/learn/ai-agent-book/`，确保页面、图片、字体和章节链接都使用本站路径。
-- 不改写正文。对构建结果仅添加离线注册所需元数据和清晰的来源、修改说明。
+- 上游现成 Astro 路由只覆盖首页和 10 章正文；构建叠加层使用同一 Markdown 渲染管线为引言、后记和思考题参考答案增加三条中文阅读路由。
+- 不改写正文。对构建结果仅增加中文路由、离线注册所需元数据和清晰的来源、修改说明。
 - 课程首页和课程库均提供原仓库链接、作者署名、上游提交及许可证入口。
 
 ## 课程数据约定
@@ -106,6 +107,7 @@ Service Worker 的作用域限定为 `/learn/`，不接管 Serebii Labs 首页�
 - `learn/sw.js`：限定在 `/learn/` 的缓存与更新逻辑。
 - `learn/offline.html`：课程资源尚未缓存时的离线提示。
 - `learn/ai-agent-book/`：上游 Astro 生成的静态课程及授权文件。
+- `overlays/ai-agent-book/`：将上游构建限定为简体中文，并补齐三条非正文章节路由的派生文件。
 - `scripts/sync-ai-agent-book.sh`：可重复的上游抓取和构建入口。
 - `scripts/generate-offline-manifest.mjs`：生成确定性的资源清单和版本哈希。
 - `tests/site-contract.test.mjs`：验证站点结构、路径、授权和离线清单。
