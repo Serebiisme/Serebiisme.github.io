@@ -13,6 +13,17 @@ import { spawnSync } from 'node:child_process';
 
 const repositoryRoot = resolve(new URL('..', import.meta.url).pathname);
 const importer = join(repositoryRoot, 'scripts', 'import-ai-agent-book.mjs');
+const pruner = join(repositoryRoot, 'scripts', 'prune-ai-agent-book.mjs');
+const provenanceWriter = join(
+  repositoryRoot,
+  'scripts',
+  'write-course-provenance.mjs',
+);
+const supplementalAssetPreparer = join(
+  repositoryRoot,
+  'scripts',
+  'prepare-supplemental-assets.mjs',
+);
 const sourceCommit = 'c8963443736004412692b1af7706c89096d46e4e';
 const sourceDate = '2026-09-17T03:05:12Z';
 const requiredPages = [
@@ -47,6 +58,130 @@ test('Chinese build configuration cannot emit other language editions', async ()
   assert.deepEqual(Object.keys(editions), ['zh-CN']);
   assert.equal(editions['zh-CN'].directory, 'book');
   assert.equal(editions['zh-CN'].home, '/');
+});
+
+test('supplemental static paths are self-contained for Astro extraction', async () => {
+  const route = await readFile(
+    join(
+      repositoryRoot,
+      'overlays',
+      'ai-agent-book',
+      'src',
+      'pages',
+      '[supplement].astro',
+    ),
+    'utf8',
+  );
+
+  assert.match(route, /export function getStaticPaths\(\) \{\s*return \[/);
+  for (const slug of ['introduction', 'afterword', 'reference-answers']) {
+    assert.match(route, new RegExp(`slug: '${slug}'`));
+  }
+});
+
+test('course header links to the canonical Labs learning area', async () => {
+  const header = await readFile(
+    join(
+      repositoryRoot,
+      'overlays',
+      'ai-agent-book',
+      'src',
+      'components',
+      'Header.astro',
+    ),
+    'utf8',
+  );
+
+  assert.match(header, /href="https:\/\/serebiisme\.github\.io\/learn\/"/);
+  assert.doesNotMatch(header, /href="\/learn\/"/);
+});
+
+test('edition pruning removes only unselected configured source directories', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'course-prune-'));
+  const source = join(root, 'source');
+  const originalEditions = join(root, 'original-editions.json');
+  const selectedEditions = join(root, 'selected-editions.json');
+  await write(join(source, 'book', 'chapter1.md'), '简体中文');
+  await write(join(source, 'book-en', 'chapter1.md'), 'English');
+  await write(join(source, 'book-ja', 'chapter1.ja.md'), '日本語');
+  await write(join(source, 'book-not-an-edition', 'keep.txt'), 'keep me');
+  await write(
+    originalEditions,
+    JSON.stringify({
+      en: { directory: 'book-en' },
+      'zh-CN': { directory: 'book' },
+      ja: { directory: 'book-ja' },
+    }),
+  );
+  await write(
+    selectedEditions,
+    JSON.stringify({ 'zh-CN': { directory: 'book' } }),
+  );
+
+  const result = spawnSync(
+    process.execPath,
+    [pruner, source, originalEditions, selectedEditions],
+    { cwd: repositoryRoot, encoding: 'utf8' },
+  );
+
+  assert.equal(result.status, 0, result.stderr);
+  await access(join(source, 'book', 'chapter1.md'));
+  await assert.rejects(access(join(source, 'book-en')));
+  await assert.rejects(access(join(source, 'book-ja')));
+  assert.equal(
+    await readFile(join(source, 'book-not-an-edition', 'keep.txt'), 'utf8'),
+    'keep me',
+  );
+});
+
+test('provenance can be generated before deployment link validation', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'course-provenance-'));
+  const target = join(root, 'dist', 'SOURCE.md');
+
+  const result = spawnSync(
+    process.execPath,
+    [provenanceWriter, target, sourceCommit, sourceDate],
+    { cwd: repositoryRoot, encoding: 'utf8' },
+  );
+
+  assert.equal(result.status, 0, result.stderr);
+  const source = await readFile(target, 'utf8');
+  assert.match(source, /https:\/\/github\.com\/bojieli\/ai-agent-book/);
+  assert.match(source, new RegExp(sourceCommit));
+  assert.match(source, /Apache License 2\.0/);
+});
+
+test('supplemental figures are prepared as original and themed local assets', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'course-supplemental-assets-'));
+  const source = join(root, 'source');
+  const publicRoot = join(root, 'public');
+  await write(
+    join(source, 'book', 'introduction.md'),
+    '![one](images/fig0-1.svg)\n![two](images/fig0-2.svg)',
+  );
+  await write(join(source, 'book', 'afterword.md'), 'No images');
+  await write(join(source, 'book', 'reference-answers.md'), 'No images');
+  await write(join(source, 'book', 'images', 'fig0-1.svg'), '<svg>one</svg>');
+  await write(join(source, 'book', 'images', 'fig0-2.svg'), '<svg>two</svg>');
+
+  const result = spawnSync(
+    process.execPath,
+    [supplementalAssetPreparer, source, publicRoot],
+    { cwd: repositoryRoot, encoding: 'utf8' },
+  );
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(
+    await readFile(join(publicRoot, 'book', 'images', 'fig0-1.svg'), 'utf8'),
+    '<svg>one</svg>',
+  );
+  for (const figure of ['fig0-1', 'fig0-2']) {
+    for (const theme of ['light', 'dark']) {
+      await access(
+        join(publicRoot, 'figures', 'book', 'book', `${figure}-${theme}.svg`),
+      );
+    }
+  }
 });
 
 test('incomplete upstream build leaves the existing course untouched', async () => {

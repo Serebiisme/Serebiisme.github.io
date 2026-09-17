@@ -1,0 +1,1 @@
+function e(e,t=`/learn/ai-agent-book/`){return!e.startsWith(`/`)||e.startsWith(`//`)?e:`${t.replace(/\/$/,``)}${e}`}export{e as t};

@@ -9,6 +9,7 @@ import {
 } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { buildManifest } from './generate-offline-manifest.mjs';
+import { writeProvenance } from './write-course-provenance.mjs';
 
 const requiredPages = [
   'index.html',
@@ -36,26 +37,6 @@ async function validateBuild(dist) {
   }
 }
 
-async function writeProvenance(staging, sourceCommit, sourceDate) {
-  const source = `# Source and modifications
-
-- Original work: [AI Agents in Depth](https://github.com/bojieli/ai-agent-book)
-- Author and copyright: Bojie Li, Copyright 2025
-- License: Apache License 2.0
-- Source commit: \`${sourceCommit}\`
-- Source commit date: ${sourceDate}
-
-## Serebii Labs modifications
-
-- Chinese-only edition configuration: the generated mirror includes the original Simplified Chinese edition only.
-- Added supplemental routes for the unmodified introduction, afterword, and reference answers Markdown sources.
-- Rebased static asset URLs under \`/learn/ai-agent-book/\` and generated an offline resource manifest.
-
-Serebii Labs provides this attributed offline mirror and is not affiliated with, endorsed by, or operated by the original author.
-`;
-  await writeFile(resolve(staging, 'SOURCE.md'), source);
-}
-
 async function importCourse(dist, target, license, sourceCommit, sourceDate) {
   await validateBuild(dist);
   const staging = `${target}.staging-${process.pid}`;
@@ -65,7 +46,11 @@ async function importCourse(dist, target, license, sourceCommit, sourceDate) {
   await mkdir(dirname(target), { recursive: true });
   await cp(dist, staging, { recursive: true });
   await copyFile(license, resolve(staging, 'LICENSE.txt'));
-  await writeProvenance(staging, sourceCommit, sourceDate);
+  await writeProvenance(
+    resolve(staging, 'SOURCE.md'),
+    sourceCommit,
+    sourceDate,
+  );
   const manifest = await buildManifest(
     staging,
     '/learn/ai-agent-book/',

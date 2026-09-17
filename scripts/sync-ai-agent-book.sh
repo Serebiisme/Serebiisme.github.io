@@ -20,10 +20,20 @@ source_date=$(git -C "$checkout" show -s --format=%cI "$source_commit")
 
 (
   cd "$checkout/web-astro"
+  export npm_config_registry="https://registry.npmjs.org/"
+  export npm_config_replace_registry_host="never"
   npm ci
-  npm test
   npm run check
+  npm run build
+  npm test
 )
+
+original_editions="$sync_root/original-editions.json"
+cp "$checkout/web-astro/src/lib/editions.json" "$original_editions"
+node "$site_root/scripts/prune-ai-agent-book.mjs" \
+  "$checkout" \
+  "$original_editions" \
+  "$site_root/overlays/ai-agent-book/editions.json"
 
 cp "$site_root/overlays/ai-agent-book/editions.json" \
   "$checkout/web-astro/src/lib/editions.json"
@@ -36,7 +46,14 @@ cp "$site_root/overlays/ai-agent-book/src/pages/[supplement].astro" \
 
 (
   cd "$checkout/web-astro"
+  node "$site_root/scripts/prepare-supplemental-assets.mjs" \
+    "$checkout" \
+    "$checkout/web-astro/public"
   ASTRO_BASE=/learn/ai-agent-book/ npm run build
+  node "$site_root/scripts/write-course-provenance.mjs" \
+    "$checkout/web-astro/dist/SOURCE.md" \
+    "$source_commit" \
+    "$source_date"
   ASTRO_BASE=/learn/ai-agent-book/ npm run check:deployment
 )
 
