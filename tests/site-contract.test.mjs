@@ -48,6 +48,17 @@ test('MMR visual note is reachable from the shelf and has described diagrams', a
   assert.equal((mmr.match(/<desc\b/g) ?? []).length, 3);
 });
 
+test('Jaccard visual note is reachable and crosslinks the MMR example', async () => {
+  const shelf = await read('notes/index.html');
+  const mmr = await read('notes/mmr/index.html');
+  const jaccard = await read('notes/jaccard/index.html');
+  assert.match(shelf, /href="\/notes\/jaccard\/"/);
+  assert.match(mmr, /href="\/notes\/jaccard\/"/);
+  assert.match(jaccard, /href="\/notes\/mmr\/"/);
+  assert.equal((jaccard.match(/<svg\b[^>]*role="img"[^>]*aria-labelledby="[^"]+"/g) ?? []).length, 3);
+  assert.equal((jaccard.match(/<desc\b/g) ?? []).length, 3);
+});
+
 test('GitHub Pages bypasses Jekyll so generated _astro assets are published', async () => {
   await access(join(repositoryRoot, '.nojekyll'));
 });
