@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <meta name="theme-color" content="#f4f1ea" />
+  <meta name="description" content="用图解读 RAG 检索分数归一化：为什么要做、Min-Max 的两步变换、边界处理与 Sigmoid 对离群值的软压缩。" />
+  <link rel="stylesheet" href="/notes/styles.css" />
+  <title>把分数放到同一把尺子上 · Serebii Labs</title>
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="返回 Serebii Labs 首页"><i class="brand-mark" aria-hidden="true"></i>Serebii Labs</a>
+      <nav aria-label="主导航"><a href="/">首页</a><a href="/learn/">AI 学习</a><a href="/notes/" aria-current="page">图解笔记</a></nav>
+      <span class="eyebrow">Visual Notes / 01</span>
+    </header>
+
+    <section class="article-hero" aria-labelledby="page-title">
+      <div>
+        <div class="breadcrumbs"><a href="/notes/">图解笔记</a> / 01 · RAG 检索基础</div>
+        <span class="eyebrow">One scale for different scores</span>
+        <h1 id="page-title">把分数放到<br /><em>同一把尺子</em>上。</h1>
+        <p class="lede">BM25 像用“十几分”说话，向量相似度却常在 0 到 1 之间。下面用一组具体数字，把归一化从动机、公式到边界情况拆开。</p>
+      </div>
+      <aside class="hero-stamp" aria-label="文章概览"><span class="eyebrow">01 / Visual explainer</span><strong>Min → 0<br />Max → 1</strong><span class="orbit" aria-hidden="true"></span></aside>
+    </section>
+    <hr class="rule" />
+
+    <div class="article-layout">
+      <nav class="toc" aria-label="本文目录">
+        <h2>Contents / 目录</h2>
+        <a href="#why">01 为什么需要归一化</a>
+        <a href="#min-max">02 平移，再缩放</a>
+        <a href="#shape">03 为什么比例不变</a>
+        <a href="#guards">04 两个边界处理</a>
+        <a href="#outliers">05 离群值与 Sigmoid</a>
+        <a href="#recap">06 一句话总结</a>
+      </nav>
+
+      <article class="article-body">
+        <section class="essay-section" id="why">
+          <span class="section-number">01 / WHY NORMALIZE</span>
+          <h2>两种分数，<br />不能直接比大小。</h2>
+          <p>RAG 混合检索会同时拿到 BM25 的关键词匹配分与向量相似度。它们的数值范围不同：例如 BM25 是 <strong>12.3</strong>，向量分是 <strong>0.82</strong>。直接相加时，即便权重各为一半，BM25 的数值仍会占据绝大部分。</p>
+          <figure class="figure">
+            <div class="figure-title"><span>Fig. 01 / 两把尺子</span><span>同一长度 ≠ 同一意义</span></div>
+            <div class="diagram-scroll">
+              <svg class="diagram" viewBox="0 0 960 350" role="img" aria-labelledby="scale-title scale-desc">
+                <title id="scale-title">BM25 与向量分数原始量级和归一化后的对比</title>
+                <desc id="scale-desc">左侧共用 0 到 12.3 的数轴，BM25 的 12.3 几乎占满，向量相似度 0.82 只有一小段。右侧分别映射到 0 到 1 后，两种信号都能在同一尺度上比较。</desc>
+                <rect width="480" height="350" fill="#c7d6ee"/><rect x="480" width="480" height="350" fill="#f8e6a9"/>
+                <line x1="480" y1="0" x2="480" y2="350" stroke="#191919" stroke-opacity=".22"/>
+                <text x="40" y="54" font-size="25" font-weight="800">直接相加</text><text x="520" y="54" font-size="25" font-weight="800">各自归一化后</text>
+                <text x="40" y="82" font-size="14">原始分数共用一条 0–12.3 的尺子</text><text x="520" y="82" font-size="14">两类分数分别映射到 0–1</text>
+                <text x="40" y="130" font-size="16" font-weight="700">BM25</text><rect x="40" y="143" width="370" height="39" rx="3" fill="#fffdf8" stroke="#191919"/><rect x="40" y="143" width="370" height="39" rx="3" fill="#191919"/><text x="352" y="169" font-size="16" font-weight="800" fill="#fffdf8" style="fill:#fffdf8">12.3</text>
+                <text x="40" y="223" font-size="16" font-weight="700">向量</text><rect x="40" y="236" width="370" height="39" rx="3" fill="#fffdf8" stroke="#191919"/><rect x="40" y="236" width="25" height="39" rx="3" fill="#ff785d"/><text x="75" y="262" font-size="16" font-weight="800">0.82</text>
+                <text x="520" y="130" font-size="16" font-weight="700">BM25</text><rect x="520" y="143" width="370" height="39" rx="3" fill="#fffdf8" stroke="#191919"/><rect x="520" y="143" width="370" height="39" rx="3" fill="#191919"/><text x="847" y="169" font-size="16" font-weight="800" style="fill:#fffdf8">1.0</text>
+                <text x="520" y="223" font-size="16" font-weight="700">向量</text><rect x="520" y="236" width="370" height="39" rx="3" fill="#fffdf8" stroke="#191919"/><rect x="520" y="236" width="370" height="39" rx="3" fill="#ff785d"/><text x="847" y="262" font-size="16" font-weight="800">1.0</text>
+                <text x="40" y="318" font-size="14">0</text><text x="380" y="318" font-size="14">12.3</text><text x="520" y="318" font-size="14">0</text><text x="880" y="318" font-size="14">1</text>
+              </svg>
+            </div>
+            <figcaption>右图展示“各自在本维度达到最大值”时的示意。真正计算时，每个维度都需要用同一批候选文档的最小值和最大值作为参照。</figcaption>
+          </figure>
+          <p>看一个更完整的例子。三篇候选文档的原始分数如下；两列分别做 Min-Max，然后各取 50% 权重：</p>
+          <div class="table-scroll"><table class="comparison">
+            <thead><tr><th>文档</th><th>BM25 原始</th><th>向量原始</th><th>原始相加</th><th>归一化后平均</th></tr></thead>
+            <tbody><tr><td>A</td><td>12.3</td><td>0.42</td><td>12.72</td><td>0.500</td></tr><tr><td>B</td><td>8.0</td><td>0.82</td><td>8.82</td><td><strong>0.791</strong></td></tr><tr><td>C</td><td>2.0</td><td>0.55</td><td>2.55</td><td>0.163</td></tr></tbody>
+          </table></div>
+          <p>原始相加会让 A 胜出；放到各自的 0–1 尺子后，B 的向量优势终于能发挥作用。<strong>等权重只有在分数尺度可比时才接近“各占一半”</strong>。这里的数字只是演示，实际排名还取决于候选集和融合策略。</p>
+        </section>
+
+        <section class="essay-section" id="min-max">
+          <span class="section-number">02 / TWO MOVES</span>
+          <h2>平移到零，<br />缩放到一。</h2>
+          <p>Min-Max 归一化只有一个公式。先减去最小值，消除整组数字的偏移；再除以极差，把最大值压到 1。</p>
+          <div class="formula" aria-label="x 减去最小值，除以最大值减去最小值">(x − min) / (max − min)</div>
+          <p>拿 <code>[2, 5, 8]</code> 走一遍：最小值是 2，最大值是 8，极差是 6。</p>
+          <figure class="figure">
+            <div class="figure-title"><span>Fig. 02 / 一组数的旅程</span><span>2 · 5 · 8</span></div>
+            <div class="diagram-scroll">
+              <svg class="diagram" viewBox="0 0 960 440" role="img" aria-labelledby="steps-title steps-desc">
+                <title id="steps-title">2、5、8 经平移和缩放变为 0、0.5、1</title>
+                <desc id="steps-desc">第一条数轴为 2、5、8。每个数减去 2 后成为 0、3、6。再各除以 6，得到 0、0.5、1。</desc>
+                <rect width="960" height="146" fill="#c7d6ee"/><rect y="147" width="960" height="146" fill="#f3c8bb"/><rect y="294" width="960" height="146" fill="#d6e3bc"/>
+                <line x1="0" y1="146" x2="960" y2="146" stroke="#191919" stroke-opacity=".2"/><line x1="0" y1="293" x2="960" y2="293" stroke="#191919" stroke-opacity=".2"/>
+                <text x="34" y="43" font-size="18" font-weight="800">01 原始</text><text x="34" y="190" font-size="18" font-weight="800">02 平移</text><text x="34" y="337" font-size="18" font-weight="800">03 缩放</text>
+                <text x="34" y="70" font-size="14">[2, 5, 8]</text><text x="34" y="217" font-size="14">每个值 − 2</text><text x="34" y="364" font-size="14">每个值 ÷ 6</text>
+                <line x1="268" y1="93" x2="826" y2="93" stroke="#191919" stroke-width="2"/><line x1="268" y1="240" x2="826" y2="240" stroke="#191919" stroke-width="2"/><line x1="268" y1="387" x2="826" y2="387" stroke="#191919" stroke-width="2"/>
+                <g fill="#191919"><circle cx="268" cy="93" r="11"/><circle cx="547" cy="93" r="11"/><circle cx="826" cy="93" r="11"/><circle cx="268" cy="240" r="11"/><circle cx="547" cy="240" r="11"/><circle cx="826" cy="240" r="11"/><circle cx="268" cy="387" r="11"/><circle cx="547" cy="387" r="11"/><circle cx="826" cy="387" r="11"/></g>
+                <g font-size="22" font-weight="800" text-anchor="middle"><text x="268" y="76">2</text><text x="547" y="76">5</text><text x="826" y="76">8</text><text x="268" y="223">0</text><text x="547" y="223">3</text><text x="826" y="223">6</text><text x="268" y="370">0</text><text x="547" y="370">0.5</text><text x="826" y="370">1.0</text></g>
+                <text x="547" y="130" font-size="13" text-anchor="middle">原来横跨 6 个单位</text><text x="547" y="277" font-size="13" text-anchor="middle">左端已对齐 0，跨度仍是 6</text><text x="547" y="424" font-size="13" text-anchor="middle">右端落在 1，跨度变成 1</text>
+              </svg>
+            </div>
+            <figcaption>平移只移动起点；缩放只改变单位长度。映射前后的顺序不会改变。</figcaption>
+          </figure>
+        </section>
+
+        <section class="essay-section" id="shape">
+          <span class="section-number">03 / PRESERVE THE SHAPE</span>
+          <h2>尺子变了，<br />相对距离没变。</h2>
+          <p>原来的 <code>2 → 5 → 8</code>，相邻两段各差 3；映射后的 <code>0 → 0.5 → 1</code>，相邻两段各差 0.5。两段的比例始终是 <strong>1 : 1</strong>。</p>
+          <figure class="figure">
+            <div class="figure-title"><span>Fig. 03 / 保持形状</span><span>线性变换</span></div>
+            <div class="diagram-scroll">
+              <svg class="diagram" viewBox="0 0 960 270" role="img" aria-labelledby="distance-title distance-desc">
+                <title id="distance-title">归一化前后相邻点的间距比例相同</title>
+                <desc id="distance-desc">原始数轴上的 2 到 5 与 5 到 8 都相差 3。归一化数轴上的 0 到 0.5 与 0.5 到 1 都相差 0.5；前后两段仍然等长。</desc>
+                <rect width="960" height="270" fill="#ded4ee"/>
+                <text x="42" y="65" font-size="17" font-weight="800">原始数轴</text><text x="42" y="184" font-size="17" font-weight="800">归一化</text>
+                <line x1="240" y1="115" x2="850" y2="115" stroke="#191919" stroke-width="3"/><line x1="240" y1="232" x2="850" y2="232" stroke="#191919" stroke-width="3"/>
+                <g fill="#d9ff53" stroke="#191919" stroke-width="2"><circle cx="240" cy="115" r="14"/><circle cx="545" cy="115" r="14"/><circle cx="850" cy="115" r="14"/><circle cx="240" cy="232" r="14"/><circle cx="545" cy="232" r="14"/><circle cx="850" cy="232" r="14"/></g>
+                <g font-size="20" font-weight="800" text-anchor="middle"><text x="240" y="95">2</text><text x="545" y="95">5</text><text x="850" y="95">8</text><text x="240" y="211">0</text><text x="545" y="211">0.5</text><text x="850" y="211">1</text></g>
+                <g font-size="14" text-anchor="middle"><text x="392" y="145">+3</text><text x="697" y="145">+3</text><text x="392" y="261">+0.5</text><text x="697" y="261">+0.5</text></g>
+              </svg>
+            </div>
+            <figcaption>Min-Max 保持点的顺序和间距比例；改变的是坐标的起点与单位。</figcaption>
+          </figure>
+          <p>这也是它的限制：一个极端最大值会拉大整条尺子，使普通值之间的距离在 0–1 区间里显得非常小。</p>
+        </section>
+
+        <section class="essay-section" id="guards">
+          <span class="section-number">04 / TWO GUARDS</span>
+          <h2>公式之外，<br />还要照顾特殊输入。</h2>
+          <div class="two-cards">
+            <div class="callout"><span class="chip">GUARD 01 / 空数组</span><h3><code>[] → []</code></h3><p>直接返回空数组。否则 <code>Math.min(...[])</code> 会得到 <code>Infinity</code>，后续计算没有意义。</p></div>
+            <div class="callout"><span class="chip">GUARD 02 / 所有值相同</span><h3><code>[5,5,5] → [0,0,0]</code></h3><p>此时 <code>max − min = 0</code>。把分母设为 <code>(max − min) || 1</code>，避免除以零；每个分子也都是 0。</p></div>
+          </div>
+          <p>第二个处理是实现约定：当所有候选值一样，这个维度没有区分力，统一归零。它不代表原始分数本身是零。</p>
+        </section>
+
+        <section class="essay-section" id="outliers">
+          <span class="section-number">05 / OUTLIERS</span>
+          <h2>极端值进来，<br />其余点会怎样？</h2>
+          <p>把输入换成 <code>[2, 5, 8, 100]</code>。Min-Max 以 100 为最大值时，前三个普通值会被挤到 0 附近。Sigmoid 则用 S 曲线做有界的“软压缩”：极端值靠近 1，但不强迫其他点挤在起点。</p>
+          <figure class="figure">
+            <div class="figure-title"><span>Fig. 04 / 同一组输入，两种映射</span><span>[2, 5, 8, 100]</span></div>
+            <div class="diagram-scroll">
+              <svg class="diagram" viewBox="0 0 960 340" role="img" aria-labelledby="outlier-title outlier-desc">
+                <title id="outlier-title">Min-Max 与 Sigmoid 对离群值 100 的不同表现</title>
+                <desc id="outlier-desc">输入 2、5、8、100。Min-Max 分别映射到 0、0.031、0.061、1，前三点挤在一起。示例 Sigmoid 使用中心 5、尺度 3，分别得到约 0.269、0.5、0.731、1，前三点仍明显分开。</desc>
+                <rect width="960" height="170" fill="#f8e6a9"/><rect y="171" width="960" height="169" fill="#c7d6ee"/><line x1="0" y1="170" x2="960" y2="170" stroke="#191919" stroke-opacity=".2"/>
+                <text x="34" y="45" font-size="23" font-weight="800">Min-Max</text><text x="34" y="72" font-size="14">最大值 100 决定整条尺子</text>
+                <text x="34" y="214" font-size="23" font-weight="800">Sigmoid</text><text x="34" y="240" font-size="14">中心 5，尺度 3（演示参数）</text>
+                <line x1="290" y1="121" x2="850" y2="121" stroke="#191919" stroke-width="3"/><line x1="290" y1="290" x2="850" y2="290" stroke="#191919" stroke-width="3"/>
+                <g fill="#191919"><circle cx="290" cy="121" r="10"/><circle cx="307" cy="121" r="10"/><circle cx="324" cy="121" r="10"/><circle cx="850" cy="121" r="11"/></g>
+                <g fill="#ff785d" stroke="#191919" stroke-width="2"><circle cx="441" cy="290" r="11"/><circle cx="570" cy="290" r="11"/><circle cx="699" cy="290" r="11"/><circle cx="850" cy="290" r="11"/></g>
+                <g class="mono-text" font-size="13" text-anchor="middle"><text x="290" y="96">2</text><text x="307" y="83">5</text><text x="324" y="70">8</text><text x="850" y="96">100</text><text x="441" y="268">2</text><text x="570" y="268">5</text><text x="699" y="268">8</text><text x="850" y="268">100</text><text x="290" y="152">0</text><text x="850" y="152">1</text><text x="290" y="324">0</text><text x="850" y="324">1</text></g>
+              </svg>
+            </div>
+            <figcaption>Sigmoid 示意使用 <code>σ((x − 5) / 3)</code>：2、5、8 分别约为 0.269、0.500、0.731；100 极接近 1。图中的具体间距取决于中心与尺度参数。</figcaption>
+          </figure>
+          <div class="table-scroll"><table class="comparison">
+            <thead><tr><th>方法</th><th>2</th><th>5</th><th>8</th><th>100</th></tr></thead>
+            <tbody><tr><td>Min-Max</td><td>0</td><td>0.031</td><td>0.061</td><td>1</td></tr><tr><td>示例 Sigmoid</td><td>0.269</td><td>0.500</td><td>0.731</td><td>≈1</td></tr></tbody>
+          </table></div>
+          <p>Sigmoid 的输出严格落在 0 与 1 之间，通常不会恰好达到两端；它的鲁棒性也依赖中心和尺度怎么选。这里用的是<strong>标准 Logistic 示意</strong>，因为未给出 <code>normalizeViaSigmoid</code> 的源码，不能把这些参数当成该函数的真实实现。</p>
+        </section>
+
+        <section class="essay-section" id="recap">
+          <span class="section-number">06 / TAKEAWAY</span>
+          <h2>记住这一句，<br />就抓住了核心。</h2>
+          <div class="summary-box">
+            <span class="eyebrow">The short version</span>
+            <blockquote>“平移到零、缩放到一。”</blockquote>
+            <ul>
+              <li><strong>目的：</strong>把不同量纲的检索分数放在可比尺度上，再做加权融合。</li>
+              <li><strong>公式：</strong><code>(x − min) / (max − min)</code>，保持顺序与间距比例。</li>
+              <li><strong>边界：</strong>空数组返回 <code>[]</code>；极差为零时分母取 1，结果全为 0。</li>
+              <li><strong>取舍：</strong>Min-Max 对离群值敏感；Sigmoid 能软压缩，但需要选择中心和尺度。</li>
+            </ul>
+          </div>
+        </section>
+        <a class="back-link" href="/notes/">← 返回图解笔记</a>
+      </article>
+    </div>
+    <footer><p>© 2026 Serebii Labs</p><p>Visual Notes / 01 · RAG retrieval</p></footer>
+  </main>
+</body>
+</html>

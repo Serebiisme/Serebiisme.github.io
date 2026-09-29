@@ -19,11 +19,13 @@ async function walk(directory) {
   return files;
 }
 
-test('root page exposes AI 学习 in navigation and the first card', async () => {
+test('root page exposes the course library and visual notes', async () => {
   const html = await read('index.html');
   assert.match(html, /<a href="\/learn\/">AI 学习<\/a>/);
+  assert.match(html, /<a href="\/notes\/">图解笔记<\/a>/);
   assert.match(html, /<a class="card card-large" href="\/learn\/">/);
-  assert.match(html, /<strong>01<\/strong>/);
+  assert.match(html, /<a class="card card-mid" href="\/notes\/">/);
+  assert.match(html, /<strong>02<\/strong>/);
 });
 
 test('GitHub Pages bypasses Jekyll so generated _astro assets are published', async () => {
