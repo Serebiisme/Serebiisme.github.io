@@ -28,6 +28,16 @@ test('root page exposes the course library and visual notes', async () => {
   assert.match(html, /<strong>02<\/strong>/);
 });
 
+test('visual notes shelf connects both normalization explainers', async () => {
+  const shelf = await read('notes/index.html');
+  const minMax = await read('notes/normalization/index.html');
+  const sigmoid = await read('notes/sigmoid/index.html');
+  assert.match(shelf, /href="\/notes\/normalization\/"/);
+  assert.match(shelf, /href="\/notes\/sigmoid\/"/);
+  assert.match(minMax, /href="\/notes\/sigmoid\/"/);
+  assert.match(sigmoid, /href="\/notes\/normalization\/"/);
+});
+
 test('GitHub Pages bypasses Jekyll so generated _astro assets are published', async () => {
   await access(join(repositoryRoot, '.nojekyll'));
 });
