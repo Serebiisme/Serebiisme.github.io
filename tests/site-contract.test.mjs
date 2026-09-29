@@ -55,6 +55,9 @@ test('GitHub Pages bypasses Jekyll so generated _astro assets are published', as
 test('course library has accessible PWA and rendering hooks', async () => {
   const html = await read('learn/index.html');
   assert.match(html, /<title>AI 学习 · Serebii Labs<\/title>/);
+  const navigation = html.match(/<nav aria-label="课程库导航">([\s\S]*?)<\/nav>/);
+  assert.ok(navigation, 'course library navigation exists');
+  assert.match(navigation[1], /<a href="\/notes\/">图解笔记<\/a>/);
   assert.match(
     html,
     /rel="manifest" href="\/learn\/manifest\.webmanifest"/,
