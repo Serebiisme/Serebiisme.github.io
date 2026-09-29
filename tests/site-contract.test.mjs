@@ -38,6 +38,16 @@ test('visual notes shelf connects both normalization explainers', async () => {
   assert.match(sigmoid, /href="\/notes\/normalization\/"/);
 });
 
+test('MMR visual note is reachable from the shelf and has described diagrams', async () => {
+  const shelf = await read('notes/index.html');
+  const mmr = await read('notes/mmr/index.html');
+  assert.match(shelf, /href="\/notes\/mmr\/"/);
+  assert.match(mmr, /href="\/notes\/"/);
+  assert.match(mmr, /MMR/);
+  assert.equal((mmr.match(/<svg\b[^>]*role="img"[^>]*aria-labelledby="[^"]+"/g) ?? []).length, 3);
+  assert.equal((mmr.match(/<desc\b/g) ?? []).length, 3);
+});
+
 test('GitHub Pages bypasses Jekyll so generated _astro assets are published', async () => {
   await access(join(repositoryRoot, '.nojekyll'));
 });
