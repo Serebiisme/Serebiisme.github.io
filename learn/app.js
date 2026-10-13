@@ -8,6 +8,13 @@ let serviceWorkerRegistration;
 
 function renderCourse(course, index) {
   const fragment = template.content.cloneNode(true);
+  fragment.querySelector('.course-card').dataset.courseId = course.id;
+  if (course.id === 'ai-engineering') {
+    fragment.querySelector('.course-visual').replaceChildren(
+      document.querySelector('#interview-cover-template').content.cloneNode(true),
+    );
+    fragment.querySelector('.course-kicker').textContent = 'Interview / 面试题库';
+  }
   fragment.querySelector('[data-course-number]').textContent =
     String(index + 1).padStart(2, '0');
   fragment.querySelector('[data-course-chapters]').textContent =

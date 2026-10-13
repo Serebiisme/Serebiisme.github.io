@@ -7,7 +7,7 @@ import {
   shellCacheName,
 } from '/learn/offline-core.mjs';
 
-const SHELL_VERSION = '2026-10-13-1';
+const SHELL_VERSION = '2026-10-13-2';
 const SHELL_CACHE = shellCacheName(SHELL_VERSION);
 const RUNTIME_CACHE = 'ai-learning-runtime:1';
 
