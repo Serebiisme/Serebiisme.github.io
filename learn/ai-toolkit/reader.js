@@ -59,7 +59,7 @@ if (!('serviceWorker' in navigator)) {
     status.textContent = '正在准备离线内容…';
     try {
       const installed = await navigator.serviceWorker.getRegistration('/learn/');
-      if (navigator.onLine || !installed?.active) await navigator.serviceWorker.register('/learn/sw.js', { scope: '/learn/', type: 'module' });
+      if (navigator.onLine || !installed?.active) await navigator.serviceWorker.register('/learn/sw.js', { scope: '/learn/', type: 'module', updateViaCache: 'none' });
       const registration = installed?.active && !navigator.onLine ? installed : await navigator.serviceWorker.ready;
       registration.active.postMessage({ type: MESSAGE.cacheCourse, courseId: 'ai-toolkit', manifestUrl: '/learn/ai-toolkit/offline-manifest.json' });
     } catch {

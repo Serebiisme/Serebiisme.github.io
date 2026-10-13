@@ -117,6 +117,7 @@ async function initializeOffline(courses) {
     await navigator.serviceWorker.register('/learn/sw.js', {
       scope: '/learn/',
       type: 'module',
+      updateViaCache: 'none',
     });
     serviceWorkerRegistration = await navigator.serviceWorker.ready;
     for (const course of courses) postCacheRequest(course);
