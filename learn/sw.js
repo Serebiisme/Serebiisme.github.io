@@ -4,10 +4,11 @@ import {
   cacheCourse,
   canonicalCourseAssetUrl,
   isLearnUrl,
+  matchCourseAsset,
   shellCacheName,
 } from '/learn/offline-core.mjs';
 
-const SHELL_VERSION = '2026-10-13-2';
+const SHELL_VERSION = '2026-10-13-3';
 const SHELL_CACHE = shellCacheName(SHELL_VERSION);
 const RUNTIME_CACHE = 'ai-learning-runtime:1';
 
@@ -92,7 +93,9 @@ async function networkFirst(request) {
 
 async function courseCacheFirst(request) {
   const canonical = canonicalCourseAssetUrl(request.url);
-  const cached = await caches.match(canonical);
+  const cached = new URL(request.url).pathname.startsWith('/learn/ai-toolkit/')
+    ? await matchCourseAsset({ cachesApi: caches, courseId: 'ai-toolkit', requestUrl: request.url, runtimeCacheName: RUNTIME_CACHE })
+    : await caches.match(canonical);
   if (cached) return cached;
   try {
     const response = await fetch(request);
@@ -117,7 +120,7 @@ self.addEventListener('fetch', (event) => {
     event.respondWith(networkFirst(request));
     return;
   }
-  if (url.pathname.startsWith('/learn/ai-agent-book/') || url.pathname.startsWith('/learn/ai-engineering/')) {
+  if (url.pathname.startsWith('/learn/ai-agent-book/') || url.pathname.startsWith('/learn/ai-engineering/') || url.pathname.startsWith('/learn/ai-toolkit/')) {
     event.respondWith(courseCacheFirst(request));
     return;
   }

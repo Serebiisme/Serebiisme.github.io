@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import * as offlineCore from '../learn/offline-core.mjs';
 import {
   cacheCourse,
   canonicalCourseAssetUrl,
@@ -71,6 +72,35 @@ function successfulFetch(log) {
     return response(`asset:${url}`);
   };
 }
+
+test('saved toolkit version takes priority over an earlier temporary page', async () => {
+  assert.equal(typeof offlineCore.matchCourseAsset, 'function', 'course lookup must isolate its saved version');
+  const cachesApi = new MemoryCaches();
+  const asset = `${origin}/learn/ai-toolkit/claude-pm/files/index.html`;
+  const runtimeCacheName = 'ai-learning-runtime:1';
+  await (await cachesApi.open(runtimeCacheName)).put(asset, response('old temporary page'));
+  await cacheCourse({
+    cachesApi, courseId: 'ai-toolkit', manifestUrl: `${origin}/learn/ai-toolkit/offline-manifest.json`, origin,
+    fetchImpl: async (url) => String(url).endsWith('offline-manifest.json')
+      ? response(JSON.stringify({ version: 'new-version', sourceCommit: 'original-guide', assets: [asset] }), 200, 'application/json')
+      : response('new saved page'),
+    onProgress: () => {},
+  });
+  const saved = await offlineCore.matchCourseAsset({ cachesApi, courseId: 'ai-toolkit', requestUrl: `${origin}/learn/ai-toolkit/claude-pm/files/#exercise`, runtimeCacheName });
+  assert.equal(await saved.text(), 'new saved page');
+  assert.equal(await (await (await cachesApi.open(runtimeCacheName)).match(asset)).text(), 'old temporary page');
+});
+
+test('toolkit lookup falls back to a temporary page only when no saved page exists', async () => {
+  assert.equal(typeof offlineCore.matchCourseAsset, 'function');
+  const cachesApi = new MemoryCaches();
+  const asset = `${origin}/learn/ai-toolkit/index.html`;
+  const runtimeCacheName = 'ai-learning-runtime:1';
+  await (await cachesApi.open(runtimeCacheName)).put(asset, response('temporary page'));
+  await (await cachesApi.open(courseCacheName('unrelated-course', 'v1'))).put(asset, response('wrong course'));
+  const result = await offlineCore.matchCourseAsset({ cachesApi, courseId: 'ai-toolkit', requestUrl: `${origin}/learn/ai-toolkit/`, runtimeCacheName });
+  assert.equal(await result.text(), 'temporary page');
+});
 
 test('scope matching rejects other origins and pages outside /learn/', () => {
   assert.equal(isLearnUrl(`${origin}/learn/`, origin), true);

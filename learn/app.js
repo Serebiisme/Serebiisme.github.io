@@ -15,15 +15,23 @@ function renderCourse(course, index) {
     );
     fragment.querySelector('.course-kicker').textContent = 'Interview / 面试题库';
   }
+  if (course.id === 'ai-toolkit') {
+    fragment.querySelector('.course-visual').replaceChildren(
+      document.querySelector('#toolkit-cover-template').content.cloneNode(true),
+    );
+    fragment.querySelector('.course-kicker').textContent = 'Original guides / 中文原创';
+    fragment.querySelector('[data-course-link]').textContent = '进入合集';
+    fragment.querySelector('[data-course-license]').textContent = '编写与来源';
+  }
   fragment.querySelector('[data-course-number]').textContent =
     String(index + 1).padStart(2, '0');
   fragment.querySelector('[data-course-chapters]').textContent =
-    `${course.chapterCount} 章`;
+    course.guideCount ? `${course.guideCount} 分区 · ${course.chapterCount} 节` : `${course.chapterCount} 章`;
   fragment.querySelector('[data-course-title]').textContent = course.title;
   fragment.querySelector('[data-course-author]').textContent =
     `作者：${course.author}`;
   fragment.querySelector('[data-course-source]').textContent =
-    `固定版本：${course.sourceCommit.slice(0, 7)} · ${course.license}`;
+    `${course.id === 'ai-toolkit' ? '主题参考版本' : '固定版本'}：${course.sourceCommit.slice(0, 7)} · ${course.license}`;
   fragment.querySelector('[data-course-link]').href = course.route;
   fragment.querySelector('[data-course-license]').href =
     `${course.route}SOURCE.md`;

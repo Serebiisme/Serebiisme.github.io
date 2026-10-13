@@ -7,7 +7,7 @@ const courses = JSON.parse(
 );
 
 test('preserves the real first course when adding new albums', () => {
-  assert.equal(courses.length, 2);
+  assert.ok(courses.length >= 2);
   assert.deepEqual(courses[0], {
     id: 'ai-agent-book',
     title: '深入理解 AI Agent：设计原理与工程实践',

@@ -44,6 +44,16 @@ export function canonicalCourseAssetUrl(value) {
   return url.href;
 }
 
+export async function matchCourseAsset({ cachesApi, courseId, requestUrl, runtimeCacheName }) {
+  const canonical = canonicalCourseAssetUrl(requestUrl);
+  const prefix = `${COURSE_PREFIX}${courseId}:`;
+  for (const name of (await cachesApi.keys()).filter((name) => name.startsWith(prefix))) {
+    const match = await (await cachesApi.open(name)).match(canonical);
+    if (match) return match;
+  }
+  return (await cachesApi.open(runtimeCacheName)).match(canonical);
+}
+
 export function offlineStatusFromMessage(message) {
   if (message.type === MESSAGE.progress) {
     return {
