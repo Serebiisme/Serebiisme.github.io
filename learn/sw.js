@@ -7,7 +7,7 @@ import {
   shellCacheName,
 } from '/learn/offline-core.mjs';
 
-const SHELL_VERSION = '2026-09-17-1';
+const SHELL_VERSION = '2026-10-13-1';
 const SHELL_CACHE = shellCacheName(SHELL_VERSION);
 const RUNTIME_CACHE = 'ai-learning-runtime:1';
 
@@ -117,7 +117,7 @@ self.addEventListener('fetch', (event) => {
     event.respondWith(networkFirst(request));
     return;
   }
-  if (url.pathname.startsWith('/learn/ai-agent-book/')) {
+  if (url.pathname.startsWith('/learn/ai-agent-book/') || url.pathname.startsWith('/learn/ai-engineering/')) {
     event.respondWith(courseCacheFirst(request));
     return;
   }

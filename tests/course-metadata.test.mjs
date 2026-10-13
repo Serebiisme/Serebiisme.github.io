@@ -6,8 +6,8 @@ const courses = JSON.parse(
   await readFile(new URL('../learn/courses.json', import.meta.url)),
 );
 
-test('publishes exactly the real first course', () => {
-  assert.equal(courses.length, 1);
+test('preserves the real first course when adding new albums', () => {
+  assert.equal(courses.length, 2);
   assert.deepEqual(courses[0], {
     id: 'ai-agent-book',
     title: '深入理解 AI Agent：设计原理与工程实践',
