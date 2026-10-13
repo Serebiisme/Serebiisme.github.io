@@ -61,3 +61,32 @@ test('course pages use same-origin runtime resources and valid local links', asy
     }
   }
 });
+
+test('public article notes cover unique real sources and expose a searchable offline shelf', async () => {
+  const files = await import('node:fs/promises').then((fs) => fs.readdir(root));
+  const notes = [...(await import('../learn/ai-engineering/article-notes.mjs')).default];
+  for (const file of files.filter((f) => /^articles-.+\.mjs$/.test(f))) {
+    notes.push(...(await import(new URL(`../learn/ai-engineering/${file}`, import.meta.url))).default);
+  }
+  assert.equal(new Set(notes.map((n) => n.slug)).size, notes.length);
+  for (const note of notes) {
+    assert.equal(bank.articles.filter((a) => a.url.endsWith('/' + note.slug)).length, 1);
+    assert.ok(note.title && note.summary && note.extension);
+  }
+  const html = await read('articles/index.html');
+  assert.match(html, /id="reading-search"/);
+  assert.equal((html.match(/data-reading /g) ?? []).length, notes.length);
+  const slugs = new Set(notes.map((n) => n.slug));
+  for (const module of bank.modules) {
+    const page = await read(`${module.id}/index.html`);
+    for (const q of module.questions) {
+      for (const source of q.sources) {
+        const slug = new URL(source.url).pathname.split('/').at(-1);
+        if (slugs.has(slug)) {
+          const question = page.slice(page.indexOf(`id="${q.id}"`), page.indexOf('</details>', page.indexOf(`id="${q.id}"`)));
+          assert.ok(question.includes(`/learn/ai-engineering/articles/#${slug}`), `${q.id} must link its local article ${slug}`);
+        }
+      }
+    }
+  }
+});

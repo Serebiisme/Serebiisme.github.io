@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 
 export const MODULES = [
@@ -49,6 +49,14 @@ if (sourceDir) {
     .filter((source) => /outcomeschool\.com\/blog\/|outcomeschool\.substack\.com\/p\//.test(source.url))
     .map((source) => [source.url, source])).values()];
   const root = resolve('learn/ai-engineering');
+  try {
+    const existing = JSON.parse(await readFile(resolve(root, 'bank.json'), 'utf8'));
+    if (existing.sourceCommit !== sourceCommit) {
+      throw new Error('The course is a pinned edition. A new source revision requires reviewing question-to-translation alignment before import.');
+    }
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+  }
   await mkdir(root, { recursive: true });
   await writeFile(resolve(root, 'bank.json'), JSON.stringify({ sourceCommit, sourceRepository: 'https://github.com/amitshekhariitbhu/ai-engineering-interview-questions', checkedAt: '2026-10-13', modules, articles }, null, 2) + '\n');
   await writeFile(resolve(root, 'LICENSE.txt'), license);

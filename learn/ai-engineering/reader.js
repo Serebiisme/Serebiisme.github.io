@@ -7,6 +7,12 @@ search?.addEventListener('input', () => {
   for (const question of questions) question.hidden = !question.dataset.search.includes(term);
   document.querySelector('#search-count').textContent = `${questions.filter((q) => !q.hidden).length} 道题`;
 });
+const readings = [...document.querySelectorAll('[data-reading]')];
+document.querySelector('#reading-search')?.addEventListener('input', (event) => {
+  const term = event.currentTarget.value.trim().toLowerCase();
+  for (const reading of readings) reading.hidden = !reading.dataset.search.includes(term);
+  document.querySelector('#reading-count').textContent = `${readings.filter((r) => !r.hidden).length} 篇笔记`;
+});
 document.querySelector('#expand-all')?.addEventListener('click', (event) => {
   const visible = questions.filter((q) => !q.hidden);
   const expand = visible.some((q) => !q.open);
@@ -57,15 +63,29 @@ if (!('serviceWorker' in navigator)) {
     if (!state) return;
     status.textContent = state.text;
     save.disabled = state.state === 'progress';
-    if (state.state === 'ready') save.textContent = '已保存 · 检查更新';
+    if (state.state === 'ready') {
+      save.textContent = '已保存 · 检查更新';
+      const refresh = document.createElement('a');
+      refresh.href = location.href;
+      refresh.textContent = '刷新，载入已保存内容';
+      refresh.style.marginLeft = '12px';
+      refresh.addEventListener('click', (event) => {
+        event.preventDefault();
+        location.reload();
+      });
+      status.append(refresh);
+    }
     if (state.state === 'error') save.textContent = '保存失败 · 重试';
   });
   save.addEventListener('click', async () => {
     save.disabled = true;
     status.textContent = '正在准备离线内容…';
     try {
-      await navigator.serviceWorker.register('/learn/sw.js', { scope: '/learn/', type: 'module' });
-      const registration = await navigator.serviceWorker.ready;
+      const installed = await navigator.serviceWorker.getRegistration('/learn/');
+      if (navigator.onLine || !installed?.active) {
+        await navigator.serviceWorker.register('/learn/sw.js', { scope: '/learn/', type: 'module' });
+      }
+      const registration = installed?.active && !navigator.onLine ? installed : await navigator.serviceWorker.ready;
       registration.active.postMessage({ type: MESSAGE.cacheCourse, courseId: 'ai-engineering', manifestUrl: '/learn/ai-engineering/offline-manifest.json' });
     } catch {
       status.textContent = '离线准备失败，请联网后重试。';
