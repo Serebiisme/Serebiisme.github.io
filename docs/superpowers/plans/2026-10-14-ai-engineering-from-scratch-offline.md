@@ -10,6 +10,8 @@
 
 **Spec:** `docs/superpowers/specs/2026-10-14-ai-engineering-from-scratch-offline-design.md`（2026-10-14 用户已确认）。
 
+**Execution correction (2026-10-14):** 用户已批准 Native 并明确选择现有专用目录。77 个 project.json 实为 76 个 ready 项目加 1 个 `_template`；本计划后续提到的项目内容/页数/验收数均以 76 为准，模板另记，不作为课程。测验存在 55 份数组格式和 323 份 questions 对象格式，原始文件均保留，消费层兼容两者。
+
 ## Global Constraints
 
 - 英文与代码快照：`f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375`；中文快照：`cf05bd927ba34d7d8be6d4875f12994fd2021e81`。
