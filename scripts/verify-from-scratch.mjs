@@ -3,6 +3,7 @@ import {readFile,stat,writeFile,mkdir} from 'node:fs/promises';
 import {resolve,extname} from 'node:path';
 import {createServer} from 'node:http';
 import {execFileSync} from 'node:child_process';
+import {waitForBrowserCondition} from './from-scratch/browser-check.mjs';
 
 const root=resolve('.'),basePath='/learn/ai-from-scratch/';
 const catalog=JSON.parse(await readFile('content/ai-from-scratch/catalog.json','utf8'));
@@ -46,11 +47,11 @@ try{
   oldFiles.set('/learn/sw.js',oldWorker);oldFiles.set('/learn/offline-core.mjs',oldCore);oldFiles.set('/learn/app.js',oldApp);oldFiles.set('/learn/courses.json',oldCourses);
   await page.goto(base+'/learn/');await page.waitForFunction(()=>document.querySelectorAll('[data-offline-status][data-state="ready"]').length===3,{},{timeout:180000});
   await page.evaluate(()=>localStorage.setItem('upgrade-fixture','preserved'));
-  oldFiles.clear();await page.evaluate(async()=>{await(await navigator.serviceWorker.getRegistration('/learn/')).update();});await page.waitForFunction(async()=>{const names=await caches.keys();return names.includes('ai-learning-shell:2026-10-14-1')&&!names.includes('ai-learning-shell:2026-10-13-4');});
+  oldFiles.clear();await page.evaluate(async()=>{await(await navigator.serviceWorker.getRegistration('/learn/')).update();});await waitForBrowserCondition(page,async()=>{const names=await caches.keys();return names.includes('ai-learning-shell:2026-10-14-1')&&!names.includes('ai-learning-shell:2026-10-13-4');});
   assert.equal(await page.evaluate(()=>localStorage.getItem('upgrade-fixture')),'preserved');report.upgrade=true;
  }
  const libraryRequests=[];page.on('request',r=>libraryRequests.push(r.url()));await page.goto(base+'/learn/');await page.waitForSelector('[data-course-id="ai-from-scratch"]');
- await page.waitForFunction(async()=>{const r=await navigator.serviceWorker.getRegistration('/learn/');return r?.active?.state==='activated'&&!r.waiting&&!r.installing;},{},{timeout:60000});
+ await waitForBrowserCondition(page,async()=>{const r=await navigator.serviceWorker.getRegistration('/learn/');return r?.active?.state==='activated'&&!r.waiting&&!r.installing;},{timeout:60000});
  await page.waitForFunction(()=>sessionStorage.getItem('ai-learning-document')==='ready:2026-10-14-1',{},{timeout:90000});
  assert.equal(libraryRequests.some(u=>u.includes('/ai-from-scratch/manifests/')),false,'Library never auto-downloads new packs');
  console.log(JSON.stringify({checkpoint:'library and old-worker upgrade checked'}));
@@ -59,7 +60,7 @@ try{
  const missing=context.newPage();const missingPage=await missing;await context.setOffline(true);await missingPage.goto(base+basePath+'lessons/'+catalog.lessons.at(-1).id+'/');assert.ok(!(await missingPage.locator('body').getAttribute('data-lesson')),'Unsaved lesson shows offline fallback');await context.setOffline(false);await missingPage.close();
  // Exercise the real bulk-save control and worker, not a test-only cache fill.
  page.once('dialog',d=>d.accept());await page.locator('[data-save-all]').click();
- await page.waitForFunction(async()=>{const names=await caches.keys();let complete=0;for(const n of names.filter(n=>n.startsWith('ai-learning-course:ai-from-scratch:')||n.startsWith('ai-learning-course:ai-from-scratch-phase-')||n.startsWith('ai-learning-course:ai-from-scratch-project-'))){const id=n.slice('ai-learning-course:'.length).split(':')[0];if(await(await caches.open(n)).match(location.origin+'/learn/ai-from-scratch/__complete__/'+encodeURIComponent(id)))complete++;}return complete===97;},{},{timeout:900000});
+ await waitForBrowserCondition(page,async()=>{const names=await caches.keys();let complete=0;for(const n of names.filter(n=>n.startsWith('ai-learning-course:ai-from-scratch:')||n.startsWith('ai-learning-course:ai-from-scratch-phase-')||n.startsWith('ai-learning-course:ai-from-scratch-project-'))){const id=n.slice('ai-learning-course:'.length).split(':')[0];if(await(await caches.open(n)).match(location.origin+'/learn/ai-from-scratch/__complete__/'+encodeURIComponent(id)))complete++;}return complete===97;},{timeout:900000});
  console.log(JSON.stringify({savedPacks:97}));
  await page.waitForFunction(()=>!document.querySelector('[data-save-all]').disabled);
  await context.setOffline(true);
@@ -73,7 +74,7 @@ try{
   }catch(e){report.offlineFailures.push({path,error:e.message});}
   checked++;if(checked%100===0)console.log(JSON.stringify({offlineChecked:checked,total:checkPages.length,failures:report.offlineFailures.length}));
  }
- await page.goto(base+basePath+'lessons/'+catalog.lessons[0].id+'/');await page.locator('[data-complete]').click();await page.reload();assert.ok((await page.locator('[data-complete]').textContent()).includes('已读完'));await page.locator('[data-quiz] button[type="submit"]').click();await page.waitForFunction(()=>document.querySelector('[data-quiz-score]').textContent.includes('答对'));
+ await page.goto(base+basePath+'lessons/'+catalog.lessons[0].id+'/');await page.waitForFunction(()=>!document.querySelector('[data-save-status]').textContent.includes('未检测'));await page.locator('[data-complete]').click();await page.reload();await page.waitForFunction(()=>document.querySelector('[data-complete]').textContent.includes('已读完'));assert.ok((await page.locator('[data-complete]').textContent()).includes('已读完'));await page.locator('[data-quiz] button[type="submit"]').click();await page.waitForFunction(()=>document.querySelector('[data-quiz-score]').textContent.includes('答对'));
  // Separate ZIP saving must work after going offline again.
  await context.setOffline(false);await page.locator('[data-save-download]').click();await page.waitForFunction(()=>!document.querySelector('[data-save-download]').disabled);await context.setOffline(true);assert.equal(await page.evaluate(async()=>{const r=await fetch(document.querySelector('[data-save-download]').dataset.saveDownload);return r.ok&&(await r.arrayBuffer()).byteLength>100;}),true);
  for(const route of ['/learn/ai-agent-book/','/learn/ai-engineering/','/learn/ai-toolkit/']){const r=await page.goto(base+route);assert.ok(r.ok());assert.ok((await page.content()).length>500);}
