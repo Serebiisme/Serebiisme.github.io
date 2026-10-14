@@ -1,0 +1,2773 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>推理优化 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-10-llms-from-scratch" data-lesson="10-llms-from-scratch/12-inference-optimization" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/10-llms-from-scratch/">从零构建大语言模型</a> / LESSON 12</p><h1 class="lesson-title">推理优化</h1><p>Inference Optimization</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>推理优化</h1>
+<blockquote>
+<p>两个阶段定义了LLM推理.预填处理你的提示并行 - - 计算式.解码一次生成代币 - - 记忆式.每个优化都针对一个或两个.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 10, Lessons 01-08 (Transformer architecture, attention)
+<strong>Time:</strong> ~120 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>实现KV缓存,以消除自动降低代币生成期间冗余计算</li>
+<li>解释LLM推理的预填与解码阶段以及为什么每个阶段都有不同的瓶 (计算与记忆)</li>
+<li>实现连续批量和PagedAttention概念,以最大限度地在同时请求下利用GPU</li>
+<li>比较推断优化技术 (KV缓存,投机解码,闪存注意力) 和其吞吐量/延迟权衡</li>
+</ul>
+<h2>问题</h2>
+<p>您在 4xA100 GPU 上部署Llama 3 70B. 一个用户每秒获得约50个代币.感觉很快. 然后100个用户同时达到终端点. 吞吐量下降到3个代币/秒/用户. 您的每月25,000美元的 GPU 账单服务响应速度比人类类型慢.</p>
+<p>模型本身在1用户到100用户之间不会发生变化. 体重相同,建筑相同,数学相同. 改变的是你安排工作的方式. 简单的推断浪费了90%以上的可用GPU计算. 预测到一个用户在等待代币47时, 整个批量插槽保持开放, 而GPU内存巴士在子之间停留. 另一方面,一个新用户的2000个代币提示可以用有用的计算来填补那个空白时间.</p>
+<p>这不是扩展问题. 这是一个规划问题. 这课中的技术 - - KV缓存,连续批量,页面注意,推测解码,前缓存 - - 是分开一个<span class="katex"><span class="katex-mathml"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>25</mn><mi>k</mi><mi mathvariant="normal">/</mi><mi>m</mi><mi>o</mi><mi>n</mi><mi>t</mi><mi>h</mi><mi>i</mi><mi>n</mi><mi>f</mi><mi>e</mi><mi>r</mi><mi>e</mi><mi>n</mi><mi>c</mi><mi>e</mi><mi>b</mi><mi>i</mi><mi>l</mi><mi>l</mi><mi>f</mi><mi>r</mi><mi>o</mi><mi>m</mi><mi>a</mi></mrow><annotation encoding="application/x-tex">25k/month inference bill from a </annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="katex-base"><span class="katex-strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">25</span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mord">/</span><span class="mord mathnormal">m</span><span class="mord mathnormal">o</span><span class="mord mathnormal">n</span><span class="mord mathnormal">t</span><span class="mord mathnormal">hin</span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="mord mathnormal" style="margin-right:0.0278em;">er</span><span class="mord mathnormal">e</span><span class="mord mathnormal">n</span><span class="mord mathnormal">ce</span><span class="mord mathnormal">bi</span><span class="mord mathnormal" style="margin-right:0.0197em;">l</span><span class="mord mathnormal" style="margin-right:0.0197em;">l</span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="mord mathnormal">o</span><span class="mord mathnormal">ma</span></span></span></span>平均每月5千辆,服务于同一个交通.</p>
+<p>通过4xA100-80GB的Llama 3 70B服务的vLLM在低同步时实现了50个代币/秒/用户,并通过连续批量和PagedAttention支持100个同步请求的15-25个TPS/用户.没有这些优化,相同的硬件在同步时服务于5个TPS/用户.相同的GPU,相同的模型,吞吐量为4倍.</p>
+<h2>概念</h2>
+<h3>预填与解码</h3>
+<p>每个士推断请求都有两个不同的阶段.</p>
+<p><strong>Prefill</strong>处理整个输入提示.所有代币都已知,因此注意力可以平行计算在整个序列中.这是一个大的矩阵乘法 - - GPU 核心保持忙碌.瓶是计算:你的硬件每秒能输送多少FLOPS.A100可以提供312 TFLOPS (BF16).在70B模型上预填4 096代币提示需要400ms在单个A100上.</p>
+<p><strong>Decode</strong>发出输出代币一次. 每个新代币都会与之前的所有代币相结合,但每次前进通行只会产生一个代币. 按矩阵的尺寸与预填量相同,但你将它们乘以单个向量而不是矩阵.  GPU 核心在微秒内完成,然后等待下一批重量从内存到达. 瓶是内存带宽:你能如何快速将模型重量从HBM流到计算单元. 机有2TB/s的带宽. 对于FP16的70B模型,则是140GB. 一次阅读完整模型需要70ms,这是你单次解码步骤的地板.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-2f2ab2b0bd1c9011a52a.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>其他<strong>ops:byte ratio</strong>计算量是计算的,它可以测量你每次从内存中加载的字节中执行多少操作.</p>
+<pre><code>ops:byte ratio = FLOPs per token / bytes read from memory
+</code></pre>
+<p>在 4,096 个代币的批量中,你执行每次加载重量的 4,096 个多积累操作.比率高 - 你是计算的.在批量大小 1 的解码过程中,你执行每次加载重量的 ~ 1 个操作.比率低 - 你是记忆的.</p>
+<p>基本的见解: <em>解码是记忆的,因为你读完整个模型,以产生一个代币</em>. 下面的每一个优化,</p>
+<h3>存储器</h3>
+<p>在注意期间,每个代币的查询都会关注每个前代币的关键和值向量.没有缓存,生成代币N需要重新计算所有N-1前代币的关键和值预测.在生成代币 2,然后再次为代币3,然后再次为代币4.通过代币1000,你已经投影代币1总共999次.</p>
+<p>存储KV缓存存储所有前代币的关键和值预测.在生成代币N时,您只计算代币N的关键和值,然后将它们与从代币1到N-1的缓存K/V连接.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-d20aea629e7e3dc54917.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p><strong>Memory formula for KV cache:</strong></p>
+<pre><code>KV cache size = 2 * num_layers * num_kv_heads * head_dim * seq_len * bytes_per_param
+</code></pre>
+<p>对于Llama 3 70B (80层,8KV头,GQA,头_dim=128,BF16):</p>
+<pre><code>per token: 2 * 80 * 8 * 128 * 2 bytes = 327,680 bytes = 320 KB
+at 4,096 tokens: 320 KB * 4,096 = 1.28 GB
+at 128K tokens: 320 KB * 131,072 = 40 GB
+</code></pre>
+<p>单个128K文本对话用于Llama 3 70B消耗40GBKV缓存 - - 一半是A100的内存.每一个4K代币的100个同步用户,KV缓存单独需要128GB.这就是为什么KV缓存管理是推断优化的主要挑战.</p>
+<h3>连续批量</h3>
+<p>静态批量等到N请求的批量到来,处理它们在一起,并在接受新请求之前等到<em>全部</em>完成.如果一个请求需要500个代币,另一个需要10,则短请求在完成后490个解码步骤停留无所作为.</p>
+<p>连续批量 (也称为反复级批量) 随着任何请求完成,就会将新请求插入批量中.每次解码步骤都会重新评估批量.在10个代币后完成的请求立即被等待请求取代.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-b34de28d6e119da29c95.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>输出长度有多大,输出长度有多大,输出长度有多大,输出长度有多大,输出长度有多大,输出长度有多大,输出长度有多大,输出长度有多大.输出长度有多大,输出长度有多大,输出长度有多大,输出长度有多大.输出长度有多大,输出长度有多大,输出长度有多大,输出长度有多大,输出长度有多大,输出长度有多大,输出长度有多大,输出长度有多大,输出长度有多大,输出长度有多大,输出长度有多大,输出长度有多大,输出长度有多大,输出长度有多大,输出长度有多大,因为 GPU 插槽永远不会空空.</p>
+<h3>页面关注</h3>
+<p>每个请求的KV缓存是连续的内存块.随着请求的到来和离开,内存碎片就像操作系统中的RAM碎片化一样.一个4K代码请求需要连续的1.28GB.即使你有2GB的自由总数,你可能没有1.28GB的连续性*.你要么浪费内存,要么拒绝请求.</p>
+<p>页面注意力 (vLLM) 应用OS式虚拟内存到KV缓存中.它不分配每请求一个连接块,而是分配固定尺寸的&quot;页面&quot; (通常每个 16 个代币).页面可以在物理GPU内存中的任何地方.页面表将每个请求的逻辑序列位置映射到物理页面位置.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-f080476b3ce1a309875f.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>页面注意力也可以实现<strong>copy-on-write</strong>如果 50 个请求共享相同的系统提示,则该系统提示的 KV缓存页面会一次存储并被所有 50 个请求引用.只有当请求分离 (不同用户消息) 时,它才会获得自己的页面.这会大幅减少共享系统提示的应用程序的内存使用.</p>
+<p>通过PagedAttention,vLLM报告了接近零的记忆浪费 (在无明的分配中~4%vs~60-80%).</p>
+<h3>投机式解码</h3>
+<p>解码是慢的,因为它是序列的 - - 你生成一个代币,回它,生成下一个.</p>
+<p>预测解码使用一个小,快速的<strong>draft model</strong>为了生成K候选代币.<strong>target model</strong>然后将所有K候选人处理在一个前进传递中 (看起来像一个预填 - 平行,计算,高效).如果目标模型与草案模型的预测一致,你会在一个目标前进传递的时间接受所有K代币.如果它在位置j上不同意,你会接受代币1到j-1,然后丢弃其余.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-c2813e780cfdce95bac6.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>速度取决于<strong>acceptance rate</strong>对于一个Llama 3 8B的编写,接受率为70-85%是自然语言的典型.这意味着解码速度增加了2-3倍.</p>
+<p>推测解码的三个方法:</p>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Draft source</th>
+<th>Acceptance rate</th>
+<th>Overhead</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Draft-target (Leviathan et al.)</td>
+<td>Separate small model</td>
+<td>70-85%</td>
+<td>Draft model memory</td>
+</tr>
+<tr>
+<td>EAGLE (Li et al.)</td>
+<td>Lightweight head on target</td>
+<td>75-90%</td>
+<td>~1% extra parameters</td>
+</tr>
+<tr>
+<td>N-gram lookup</td>
+<td>Token n-gram table</td>
+<td>40-60%</td>
+<td>Negligible</td>
+</tr>
+</tbody>
+</table>
+<p><strong>EAGLE</strong>训练一个小的自动降低头, 它预测下一个代币的嵌入,使用目标模型的第二至最后层功能. 由于它运行目标模型的自己的表示 (而不是单独的模型),因此它实现了更高的接受率,并且具有最小的额外内存. -2增加了一个动态的草稿树,根据环境调整候选人数量.</p>
+<p><strong>N-gram speculative decoding</strong>如果草案与同一对话中之前出现的内容 (重复模式,代码,结构化输出) 匹配,则它会带来零神经网络的通用费用.接受率平均较低,但每次猜测的成本基本上是免费的.</p>
+<p>测量解码是 <em>数学上精确</em> - - 输出分布与目标模型的分布相同.它不是近似.验证步骤确保每个接受的代币都有目标模型分配的概率.</p>
+<h3>预写 缓存</h3>
+<p>许多请求共享相同的预先语.一个聊天机器人系统提示.一个RAG文本区块.几个拍摄的例子设置.没有预先语缓存,每个请求从零开始重新计算这些共享代币的KV缓存.</p>
+<p>预先预先存储KV缓存用于常见预先存储器,并在请求中重复使用.当一个新的请求带有已知预先存储器到来时,系统复制 (或引用) 缓存的KV输入,仅计算KV为独特的后音.</p>
+<p>对于所有请求中共享2000个代币的系统提示,预先缓存消除了每请求的预填量400ms. 在每秒100次请求时,这节省了每秒40秒的GPU计算 - - 超过一个GPU的值.</p>
+<p>根据其标志内容,该树将预写标志索引.任何与存储的预写标志相匹配的请求都会免费获得其KV缓存.该树可实现部分预写标志相匹配 - - 如果你共享了1,500个2000个预写标志的缓存输入,你将重新使用这些1,500个,只会重新计算500个.</p>
+<h3>推进引擎</h3>
+<p>生产的三种发动机主导着LLM服务:</p>
+<table>
+<thead>
+<tr>
+<th>Engine</th>
+<th>Key innovation</th>
+<th>Best for</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>vLLM</td>
+<td>PagedAttention, continuous batching</td>
+<td>General-purpose serving, highest compatibility</td>
+</tr>
+<tr>
+<td>SGLang</td>
+<td>RadixAttention (prefix caching), structured generation</td>
+<td>Multi-turn chatbots, constrained decoding</td>
+</tr>
+<tr>
+<td>TensorRT-LLM</td>
+<td>NVIDIA kernel fusion, FP8 quantization</td>
+<td>Maximum single-GPU throughput on NVIDIA hardware</td>
+</tr>
+</tbody>
+</table>
+<p><strong>vLLM</strong>它支持最广泛的模型,运行在任何GPU供应商 (NVIDIA,AMD,Intel) 上,并通过PagedAttention +连续批量实现强大的吞吐量.OpenAI兼容的API意味着您可以将其作为任何OpenAI API调用的替代品.</p>
+<p><strong>SGLang</strong>基于vLLM的基础,但增加了RadixAttention用于预写缓存和结构化的LLM程序的域名特定语言.如果您的工作负载涉及多轮对话,工具使用或限制式解码 (JSON输出,regex指导生成),SGLang通常通过预写重复使用超过vLLM2-5倍.</p>
+<p><strong>TensorRT-LLM</strong>它将模型组建成优化NVIDIA GPU内核. 它将操作 (注意力+线性+激活在一个内核中) 合并,在H100 GPU上使用FP8,并用于生产部署与NVIDIA Triton 输入服务器集成. 它实现了NVIDIA硬件上最高的单GPU吞吐量,但需要更多的设置,并且仅在NVIDIA GPU上工作.</p>
+<p>对于Llama 3 70B (4xA100-80GB,BF16) 的现实世界号码:</p>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th>vLLM</th>
+<th>SGLang</th>
+<th>TensorRT-LLM</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Throughput (1 user)</td>
+<td>~50 TPS</td>
+<td>~55 TPS</td>
+<td>~65 TPS</td>
+</tr>
+<tr>
+<td>Throughput (100 users)</td>
+<td>~2,500 total TPS</td>
+<td>~3,200 total TPS</td>
+<td>~3,000 total TPS</td>
+</tr>
+<tr>
+<td>Time to first token</td>
+<td>~400ms</td>
+<td>~300ms (prefix hit)</td>
+<td>~350ms</td>
+</tr>
+<tr>
+<td>Max context</td>
+<td>128K</td>
+<td>128K</td>
+<td>128K</td>
+</tr>
+</tbody>
+</table>
+<h3>操作:字节框架</h3>
+<p>运营:字节比率告诉你你是否是计算或记忆的,这决定了哪些优化是重要的.</p>
+<pre><code>Compute roof: peak FLOPS of the GPU
+Memory roof:  peak bandwidth * ops:byte ratio
+</code></pre>
+<p>当ops:byte低 (解码,小批量),你会击中内存带宽屋顶.增加更多计算 (较高的钟,更多的核心) 不会有帮助.你需要减少内存读数 (量化,KV缓存压缩) 或增加批量大小,以抵偿更有用的工作.</p>
+<p>运算:byte高时 (预填,大批量),你会碰到计算屋顶.内存带宽优化并没有帮助.你需要更快的GPU,内核融合或更低的精度来挤压更多的FLOPS.</p>
+<table>
+<thead>
+<tr>
+<th>Scenario</th>
+<th>ops:byte</th>
+<th>Bound</th>
+<th>Optimize with</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Prefill, batch=1</td>
+<td>~4,096</td>
+<td>Compute</td>
+<td>Kernel fusion, FP8</td>
+</tr>
+<tr>
+<td>Decode, batch=1</td>
+<td>~1</td>
+<td>Memory</td>
+<td>Quantization, KV compression</td>
+</tr>
+<tr>
+<td>Decode, batch=32</td>
+<td>~32</td>
+<td>Memory</td>
+<td>Larger batch, continuous batching</td>
+</tr>
+<tr>
+<td>Decode, batch=256</td>
+<td>~256</td>
+<td>Transitioning</td>
+<td>Both matter</td>
+</tr>
+<tr>
+<td>Decode, batch=1024</td>
+<td>~1,024</td>
+<td>Compute</td>
+<td>Kernel fusion, tensor parallelism</td>
+</tr>
+</tbody>
+</table>
+<p>在A100上的交叉点是 ops:byte = 156 (312 TFLOPS / 2 TB/s) 周围.在156下,你是记忆绑定.在156上,你是计算绑定.持续批量通过每次代码包装更多代码来推动解码到这个交叉.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-e99db1980277b770cd49.png" alt="context-window-slide 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<h3>步骤1:从零开始存储KV缓存</h3>
+<p>我们建立了一个多头KV缓存, 存储每个层,每个头的关键和值预测,</p>
+<pre><code class="language-python">import numpy as np
+
+class KVCache:
+    def __init__(self, num_layers, num_heads, head_dim, max_seq_len, dtype=np.float16):
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.max_seq_len = max_seq_len
+        self.dtype = dtype
+
+        self.k_cache = np.zeros(
+            (num_layers, num_heads, max_seq_len, head_dim), dtype=dtype
+        )
+        self.v_cache = np.zeros(
+            (num_layers, num_heads, max_seq_len, head_dim), dtype=dtype
+        )
+        self.seq_len = 0
+
+    def update(self, layer_idx, new_keys, new_values):
+        num_new = new_keys.shape[1]
+        end = self.seq_len + num_new
+        self.k_cache[layer_idx, :, self.seq_len:end, :] = new_keys
+        self.v_cache[layer_idx, :, self.seq_len:end, :] = new_values
+        return (
+            self.k_cache[layer_idx, :, :end, :],
+            self.v_cache[layer_idx, :, :end, :]
+        )
+
+    def advance(self, num_tokens):
+        self.seq_len += num_tokens
+
+    def memory_bytes(self):
+        return self.k_cache.nbytes + self.v_cache.nbytes
+
+    def used_bytes(self):
+        per_token = 2 * self.num_layers * self.num_heads * self.head_dim * np.dtype(self.dtype).itemsize
+        return per_token * self.seq_len
+</code></pre>
+<h3>步骤 2: KV缓存的注意力</h3>
+<p>简单的多头注意力,使用KV缓存解码步骤.</p>
+<pre><code class="language-python">def scaled_dot_product_attention(query, keys, values):
+    head_dim = query.shape[-1]
+    scores = np.matmul(query, keys.transpose(0, 1, 3, 2)) / np.sqrt(head_dim)
+    seq_len_q = scores.shape[-2]
+    seq_len_k = scores.shape[-1]
+    if seq_len_q &gt; 1:
+        mask = np.triu(np.ones((seq_len_q, seq_len_k), dtype=np.float32), k=seq_len_k - seq_len_q + 1)
+        scores = scores + mask * (-1e9)
+    max_scores = np.max(scores, axis=-1, keepdims=True)
+    exp_scores = np.exp(scores - max_scores)
+    attn_weights = exp_scores / np.sum(exp_scores, axis=-1, keepdims=True)
+    return np.matmul(attn_weights, values)
+
+
+class MultiHeadAttention:
+    def __init__(self, d_model, num_heads):
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+        scale = np.sqrt(2.0 / d_model)
+        self.W_q = np.random.randn(d_model, d_model).astype(np.float32) * scale
+        self.W_k = np.random.randn(d_model, d_model).astype(np.float32) * scale
+        self.W_v = np.random.randn(d_model, d_model).astype(np.float32) * scale
+        self.W_o = np.random.randn(d_model, d_model).astype(np.float32) * scale
+
+    def forward(self, x, kv_cache=None, layer_idx=0):
+        batch, seq_len, d_model = x.shape
+        Q = np.matmul(x, self.W_q).reshape(batch, seq_len, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        K = np.matmul(x, self.W_k).reshape(batch, seq_len, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        V = np.matmul(x, self.W_v).reshape(batch, seq_len, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+
+        if kv_cache is not None:
+            K_full, V_full = kv_cache.update(layer_idx, K[0], V[0])
+            K = K_full[np.newaxis, :, :, :]
+            V = V_full[np.newaxis, :, :, :]
+            if seq_len == 1:
+                kv_cache.advance(1)
+
+        attn_out = scaled_dot_product_attention(Q, K, V)
+        attn_out = attn_out.transpose(0, 2, 1, 3).reshape(batch, -1, d_model)
+        return np.matmul(attn_out, self.W_o)
+</code></pre>
+<h3>步骤3:连续批量模拟器</h3>
+<p>这模拟了静态和连续批量之间的时间表差异.</p>
+<pre><code class="language-python">import heapq
+
+class Request:
+    def __init__(self, request_id, prompt_tokens, output_tokens, arrival_step):
+        self.request_id = request_id
+        self.prompt_tokens = prompt_tokens
+        self.output_tokens = output_tokens
+        self.arrival_step = arrival_step
+        self.tokens_generated = 0
+        self.start_step = None
+        self.end_step = None
+
+    def is_done(self):
+        return self.tokens_generated &gt;= self.output_tokens
+
+
+def simulate_static_batching(requests, batch_size):
+    step = 0
+    completed = []
+    queue = list(requests)
+    queue.sort(key=lambda r: r.arrival_step)
+
+    while queue:
+        batch = []
+        while queue and len(batch) &lt; batch_size:
+            r = queue.pop(0)
+            r.start_step = max(step, r.arrival_step)
+            batch.append(r)
+
+        if batch:
+            step = max(step, max(r.start_step for r in batch))
+            max_output = max(r.output_tokens for r in batch)
+            for r in batch:
+                r.tokens_generated = r.output_tokens
+                r.end_step = step + max_output
+            step += max_output
+            completed.extend(batch)
+
+    return completed
+
+
+def simulate_continuous_batching(requests, batch_size):
+    step = 0
+    completed = []
+    queue = sorted(requests, key=lambda r: r.arrival_step)
+    queue_idx = 0
+    active = []
+    waiting = []
+
+    while queue_idx &lt; len(queue) or active or waiting:
+        while queue_idx &lt; len(queue) and queue[queue_idx].arrival_step &lt;= step:
+            waiting.append(queue[queue_idx])
+            queue_idx += 1
+
+        while waiting and len(active) &lt; batch_size:
+            r = waiting.pop(0)
+            r.start_step = step
+            active.append(r)
+
+        if not active:
+            if waiting:
+                step += 1
+                continue
+            elif queue_idx &lt; len(queue):
+                step = queue[queue_idx].arrival_step
+                continue
+            else:
+                break
+
+        for r in active:
+            r.tokens_generated += 1
+
+        done = [r for r in active if r.is_done()]
+        for r in done:
+            r.end_step = step + 1
+            completed.append(r)
+        active = [r for r in active if not r.is_done()]
+
+        step += 1
+
+    return completed
+
+
+def batching_stats(completed):
+    latencies = [r.end_step - r.arrival_step for r in completed]
+    total_time = max(r.end_step for r in completed) - min(r.arrival_step for r in completed)
+    total_tokens = sum(r.output_tokens for r in completed)
+    return {
+        &quot;avg_latency&quot;: np.mean(latencies),
+        &quot;p50_latency&quot;: np.median(latencies),
+        &quot;p99_latency&quot;: np.percentile(latencies, 99),
+        &quot;total_time&quot;: total_time,
+        &quot;throughput&quot;: total_tokens / total_time if total_time &gt; 0 else 0,
+    }
+</code></pre>
+<h3>步骤4:预写缓存</h3>
+<p>基于试验的预写缓存,存储共享预写的KV输入.</p>
+<pre><code class="language-python">class TrieNode:
+    def __init__(self):
+        self.children = {}
+        self.kv_data = None
+        self.hit_count = 0
+
+
+class PrefixCache:
+    def __init__(self, max_entries=1000):
+        self.root = TrieNode()
+        self.max_entries = max_entries
+        self.total_entries = 0
+        self.hits = 0
+        self.misses = 0
+
+    def _walk(self, token_ids):
+        node = self.root
+        depth = 0
+        for tid in token_ids:
+            if tid not in node.children:
+                break
+            node = node.children[tid]
+            depth += 1
+        return node, depth
+
+    def lookup(self, token_ids):
+        node, depth = self._walk(token_ids)
+        if depth &gt; 0:
+            self.hits += 1
+            current = self.root
+            for tid in token_ids[:depth]:
+                current = current.children[tid]
+                current.hit_count += 1
+            kv_entries = []
+            current = self.root
+            for tid in token_ids[:depth]:
+                current = current.children[tid]
+                if current.kv_data is not None:
+                    kv_entries.append(current.kv_data)
+            return depth, kv_entries
+        self.misses += 1
+        return 0, []
+
+    def insert(self, token_ids, kv_per_token):
+        node = self.root
+        for i, tid in enumerate(token_ids):
+            if tid not in node.children:
+                if self.total_entries &gt;= self.max_entries:
+                    return i
+                node.children[tid] = TrieNode()
+                self.total_entries += 1
+            node = node.children[tid]
+            if i &lt; len(kv_per_token):
+                node.kv_data = kv_per_token[i]
+        return len(token_ids)
+
+    def hit_rate(self):
+        total = self.hits + self.misses
+        return self.hits / total if total &gt; 0 else 0.0
+</code></pre>
+<h3>步骤5: 推测式解码模拟器</h3>
+<p>我们模拟了可配置的接受率.</p>
+<pre><code class="language-python">class DraftModel:
+    def __init__(self, vocab_size, acceptance_rate=0.8):
+        self.vocab_size = vocab_size
+        self.acceptance_rate = acceptance_rate
+
+    def generate(self, context, num_tokens):
+        tokens = np.random.randint(0, self.vocab_size, size=num_tokens)
+        return tokens
+
+    def get_probs(self, context, token):
+        probs = np.random.dirichlet(np.ones(self.vocab_size))
+        return probs
+
+
+class TargetModel:
+    def __init__(self, vocab_size):
+        self.vocab_size = vocab_size
+
+    def get_probs(self, context, tokens=None):
+        if tokens is not None:
+            return [np.random.dirichlet(np.ones(self.vocab_size)) for _ in tokens]
+        return np.random.dirichlet(np.ones(self.vocab_size))
+
+
+def speculative_decode(draft_model, target_model, context, num_speculative=5,
+                       draft_cost=1.0, target_cost=10.0, verify_cost=12.0):
+    total_tokens = 0
+    total_cost = 0.0
+    accepted_counts = []
+    context = list(context)
+
+    max_tokens = 100
+
+    while total_tokens &lt; max_tokens:
+        draft_tokens = draft_model.generate(context, num_speculative)
+        total_cost += draft_cost * num_speculative
+
+        target_probs = target_model.get_probs(context, draft_tokens)
+        total_cost += verify_cost
+
+        accepted = 0
+        for i, token in enumerate(draft_tokens):
+            draft_p = draft_model.get_probs(context + list(draft_tokens[:i]), token)
+            target_p = target_probs[i]
+
+            r = np.random.random()
+            acceptance_prob = min(1.0, target_p[token] / (draft_p[token] + 1e-10))
+
+            if r &lt; draft_model.acceptance_rate:
+                accepted += 1
+                context.append(token)
+                total_tokens += 1
+            else:
+                new_token = np.random.choice(draft_model.vocab_size, p=target_p)
+                context.append(new_token)
+                total_tokens += 1
+                break
+
+        accepted_counts.append(accepted)
+
+        if accepted == num_speculative:
+            bonus_probs = target_model.get_probs(context)
+            bonus_token = np.random.choice(draft_model.vocab_size, p=bonus_probs)
+            context.append(bonus_token)
+            total_tokens += 1
+
+    sequential_cost = total_tokens * target_cost
+    return {
+        &quot;total_tokens&quot;: total_tokens,
+        &quot;speculative_cost&quot;: total_cost,
+        &quot;sequential_cost&quot;: sequential_cost,
+        &quot;speedup&quot;: sequential_cost / total_cost if total_cost &gt; 0 else 1.0,
+        &quot;avg_accepted&quot;: np.mean(accepted_counts),
+        &quot;acceptance_rate&quot;: np.mean(accepted_counts) / num_speculative,
+    }
+
+
+def compare_speculation_strategies(vocab_size=1000, num_trials=20):
+    results = {}
+
+    for name, acceptance_rate, spec_tokens in [
+        (&quot;Draft-target (8B-&gt;70B)&quot;, 0.78, 5),
+        (&quot;EAGLE&quot;, 0.85, 6),
+        (&quot;N-gram&quot;, 0.50, 4),
+        (&quot;No speculation&quot;, 0.0, 0),
+    ]:
+        if spec_tokens == 0:
+            results[name] = {
+                &quot;speedup&quot;: 1.0,
+                &quot;acceptance_rate&quot;: 0.0,
+                &quot;avg_accepted&quot;: 0.0,
+            }
+            continue
+
+        trial_results = []
+        for _ in range(num_trials):
+            draft = DraftModel(vocab_size, acceptance_rate=acceptance_rate)
+            target = TargetModel(vocab_size)
+            context = list(np.random.randint(0, vocab_size, size=10))
+            result = speculative_decode(draft, target, context, num_speculative=spec_tokens)
+            trial_results.append(result)
+
+        results[name] = {
+            &quot;speedup&quot;: np.mean([r[&quot;speedup&quot;] for r in trial_results]),
+            &quot;acceptance_rate&quot;: np.mean([r[&quot;acceptance_rate&quot;] for r in trial_results]),
+            &quot;avg_accepted&quot;: np.mean([r[&quot;avg_accepted&quot;] for r in trial_results]),
+        }
+
+    return results
+</code></pre>
+<h3>步骤 6: KV缓存存储器配置文件</h3>
+<p>计算KV缓存内存要求用于实际模型配置.</p>
+<pre><code class="language-python">MODEL_CONFIGS = {
+    &quot;Llama-3-8B&quot;: {
+        &quot;num_layers&quot;: 32, &quot;num_kv_heads&quot;: 8, &quot;head_dim&quot;: 128,
+        &quot;model_params_b&quot;: 8, &quot;gqa&quot;: True,
+    },
+    &quot;Llama-3-70B&quot;: {
+        &quot;num_layers&quot;: 80, &quot;num_kv_heads&quot;: 8, &quot;head_dim&quot;: 128,
+        &quot;model_params_b&quot;: 70, &quot;gqa&quot;: True,
+    },
+    &quot;Llama-3-405B&quot;: {
+        &quot;num_layers&quot;: 126, &quot;num_kv_heads&quot;: 8, &quot;head_dim&quot;: 128,
+        &quot;model_params_b&quot;: 405, &quot;gqa&quot;: True,
+    },
+    &quot;Mistral-7B&quot;: {
+        &quot;num_layers&quot;: 32, &quot;num_kv_heads&quot;: 8, &quot;head_dim&quot;: 128,
+        &quot;model_params_b&quot;: 7, &quot;gqa&quot;: True,
+    },
+    &quot;GPT-4-est&quot;: {
+        &quot;num_layers&quot;: 120, &quot;num_kv_heads&quot;: 96, &quot;head_dim&quot;: 128,
+        &quot;model_params_b&quot;: 1800, &quot;gqa&quot;: False,
+    },
+}
+
+
+def kv_cache_memory(config, seq_len, dtype_bytes=2):
+    per_token = 2 * config[&quot;num_layers&quot;] * config[&quot;num_kv_heads&quot;] * config[&quot;head_dim&quot;] * dtype_bytes
+    total = per_token * seq_len
+    return {
+        &quot;per_token_bytes&quot;: per_token,
+        &quot;per_token_kb&quot;: per_token / 1024,
+        &quot;total_bytes&quot;: total,
+        &quot;total_mb&quot;: total / (1024 ** 2),
+        &quot;total_gb&quot;: total / (1024 ** 3),
+    }
+
+
+def memory_budget(config, gpu_memory_gb, model_dtype_bytes=2, kv_dtype_bytes=2):
+    model_memory_gb = config[&quot;model_params_b&quot;] * 1e9 * model_dtype_bytes / (1024 ** 3)
+    overhead_gb = gpu_memory_gb * 0.1
+    available_for_kv = gpu_memory_gb - model_memory_gb - overhead_gb
+
+    if available_for_kv &lt;= 0:
+        return {&quot;error&quot;: &quot;Model does not fit in GPU memory&quot;, &quot;model_memory_gb&quot;: model_memory_gb}
+
+    per_token = 2 * config[&quot;num_layers&quot;] * config[&quot;num_kv_heads&quot;] * config[&quot;head_dim&quot;] * kv_dtype_bytes
+    max_tokens = int(available_for_kv * (1024 ** 3) / per_token)
+
+    return {
+        &quot;gpu_memory_gb&quot;: gpu_memory_gb,
+        &quot;model_memory_gb&quot;: round(model_memory_gb, 1),
+        &quot;overhead_gb&quot;: round(overhead_gb, 1),
+        &quot;available_for_kv_gb&quot;: round(available_for_kv, 1),
+        &quot;max_total_tokens&quot;: max_tokens,
+        &quot;max_users_at_2k&quot;: max_tokens // 2048,
+        &quot;max_users_at_4k&quot;: max_tokens // 4096,
+        &quot;max_users_at_32k&quot;: max_tokens // 32768,
+    }
+</code></pre>
+<h2>用它</h2>
+<p>通过vLLM:</p>
+<pre><code class="language-python">from vllm import LLM, SamplingParams
+
+llm = LLM(
+    model=&quot;meta-llama/Meta-Llama-3-70B-Instruct&quot;,
+    tensor_parallel_size=4,
+    enable_prefix_caching=True,
+    max_model_len=8192,
+    gpu_memory_utilization=0.9,
+)
+
+params = SamplingParams(temperature=0.7, max_tokens=256)
+outputs = llm.generate([&quot;Explain inference optimization in one paragraph.&quot;], params)
+</code></pre>
+<p>通过SGLang用于预写缓存 +结构输出:</p>
+<pre><code class="language-python">import sglang as sgl
+
+@sgl.function
+def classify(s, text):
+    s += sgl.system(&quot;You are a classifier. Output JSON only.&quot;)
+    s += sgl.user(f&quot;Classify this text: {text}&quot;)
+    s += sgl.assistant(sgl.gen(&quot;result&quot;, regex=r'\{&quot;label&quot;: &quot;(positive|negative|neutral)&quot;\}'))
+
+runtime = sgl.Runtime(model_path=&quot;meta-llama/Meta-Llama-3-70B-Instruct&quot;, tp_size=4)
+sgl.set_default_backend(runtime)
+
+results = classify.run_batch([
+    {&quot;text&quot;: &quot;This product is amazing!&quot;},
+    {&quot;text&quot;: &quot;Terrible experience.&quot;},
+    {&quot;text&quot;: &quot;It was okay I guess.&quot;},
+])
+</code></pre>
+<p>使用TensorRT-LLM:</p>
+<pre><code class="language-python">import tensorrt_llm
+from tensorrt_llm.runtime import ModelRunner
+
+runner = ModelRunner.from_dir(&quot;./llama-70b-trt-engine/&quot;, rank=0)
+
+outputs = runner.generate(
+    batch_input_ids=[tokenizer.encode(&quot;Explain KV caching.&quot;)],
+    max_new_tokens=256,
+    temperature=0.7,
+)
+</code></pre>
+<h2>运送它</h2>
+<p>这一课产生了:</p>
+<ul>
+<li><code>outputs/skill-inference-optimization.md</code>对于诊断和优化LLM推断服务的技能</li>
+</ul>
+<h2>运动</h2>
+<ol>
+<li>
+<p>修改KV缓存配置文件,以比较FP16与FP8与INT4KV缓存量化.在4K环境下,计算每一个用户的最大共享用户为4xA100-80GB.KV量化到INT4应该大约是4倍的用户容量.</p>
+</li>
+<li>
+<p>扩展连续批量模拟器,以追踪GPU利用率 (每步填充的批量插槽的部分).随时间推移,用于静态和连续批量,采用50个请求,其输出长度遵循帕雷托分布 (形状=1.5,规模=20).连续批量应保持80%的利用率.</p>
+</li>
+<li>
+<p>实现KV缓存的集成查询注意 (GQA) 版本,<code>num_kv_heads &lt; num_query_heads</code>计算存储存量与全重多头注意力 (KV缓存大小减少8倍).</p>
+</li>
+<li>
+<p>建立一个使用 LRU 驱逐的预写缓存.设置最大_entries为500,生成1000个请求,其中60%共享了5个常见预写中的一个.测量击率并与无限缓存进行比较.如果有良好的驱逐,击率应该保持在 55% 以上.</p>
+</li>
+<li>
+<p>扩展投机解码模拟器实现基于树的投机 (EAGLE-2 式).而不是单个链K草案代币,生成一个候选树 (例如,每个3级的2个分支=8个叶子候选).对验证轮和线性投机均接受的总代币进行比较.</p>
+</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Prefill</td>
+<td>&quot;Processing the prompt&quot;</td>
+<td>Computing attention over all input tokens in parallel -- compute-bound because the full matrix multiplication keeps GPU cores busy</td>
+</tr>
+<tr>
+<td>Decode</td>
+<td>&quot;Generating tokens&quot;</td>
+<td>Producing one token per forward pass, reading the full model weights each time -- memory-bound because compute finishes before the next weights arrive</td>
+</tr>
+<tr>
+<td>KV cache</td>
+<td>&quot;Caching attention states&quot;</td>
+<td>Storing the key and value projections for all previous tokens so they are not recomputed at each decode step -- trades memory for compute</td>
+</tr>
+<tr>
+<td>Continuous batching</td>
+<td>&quot;Dynamic batching&quot;</td>
+<td>Inserting new requests into the running batch as soon as any request finishes, evaluated at every decode iteration rather than waiting for the whole batch</td>
+</tr>
+<tr>
+<td>PagedAttention</td>
+<td>&quot;Virtual memory for KV cache&quot;</td>
+<td>Allocating KV cache in fixed-size pages instead of contiguous blocks, eliminating memory fragmentation and enabling copy-on-write for shared prefixes</td>
+</tr>
+<tr>
+<td>Speculative decoding</td>
+<td>&quot;Draft and verify&quot;</td>
+<td>Using a fast draft model to propose multiple tokens, then verifying them all in one target model forward pass -- mathematically exact, 2-3x speedup</td>
+</tr>
+<tr>
+<td>EAGLE</td>
+<td>&quot;Self-speculative decoding&quot;</td>
+<td>A speculative decoding variant that trains a lightweight head on the target model's own hidden states, achieving higher acceptance rates than a separate draft model</td>
+</tr>
+<tr>
+<td>Prefix caching</td>
+<td>&quot;Reusing system prompt KV&quot;</td>
+<td>Storing computed KV cache entries for common prefixes (system prompts, few-shot examples) and reusing them across requests to skip redundant prefill</td>
+</tr>
+<tr>
+<td>Ops:byte ratio</td>
+<td>&quot;Arithmetic intensity&quot;</td>
+<td>The ratio of compute operations to memory bytes read -- determines whether a workload is compute-bound (high ratio) or memory-bound (low ratio)</td>
+</tr>
+<tr>
+<td>Time to first token</td>
+<td>&quot;TTFT&quot;</td>
+<td>Latency from receiving a request to producing the first output token -- dominated by prefill time for long prompts</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li>昆等人&quot;,用页面注意力服务的大语言模型的有效内存管理&quot; (2023) - 引入页面 KV缓存管理的vLLM论文,现在是推断服务的行业标准</li>
+<li>利维亚坦等, &quot;通过推测解码从变压器快速推理&quot; (2023) -- 证明了草案验证推测产生了精确的目标模型分布,同时实现了2-3倍的速度</li>
+<li>利等人&quot;,EAGLE:投机性样本采集需要重新思考特征不确定性&quot; (2024) --通过培训一个头脑对目标模型的特征而不是使用单独的草案模型来实现更高的接受率</li>
+<li>等&quot;,SGLang:结构化语言模型程序的有效执行&quot; (2024) -- 引入了RadixAttention用于预写缓存和多调用LLM课程的编程模型</li>
+<li>威廉姆斯等人&quot;,多核架构的屋顶线:一个洞察力的视觉性能模型&quot; (2009) - - 官方的原始屋顶线论文,将 ops:byte框架正式化为计算与内存瓶的推理</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Inference Optimization</h1>
+<blockquote>
+<p>Two phases define LLM inference. Prefill processes your prompt in parallel -- compute-bound. Decode generates tokens one at a time -- memory-bound. Every optimization targets one or both.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 10, Lessons 01-08 (Transformer architecture, attention)
+<strong>Time:</strong> ~120 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Implement KV-cache to eliminate redundant computation during autoregressive token generation</li>
+<li>Explain the prefill vs decode phases of LLM inference and why each has different bottlenecks (compute-bound vs memory-bound)</li>
+<li>Implement continuous batching and PagedAttention concepts to maximize GPU utilization under concurrent requests</li>
+<li>Compare inference optimization techniques (KV-cache, speculative decoding, flash attention) and their throughput/latency tradeoffs</li>
+</ul>
+<h2>The Problem</h2>
+<p>You deploy Llama 3 70B on 4xA100 GPUs. A single user gets ~50 tokens per second. Feels fast. Then 100 users hit the endpoint simultaneously. Throughput drops to 3 tokens/second/user. Your $25,000/month GPU bill is serving responses slower than a human types.</p>
+<p>The model itself does not change between 1 user and 100 users. Same weights, same architecture, same math. What changes is how you schedule the work. Naive inference wastes 90%+ of available GPU compute. A user waiting for token 47 holds an entire batch slot open while the GPU memory bus sits idle between matmuls. Meanwhile, a new user's 2,000-token prompt could fill that dead time with useful compute.</p>
+<p>This is not a scaling problem. It is a scheduling problem. The techniques in this lesson -- KV caching, continuous batching, PagedAttention, speculative decoding, prefix caching -- are what separate a <span class="katex"><span class="katex-mathml"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>25</mn><mi>k</mi><mi mathvariant="normal">/</mi><mi>m</mi><mi>o</mi><mi>n</mi><mi>t</mi><mi>h</mi><mi>i</mi><mi>n</mi><mi>f</mi><mi>e</mi><mi>r</mi><mi>e</mi><mi>n</mi><mi>c</mi><mi>e</mi><mi>b</mi><mi>i</mi><mi>l</mi><mi>l</mi><mi>f</mi><mi>r</mi><mi>o</mi><mi>m</mi><mi>a</mi></mrow><annotation encoding="application/x-tex">25k/month inference bill from a </annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="katex-base"><span class="katex-strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">25</span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mord">/</span><span class="mord mathnormal">m</span><span class="mord mathnormal">o</span><span class="mord mathnormal">n</span><span class="mord mathnormal">t</span><span class="mord mathnormal">hin</span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="mord mathnormal" style="margin-right:0.0278em;">er</span><span class="mord mathnormal">e</span><span class="mord mathnormal">n</span><span class="mord mathnormal">ce</span><span class="mord mathnormal">bi</span><span class="mord mathnormal" style="margin-right:0.0197em;">l</span><span class="mord mathnormal" style="margin-right:0.0197em;">l</span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="mord mathnormal">o</span><span class="mord mathnormal">ma</span></span></span></span>5k/month one serving the same traffic.</p>
+<p>vLLM serving Llama 3 70B on 4xA100-80GB achieves ~50 tokens/second/user at low concurrency, and sustains 15-25 TPS/user at 100 concurrent requests through continuous batching and PagedAttention. Without these optimizations, the same hardware serves 5 TPS/user at that concurrency. Same GPUs, same model, 4x the throughput.</p>
+<h2>The Concept</h2>
+<h3>Prefill vs Decode</h3>
+<p>Every LLM inference request has two distinct phases.</p>
+<p><strong>Prefill</strong> processes the entire input prompt. All tokens are known, so attention can be computed in parallel across the full sequence. This is a large matrix multiplication -- GPU cores stay busy. The bottleneck is compute: how many FLOPS your hardware can deliver per second. An A100 does 312 TFLOPS (BF16). Prefill for a 4,096-token prompt on a 70B model takes ~400ms on a single A100.</p>
+<p><strong>Decode</strong> generates output tokens one at a time. Each new token attends to all previous tokens, but only one token is produced per forward pass. The weight matrices are the same size as during prefill, but you are multiplying them by a single vector instead of a matrix. The GPU cores finish in microseconds, then wait for the next batch of weights to arrive from memory. The bottleneck is memory bandwidth: how fast you can stream model weights from HBM to the compute units. An A100 has 2 TB/s bandwidth. A 70B model in FP16 is 140 GB. Reading the full model once takes 70ms -- that is your floor for a single decode step.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-2f2ab2b0bd1c9011a52a.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>The <strong>ops:byte ratio</strong> (also called arithmetic intensity) captures this tradeoff. It measures how many operations you perform per byte loaded from memory.</p>
+<pre><code>ops:byte ratio = FLOPs per token / bytes read from memory
+</code></pre>
+<p>During prefill with a batch of 4,096 tokens, you perform ~4,096 multiply-accumulate operations per weight loaded. The ratio is high -- you are compute-bound. During decode with batch size 1, you perform ~1 operation per weight loaded. The ratio is low -- you are memory-bound.</p>
+<p>The fundamental insight: <em>decode is memory-bound because you read the entire model to produce a single token</em>. Every optimization below either reduces what you read, increases the batch of tokens processed per read, or avoids reads entirely.</p>
+<h3>KV Cache</h3>
+<p>During attention, each token's query attends to every previous token's key and value vectors. Without caching, generating token N requires recomputing the key and value projections for all N-1 preceding tokens. Token 1 gets projected when generating token 2, then again for token 3, then again for token 4. By token 1,000, you have projected token 1 a total of 999 times.</p>
+<p>The KV cache stores the key and value projections from all previous tokens. When generating token N, you only compute the key and value for token N, then concatenate them with the cached K/V from tokens 1 through N-1.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-d20aea629e7e3dc54917.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p><strong>Memory formula for KV cache:</strong></p>
+<pre><code>KV cache size = 2 * num_layers * num_kv_heads * head_dim * seq_len * bytes_per_param
+</code></pre>
+<p>For Llama 3 70B (80 layers, 8 KV heads with GQA, head_dim=128, BF16):</p>
+<pre><code>per token: 2 * 80 * 8 * 128 * 2 bytes = 327,680 bytes = 320 KB
+at 4,096 tokens: 320 KB * 4,096 = 1.28 GB
+at 128K tokens: 320 KB * 131,072 = 40 GB
+</code></pre>
+<p>A single 128K-context conversation for Llama 3 70B consumes 40 GB of KV cache -- half an A100's memory. With 100 concurrent users at 4K tokens each, KV cache alone requires 128 GB. This is why KV cache management is the central challenge of inference optimization.</p>
+<h3>Continuous Batching</h3>
+<p>Static batching waits until a batch of N requests arrives, processes them together, and waits until <em>all</em> finish before accepting new requests. If one request needs 500 tokens and another needs 10, the short request sits idle for 490 decode steps after it finishes.</p>
+<p>Continuous batching (also called iteration-level batching) inserts new requests into the batch as soon as any request completes. The batch is reevaluated at every decode step. A request that finishes after 10 tokens is immediately replaced by a waiting request.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-b34de28d6e119da29c95.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>The throughput improvement depends on how much output lengths vary. With uniform lengths, continuous batching matches static batching. With variable lengths (the common case), continuous batching can deliver 2-5x higher throughput because GPU slots never sit empty.</p>
+<h3>PagedAttention</h3>
+<p>The KV cache for each request is a contiguous block of memory. As requests arrive and depart, memory fragments -- exactly like RAM fragmentation in operating systems. A 4K-token request needs 1.28 GB contiguous. Even if you have 2 GB free total, you might not have 1.28 GB <em>contiguous</em>. You either waste memory or reject the request.</p>
+<p>PagedAttention (from vLLM) applies OS-style virtual memory to KV cache. Instead of allocating one contiguous block per request, it allocates fixed-size &quot;pages&quot; (typically 16 tokens each). Pages can be anywhere in physical GPU memory. A page table maps each request's logical sequence positions to physical page locations.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-f080476b3ce1a309875f.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>PagedAttention also enables <strong>copy-on-write</strong> for shared prefixes. If 50 requests share the same system prompt, the KV cache pages for that system prompt are stored once and referenced by all 50 requests. Only when a request diverges (different user messages) does it get its own pages. This cuts memory usage dramatically for applications with shared system prompts.</p>
+<p>vLLM reports near-zero memory waste (~4% vs ~60-80% in naive allocation) through PagedAttention.</p>
+<h3>Speculative Decoding</h3>
+<p>Decode is slow because it is sequential -- you generate one token, feed it back, generate the next. But what if you could guess the next 5 tokens cheaply, then verify them all at once?</p>
+<p>Speculative decoding uses a small, fast <strong>draft model</strong> to generate K candidate tokens. The large <strong>target model</strong> then processes all K candidates in a single forward pass (which looks like a prefill -- parallel, compute-bound, efficient). If the target model agrees with the draft model's predictions, you accept all K tokens in the time of one target forward pass. If it disagrees at position j, you accept tokens 1 through j-1 and discard the rest.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-c2813e780cfdce95bac6.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>The speedup depends on the <strong>acceptance rate</strong> -- how often the draft model's predictions match the target. For a Llama 3 8B drafting for Llama 3 70B, acceptance rates of 70-85% are typical on natural language. This translates to 2-3x decode speedup.</p>
+<p>Three approaches to speculative decoding:</p>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Draft source</th>
+<th>Acceptance rate</th>
+<th>Overhead</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Draft-target (Leviathan et al.)</td>
+<td>Separate small model</td>
+<td>70-85%</td>
+<td>Draft model memory</td>
+</tr>
+<tr>
+<td>EAGLE (Li et al.)</td>
+<td>Lightweight head on target</td>
+<td>75-90%</td>
+<td>~1% extra parameters</td>
+</tr>
+<tr>
+<td>N-gram lookup</td>
+<td>Token n-gram table</td>
+<td>40-60%</td>
+<td>Negligible</td>
+</tr>
+</tbody>
+</table>
+<p><strong>EAGLE</strong> trains a small autoregressive head on top of the target model's hidden states. It predicts the next token's embedding using the target model's second-to-last layer features. Because it operates on the target model's own representations (not a separate model's), it achieves higher acceptance rates with minimal extra memory. EAGLE-2 adds a dynamic draft tree that adjusts candidate count based on context.</p>
+<p><strong>N-gram speculative decoding</strong> maintains a table of n-gram continuations from the current context or a prebuilt corpus. If the draft matches what appeared before in the same conversation (repetitive patterns, code, structured output), it fires with zero neural network overhead. Acceptance rates are lower on average but the cost per speculation is essentially free.</p>
+<p>Speculative decoding is <em>mathematically exact</em> -- the output distribution is identical to the target model's distribution. It is not an approximation. The verification step ensures that every accepted token has exactly the probability the target model would have assigned.</p>
+<h3>Prefix Caching</h3>
+<p>Many requests share the same prefix. A chatbot system prompt. A RAG context block. A few-shot example set. Without prefix caching, every request recomputes the KV cache for these shared tokens from scratch.</p>
+<p>Prefix caching stores the KV cache for common prefixes and reuses it across requests. When a new request arrives with a known prefix, the system copies (or references) the cached KV entries and only computes the KV for the unique suffix.</p>
+<p>For a 2,000-token system prompt shared across all requests, prefix caching eliminates ~400ms of prefill per request. At 100 requests/second, that saves 40 seconds of GPU compute per second -- more than one GPU's worth of work.</p>
+<p>SGLang's RadixAttention implements prefix caching with a radix tree (trie) that indexes prefixes by their token content. Any request matching a stored prefix gets its KV cache for free. The tree enables partial prefix matches -- if you share 1,500 of 2,000 prefix tokens with a cached entry, you reuse those 1,500 and recompute only 500.</p>
+<h3>Inference Engines</h3>
+<p>Three engines dominate production LLM serving:</p>
+<table>
+<thead>
+<tr>
+<th>Engine</th>
+<th>Key innovation</th>
+<th>Best for</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>vLLM</td>
+<td>PagedAttention, continuous batching</td>
+<td>General-purpose serving, highest compatibility</td>
+</tr>
+<tr>
+<td>SGLang</td>
+<td>RadixAttention (prefix caching), structured generation</td>
+<td>Multi-turn chatbots, constrained decoding</td>
+</tr>
+<tr>
+<td>TensorRT-LLM</td>
+<td>NVIDIA kernel fusion, FP8 quantization</td>
+<td>Maximum single-GPU throughput on NVIDIA hardware</td>
+</tr>
+</tbody>
+</table>
+<p><strong>vLLM</strong> is the default starting point. It supports the widest range of models, runs on any GPU vendor (NVIDIA, AMD, Intel), and achieves strong throughput through PagedAttention + continuous batching. The OpenAI-compatible API means you can drop it in as a replacement for any OpenAI API call.</p>
+<p><strong>SGLang</strong> builds on the same foundations as vLLM but adds RadixAttention for prefix caching and a domain-specific language for structured LLM programs. If your workload involves multi-turn conversations, tool use, or constrained decoding (JSON output, regex-guided generation), SGLang often outperforms vLLM by 2-5x through prefix reuse.</p>
+<p><strong>TensorRT-LLM</strong> compiles models into optimized NVIDIA GPU kernels. It fuses operations (attention + linear + activation in one kernel), uses FP8 on H100 GPUs, and integrates with NVIDIA Triton Inference Server for production deployment. It achieves the highest single-GPU throughput on NVIDIA hardware but requires more setup and only works on NVIDIA GPUs.</p>
+<p>Real-world numbers for Llama 3 70B (4xA100-80GB, BF16):</p>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th>vLLM</th>
+<th>SGLang</th>
+<th>TensorRT-LLM</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Throughput (1 user)</td>
+<td>~50 TPS</td>
+<td>~55 TPS</td>
+<td>~65 TPS</td>
+</tr>
+<tr>
+<td>Throughput (100 users)</td>
+<td>~2,500 total TPS</td>
+<td>~3,200 total TPS</td>
+<td>~3,000 total TPS</td>
+</tr>
+<tr>
+<td>Time to first token</td>
+<td>~400ms</td>
+<td>~300ms (prefix hit)</td>
+<td>~350ms</td>
+</tr>
+<tr>
+<td>Max context</td>
+<td>128K</td>
+<td>128K</td>
+<td>128K</td>
+</tr>
+</tbody>
+</table>
+<h3>The Ops:Byte Framework</h3>
+<p>You cannot optimize what you do not measure. The ops:byte ratio tells you whether you are compute-bound or memory-bound, which determines which optimizations matter.</p>
+<pre><code>Compute roof: peak FLOPS of the GPU
+Memory roof:  peak bandwidth * ops:byte ratio
+</code></pre>
+<p>When ops:byte is low (decode, small batches), you hit the memory bandwidth roof. Adding more compute (higher clock, more cores) does not help. You need to reduce memory reads (quantization, KV cache compression) or increase the batch size to amortize reads across more useful work.</p>
+<p>When ops:byte is high (prefill, large batches), you hit the compute roof. Memory bandwidth optimization does not help. You need faster GPUs, kernel fusion, or reduced precision to squeeze more FLOPS.</p>
+<table>
+<thead>
+<tr>
+<th>Scenario</th>
+<th>ops:byte</th>
+<th>Bound</th>
+<th>Optimize with</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Prefill, batch=1</td>
+<td>~4,096</td>
+<td>Compute</td>
+<td>Kernel fusion, FP8</td>
+</tr>
+<tr>
+<td>Decode, batch=1</td>
+<td>~1</td>
+<td>Memory</td>
+<td>Quantization, KV compression</td>
+</tr>
+<tr>
+<td>Decode, batch=32</td>
+<td>~32</td>
+<td>Memory</td>
+<td>Larger batch, continuous batching</td>
+</tr>
+<tr>
+<td>Decode, batch=256</td>
+<td>~256</td>
+<td>Transitioning</td>
+<td>Both matter</td>
+</tr>
+<tr>
+<td>Decode, batch=1024</td>
+<td>~1,024</td>
+<td>Compute</td>
+<td>Kernel fusion, tensor parallelism</td>
+</tr>
+</tbody>
+</table>
+<p>The crossover point on A100 is around ops:byte = 156 (312 TFLOPS / 2 TB/s). Below 156, you are memory-bound. Above 156, you are compute-bound. Continuous batching pushes decode toward this crossover by packing more tokens per iteration.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-e99db1980277b770cd49.png" alt="context-window-slide 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<h3>Step 1: KV Cache from Scratch</h3>
+<p>We build a multi-head KV cache that stores key and value projections per layer, per head, and demonstrates the memory growth pattern.</p>
+<pre><code class="language-python">import numpy as np
+
+class KVCache:
+    def __init__(self, num_layers, num_heads, head_dim, max_seq_len, dtype=np.float16):
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.max_seq_len = max_seq_len
+        self.dtype = dtype
+
+        self.k_cache = np.zeros(
+            (num_layers, num_heads, max_seq_len, head_dim), dtype=dtype
+        )
+        self.v_cache = np.zeros(
+            (num_layers, num_heads, max_seq_len, head_dim), dtype=dtype
+        )
+        self.seq_len = 0
+
+    def update(self, layer_idx, new_keys, new_values):
+        num_new = new_keys.shape[1]
+        end = self.seq_len + num_new
+        self.k_cache[layer_idx, :, self.seq_len:end, :] = new_keys
+        self.v_cache[layer_idx, :, self.seq_len:end, :] = new_values
+        return (
+            self.k_cache[layer_idx, :, :end, :],
+            self.v_cache[layer_idx, :, :end, :]
+        )
+
+    def advance(self, num_tokens):
+        self.seq_len += num_tokens
+
+    def memory_bytes(self):
+        return self.k_cache.nbytes + self.v_cache.nbytes
+
+    def used_bytes(self):
+        per_token = 2 * self.num_layers * self.num_heads * self.head_dim * np.dtype(self.dtype).itemsize
+        return per_token * self.seq_len
+</code></pre>
+<h3>Step 2: Attention with KV Cache</h3>
+<p>A simplified multi-head attention that uses the KV cache for decode steps.</p>
+<pre><code class="language-python">def scaled_dot_product_attention(query, keys, values):
+    head_dim = query.shape[-1]
+    scores = np.matmul(query, keys.transpose(0, 1, 3, 2)) / np.sqrt(head_dim)
+    seq_len_q = scores.shape[-2]
+    seq_len_k = scores.shape[-1]
+    if seq_len_q &gt; 1:
+        mask = np.triu(np.ones((seq_len_q, seq_len_k), dtype=np.float32), k=seq_len_k - seq_len_q + 1)
+        scores = scores + mask * (-1e9)
+    max_scores = np.max(scores, axis=-1, keepdims=True)
+    exp_scores = np.exp(scores - max_scores)
+    attn_weights = exp_scores / np.sum(exp_scores, axis=-1, keepdims=True)
+    return np.matmul(attn_weights, values)
+
+
+class MultiHeadAttention:
+    def __init__(self, d_model, num_heads):
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+        scale = np.sqrt(2.0 / d_model)
+        self.W_q = np.random.randn(d_model, d_model).astype(np.float32) * scale
+        self.W_k = np.random.randn(d_model, d_model).astype(np.float32) * scale
+        self.W_v = np.random.randn(d_model, d_model).astype(np.float32) * scale
+        self.W_o = np.random.randn(d_model, d_model).astype(np.float32) * scale
+
+    def forward(self, x, kv_cache=None, layer_idx=0):
+        batch, seq_len, d_model = x.shape
+        Q = np.matmul(x, self.W_q).reshape(batch, seq_len, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        K = np.matmul(x, self.W_k).reshape(batch, seq_len, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        V = np.matmul(x, self.W_v).reshape(batch, seq_len, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+
+        if kv_cache is not None:
+            K_full, V_full = kv_cache.update(layer_idx, K[0], V[0])
+            K = K_full[np.newaxis, :, :, :]
+            V = V_full[np.newaxis, :, :, :]
+            if seq_len == 1:
+                kv_cache.advance(1)
+
+        attn_out = scaled_dot_product_attention(Q, K, V)
+        attn_out = attn_out.transpose(0, 2, 1, 3).reshape(batch, -1, d_model)
+        return np.matmul(attn_out, self.W_o)
+</code></pre>
+<h3>Step 3: Continuous Batching Simulator</h3>
+<p>This simulates the scheduling difference between static and continuous batching.</p>
+<pre><code class="language-python">import heapq
+
+class Request:
+    def __init__(self, request_id, prompt_tokens, output_tokens, arrival_step):
+        self.request_id = request_id
+        self.prompt_tokens = prompt_tokens
+        self.output_tokens = output_tokens
+        self.arrival_step = arrival_step
+        self.tokens_generated = 0
+        self.start_step = None
+        self.end_step = None
+
+    def is_done(self):
+        return self.tokens_generated &gt;= self.output_tokens
+
+
+def simulate_static_batching(requests, batch_size):
+    step = 0
+    completed = []
+    queue = list(requests)
+    queue.sort(key=lambda r: r.arrival_step)
+
+    while queue:
+        batch = []
+        while queue and len(batch) &lt; batch_size:
+            r = queue.pop(0)
+            r.start_step = max(step, r.arrival_step)
+            batch.append(r)
+
+        if batch:
+            step = max(step, max(r.start_step for r in batch))
+            max_output = max(r.output_tokens for r in batch)
+            for r in batch:
+                r.tokens_generated = r.output_tokens
+                r.end_step = step + max_output
+            step += max_output
+            completed.extend(batch)
+
+    return completed
+
+
+def simulate_continuous_batching(requests, batch_size):
+    step = 0
+    completed = []
+    queue = sorted(requests, key=lambda r: r.arrival_step)
+    queue_idx = 0
+    active = []
+    waiting = []
+
+    while queue_idx &lt; len(queue) or active or waiting:
+        while queue_idx &lt; len(queue) and queue[queue_idx].arrival_step &lt;= step:
+            waiting.append(queue[queue_idx])
+            queue_idx += 1
+
+        while waiting and len(active) &lt; batch_size:
+            r = waiting.pop(0)
+            r.start_step = step
+            active.append(r)
+
+        if not active:
+            if waiting:
+                step += 1
+                continue
+            elif queue_idx &lt; len(queue):
+                step = queue[queue_idx].arrival_step
+                continue
+            else:
+                break
+
+        for r in active:
+            r.tokens_generated += 1
+
+        done = [r for r in active if r.is_done()]
+        for r in done:
+            r.end_step = step + 1
+            completed.append(r)
+        active = [r for r in active if not r.is_done()]
+
+        step += 1
+
+    return completed
+
+
+def batching_stats(completed):
+    latencies = [r.end_step - r.arrival_step for r in completed]
+    total_time = max(r.end_step for r in completed) - min(r.arrival_step for r in completed)
+    total_tokens = sum(r.output_tokens for r in completed)
+    return {
+        &quot;avg_latency&quot;: np.mean(latencies),
+        &quot;p50_latency&quot;: np.median(latencies),
+        &quot;p99_latency&quot;: np.percentile(latencies, 99),
+        &quot;total_time&quot;: total_time,
+        &quot;throughput&quot;: total_tokens / total_time if total_time &gt; 0 else 0,
+    }
+</code></pre>
+<h3>Step 4: Prefix Cache</h3>
+<p>A trie-based prefix cache that stores KV entries for shared prefixes.</p>
+<pre><code class="language-python">class TrieNode:
+    def __init__(self):
+        self.children = {}
+        self.kv_data = None
+        self.hit_count = 0
+
+
+class PrefixCache:
+    def __init__(self, max_entries=1000):
+        self.root = TrieNode()
+        self.max_entries = max_entries
+        self.total_entries = 0
+        self.hits = 0
+        self.misses = 0
+
+    def _walk(self, token_ids):
+        node = self.root
+        depth = 0
+        for tid in token_ids:
+            if tid not in node.children:
+                break
+            node = node.children[tid]
+            depth += 1
+        return node, depth
+
+    def lookup(self, token_ids):
+        node, depth = self._walk(token_ids)
+        if depth &gt; 0:
+            self.hits += 1
+            current = self.root
+            for tid in token_ids[:depth]:
+                current = current.children[tid]
+                current.hit_count += 1
+            kv_entries = []
+            current = self.root
+            for tid in token_ids[:depth]:
+                current = current.children[tid]
+                if current.kv_data is not None:
+                    kv_entries.append(current.kv_data)
+            return depth, kv_entries
+        self.misses += 1
+        return 0, []
+
+    def insert(self, token_ids, kv_per_token):
+        node = self.root
+        for i, tid in enumerate(token_ids):
+            if tid not in node.children:
+                if self.total_entries &gt;= self.max_entries:
+                    return i
+                node.children[tid] = TrieNode()
+                self.total_entries += 1
+            node = node.children[tid]
+            if i &lt; len(kv_per_token):
+                node.kv_data = kv_per_token[i]
+        return len(token_ids)
+
+    def hit_rate(self):
+        total = self.hits + self.misses
+        return self.hits / total if total &gt; 0 else 0.0
+</code></pre>
+<h3>Step 5: Speculative Decoding Simulator</h3>
+<p>We simulate draft-target speculative decoding with configurable acceptance rates.</p>
+<pre><code class="language-python">class DraftModel:
+    def __init__(self, vocab_size, acceptance_rate=0.8):
+        self.vocab_size = vocab_size
+        self.acceptance_rate = acceptance_rate
+
+    def generate(self, context, num_tokens):
+        tokens = np.random.randint(0, self.vocab_size, size=num_tokens)
+        return tokens
+
+    def get_probs(self, context, token):
+        probs = np.random.dirichlet(np.ones(self.vocab_size))
+        return probs
+
+
+class TargetModel:
+    def __init__(self, vocab_size):
+        self.vocab_size = vocab_size
+
+    def get_probs(self, context, tokens=None):
+        if tokens is not None:
+            return [np.random.dirichlet(np.ones(self.vocab_size)) for _ in tokens]
+        return np.random.dirichlet(np.ones(self.vocab_size))
+
+
+def speculative_decode(draft_model, target_model, context, num_speculative=5,
+                       draft_cost=1.0, target_cost=10.0, verify_cost=12.0):
+    total_tokens = 0
+    total_cost = 0.0
+    accepted_counts = []
+    context = list(context)
+
+    max_tokens = 100
+
+    while total_tokens &lt; max_tokens:
+        draft_tokens = draft_model.generate(context, num_speculative)
+        total_cost += draft_cost * num_speculative
+
+        target_probs = target_model.get_probs(context, draft_tokens)
+        total_cost += verify_cost
+
+        accepted = 0
+        for i, token in enumerate(draft_tokens):
+            draft_p = draft_model.get_probs(context + list(draft_tokens[:i]), token)
+            target_p = target_probs[i]
+
+            r = np.random.random()
+            acceptance_prob = min(1.0, target_p[token] / (draft_p[token] + 1e-10))
+
+            if r &lt; draft_model.acceptance_rate:
+                accepted += 1
+                context.append(token)
+                total_tokens += 1
+            else:
+                new_token = np.random.choice(draft_model.vocab_size, p=target_p)
+                context.append(new_token)
+                total_tokens += 1
+                break
+
+        accepted_counts.append(accepted)
+
+        if accepted == num_speculative:
+            bonus_probs = target_model.get_probs(context)
+            bonus_token = np.random.choice(draft_model.vocab_size, p=bonus_probs)
+            context.append(bonus_token)
+            total_tokens += 1
+
+    sequential_cost = total_tokens * target_cost
+    return {
+        &quot;total_tokens&quot;: total_tokens,
+        &quot;speculative_cost&quot;: total_cost,
+        &quot;sequential_cost&quot;: sequential_cost,
+        &quot;speedup&quot;: sequential_cost / total_cost if total_cost &gt; 0 else 1.0,
+        &quot;avg_accepted&quot;: np.mean(accepted_counts),
+        &quot;acceptance_rate&quot;: np.mean(accepted_counts) / num_speculative,
+    }
+
+
+def compare_speculation_strategies(vocab_size=1000, num_trials=20):
+    results = {}
+
+    for name, acceptance_rate, spec_tokens in [
+        (&quot;Draft-target (8B-&gt;70B)&quot;, 0.78, 5),
+        (&quot;EAGLE&quot;, 0.85, 6),
+        (&quot;N-gram&quot;, 0.50, 4),
+        (&quot;No speculation&quot;, 0.0, 0),
+    ]:
+        if spec_tokens == 0:
+            results[name] = {
+                &quot;speedup&quot;: 1.0,
+                &quot;acceptance_rate&quot;: 0.0,
+                &quot;avg_accepted&quot;: 0.0,
+            }
+            continue
+
+        trial_results = []
+        for _ in range(num_trials):
+            draft = DraftModel(vocab_size, acceptance_rate=acceptance_rate)
+            target = TargetModel(vocab_size)
+            context = list(np.random.randint(0, vocab_size, size=10))
+            result = speculative_decode(draft, target, context, num_speculative=spec_tokens)
+            trial_results.append(result)
+
+        results[name] = {
+            &quot;speedup&quot;: np.mean([r[&quot;speedup&quot;] for r in trial_results]),
+            &quot;acceptance_rate&quot;: np.mean([r[&quot;acceptance_rate&quot;] for r in trial_results]),
+            &quot;avg_accepted&quot;: np.mean([r[&quot;avg_accepted&quot;] for r in trial_results]),
+        }
+
+    return results
+</code></pre>
+<h3>Step 6: KV Cache Memory Profiler</h3>
+<p>Compute KV cache memory requirements for real model configurations.</p>
+<pre><code class="language-python">MODEL_CONFIGS = {
+    &quot;Llama-3-8B&quot;: {
+        &quot;num_layers&quot;: 32, &quot;num_kv_heads&quot;: 8, &quot;head_dim&quot;: 128,
+        &quot;model_params_b&quot;: 8, &quot;gqa&quot;: True,
+    },
+    &quot;Llama-3-70B&quot;: {
+        &quot;num_layers&quot;: 80, &quot;num_kv_heads&quot;: 8, &quot;head_dim&quot;: 128,
+        &quot;model_params_b&quot;: 70, &quot;gqa&quot;: True,
+    },
+    &quot;Llama-3-405B&quot;: {
+        &quot;num_layers&quot;: 126, &quot;num_kv_heads&quot;: 8, &quot;head_dim&quot;: 128,
+        &quot;model_params_b&quot;: 405, &quot;gqa&quot;: True,
+    },
+    &quot;Mistral-7B&quot;: {
+        &quot;num_layers&quot;: 32, &quot;num_kv_heads&quot;: 8, &quot;head_dim&quot;: 128,
+        &quot;model_params_b&quot;: 7, &quot;gqa&quot;: True,
+    },
+    &quot;GPT-4-est&quot;: {
+        &quot;num_layers&quot;: 120, &quot;num_kv_heads&quot;: 96, &quot;head_dim&quot;: 128,
+        &quot;model_params_b&quot;: 1800, &quot;gqa&quot;: False,
+    },
+}
+
+
+def kv_cache_memory(config, seq_len, dtype_bytes=2):
+    per_token = 2 * config[&quot;num_layers&quot;] * config[&quot;num_kv_heads&quot;] * config[&quot;head_dim&quot;] * dtype_bytes
+    total = per_token * seq_len
+    return {
+        &quot;per_token_bytes&quot;: per_token,
+        &quot;per_token_kb&quot;: per_token / 1024,
+        &quot;total_bytes&quot;: total,
+        &quot;total_mb&quot;: total / (1024 ** 2),
+        &quot;total_gb&quot;: total / (1024 ** 3),
+    }
+
+
+def memory_budget(config, gpu_memory_gb, model_dtype_bytes=2, kv_dtype_bytes=2):
+    model_memory_gb = config[&quot;model_params_b&quot;] * 1e9 * model_dtype_bytes / (1024 ** 3)
+    overhead_gb = gpu_memory_gb * 0.1
+    available_for_kv = gpu_memory_gb - model_memory_gb - overhead_gb
+
+    if available_for_kv &lt;= 0:
+        return {&quot;error&quot;: &quot;Model does not fit in GPU memory&quot;, &quot;model_memory_gb&quot;: model_memory_gb}
+
+    per_token = 2 * config[&quot;num_layers&quot;] * config[&quot;num_kv_heads&quot;] * config[&quot;head_dim&quot;] * kv_dtype_bytes
+    max_tokens = int(available_for_kv * (1024 ** 3) / per_token)
+
+    return {
+        &quot;gpu_memory_gb&quot;: gpu_memory_gb,
+        &quot;model_memory_gb&quot;: round(model_memory_gb, 1),
+        &quot;overhead_gb&quot;: round(overhead_gb, 1),
+        &quot;available_for_kv_gb&quot;: round(available_for_kv, 1),
+        &quot;max_total_tokens&quot;: max_tokens,
+        &quot;max_users_at_2k&quot;: max_tokens // 2048,
+        &quot;max_users_at_4k&quot;: max_tokens // 4096,
+        &quot;max_users_at_32k&quot;: max_tokens // 32768,
+    }
+</code></pre>
+<h2>Use It</h2>
+<p>With vLLM:</p>
+<pre><code class="language-python">from vllm import LLM, SamplingParams
+
+llm = LLM(
+    model=&quot;meta-llama/Meta-Llama-3-70B-Instruct&quot;,
+    tensor_parallel_size=4,
+    enable_prefix_caching=True,
+    max_model_len=8192,
+    gpu_memory_utilization=0.9,
+)
+
+params = SamplingParams(temperature=0.7, max_tokens=256)
+outputs = llm.generate([&quot;Explain inference optimization in one paragraph.&quot;], params)
+</code></pre>
+<p>With SGLang for prefix caching + structured output:</p>
+<pre><code class="language-python">import sglang as sgl
+
+@sgl.function
+def classify(s, text):
+    s += sgl.system(&quot;You are a classifier. Output JSON only.&quot;)
+    s += sgl.user(f&quot;Classify this text: {text}&quot;)
+    s += sgl.assistant(sgl.gen(&quot;result&quot;, regex=r'\{&quot;label&quot;: &quot;(positive|negative|neutral)&quot;\}'))
+
+runtime = sgl.Runtime(model_path=&quot;meta-llama/Meta-Llama-3-70B-Instruct&quot;, tp_size=4)
+sgl.set_default_backend(runtime)
+
+results = classify.run_batch([
+    {&quot;text&quot;: &quot;This product is amazing!&quot;},
+    {&quot;text&quot;: &quot;Terrible experience.&quot;},
+    {&quot;text&quot;: &quot;It was okay I guess.&quot;},
+])
+</code></pre>
+<p>With TensorRT-LLM:</p>
+<pre><code class="language-python">import tensorrt_llm
+from tensorrt_llm.runtime import ModelRunner
+
+runner = ModelRunner.from_dir(&quot;./llama-70b-trt-engine/&quot;, rank=0)
+
+outputs = runner.generate(
+    batch_input_ids=[tokenizer.encode(&quot;Explain KV caching.&quot;)],
+    max_new_tokens=256,
+    temperature=0.7,
+)
+</code></pre>
+<h2>Ship It</h2>
+<p>This lesson produces:</p>
+<ul>
+<li><code>outputs/skill-inference-optimization.md</code> -- a skill for diagnosing and optimizing LLM inference serving</li>
+</ul>
+<h2>Exercises</h2>
+<ol>
+<li>
+<p>Modify the KV cache profiler to compare FP16 vs FP8 vs INT4 KV cache quantization. For Llama 3 70B at 4K context, compute the max concurrent users for each on 4xA100-80GB. KV quantization to INT4 should roughly 4x the user capacity.</p>
+</li>
+<li>
+<p>Extend the continuous batching simulator to track GPU utilization (fraction of batch slots filled per step). Plot utilization over time for both static and continuous batching with 50 requests whose output lengths follow a Pareto distribution (shape=1.5, scale=20). Continuous batching should maintain &gt;80% utilization.</p>
+</li>
+<li>
+<p>Implement a grouped-query attention (GQA) version of the KV cache where <code>num_kv_heads &lt; num_query_heads</code>. Llama 3 70B uses 64 query heads but only 8 KV heads. Compute the memory savings vs full multi-head attention (8x reduction in KV cache size).</p>
+</li>
+<li>
+<p>Build a prefix cache that uses LRU eviction. Set max_entries to 500 and generate 1,000 requests where 60% share one of 5 common prefixes. Measure hit rate and compare to unlimited cache. With good eviction, hit rate should stay above 55%.</p>
+</li>
+<li>
+<p>Extend the speculative decoding simulator to implement tree-based speculation (EAGLE-2 style). Instead of a single chain of K draft tokens, generate a tree of candidates (e.g., 2 branches at each of 3 levels = 8 leaf candidates). Compare total tokens accepted per verification round vs linear speculation.</p>
+</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Prefill</td>
+<td>&quot;Processing the prompt&quot;</td>
+<td>Computing attention over all input tokens in parallel -- compute-bound because the full matrix multiplication keeps GPU cores busy</td>
+</tr>
+<tr>
+<td>Decode</td>
+<td>&quot;Generating tokens&quot;</td>
+<td>Producing one token per forward pass, reading the full model weights each time -- memory-bound because compute finishes before the next weights arrive</td>
+</tr>
+<tr>
+<td>KV cache</td>
+<td>&quot;Caching attention states&quot;</td>
+<td>Storing the key and value projections for all previous tokens so they are not recomputed at each decode step -- trades memory for compute</td>
+</tr>
+<tr>
+<td>Continuous batching</td>
+<td>&quot;Dynamic batching&quot;</td>
+<td>Inserting new requests into the running batch as soon as any request finishes, evaluated at every decode iteration rather than waiting for the whole batch</td>
+</tr>
+<tr>
+<td>PagedAttention</td>
+<td>&quot;Virtual memory for KV cache&quot;</td>
+<td>Allocating KV cache in fixed-size pages instead of contiguous blocks, eliminating memory fragmentation and enabling copy-on-write for shared prefixes</td>
+</tr>
+<tr>
+<td>Speculative decoding</td>
+<td>&quot;Draft and verify&quot;</td>
+<td>Using a fast draft model to propose multiple tokens, then verifying them all in one target model forward pass -- mathematically exact, 2-3x speedup</td>
+</tr>
+<tr>
+<td>EAGLE</td>
+<td>&quot;Self-speculative decoding&quot;</td>
+<td>A speculative decoding variant that trains a lightweight head on the target model's own hidden states, achieving higher acceptance rates than a separate draft model</td>
+</tr>
+<tr>
+<td>Prefix caching</td>
+<td>&quot;Reusing system prompt KV&quot;</td>
+<td>Storing computed KV cache entries for common prefixes (system prompts, few-shot examples) and reusing them across requests to skip redundant prefill</td>
+</tr>
+<tr>
+<td>Ops:byte ratio</td>
+<td>&quot;Arithmetic intensity&quot;</td>
+<td>The ratio of compute operations to memory bytes read -- determines whether a workload is compute-bound (high ratio) or memory-bound (low ratio)</td>
+</tr>
+<tr>
+<td>Time to first token</td>
+<td>&quot;TTFT&quot;</td>
+<td>Latency from receiving a request to producing the first output token -- dominated by prefill time for long prompts</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li>Kwon et al., &quot;Efficient Memory Management for Large Language Model Serving with PagedAttention&quot; (2023) -- the vLLM paper that introduced paged KV cache management, now the industry standard for inference serving</li>
+<li>Leviathan et al., &quot;Fast Inference from Transformers via Speculative Decoding&quot; (2023) -- the foundational paper proving that draft-verify speculation produces exact target model distributions while achieving 2-3x speedup</li>
+<li>Li et al., &quot;EAGLE: Speculative Sampling Requires Rethinking Feature Uncertainty&quot; (2024) -- achieves higher acceptance rates by training a head on the target model's own features instead of using a separate draft model</li>
+<li>Zheng et al., &quot;SGLang: Efficient Execution of Structured Language Model Programs&quot; (2024) -- introduces RadixAttention for prefix caching and a programming model for multi-call LLM programs</li>
+<li>Williams et al., &quot;Roofline: An Insightful Visual Performance Model for Multicore Architectures&quot; (2009) -- the original roofline paper that formalized the ops:byte framework for reasoning about compute vs memory bottlenecks</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-10-llms-from-scratch--12-inference-optimization.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-10-llms-from-scratch--12-inference-optimization.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/10-llms-from-scratch/12-inference-optimization/code/main.py">phases/10-llms-from-scratch/12-inference-optimization/code/main.py</a><details><summary>查看原始文本</summary><pre><code>import numpy as np
+import heapq
+
+
+class KVCache:
+    def __init__(self, num_layers, num_heads, head_dim, max_seq_len, dtype=np.float16):
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.max_seq_len = max_seq_len
+        self.dtype = dtype
+
+        self.k_cache = np.zeros(
+            (num_layers, num_heads, max_seq_len, head_dim), dtype=dtype
+        )
+        self.v_cache = np.zeros(
+            (num_layers, num_heads, max_seq_len, head_dim), dtype=dtype
+        )
+        self.seq_len = 0
+
+    def update(self, layer_idx, new_keys, new_values):
+        num_new = new_keys.shape[1]
+        end = self.seq_len + num_new
+        self.k_cache[layer_idx, :, self.seq_len:end, :] = new_keys
+        self.v_cache[layer_idx, :, self.seq_len:end, :] = new_values
+        return (
+            self.k_cache[layer_idx, :, :end, :],
+            self.v_cache[layer_idx, :, :end, :]
+        )
+
+    def advance(self, num_tokens):
+        self.seq_len += num_tokens
+
+    def memory_bytes(self):
+        return self.k_cache.nbytes + self.v_cache.nbytes
+
+    def used_bytes(self):
+        per_token = 2 * self.num_layers * self.num_heads * self.head_dim * np.dtype(self.dtype).itemsize
+        return per_token * self.seq_len
+
+
+def scaled_dot_product_attention(query, keys, values):
+    head_dim = query.shape[-1]
+    scores = np.matmul(query, keys.transpose(0, 1, 3, 2)) / np.sqrt(head_dim)
+    seq_len_q = scores.shape[-2]
+    seq_len_k = scores.shape[-1]
+    if seq_len_q &gt; 1:
+        mask = np.triu(np.ones((seq_len_q, seq_len_k), dtype=np.float32), k=seq_len_k - seq_len_q + 1)
+        scores = scores + mask * (-1e9)
+    max_scores = np.max(scores, axis=-1, keepdims=True)
+    exp_scores = np.exp(scores - max_scores)
+    attn_weights = exp_scores / np.sum(exp_scores, axis=-1, keepdims=True)
+    return np.matmul(attn_weights, values)
+
+
+class MultiHeadAttention:
+    def __init__(self, d_model, num_heads):
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+        scale = np.sqrt(2.0 / d_model)
+        self.W_q = np.random.randn(d_model, d_model).astype(np.float32) * scale
+        self.W_k = np.random.randn(d_model, d_model).astype(np.float32) * scale
+        self.W_v = np.random.randn(d_model, d_model).astype(np.float32) * scale
+        self.W_o = np.random.randn(d_model, d_model).astype(np.float32) * scale
+
+    def forward(self, x, kv_cache=None, layer_idx=0):
+        batch, seq_len, d_model = x.shape
+        Q = np.matmul(x, self.W_q).reshape(batch, seq_len, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        K = np.matmul(x, self.W_k).reshape(batch, seq_len, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        V = np.matmul(x, self.W_v).reshape(batch, seq_len, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+
+        if kv_cache is not None:
+            K_full, V_full = kv_cache.update(layer_idx, K[0], V[0])
+            K = K_full[np.newaxis, :, :, :]
+            V = V_full[np.newaxis, :, :, :]
+            if seq_len == 1:
+                kv_cache.advance(1)
+
+        attn_out = scaled_dot_product_attention(Q, K, V)
+        attn_out = attn_out.transpose(0, 2, 1, 3).reshape(batch, -1, d_model)
+        return np.matmul(attn_out, self.W_o)
+
+
+class Request:
+    def __init__(self, request_id, prompt_tokens, output_tokens, arrival_step):
+        self.request_id = request_id
+        self.prompt_tokens = prompt_tokens
+        self.output_tokens = output_tokens
+        self.arrival_step = arrival_step
+        self.tokens_generated = 0
+        self.start_step = None
+        self.end_step = None
+
+    def is_done(self):
+        return self.tokens_generated &gt;= self.output_tokens
+
+
+def simulate_static_batching(requests, batch_size):
+    step = 0
+    completed = []
+    queue = sorted(requests, key=lambda r: r.arrival_step)
+
+    while queue:
+        batch = []
+        while queue and len(batch) &lt; batch_size:
+            r = queue.pop(0)
+            r.start_step = max(step, r.arrival_step)
+            batch.append(r)
+
+        if batch:
+            step = max(step, max(r.start_step for r in batch))
+            max_output = max(r.output_tokens for r in batch)
+            for r in batch:
+                r.tokens_generated = r.output_tokens
+                r.end_step = step + max_output
+            step += max_output
+            completed.extend(batch)
+
+    return completed
+
+
+def simulate_continuous_batching(requests, batch_size):
+    step = 0
+    completed = []
+    queue = sorted(requests, key=lambda r: r.arrival_step)
+    queue_idx = 0
+    active = []
+    waiting = []
+
+    while queue_idx &lt; len(queue) or active or waiting:
+        while queue_idx &lt; len(queue) and queue[queue_idx].arrival_step &lt;= step:
+            waiting.append(queue[queue_idx])
+            queue_idx += 1
+
+        while waiting and len(active) &lt; batch_size:
+            r = waiting.pop(0)
+            r.start_step = step
+            active.append(r)
+
+        if not active:
+            if waiting:
+                step += 1
+                continue
+            elif queue_idx &lt; len(queue):
+                step = queue[queue_idx].arrival_step
+                continue
+            else:
+                break
+
+        for r in active:
+            r.tokens_generated += 1
+
+        done = [r for r in active if r.is_done()]
+        for r in done:
+            r.end_step = step + 1
+            completed.append(r)
+        active = [r for r in active if not r.is_done()]
+
+        step += 1
+
+    return completed
+
+
+def batching_stats(completed):
+    latencies = [r.end_step - r.arrival_step for r in completed]
+    total_time = max(r.end_step for r in completed) - min(r.arrival_step for r in completed)
+    total_tokens = sum(r.output_tokens for r in completed)
+    return {
+        &quot;avg_latency&quot;: np.mean(latencies),
+        &quot;p50_latency&quot;: np.median(latencies),
+        &quot;p99_latency&quot;: np.percentile(latencies, 99),
+        &quot;total_time&quot;: total_time,
+        &quot;throughput&quot;: total_tokens / total_time if total_time &gt; 0 else 0,
+    }
+
+
+class TrieNode:
+    def __init__(self):
+        self.children = {}
+        self.kv_data = None
+        self.hit_count = 0
+
+
+class PrefixCache:
+    def __init__(self, max_entries=1000):
+        self.root = TrieNode()
+        self.max_entries = max_entries
+        self.total_entries = 0
+        self.hits = 0
+        self.misses = 0
+
+    def _walk(self, token_ids):
+        node = self.root
+        depth = 0
+        for tid in token_ids:
+            if tid not in node.children:
+                break
+            node = node.children[tid]
+            depth += 1
+        return node, depth
+
+    def lookup(self, token_ids):
+        node, depth = self._walk(token_ids)
+        if depth &gt; 0:
+            self.hits += 1
+            current = self.root
+            for tid in token_ids[:depth]:
+                current = current.children[tid]
+                current.hit_count += 1
+            kv_entries = []
+            current = self.root
+            for tid in token_ids[:depth]:
+                current = current.children[tid]
+                if current.kv_data is not None:
+                    kv_entries.append(current.kv_data)
+            return depth, kv_entries
+        self.misses += 1
+        return 0, []
+
+    def insert(self, token_ids, kv_per_token):
+        node = self.root
+        for i, tid in enumerate(token_ids):
+            if tid not in node.children:
+                if self.total_entries &gt;= self.max_entries:
+                    return i
+                node.children[tid] = TrieNode()
+                self.total_entries += 1
+            node = node.children[tid]
+            if i &lt; len(kv_per_token):
+                node.kv_data = kv_per_token[i]
+        return len(token_ids)
+
+    def hit_rate(self):
+        total = self.hits + self.misses
+        return self.hits / total if total &gt; 0 else 0.0
+
+
+class DraftModel:
+    def __init__(self, vocab_size, acceptance_rate=0.8):
+        self.vocab_size = vocab_size
+        self.acceptance_rate = acceptance_rate
+
+    def generate(self, context, num_tokens):
+        return np.random.randint(0, self.vocab_size, size=num_tokens)
+
+    def get_probs(self, context, token):
+        return np.random.dirichlet(np.ones(self.vocab_size))
+
+
+class TargetModel:
+    def __init__(self, vocab_size):
+        self.vocab_size = vocab_size
+
+    def get_probs(self, context, tokens=None):
+        if tokens is not None:
+            return [np.random.dirichlet(np.ones(self.vocab_size)) for _ in tokens]
+        return np.random.dirichlet(np.ones(self.vocab_size))
+
+
+def speculative_decode(draft_model, target_model, context, num_speculative=5,
+                       draft_cost=1.0, target_cost=10.0, verify_cost=12.0):
+    total_tokens = 0
+    total_cost = 0.0
+    accepted_counts = []
+    context = list(context)
+    max_tokens = 100
+
+    while total_tokens &lt; max_tokens:
+        draft_tokens = draft_model.generate(context, num_speculative)
+        total_cost += draft_cost * num_speculative
+
+        target_probs = target_model.get_probs(context, draft_tokens)
+        total_cost += verify_cost
+
+        accepted = 0
+        for i, token in enumerate(draft_tokens):
+            draft_p = draft_model.get_probs(context + list(draft_tokens[:i]), token)
+            target_p = target_probs[i]
+
+            r = np.random.random()
+
+            if r &lt; draft_model.acceptance_rate:
+                accepted += 1
+                context.append(token)
+                total_tokens += 1
+            else:
+                new_token = np.random.choice(draft_model.vocab_size, p=target_p)
+                context.append(new_token)
+                total_tokens += 1
+                break
+
+        accepted_counts.append(accepted)
+
+        if accepted == num_speculative:
+            bonus_probs = target_model.get_probs(context)
+            bonus_token = np.random.choice(draft_model.vocab_size, p=bonus_probs)
+            context.append(bonus_token)
+            total_tokens += 1
+
+    sequential_cost = total_tokens * target_cost
+    return {
+        &quot;total_tokens&quot;: total_tokens,
+        &quot;speculative_cost&quot;: total_cost,
+        &quot;sequential_cost&quot;: sequential_cost,
+        &quot;speedup&quot;: sequential_cost / total_cost if total_cost &gt; 0 else 1.0,
+        &quot;avg_accepted&quot;: np.mean(accepted_counts),
+        &quot;acceptance_rate&quot;: np.mean(accepted_counts) / num_speculative,
+    }
+
+
+MODEL_CONFIGS = {
+    &quot;Llama-3-8B&quot;: {
+        &quot;num_layers&quot;: 32, &quot;num_kv_heads&quot;: 8, &quot;head_dim&quot;: 128,
+        &quot;model_params_b&quot;: 8, &quot;gqa&quot;: True,
+    },
+    &quot;Llama-3-70B&quot;: {
+        &quot;num_layers&quot;: 80, &quot;num_kv_heads&quot;: 8, &quot;head_dim&quot;: 128,
+        &quot;model_params_b&quot;: 70, &quot;gqa&quot;: True,
+    },
+    &quot;Llama-3-405B&quot;: {
+        &quot;num_layers&quot;: 126, &quot;num_kv_heads&quot;: 8, &quot;head_dim&quot;: 128,
+        &quot;model_params_b&quot;: 405, &quot;gqa&quot;: True,
+    },
+    &quot;Mistral-7B&quot;: {
+        &quot;num_layers&quot;: 32, &quot;num_kv_heads&quot;: 8, &quot;head_dim&quot;: 128,
+        &quot;model_params_b&quot;: 7, &quot;gqa&quot;: True,
+    },
+    &quot;GPT-4-est&quot;: {
+        &quot;num_layers&quot;: 120, &quot;num_kv_heads&quot;: 96, &quot;head_dim&quot;: 128,
+        &quot;model_params_b&quot;: 1800, &quot;gqa&quot;: False,
+    },
+}
+
+
+def kv_cache_memory(config, seq_len, dtype_bytes=2):
+    per_token = 2 * config[&quot;num_layers&quot;] * config[&quot;num_kv_heads&quot;] * config[&quot;head_dim&quot;] * dtype_bytes
+    total = per_token * seq_len
+    return {
+        &quot;per_token_bytes&quot;: per_token,
+        &quot;per_token_kb&quot;: per_token / 1024,
+        &quot;total_bytes&quot;: total,
+        &quot;total_mb&quot;: total / (1024 ** 2),
+        &quot;total_gb&quot;: total / (1024 ** 3),
+    }
+
+
+def memory_budget(config, gpu_memory_gb, model_dtype_bytes=2, kv_dtype_bytes=2):
+    model_memory_gb = config[&quot;model_params_b&quot;] * 1e9 * model_dtype_bytes / (1024 ** 3)
+    overhead_gb = gpu_memory_gb * 0.1
+    available_for_kv = gpu_memory_gb - model_memory_gb - overhead_gb
+
+    if available_for_kv &lt;= 0:
+        return {&quot;error&quot;: &quot;Model does not fit in GPU memory&quot;, &quot;model_memory_gb&quot;: model_memory_gb}
+
+    per_token = 2 * config[&quot;num_layers&quot;] * config[&quot;num_kv_heads&quot;] * config[&quot;head_dim&quot;] * kv_dtype_bytes
+    max_tokens = int(available_for_kv * (1024 ** 3) / per_token)
+
+    return {
+        &quot;gpu_memory_gb&quot;: gpu_memory_gb,
+        &quot;model_memory_gb&quot;: round(model_memory_gb, 1),
+        &quot;overhead_gb&quot;: round(overhead_gb, 1),
+        &quot;available_for_kv_gb&quot;: round(available_for_kv, 1),
+        &quot;max_total_tokens&quot;: max_tokens,
+        &quot;max_users_at_2k&quot;: max_tokens // 2048,
+        &quot;max_users_at_4k&quot;: max_tokens // 4096,
+        &quot;max_users_at_32k&quot;: max_tokens // 32768,
+    }
+
+
+if __name__ == &quot;__main__&quot;:
+    np.random.seed(42)
+
+    print(&quot;=&quot; * 70)
+    print(&quot;STEP 1: KV Cache Memory Analysis&quot;)
+    print(&quot;=&quot; * 70)
+
+    print(f&quot;\n  {&#39;Model&#39;:&lt;20s} {&#39;Per Token&#39;:&gt;12s} {&#39;@ 4K ctx&#39;:&gt;12s} {&#39;@ 32K ctx&#39;:&gt;12s} {&#39;@ 128K ctx&#39;:&gt;12s}&quot;)
+    print(&quot;  &quot; + &quot;-&quot; * 68)
+
+    for name, config in MODEL_CONFIGS.items():
+        mem_4k = kv_cache_memory(config, 4096)
+        mem_32k = kv_cache_memory(config, 32768)
+        mem_128k = kv_cache_memory(config, 131072)
+        pt = kv_cache_memory(config, 1)
+        print(f&quot;  {name:&lt;20s} {pt[&#39;per_token_kb&#39;]:&gt;10.1f}KB {mem_4k[&#39;total_gb&#39;]:&gt;10.2f}GB &quot;
+              f&quot;{mem_32k[&#39;total_gb&#39;]:&gt;10.2f}GB {mem_128k[&#39;total_gb&#39;]:&gt;10.2f}GB&quot;)
+
+    print(f&quot;\n  Memory budget for Llama 3 70B on different GPU configs:&quot;)
+    print(f&quot;  {&#39;GPU Config&#39;:&lt;25s} {&#39;Model&#39;:&gt;8s} {&#39;KV Avail&#39;:&gt;10s} {&#39;@2K users&#39;:&gt;10s} {&#39;@4K users&#39;:&gt;10s}&quot;)
+    print(&quot;  &quot; + &quot;-&quot; * 63)
+
+    config_70b = MODEL_CONFIGS[&quot;Llama-3-70B&quot;]
+    for gpu_name, gpu_gb in [(&quot;1xA100-80GB&quot;, 80), (&quot;2xA100-80GB&quot;, 160), (&quot;4xA100-80GB&quot;, 320), (&quot;8xH100-80GB&quot;, 640)]:
+        budget = memory_budget(config_70b, gpu_gb)
+        if &quot;error&quot; in budget:
+            print(f&quot;  {gpu_name:&lt;25s} {budget[&#39;model_memory_gb&#39;]:&gt;7.1f}GB   DOES NOT FIT&quot;)
+        else:
+            print(f&quot;  {gpu_name:&lt;25s} {budget[&#39;model_memory_gb&#39;]:&gt;7.1f}GB {budget[&#39;available_for_kv_gb&#39;]:&gt;9.1f}GB &quot;
+                  f&quot;{budget[&#39;max_users_at_2k&#39;]:&gt;10d} {budget[&#39;max_users_at_4k&#39;]:&gt;10d}&quot;)
+
+    print(&quot;\n&quot; + &quot;=&quot; * 70)
+    print(&quot;STEP 2: KV Cache with Attention&quot;)
+    print(&quot;=&quot; * 70)
+
+    d_model = 64
+    num_heads = 4
+    seq_len = 8
+    head_dim = d_model // num_heads
+
+    cache = KVCache(num_layers=1, num_heads=num_heads, head_dim=head_dim, max_seq_len=128)
+    attn = MultiHeadAttention(d_model, num_heads)
+
+    prompt = np.random.randn(1, seq_len, d_model).astype(np.float32)
+    prefill_out = attn.forward(prompt, kv_cache=cache, layer_idx=0)
+    cache.advance(seq_len)
+
+    print(f&quot;\n  Prefill: {seq_len} tokens processed&quot;)
+    print(f&quot;  KV cache after prefill: {cache.seq_len} tokens, {cache.used_bytes()} bytes&quot;)
+    print(f&quot;  Output shape: {prefill_out.shape}&quot;)
+
+    for step in range(4):
+        new_token = np.random.randn(1, 1, d_model).astype(np.float32)
+        decode_out = attn.forward(new_token, kv_cache=cache, layer_idx=0)
+        print(f&quot;  Decode step {step + 1}: cache={cache.seq_len} tokens, &quot;
+              f&quot;output shape={decode_out.shape}, used={cache.used_bytes()} bytes&quot;)
+
+    print(&quot;\n&quot; + &quot;=&quot; * 70)
+    print(&quot;STEP 3: Static vs Continuous Batching&quot;)
+    print(&quot;=&quot; * 70)
+
+    def make_requests(n=30, seed=42):
+        rng = np.random.RandomState(seed)
+        requests = []
+        for i in range(n):
+            arrival = rng.randint(0, 20)
+            output_len = int(rng.pareto(1.5) * 15) + 5
+            output_len = min(output_len, 200)
+            requests.append(Request(i, prompt_tokens=100, output_tokens=output_len, arrival_step=arrival))
+        return requests
+
+    batch_size = 8
+
+    static_requests = make_requests()
+    static_results = simulate_static_batching(static_requests, batch_size)
+    static_stats = batching_stats(static_results)
+
+    continuous_requests = make_requests()
+    continuous_results = simulate_continuous_batching(continuous_requests, batch_size)
+    continuous_stats = batching_stats(continuous_results)
+
+    print(f&quot;\n  {30} requests, batch_size={batch_size}&quot;)
+    print(f&quot;  Output lengths: min={min(r.output_tokens for r in make_requests())}, &quot;
+          f&quot;max={max(r.output_tokens for r in make_requests())}, &quot;
+          f&quot;mean={np.mean([r.output_tokens for r in make_requests()]):.1f}&quot;)
+
+    print(f&quot;\n  {&#39;Metric&#39;:&lt;25s} {&#39;Static&#39;:&gt;12s} {&#39;Continuous&#39;:&gt;12s} {&#39;Improvement&#39;:&gt;12s}&quot;)
+    print(&quot;  &quot; + &quot;-&quot; * 61)
+
+    for metric in [&quot;avg_latency&quot;, &quot;p50_latency&quot;, &quot;p99_latency&quot;, &quot;total_time&quot;, &quot;throughput&quot;]:
+        s = static_stats[metric]
+        c = continuous_stats[metric]
+        if metric == &quot;throughput&quot;:
+            improvement = f&quot;{c/s:.2f}x&quot; if s &gt; 0 else &quot;N/A&quot;
+        else:
+            improvement = f&quot;{(s-c)/s*100:.1f}% less&quot; if s &gt; 0 else &quot;N/A&quot;
+        print(f&quot;  {metric:&lt;25s} {s:&gt;12.1f} {c:&gt;12.1f} {improvement:&gt;12s}&quot;)
+
+    print(&quot;\n&quot; + &quot;=&quot; * 70)
+    print(&quot;STEP 4: Prefix Caching&quot;)
+    print(&quot;=&quot; * 70)
+
+    cache = PrefixCache(max_entries=5000)
+
+    system_prompts = [
+        list(range(100, 200)),
+        list(range(200, 350)),
+        list(range(400, 480)),
+    ]
+
+    for i, prefix in enumerate(system_prompts):
+        kv_data = [np.random.randn(4, 16).astype(np.float16) for _ in prefix]
+        inserted = cache.insert(prefix, kv_data)
+        print(f&quot;\n  Cached system prompt {i+1}: {len(prefix)} tokens, {inserted} inserted&quot;)
+
+    num_requests = 100
+    hit_count = 0
+    tokens_saved = 0
+
+    for i in range(num_requests):
+        prompt_idx = np.random.randint(0, len(system_prompts))
+        system = system_prompts[prompt_idx]
+        user_tokens = list(np.random.randint(500, 1000, size=np.random.randint(20, 50)))
+        full_tokens = system + user_tokens
+
+        depth, kv_entries = cache.lookup(full_tokens)
+        if depth &gt; 0:
+            hit_count += 1
+            tokens_saved += depth
+
+    print(f&quot;\n  {num_requests} requests with shared system prompts:&quot;)
+    print(f&quot;  Cache hit rate: {cache.hit_rate():.1%}&quot;)
+    print(f&quot;  Tokens saved (prefix reuse): {tokens_saved}&quot;)
+    print(f&quot;  Avg tokens saved per hit: {tokens_saved / max(hit_count, 1):.1f}&quot;)
+    print(f&quot;  Total entries in trie: {cache.total_entries}&quot;)
+
+    print(&quot;\n&quot; + &quot;=&quot; * 70)
+    print(&quot;STEP 5: Speculative Decoding&quot;)
+    print(&quot;=&quot; * 70)
+
+    vocab_size = 500
+    num_trials = 10
+
+    strategies = [
+        (&quot;Draft-target (8B-&gt;70B)&quot;, 0.78, 5),
+        (&quot;EAGLE&quot;, 0.85, 6),
+        (&quot;N-gram lookup&quot;, 0.50, 4),
+    ]
+
+    print(f&quot;\n  {&#39;Strategy&#39;:&lt;25s} {&#39;Accept Rate&#39;:&gt;12s} {&#39;Avg Accept&#39;:&gt;12s} {&#39;Speedup&#39;:&gt;10s}&quot;)
+    print(&quot;  &quot; + &quot;-&quot; * 59)
+
+    for name, acc_rate, spec_k in strategies:
+        trial_speedups = []
+        trial_accept_rates = []
+        trial_avg_accepts = []
+
+        for _ in range(num_trials):
+            draft = DraftModel(vocab_size, acceptance_rate=acc_rate)
+            target = TargetModel(vocab_size)
+            context = list(np.random.randint(0, vocab_size, size=10))
+            result = speculative_decode(draft, target, context, num_speculative=spec_k)
+            trial_speedups.append(result[&quot;speedup&quot;])
+            trial_accept_rates.append(result[&quot;acceptance_rate&quot;])
+            trial_avg_accepts.append(result[&quot;avg_accepted&quot;])
+
+        print(f&quot;  {name:&lt;25s} {np.mean(trial_accept_rates):&gt;11.1%} &quot;
+              f&quot;{np.mean(trial_avg_accepts):&gt;12.2f} {np.mean(trial_speedups):&gt;9.2f}x&quot;)
+
+    print(&quot;\n&quot; + &quot;=&quot; * 70)
+    print(&quot;STEP 6: Ops:Byte Analysis&quot;)
+    print(&quot;=&quot; * 70)
+
+    a100_tflops = 312
+    a100_bandwidth_tbs = 2.0
+    crossover = a100_tflops / a100_bandwidth_tbs
+
+    print(f&quot;\n  A100 specs: {a100_tflops} TFLOPS (BF16), {a100_bandwidth_tbs} TB/s bandwidth&quot;)
+    print(f&quot;  Crossover ops:byte ratio: {crossover:.0f}&quot;)
+
+    scenarios = [
+        (&quot;Prefill, batch=1, seq=4096&quot;, 4096),
+        (&quot;Decode, batch=1&quot;, 1),
+        (&quot;Decode, batch=8&quot;, 8),
+        (&quot;Decode, batch=32&quot;, 32),
+        (&quot;Decode, batch=128&quot;, 128),
+        (&quot;Decode, batch=256&quot;, 256),
+        (&quot;Decode, batch=512&quot;, 512),
+    ]
+
+    print(f&quot;\n  {&#39;Scenario&#39;:&lt;35s} {&#39;Ops:Byte&#39;:&gt;10s} {&#39;Bound&#39;:&gt;12s} {&#39;Utilization&#39;:&gt;12s}&quot;)
+    print(&quot;  &quot; + &quot;-&quot; * 69)
+
+    for name, ops_per_byte in scenarios:
+        bound = &quot;Compute&quot; if ops_per_byte &gt;= crossover else &quot;Memory&quot;
+        if bound == &quot;Memory&quot;:
+            util = ops_per_byte / crossover * 100
+        else:
+            util = 100.0
+        print(f&quot;  {name:&lt;35s} {ops_per_byte:&gt;10d} {bound:&gt;12s} {util:&gt;11.1f}%&quot;)
+
+    print(&quot;\n  Takeaway: batch decode until ops:byte exceeds the crossover point.&quot;)
+    print(f&quot;  On A100, this means batch size &gt;= ~{int(crossover)} for full compute utilization.&quot;)
+
+    print(&quot;\n&quot; + &quot;=&quot; * 70)
+    print(&quot;SUMMARY&quot;)
+    print(&quot;=&quot; * 70)
+    print(&quot;  1. KV cache trades memory for compute: 320KB/token for Llama 3 70B&quot;)
+    print(&quot;  2. Continuous batching fills idle GPU slots as requests finish&quot;)
+    print(&quot;  3. PagedAttention eliminates memory fragmentation (simulated via trie)&quot;)
+    print(&quot;  4. Prefix caching reuses KV entries for shared system prompts&quot;)
+    print(&quot;  5. Speculative decoding gets 2-3x speedup by batching verification&quot;)
+    print(&quot;  6. Ops:byte ratio determines whether you are compute or memory bound&quot;)
+    print(&quot;\n  Production stack: vLLM or SGLang with PagedAttention + continuous&quot;)
+    print(&quot;  batching + prefix caching. Add speculative decoding for latency.&quot;)
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/10-llms-from-scratch/12-inference-optimization/code/main.rs">phases/10-llms-from-scratch/12-inference-optimization/code/main.rs</a><details><summary>查看原始文本</summary><pre><code>// Inference optimization: KV cache + speculative decoding sketch. Stdlib only.
+// Topic: prefill vs decode, KV cache memory layout, prefix cache trie, draft-verify loop.
+// References (cited in spirit, not as deps):
+//   - vLLM PagedAttention (Kwon 2023):    https://arxiv.org/abs/2309.06180
+//   - Speculative decoding (Leviathan):   https://arxiv.org/abs/2211.17192
+//   - candle KV cache:                    https://github.com/huggingface/candle/blob/main/candle-transformers/src/models/llama.rs
+//   - llm.c inference notes:              https://github.com/karpathy/llm.c
+//
+// Compile + run:  rustc --edition 2021 main.rs -o /tmp/inf &amp;&amp; /tmp/inf
+
+use std::collections::HashMap;
+use std::f32::consts::PI;
+
+// ---------- xorshift64 RNG (deterministic, good distribution in low bits) ----------
+struct Rng { state: u64 }
+impl Rng {
+    fn new(seed: u64) -&gt; Self {
+        let mut s = seed;
+        if s == 0 { s = 0xdead_beef_cafe_babe; }
+        Rng { state: s }
+    }
+    fn next_u64(&amp;mut self) -&gt; u64 {
+        let mut x = self.state;
+        x ^= x &lt;&lt; 13;
+        x ^= x &gt;&gt; 7;
+        x ^= x &lt;&lt; 17;
+        self.state = x;
+        x
+    }
+    fn next_u32(&amp;mut self) -&gt; u32 { (self.next_u64() &gt;&gt; 32) as u32 }
+    fn uniform(&amp;mut self) -&gt; f32 { (self.next_u32() as f32 + 1.0) / (u32::MAX as f32 + 2.0) }
+    fn gauss(&amp;mut self) -&gt; f32 {
+        let u1 = self.uniform();
+        let u2 = self.uniform();
+        (-2.0 * u1.ln()).sqrt() * (2.0 * PI * u2).cos()
+    }
+    fn range(&amp;mut self, hi: usize) -&gt; usize { (self.next_u32() as usize) % hi }
+    fn choice(&amp;mut self, probs: &amp;[f32]) -&gt; usize {
+        let r = self.uniform();
+        let mut acc = 0.0;
+        for (i, p) in probs.iter().enumerate() {
+            acc += *p;
+            if r &lt;= acc { return i; }
+        }
+        probs.len() - 1
+    }
+}
+
+// ---------- KVCache: layered [num_layers, num_heads, max_seq, head_dim] ----------
+struct KVCache {
+    num_layers: usize,
+    num_heads: usize,
+    head_dim: usize,
+    max_seq_len: usize,
+    bytes_per_element: usize,
+    k: Vec&lt;f32&gt;,
+    v: Vec&lt;f32&gt;,
+    seq_len: usize,
+}
+
+impl KVCache {
+    fn new(num_layers: usize, num_heads: usize, head_dim: usize, max_seq_len: usize) -&gt; Self {
+        let total = num_layers * num_heads * max_seq_len * head_dim;
+        KVCache {
+            num_layers, num_heads, head_dim, max_seq_len,
+            bytes_per_element: 2, // simulate fp16
+            k: vec![0.0; total],
+            v: vec![0.0; total],
+            seq_len: 0,
+        }
+    }
+
+    fn idx(&amp;self, layer: usize, head: usize, pos: usize, dim: usize) -&gt; usize {
+        ((layer * self.num_heads + head) * self.max_seq_len + pos) * self.head_dim + dim
+    }
+
+    // Write new K/V slices of shape [n_new, num_heads, head_dim] for one layer.
+    fn update(&amp;mut self, layer: usize, new_k: &amp;[f32], new_v: &amp;[f32], n_new: usize) {
+        assert_eq!(new_k.len(), n_new * self.num_heads * self.head_dim);
+        assert_eq!(new_v.len(), n_new * self.num_heads * self.head_dim);
+        assert!(layer &lt; self.num_layers, &quot;layer index out of range&quot;);
+        let start = self.seq_len;
+        assert!(start + n_new &lt;= self.max_seq_len, &quot;KV cache capacity exceeded&quot;);
+        for t in 0..n_new {
+            for h in 0..self.num_heads {
+                for d in 0..self.head_dim {
+                    let src = (t * self.num_heads + h) * self.head_dim + d;
+                    let dst = self.idx(layer, h, start + t, d);
+                    self.k[dst] = new_k[src];
+                    self.v[dst] = new_v[src];
+                }
+            }
+        }
+    }
+
+    fn advance(&amp;mut self, n: usize) { self.seq_len += n; }
+
+    fn capacity_bytes(&amp;self) -&gt; usize {
+        2 * self.k.len() * self.bytes_per_element
+    }
+    fn used_bytes(&amp;self) -&gt; usize {
+        let per_tok = 2 * self.num_layers * self.num_heads * self.head_dim * self.bytes_per_element;
+        per_tok * self.seq_len
+    }
+}
+
+// ---------- Prefix cache trie (PagedAttention-style prefix sharing) ----------
+struct TrieNode {
+    children: HashMap&lt;usize, usize&gt;, // token -&gt; node idx
+    hit_count: usize,
+}
+
+struct PrefixCache {
+    nodes: Vec&lt;TrieNode&gt;,
+    max_entries: usize,
+    hits: usize,
+    misses: usize,
+}
+
+impl PrefixCache {
+    fn new(max_entries: usize) -&gt; Self {
+        PrefixCache {
+            nodes: vec![TrieNode { children: HashMap::new(), hit_count: 0 }],
+            max_entries,
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    fn walk(&amp;self, tokens: &amp;[usize]) -&gt; usize {
+        let mut node = 0usize;
+        let mut depth = 0usize;
+        for &amp;t in tokens {
+            match self.nodes[node].children.get(&amp;t) {
+                Some(&amp;next) =&gt; { node = next; depth += 1; }
+                None =&gt; break,
+            }
+        }
+        depth
+    }
+
+    fn lookup(&amp;mut self, tokens: &amp;[usize]) -&gt; usize {
+        let depth = self.walk(tokens);
+        if depth &gt; 0 {
+            self.hits += 1;
+            let mut node = 0usize;
+            for &amp;t in tokens.iter().take(depth) {
+                node = *self.nodes[node].children.get(&amp;t).unwrap();
+                self.nodes[node].hit_count += 1;
+            }
+        } else {
+            self.misses += 1;
+        }
+        depth
+    }
+
+    fn insert(&amp;mut self, tokens: &amp;[usize]) -&gt; usize {
+        let mut node = 0usize;
+        for (i, &amp;t) in tokens.iter().enumerate() {
+            if !self.nodes[node].children.contains_key(&amp;t) {
+                if self.nodes.len() &gt;= self.max_entries { return i; }
+                let new_idx = self.nodes.len();
+                self.nodes.push(TrieNode { children: HashMap::new(), hit_count: 0 });
+                self.nodes[node].children.insert(t, new_idx);
+            }
+            node = *self.nodes[node].children.get(&amp;t).unwrap();
+        }
+        tokens.len()
+    }
+
+    fn hit_rate(&amp;self) -&gt; f32 {
+        let total = self.hits + self.misses;
+        if total == 0 { 0.0 } else { self.hits as f32 / total as f32 }
+    }
+}
+
+// ---------- Batching simulators ----------
+#[derive(Clone)]
+struct Request {
+    arrival: usize,
+    output_tokens: usize,
+    tokens_generated: usize,
+    start: usize,
+    end: usize,
+}
+impl Request {
+    fn new(arrival: usize, output_tokens: usize) -&gt; Self {
+        Request { arrival, output_tokens, tokens_generated: 0, start: 0, end: 0 }
+    }
+    fn done(&amp;self) -&gt; bool { self.tokens_generated &gt;= self.output_tokens }
+}
+
+fn simulate_static_batching(mut reqs: Vec&lt;Request&gt;, batch_size: usize) -&gt; Vec&lt;Request&gt; {
+    reqs.sort_by_key(|r| r.arrival);
+    let mut step = 0;
+    let mut completed = Vec::new();
+    let mut idx = 0;
+    while idx &lt; reqs.len() {
+        let mut batch: Vec&lt;Request&gt; = Vec::new();
+        while idx &lt; reqs.len() &amp;&amp; batch.len() &lt; batch_size {
+            let mut r = reqs[idx].clone();
+            r.start = step.max(r.arrival);
+            batch.push(r);
+            idx += 1;
+        }
+        if !batch.is_empty() {
+            step = step.max(batch.iter().map(|r| r.start).max().unwrap());
+            let max_out = batch.iter().map(|r| r.output_tokens).max().unwrap();
+            for mut r in batch.into_iter() {
+                r.tokens_generated = r.output_tokens;
+                r.end = step + max_out;
+                completed.push(r);
+            }
+            step += max_out;
+        }
+    }
+    completed
+}
+
+fn simulate_continuous_batching(mut reqs: Vec&lt;Request&gt;, batch_size: usize) -&gt; Vec&lt;Request&gt; {
+    reqs.sort_by_key(|r| r.arrival);
+    let mut step = 0usize;
+    let mut completed = Vec::new();
+    let mut waiting: Vec&lt;Request&gt; = Vec::new();
+    let mut active: Vec&lt;Request&gt; = Vec::new();
+    let mut idx = 0;
+
+    while idx &lt; reqs.len() || !active.is_empty() || !waiting.is_empty() {
+        while idx &lt; reqs.len() &amp;&amp; reqs[idx].arrival &lt;= step {
+            waiting.push(reqs[idx].clone());
+            idx += 1;
+        }
+        while !waiting.is_empty() &amp;&amp; active.len() &lt; batch_size {
+            let mut r = waiting.remove(0);
+            r.start = step;
+            active.push(r);
+        }
+        if active.is_empty() {
+            if !waiting.is_empty() { step += 1; continue; }
+            if idx &lt; reqs.len() { step = reqs[idx].arrival; continue; }
+            break;
+        }
+        for r in active.iter_mut() { r.tokens_generated += 1; }
+        let mut still: Vec&lt;Request&gt; = Vec::new();
+        for mut r in active.drain(..) {
+            if r.done() {
+                r.end = step + 1;
+                completed.push(r);
+            } else {
+                still.push(r);
+            }
+        }
+        active = still;
+        step += 1;
+    }
+    completed
+}
+
+struct BatchStats {
+    avg_latency: f32,
+    p50: f32,
+    p99: f32,
+    total_time: f32,
+    throughput: f32,
+}
+
+fn batch_stats(completed: &amp;[Request]) -&gt; BatchStats {
+    let mut lats: Vec&lt;f32&gt; = completed.iter().map(|r| (r.end - r.arrival) as f32).collect();
+    lats.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let avg = lats.iter().sum::&lt;f32&gt;() / lats.len() as f32;
+    let p50 = lats[lats.len() / 2];
+    let p99 = lats[((lats.len() as f32 * 0.99) as usize).min(lats.len() - 1)];
+    let total = completed.iter().map(|r| r.end).max().unwrap() as f32
+        - completed.iter().map(|r| r.arrival).min().unwrap() as f32;
+    let total_tokens: usize = completed.iter().map(|r| r.output_tokens).sum();
+    let thr = if total &gt; 0.0 { total_tokens as f32 / total } else { 0.0 };
+    BatchStats { avg_latency: avg, p50, p99, total_time: total, throughput: thr }
+}
+
+// ---------- Speculative decoding sketch ----------
+struct DraftModel { vocab: usize, acceptance_rate: f32 }
+struct TargetModel { vocab: usize }
+
+impl DraftModel {
+    fn generate(&amp;self, k: usize, rng: &amp;mut Rng) -&gt; Vec&lt;usize&gt; {
+        (0..k).map(|_| rng.range(self.vocab)).collect()
+    }
+}
+
+impl TargetModel {
+    // Returns a (uniform) probability vector. A real target would sample its true distribution.
+    fn uniform_probs(&amp;self) -&gt; Vec&lt;f32&gt; { vec![1.0 / self.vocab as f32; self.vocab] }
+}
+
+#[allow(dead_code)]
+struct SpecResult {
+    total_tokens: usize,
+    spec_cost: f32,
+    seq_cost: f32,
+    speedup: f32,
+    avg_accepted: f32,
+}
+
+fn speculative_decode(
+    draft: &amp;DraftModel, target: &amp;TargetModel,
+    context: &amp;[usize], num_spec: usize,
+    draft_cost: f32, target_cost: f32, verify_cost: f32,
+    max_tokens: usize,
+    rng: &amp;mut Rng,
+) -&gt; SpecResult {
+    let mut ctx: Vec&lt;usize&gt; = context.to_vec();
+    let mut total_tokens = 0usize;
+    let mut total_cost = 0.0f32;
+    let mut accepted_counts: Vec&lt;usize&gt; = Vec::new();
+
+    while total_tokens &lt; max_tokens {
+        let draft_tokens = draft.generate(num_spec, rng);
+        total_cost += draft_cost * num_spec as f32;
+
+        // One verify pass scores all k tokens.
+        total_cost += verify_cost;
+
+        let mut accepted = 0usize;
+        for &amp;tok in &amp;draft_tokens {
+            if total_tokens &gt;= max_tokens { break; }
+            let r = rng.uniform();
+            if r &lt; draft.acceptance_rate {
+                accepted += 1;
+                ctx.push(tok);
+                total_tokens += 1;
+            } else {
+                let probs = target.uniform_probs();
+                let resampled = rng.choice(&amp;probs);
+                ctx.push(resampled);
+                total_tokens += 1;
+                break;
+            }
+        }
+        accepted_counts.push(accepted);
+
+        if accepted == num_spec &amp;&amp; total_tokens &lt; max_tokens {
+            // Bonus token from target&#39;s free-standing prediction.
+            let probs = target.uniform_probs();
+            let bonus = rng.choice(&amp;probs);
+            ctx.push(bonus);
+            total_tokens += 1;
+        }
+    }
+    let seq_cost = total_tokens as f32 * target_cost;
+    let avg_accept = accepted_counts.iter().sum::&lt;usize&gt;() as f32 / accepted_counts.len() as f32;
+    SpecResult {
+        total_tokens,
+        spec_cost: total_cost,
+        seq_cost,
+        speedup: if total_cost &gt; 0.0 { seq_cost / total_cost } else { 1.0 },
+        avg_accepted: avg_accept,
+    }
+}
+
+// ---------- KV cache memory analysis ----------
+#[allow(dead_code)]
+struct ModelCfg {
+    name: &amp;&#39;static str,
+    num_layers: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    params_b: f64,
+}
+
+fn kv_cache_mem(cfg: &amp;ModelCfg, seq_len: usize, bytes: usize) -&gt; (usize, f64) {
+    let per_token = 2 * cfg.num_layers * cfg.num_kv_heads * cfg.head_dim * bytes;
+    let total = per_token * seq_len;
+    (per_token, total as f64 / (1024.0 * 1024.0 * 1024.0))
+}
+
+fn main() {
+    let mut rng = Rng::new(42);
+
+    // --- Step 1: KV cache memory analysis ---
+    println!(&quot;{}&quot;, &quot;=&quot;.repeat(70));
+    println!(&quot;STEP 1: KV cache memory per model&quot;);
+    println!(&quot;{}&quot;, &quot;=&quot;.repeat(70));
+    let configs: [ModelCfg; 5] = [
+        ModelCfg { name: &quot;Llama-3-8B&quot;,   num_layers: 32, num_kv_heads: 8, head_dim: 128, params_b: 8.0 },
+        ModelCfg { name: &quot;Llama-3-70B&quot;,  num_layers: 80, num_kv_heads: 8, head_dim: 128, params_b: 70.0 },
+        ModelCfg { name: &quot;Llama-3-405B&quot;, num_layers: 126, num_kv_heads: 8, head_dim: 128, params_b: 405.0 },
+        ModelCfg { name: &quot;Mistral-7B&quot;,   num_layers: 32, num_kv_heads: 8, head_dim: 128, params_b: 7.0 },
+        ModelCfg { name: &quot;GPT-4-est&quot;,    num_layers: 120, num_kv_heads: 96, head_dim: 128, params_b: 1800.0 },
+    ];
+    println!(&quot;  {:&lt;20} {:&gt;12} {:&gt;12} {:&gt;12} {:&gt;12}&quot;, &quot;Model&quot;, &quot;Per Token&quot;, &quot;@ 4K ctx&quot;, &quot;@ 32K ctx&quot;, &quot;@ 128K ctx&quot;);
+    println!(&quot;  {}&quot;, &quot;-&quot;.repeat(70));
+    for c in &amp;configs {
+        let (pt, _) = kv_cache_mem(c, 1, 2);
+        let (_, g4) = kv_cache_mem(c, 4096, 2);
+        let (_, g32) = kv_cache_mem(c, 32768, 2);
+        let (_, g128) = kv_cache_mem(c, 131072, 2);
+        println!(&quot;  {:&lt;20} {:&gt;10}KB {:&gt;10.2}GB {:&gt;10.2}GB {:&gt;10.2}GB&quot;,
+            c.name, pt / 1024, g4, g32, g128);
+    }
+
+    // --- Step 2: KV cache with simulated attention writes ---
+    println!(&quot;\n{}&quot;, &quot;=&quot;.repeat(70));
+    println!(&quot;STEP 2: KV cache prefill + decode&quot;);
+    println!(&quot;{}&quot;, &quot;=&quot;.repeat(70));
+    let num_heads = 4usize;
+    let head_dim = 16usize;
+    let seq_len = 8usize;
+    let mut cache = KVCache::new(1, num_heads, head_dim, 128);
+
+    // Fake K/V tensors for prefill.
+    let n_prefill = seq_len;
+    let kv_size = n_prefill * num_heads * head_dim;
+    let k: Vec&lt;f32&gt; = (0..kv_size).map(|_| rng.gauss()).collect();
+    let v: Vec&lt;f32&gt; = (0..kv_size).map(|_| rng.gauss()).collect();
+    cache.update(0, &amp;k, &amp;v, n_prefill);
+    cache.advance(n_prefill);
+    println!(&quot;  prefill: {} tokens cached, used={} bytes (cap={} bytes)&quot;,
+        cache.seq_len, cache.used_bytes(), cache.capacity_bytes());
+
+    // Decode: 4 steps, each appending 1 token&#39;s K/V.
+    for step in 0..4 {
+        let kv_size = num_heads * head_dim;
+        let k_new: Vec&lt;f32&gt; = (0..kv_size).map(|_| rng.gauss()).collect();
+        let v_new: Vec&lt;f32&gt; = (0..kv_size).map(|_| rng.gauss()).collect();
+        cache.update(0, &amp;k_new, &amp;v_new, 1);
+        cache.advance(1);
+        println!(&quot;  decode step {}: cache={} tokens, used={} bytes&quot;,
+            step + 1, cache.seq_len, cache.used_bytes());
+    }
+
+    // --- Step 3: static vs continuous batching ---
+    println!(&quot;\n{}&quot;, &quot;=&quot;.repeat(70));
+    println!(&quot;STEP 3: static vs continuous batching&quot;);
+    println!(&quot;{}&quot;, &quot;=&quot;.repeat(70));
+
+    let make_reqs = |seed: u64, n: usize| -&gt; Vec&lt;Request&gt; {
+        let mut r = Rng::new(seed);
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            let arrival = r.range(20);
+            // Pareto-ish: heavy tail via inverse uniform.
+            let u = r.uniform().max(1e-3);
+            let out_len = ((1.0 / u.powf(1.0 / 1.5)) * 15.0) as usize + 5;
+            let out_len = out_len.min(200);
+            out.push(Request::new(arrival, out_len));
+        }
+        out
+    };
+    let batch_size = 8usize;
+    let s = simulate_static_batching(make_reqs(42, 30), batch_size);
+    let c = simulate_continuous_batching(make_reqs(42, 30), batch_size);
+    let ss = batch_stats(&amp;s);
+    let cs = batch_stats(&amp;c);
+    println!(&quot;  30 requests, batch_size={}&quot;, batch_size);
+    println!(&quot;  {:&lt;14} {:&gt;12} {:&gt;12} {:&gt;12}&quot;, &quot;Metric&quot;, &quot;Static&quot;, &quot;Continuous&quot;, &quot;Delta&quot;);
+    println!(&quot;  {}&quot;, &quot;-&quot;.repeat(54));
+    let print_delta = |name: &amp;str, sv: f32, cv: f32, smaller_better: bool| {
+        let delta = if smaller_better {
+            if sv &gt; 0.0 { format!(&quot;{:+.1}%&quot;, (sv - cv) / sv * 100.0) } else { &quot;n/a&quot;.to_string() }
+        } else {
+            if sv &gt; 0.0 { format!(&quot;{:.2}x&quot;, cv / sv) } else { &quot;n/a&quot;.to_string() }
+        };
+        println!(&quot;  {:&lt;14} {:&gt;12.1} {:&gt;12.1} {:&gt;12}&quot;, name, sv, cv, delta);
+    };
+    print_delta(&quot;avg_latency&quot;, ss.avg_latency, cs.avg_latency, true);
+    print_delta(&quot;p50_latency&quot;, ss.p50, cs.p50, true);
+    print_delta(&quot;p99_latency&quot;, ss.p99, cs.p99, true);
+    print_delta(&quot;total_time&quot;,  ss.total_time, cs.total_time, true);
+    print_delta(&quot;throughput&quot;,  ss.throughput, cs.throughput, false);
+
+    // --- Step 4: prefix cache ---
+    println!(&quot;\n{}&quot;, &quot;=&quot;.repeat(70));
+    println!(&quot;STEP 4: prefix caching for shared system prompts&quot;);
+    println!(&quot;{}&quot;, &quot;=&quot;.repeat(70));
+    let mut pc = PrefixCache::new(5000);
+    let prompts: Vec&lt;Vec&lt;usize&gt;&gt; = vec![
+        (100..200).collect(),
+        (200..350).collect(),
+        (400..480).collect(),
+    ];
+    for (i, p) in prompts.iter().enumerate() {
+        let inserted = pc.insert(p);
+        println!(&quot;  cached system prompt {}: {} tokens, {} new nodes inserted&quot;, i + 1, p.len(), inserted);
+    }
+
+    let mut hit_count = 0usize;
+    let mut tokens_saved = 0usize;
+    for _ in 0..100 {
+        let idx = rng.range(prompts.len());
+        let sys = &amp;prompts[idx];
+        let user_len = 20 + rng.range(30);
+        let mut full = sys.clone();
+        full.extend((0..user_len).map(|_| 500 + rng.range(500)));
+        let depth = pc.lookup(&amp;full);
+        if depth &gt; 0 { hit_count += 1; tokens_saved += depth; }
+    }
+    println!(&quot;  hit rate: {:.1}%&quot;, pc.hit_rate() * 100.0);
+    println!(&quot;  tokens saved (prefix reuse): {}&quot;, tokens_saved);
+    println!(&quot;  avg saved per hit: {:.1}&quot;, tokens_saved as f32 / hit_count.max(1) as f32);
+
+    // --- Step 5: speculative decoding ---
+    println!(&quot;\n{}&quot;, &quot;=&quot;.repeat(70));
+    println!(&quot;STEP 5: speculative decoding speedup (sketch)&quot;);
+    println!(&quot;{}&quot;, &quot;=&quot;.repeat(70));
+    let vocab = 500usize;
+    let trials = 10usize;
+    let strategies: [(&amp;str, f32, usize); 3] = [
+        (&quot;draft-target (8B-&gt;70B)&quot;, 0.78, 5),
+        (&quot;EAGLE&quot;,                  0.85, 6),
+        (&quot;n-gram lookup&quot;,          0.50, 4),
+    ];
+    println!(&quot;  {:&lt;24} {:&gt;14} {:&gt;12} {:&gt;10}&quot;, &quot;Strategy&quot;, &quot;AcceptRate&quot;, &quot;AvgAccept&quot;, &quot;Speedup&quot;);
+    println!(&quot;  {}&quot;, &quot;-&quot;.repeat(64));
+    for (name, acc, k) in strategies {
+        let mut speedups = 0.0f32;
+        let mut accept_rates = 0.0f32;
+        let mut avg_accepts = 0.0f32;
+        for _ in 0..trials {
+            let draft = DraftModel { vocab, acceptance_rate: acc };
+            let target = TargetModel { vocab };
+            let ctx: Vec&lt;usize&gt; = (0..10).map(|_| rng.range(vocab)).collect();
+            let r = speculative_decode(&amp;draft, &amp;target, &amp;ctx, k, 1.0, 10.0, 12.0, 100, &amp;mut rng);
+            speedups += r.speedup;
+            accept_rates += r.avg_accepted / k as f32;
+            avg_accepts += r.avg_accepted;
+        }
+        println!(&quot;  {:&lt;24} {:&gt;13.1}% {:&gt;12.2} {:&gt;9.2}x&quot;,
+            name,
+            accept_rates / trials as f32 * 100.0,
+            avg_accepts / trials as f32,
+            speedups / trials as f32,
+        );
+    }
+
+    // --- Step 6: ops:byte ---
+    println!(&quot;\n{}&quot;, &quot;=&quot;.repeat(70));
+    println!(&quot;STEP 6: ops:byte and memory vs compute bound&quot;);
+    println!(&quot;{}&quot;, &quot;=&quot;.repeat(70));
+    let a100_tflops = 312.0f32;
+    let a100_bandwidth_tbs = 2.0f32;
+    let crossover = a100_tflops / a100_bandwidth_tbs;
+    println!(&quot;  A100 specs: {} TFLOPS, {} TB/s bandwidth, crossover ops:byte = {:.0}&quot;,
+        a100_tflops, a100_bandwidth_tbs, crossover);
+    let scenarios: [(&amp;str, usize); 7] = [
+        (&quot;Prefill, batch=1, seq=4096&quot;, 4096),
+        (&quot;Decode, batch=1&quot;,   1),
+        (&quot;Decode, batch=8&quot;,   8),
+        (&quot;Decode, batch=32&quot;,  32),
+        (&quot;Decode, batch=128&quot;, 128),
+        (&quot;Decode, batch=256&quot;, 256),
+        (&quot;Decode, batch=512&quot;, 512),
+    ];
+    println!(&quot;  {:&lt;32} {:&gt;10} {:&gt;12} {:&gt;12}&quot;, &quot;Scenario&quot;, &quot;Ops:Byte&quot;, &quot;Bound&quot;, &quot;Utilization&quot;);
+    println!(&quot;  {}&quot;, &quot;-&quot;.repeat(70));
+    for (name, opb) in scenarios {
+        let bound = if opb as f32 &gt;= crossover { &quot;Compute&quot; } else { &quot;Memory&quot; };
+        let util = if bound == &quot;Memory&quot; { opb as f32 / crossover * 100.0 } else { 100.0 };
+        println!(&quot;  {:&lt;32} {:&gt;10} {:&gt;12} {:&gt;11.1}%&quot;, name, opb, bound, util);
+    }
+
+    println!(&quot;\n{}&quot;, &quot;=&quot;.repeat(70));
+    println!(&quot;SUMMARY&quot;);
+    println!(&quot;{}&quot;, &quot;=&quot;.repeat(70));
+    println!(&quot;  1. KV cache trades memory for compute; per-token cost scales with layers x kv_heads x head_dim.&quot;);
+    println!(&quot;  2. Continuous batching keeps the GPU busy as requests retire mid-batch.&quot;);
+    println!(&quot;  3. Prefix caching shares KV entries across shared system prompts.&quot;);
+    println!(&quot;  4. Speculative decoding amortizes verification across k draft tokens.&quot;);
+    println!(&quot;  5. Decode is memory bound at small batch; raise batch until ops:byte clears crossover.&quot;);
+}
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/10-llms-from-scratch/12-inference-optimization/outputs/skill-inference-optimization.md">phases/10-llms-from-scratch/12-inference-optimization/outputs/skill-inference-optimization.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: skill-inference-optimization
+description: Diagnose and optimize LLM inference serving throughput, latency, and cost
+version: 1.0.0
+phase: 10
+lesson: 12
+tags: [inference, kv-cache, batching, speculative-decoding, vllm, optimization]
+---
+
+# LLM Inference Optimization Pattern
+
+Two phases: prefill (compute-bound, parallel) and decode (memory-bound, sequential).
+Every optimization targets one or both.
+
+```
+Request -&gt; Prefill (process prompt) -&gt; Decode (generate tokens) -&gt; Response
+              |                            |
+         Compute-bound               Memory-bound
+         Optimize: fusion,           Optimize: batching,
+         prefix caching              quantization, speculation
+```
+
+## Decision framework
+
+### Step 1: Identify your bottleneck
+
+Measure ops:byte ratio for your workload:
+
+| ops:byte | Bound | What to optimize |
+|----------|-------|-----------------|
+| &lt; 50 | Memory | Quantize KV cache, increase batch size |
+| 50-200 | Transitional | Both matter, start with batching |
+| &gt; 200 | Compute | Kernel fusion, tensor parallelism, FP8 |
+
+### Step 2: Pick your engine
+
+- **Default**: vLLM (widest model support, PagedAttention, OpenAI-compatible API)
+- **Multi-turn / structured output**: SGLang (RadixAttention prefix caching, constrained decoding)
+- **Max NVIDIA throughput**: TensorRT-LLM (kernel fusion, FP8 on H100)
+
+### Step 3: Apply optimizations in order
+
+1. **KV cache** -- always on, no downside
+2. **Continuous batching** -- always on, no downside (vLLM/SGLang do this by default)
+3. **Prefix caching** -- enable if you have shared system prompts (most chatbots do)
+4. **Quantization** -- KV cache INT8/FP8 reduces memory 2-4x with minimal quality loss
+5. **Speculative decoding** -- add when latency matters more than throughput
+6. **Tensor parallelism** -- split across GPUs when model does not fit on one
+
+## KV cache memory formula
+
+```
+per_token = 2 * num_layers * num_kv_heads * head_dim * bytes_per_param
+total = per_token * sequence_length * num_concurrent_users
+```
+
+Quick reference for common models (BF16):
+
+| Model | Per token | 100 users @ 4K |
+|-------|-----------|----------------|
+| Llama 3 8B | 32 KB | 12.5 GB |
+| Llama 3 70B | 320 KB | 125 GB |
+| Llama 3 405B | 504 KB | 197 GB |
+
+## Speculative decoding checklist
+
+- Draft model should be 5-10x smaller than target (e.g., 8B drafts for 70B)
+- Acceptance rate &gt; 70% for meaningful speedup
+- Best on predictable text (code, structured output, natural language)
+- Worst on creative/sampling-heavy tasks (low temperature helps)
+- EAGLE &gt; draft-target &gt; n-gram for most workloads
+
+## Common mistakes
+
+- Running decode at batch=1 (memory-bound, GPU 95% idle on compute)
+- Allocating contiguous KV cache blocks (use PagedAttention, get near-zero waste)
+- Ignoring prefix caching when 80% of requests share the same system prompt
+- Over-provisioning GPU memory for model weights, leaving nothing for KV cache
+- Measuring throughput without measuring latency (high throughput at 10s TTFT is useless)
+- Using speculative decoding with high temperature (acceptance rate drops below 50%)
+
+## Monitoring checklist
+
+- Time to first token (TTFT): prefill latency, target &lt; 500ms for interactive use
+- Inter-token latency (ITL): decode speed, target &lt; 50ms for streaming
+- Throughput (tokens/second): total across all concurrent users
+- KV cache utilization: percentage of allocated cache in use
+- Batch utilization: percentage of batch slots filled per iteration
+- Queue depth: requests waiting for a batch slot
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. What are the two phases of LLM inference?</legend><label class="option"><input type="radio" name="q0" value="0"> Forward and backward</label><label class="option"><input type="radio" name="q0" value="1"> Encoding and decoding</label><label class="option"><input type="radio" name="q0" value="2"> Training and evaluation</label><label class="option"><input type="radio" name="q0" value="3"> Prefill (processes the prompt in parallel, compute-bound) and decode (generates tokens one at a time, memory-bound)</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. What does KV-cache eliminate during autoregressive generation?</legend><label class="option"><input type="radio" name="q1" value="0"> The embedding lookup</label><label class="option"><input type="radio" name="q1" value="1"> The need for attention masks</label><label class="option"><input type="radio" name="q1" value="2"> The softmax computation</label><label class="option"><input type="radio" name="q1" value="3"> Redundant recomputation of key and value vectors for all previous tokens at each generation step</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. What is continuous batching and why does it improve throughput?</legend><label class="option"><input type="radio" name="q2" value="0"> Batching across multiple models</label><label class="option"><input type="radio" name="q2" value="1"> Using larger batch sizes</label><label class="option"><input type="radio" name="q2" value="2"> Processing all requests in one large batch</label><label class="option"><input type="radio" name="q2" value="3"> Dynamically adding and removing requests from the running batch as they start and finish, instead of waiting for the entire batch to complete</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. What problem does PagedAttention (used in vLLM) solve?</legend><label class="option"><input type="radio" name="q3" value="0"> It improves tokenization speed</label><label class="option"><input type="radio" name="q3" value="1"> It reduces model size</label><label class="option"><input type="radio" name="q3" value="2"> It manages KV-cache memory in fixed-size blocks like virtual memory, eliminating fragmentation from variable-length sequences</label><label class="option"><input type="radio" name="q3" value="3"> It speeds up the attention computation</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. What is speculative decoding?</legend><label class="option"><input type="radio" name="q4" value="0"> Using a small draft model to propose multiple tokens that the large model verifies in parallel, speeding up generation</label><label class="option"><input type="radio" name="q4" value="1"> Predicting which tokens the user wants</label><label class="option"><input type="radio" name="q4" value="2"> Generating multiple responses and picking the best</label><label class="option"><input type="radio" name="q4" value="3"> Caching frequently generated sequences</label><p data-feedback="4"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/10-llms-from-scratch/11-quantization/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/10-llms-from-scratch/13-building-complete-llm-pipeline/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/10-llms-from-scratch/12-inference-optimization/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

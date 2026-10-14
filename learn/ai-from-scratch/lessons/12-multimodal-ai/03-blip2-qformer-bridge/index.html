@@ -1,0 +1,533 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>从CLIP到BLIP-2 Q-Former作为一种模拟桥梁 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-12-multimodal-ai" data-lesson="12-multimodal-ai/03-blip2-qformer-bridge" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/12-multimodal-ai/">多模态 AI</a> / LESSON 03</p><h1 class="lesson-title">从CLIP到BLIP-2 Q-Former作为一种模拟桥梁</h1><p>From CLIP to BLIP-2 — Q-Former as Modality Bridge</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>从CLIP到BLIP-2 Q-Former作为一种模拟桥梁</h1>
+<blockquote>
+<p>CLIP将图像和文字相对应,但不能生成标题,回答问题,或进行对话. 通过跨度注意力来通过结结结 ViT 的特征,然后直接插入结结 LLM 的输入流中, 188万个桥梁参数将11B LLM连接到ViT-g/14. 到2026年,每一个基于适配器的VLM都是 MiniGPT-4,InstructBLIP,LLaVA的表弟都是后代. 这一课程阅读了Q-Former的架构,解释了它的两阶段训练,</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python (stdlib, cross-attention + learnable-query demo)
+<strong>Prerequisites:</strong> Phase 12 · 02 (CLIP), Phase 7 (Transformers)
+<strong>Time:</strong> ~180 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>解释为什么冷视觉编码器和冷的LLM之间的可训练的瓶比成本和稳定性更好.</li>
+<li>实现一个跨重视区块,其中一个固定的学习性查询集处理外部图像特征.</li>
+<li>通过BLIP-2的两阶段预训练:表示 (ITC + ITM + ITG) 然后生成 (通过冷解码器损失LM).</li>
+<li>比较Q-Former与LLaVA中使用的简单的MLP投影机,并讨论当每一个选择赢得时.</li>
+</ul>
+<h2>问题</h2>
+<p>你有一个冷的ViT,每张图片产生256个补丁代币,每张图片均为14080.你有一个冷的7B LLM,预计将4096的代币嵌入.明显的桥梁从1408到4096 的线性层工作,但将所有256个补丁代币输入到LLM的文本中,每张图片每张代币额外256个.超过32个图像的批量仅仅是视觉模式消耗的8192个代币.</p>
+<p>问:你可以将256个代币的图像表示压缩到更少的代币 (例如32个代币),同时保留足够的信息,让LLM能够标题,回答问题,并解释图像?</p>
+<p>答案:一个Q-Former. 32个可学习的&quot;查询&quot;向量,它们交叉地处理VIT的补丁代码,产生了LLM所消耗的32代代码视觉总结.总共188万个参数.在触及LLM之前,训练有素进行对比,匹配和生成目标.</p>
+<h2>概念</h2>
+<h3>需要学习的问题</h3>
+<p>模具的核心技巧:而不是让LLM的文字代币关注图像补丁,<code>Q</code>查询是模型的参数,它们是在训练中学习,并且用于每个图像的相同32个查询.</p>
+<p>经过交叉关注,每个查询都包含了图像的压缩总结&quot;描述主对象&quot;,&quot;描述背景&quot;,&quot;数对象&quot;,等.查询不真正专注于语义标签;它们学习任何编码导致下游损失下降.</p>
+<h3>建筑</h3>
+<p>形器是一个小型变压器 (12层,大约100M参数),具有两个路径:</p>
+<ol>
+<li>查询路径:32个查询向量通过自我注意 (彼此),然后通过冷的ViT补丁代币进行交叉注意,然后FFN.</li>
+<li>文本路径:一个类似BERT的文本编码器与查询路径共享自注意和FFN权重.文本路径被禁用交叉注意.</li>
+</ol>
+<p>在训练时间,两个路径都运行.查询和文本通过共享自我注意力相互作用,这意味着查询可以对需要它的工作 (ITM,ITG) 进行文本条件.在VLM交付的推断时间,只有查询流过,产生32个视觉代币.</p>
+<h3>两阶段的培训</h3>
+<p>双重飞行器-2预训练有两阶段:</p>
+<p>阶段1:代表性学习 (没有法学士).</p>
+<ul>
+<li>图像与文本对比:集成查询代币和文本CLS代币之间的CLIP式对比.</li>
+<li>图像和文本匹配:二进制分类器 是不是图像和文本对相匹配?硬负采矿.</li>
+<li>图像基文本生成:因果性LM对文本进行标记,根据查询进行条件. 要求查询编码可生成文本的内容.</li>
+</ul>
+<p>只有Q-Former列车,ViT被结,没有LLM涉及.</p>
+<p>阶段2:生成学习. 附加一个结的LLM (OPT-2.7B或Flan-T5-XL,等).通过一个小的线性层将32个查询输出投影到LLM的嵌入式. 准备它们进入文本提示. 仅训练线性投影和Q-Former在LC损失上连接提示 +图像 +标题序列.</p>
+<p>在第二阶段之后,Q-Former+投影是完整的视觉适配器.在推断时:图像 → ViT → Q-Former →线性项目 →预pendium → text → frozen LLM 发出.</p>
+<h3>参数经济学</h3>
+<p>造型 (B-Former) 总数为8B,训练有素188M.仅Q-Former为全堆参数的2.4% .训练成本反映了这一点:几天在少数A100s上与周为端到端.</p>
+<p>质量:BLIP-2与Flamingo-80B相匹配或超过零射击VQA,同时小50倍.</p>
+<h3>导航BLIP和指令知情的Q-Former</h3>
+<p>导读BLIP (2023) 通过一个额外的输入:指令文本本身,扩展了Q-Former.在交叉注意力时间,查询现在可以访问图像补丁和指令.查询可以专业化每条指令 (&quot;数车&quot;,&quot;描述情绪&quot;) 而不是学习单个固定总结.基准在完成任务上获益.</p>
+<h3>迷你GPT-4和仅用投影仪的方法</h3>
+<p>迷你GPT-4 保留了Q-Former,但仅训练出口线性投影,同时结了其他一切.便宜,但成本是质量.</p>
+<h3>为什么LLaVA变得更简单</h3>
+<p>拉瓦 (2023,课时12.05) 取代了Q-Former,用一个简单的2层MLP,将每个ViT补丁代币投射到LLM空间中. 压缩更糟,但让法师参加了原始补丁. 当时这是有争议的;到2023年底,它是主导的,因为视觉指导数据 (LLaVA-Instruct-150k) 证明MLP可以训练来保存足够的信号. 交易:LLaVA的背景更快地填充,但它自然可以扩展到多个图像和视频.</p>
+<p>到2026年,该领域的分化:Q-Former在代币预算重要的地方存活下来 (长视频,许多图像);MLP投影器在每代币原质量优先考虑的地方占主导地位.</p>
+<h3>门的跨越注意力:弗拉明戈,祖先</h3>
+<p>弗拉明戈 (课 12.04) 在BLIP-2之前使用了相同的跨注意力想法,但在每个结的LLM层上,不是单一的桥梁.BLIP-2显示你可以只压缩到输入层,仍然工作.双胞胎和Idefics结合了两者:交叉输入代币加上可选的门式跨注意力在文本中的几次拍摄.</p>
+<h3>2026年的后代</h3>
+<ul>
+<li>问:前者:BLIP-2,InstructBLIP,MiniGPT-4,以及大多数视频语言模型,</li>
+<li>感知器重样:弗拉明戈变体 (课 12.04);Idefics家族,,OmniMAE.</li>
+<li>光器:LLaVA,LLaVA-NeXT,LLaVA-OneVision,Cambrian-1.</li>
+<li>警池:维拉,帕利盖玛.</li>
+</ul>
+<p>重要的问题是,你是否受到代币预算或质量限制.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-8dd7a62d4e40992a9445.png" alt="modality-projection 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>用它</h2>
+<p><code>code/main.py</code>建立一个像Q-Former这样的交叉注意力:</p>
+<ol>
+<li>模拟 256 个图像补丁代币 (dim 128).</li>
+<li>立即完成32个可学习的查询 (第128个).</li>
+<li>运行分点-产品跨度关注 (查询中的Q,补丁中的K/V).</li>
+<li>通过线性层进行LLMdim (512) 项目.</li>
+<li>输出32个准备好LLM的视觉代币.</li>
+</ol>
+<p>算法是纯 Python (嵌在向量上循环).玩具但正确的形状.注意力重量矩阵打印,这样你可以看到每个查询从哪个补丁中拉出来.</p>
+<h2>运送它</h2>
+<p>这一课产生了<code>outputs/skill-modality-bridge-picker.md</code>鉴于目标VLM配置 (视觉编码器代币数量,LLM环境预算,部署限制,质量目标),它建议为每个桥梁提供简短的理由和参数数数量估计的Q-Former vs MLP vs Perceiver重样样本.</p>
+<h2>运动</h2>
+<ol>
+<li>
+<p>执行PyTorch中跨注意力区块. 检查32个查询和256个键/值,注意力重量矩阵为32 x 256 ,每行总和在 softmax之后为1.</p>
+</li>
+<li>
+<p>在BLIP-2阶段1中,Q-Former同时运行三个输失:ITC,ITM,ITG.用伪代码写出每个人的前进签名.哪个需要文字编码器路径才能活跃?</p>
+</li>
+<li>
+<p>比较参数数:Q-Former (12层,隐藏 768层) 与2层MLP投影机 (1408 → 4096,两个层).在什么LLM规模上,188MQ-Former成本回报了训练效率?</p>
+</li>
+<li>
+<p>阅读BLIP-2论文 (arXiv:2301.12597) 的3.2节,说明Q-Former如何初始化.解释为什么从BERT-base初始化 (非随机) 加速了融合.</p>
+</li>
+<li>
+<p>对于一个10分钟的视频,以1FPS样本为60个,计算每代币成本在 (Q-Former → 32代币/) vs (MLP投影器 → 576代币/).哪个适合一个128k代币的LLM文本窗口?</p>
+</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Q-Former</td>
+<td>&quot;Querying transformer&quot;</td>
+<td>Small transformer with 32 learnable query vectors that cross-attend to frozen ViT features</td>
+</tr>
+<tr>
+<td>Learnable queries</td>
+<td>&quot;Soft prompt for vision&quot;</td>
+<td>A fixed set of parameters that serve as the query side of cross-attention; learned per model, shared across all inputs</td>
+</tr>
+<tr>
+<td>Cross-attention</td>
+<td>&quot;Q from here, K/V from there&quot;</td>
+<td>Attention where query, key, and value come from different sources; how the queries pull from ViT patches</td>
+</tr>
+<tr>
+<td>ITC</td>
+<td>&quot;Image-text contrastive&quot;</td>
+<td>CLIP-style loss applied to Q-Former pooled queries vs text CLS</td>
+</tr>
+<tr>
+<td>ITM</td>
+<td>&quot;Image-text matching&quot;</td>
+<td>Binary classifier on hard-negative-mined pairs; forces the queries to discriminate fine-grained mismatches</td>
+</tr>
+<tr>
+<td>ITG</td>
+<td>&quot;Image-grounded text generation&quot;</td>
+<td>Causal LM loss where text is generated conditioned on queries; forces queries to encode text-decodable content</td>
+</tr>
+<tr>
+<td>Two-stage pretraining</td>
+<td>&quot;Representation then generative&quot;</td>
+<td>Stage 1 trains Q-Former alone (ITC/ITM/ITG); Stage 2 attaches frozen LLM and trains only the projection + Q-Former</td>
+</tr>
+<tr>
+<td>Frozen backbone</td>
+<td>&quot;Do not finetune&quot;</td>
+<td>The vision encoder and LLM weights are fixed; only the bridge trains</td>
+</tr>
+<tr>
+<td>Projection head</td>
+<td>&quot;Linear to LLM dim&quot;</td>
+<td>Final linear layer mapping Q-Former output to the LLM's embedding dimension</td>
+</tr>
+<tr>
+<td>Perceiver resampler</td>
+<td>&quot;Flamingo's version&quot;</td>
+<td>Similar learnable-query cross-attention, used by Flamingo at every layer rather than as a single bridge</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2301.12597" rel="noreferrer" data-network="true">Li et al. — BLIP-2 (arXiv:2301.12597) <small>↗ 需要联网</small></a>核心纸</li>
+<li><a href="https://arxiv.org/abs/2201.12086" rel="noreferrer" data-network="true">Li et al. — BLIP (arXiv:2201.12086) <small>↗ 需要联网</small></a>前任与ITC/ITM/ITG三重组.</li>
+<li><a href="https://arxiv.org/abs/2107.07651" rel="noreferrer" data-network="true">Li et al. — ALBEF (arXiv:2107.07651) <small>↗ 需要联网</small></a>&quot;前配线&quot; 第一阶段训练的概念祖先.</li>
+<li><a href="https://arxiv.org/abs/2305.06500" rel="noreferrer" data-network="true">Dai et al. — InstructBLIP (arXiv:2305.06500) <small>↗ 需要联网</small></a></li>
+<li><a href="https://arxiv.org/abs/2304.10592" rel="noreferrer" data-network="true">Zhu et al. — MiniGPT-4 (arXiv:2304.10592) <small>↗ 需要联网</small></a>仅使用投影仪的方法.</li>
+<li><a href="https://arxiv.org/abs/2107.14795" rel="noreferrer" data-network="true">Jaegle et al. — Perceiver IO (arXiv:2107.14795) <small>↗ 需要联网</small></a>学习性-查询性交叉注意力的一般架构.</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>From CLIP to BLIP-2 — Q-Former as Modality Bridge</h1>
+<blockquote>
+<p>CLIP aligns image and text but cannot generate captions, answer questions, or hold a conversation. BLIP-2 (Salesforce, 2023) solved that with a small trainable bridge: 32 learnable query vectors attend over a frozen ViT's features via cross-attention, then slot directly into a frozen LLM's input stream. 188M parameters of bridge connected an 11B LLM to a ViT-g/14. Every adapter-based VLM through 2026 — MiniGPT-4, InstructBLIP, LLaVA's cousins — is a descendant. This lesson reads the Q-Former's architecture, explains its two-stage training, and builds a toy version that feeds visual tokens into a frozen text decoder.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python (stdlib, cross-attention + learnable-query demo)
+<strong>Prerequisites:</strong> Phase 12 · 02 (CLIP), Phase 7 (Transformers)
+<strong>Time:</strong> ~180 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Explain why a trainable bottleneck between a frozen vision encoder and frozen LLM beats end-to-end finetuning in cost and stability.</li>
+<li>Implement a cross-attention block where a fixed set of learnable queries attend to external image features.</li>
+<li>Walk through BLIP-2's two-stage pretraining: representation (ITC + ITM + ITG) then generative (LM loss with frozen decoder).</li>
+<li>Compare Q-Former to the simpler MLP projector used in LLaVA and argue when each choice wins.</li>
+</ul>
+<h2>The Problem</h2>
+<p>You have a frozen ViT that produces 256 patch tokens of dim 1408 per image. You have a frozen 7B LLM that expects token embeddings of dim 4096. The obvious bridge — a linear layer from 1408 to 4096 — works, but feeding all 256 patch tokens into the LLM's context costs 256 extra tokens per image. Over a batch of 32 images that is 8192 tokens consumed by the visual modality alone.</p>
+<p>The BLIP-2 question: can you compress the 256-token image representation into far fewer tokens (say 32) while preserving enough information for the LLM to caption, answer questions, and reason about the image? And can you train this bridge without touching the frozen backbones, keeping the training cost at just the bridge's parameters?</p>
+<p>The answer: a Q-Former. 32 learnable &quot;query&quot; vectors that cross-attend to the ViT's patch tokens, producing a 32-token visual summary that the LLM consumes. 188M parameters total. Trained with contrastive, matching, and generative objectives before ever touching the LLM.</p>
+<h2>The Concept</h2>
+<h3>Learnable queries</h3>
+<p>The Q-Former's core trick: instead of letting the LLM's text tokens attend to image patches, introduce a new set of 32 learnable query vectors <code>Q</code> and let <em>them</em> attend to image patches. The queries are parameters of the model — they are learned during training and the same 32 queries are used for every image.</p>
+<p>After cross-attention, each query holds a compressed summary of the image — &quot;describe the main object&quot;, &quot;describe the background&quot;, &quot;count the objects&quot;, etc. The queries do not literally specialize on semantic labels; they learn whatever encoding makes downstream losses drop.</p>
+<h3>Architecture</h3>
+<p>The Q-Former is a small transformer (12 layers, ~100M params) with two paths:</p>
+<ol>
+<li>Query path: 32 query vectors flow through self-attention (among themselves), then cross-attention over the frozen ViT's patch tokens, then FFN.</li>
+<li>Text path: a BERT-like text encoder shares the self-attention and FFN weights with the query path. Cross-attention is disabled for the text path.</li>
+</ol>
+<p>At training time both paths run. The queries and text interact through shared self-attention, which means the queries can condition on text for tasks that need it (ITM, ITG). At inference time for VLM handoff, only the queries flow through, yielding 32 visual tokens.</p>
+<h3>Two-stage training</h3>
+<p>BLIP-2 pretrains in two stages:</p>
+<p>Stage 1: representation learning (no LLM). Three losses:</p>
+<ul>
+<li>ITC (image-text contrastive): CLIP-style contrastive between pooled query tokens and text CLS token.</li>
+<li>ITM (image-text matching): binary classifier — is this image-text pair a match? Hard-negative-mined.</li>
+<li>ITG (image-grounded text generation): causal LM head on text, conditioned on the queries. Forces queries to encode text-generatable content.</li>
+</ul>
+<p>Only the Q-Former trains. The ViT is frozen. No LLM involved.</p>
+<p>Stage 2: generative learning. Attach a frozen LLM (OPT-2.7B or Flan-T5-XL, etc.). Project the 32 query outputs to the LLM's embedding dim via a small linear layer. Prepend them to the text prompt. Train only the linear projection and the Q-Former on LM loss over the concatenated prompt + image + caption sequence.</p>
+<p>After stage 2, the Q-Former + projection is the full visual adapter. At inference: image → ViT → Q-Former → linear proj → prepended to text → frozen LLM emits output.</p>
+<h3>Parameter economics</h3>
+<p>BLIP-2 with ViT-g/14 (1.1B, frozen) + OPT-6.7B (6.7B, frozen) + Q-Former (188M, trained) = 8B total, 188M trained. The Q-Former alone is ~2.4% of the full stack's parameters. Training cost reflects this: days on a handful of A100s vs weeks for end-to-end.</p>
+<p>Quality: BLIP-2 matches or beats Flamingo-80B on zero-shot VQA while being 50x smaller. The bridge works.</p>
+<h3>InstructBLIP and the instruction-aware Q-Former</h3>
+<p>InstructBLIP (2023) extends the Q-Former with an extra input: the instruction text itself. At cross-attention time, the queries now have access to both the image patches and the instruction. The queries can specialize per-instruction (&quot;count the cars&quot;, &quot;describe the mood&quot;) rather than learning a single fixed summary. Benchmark gains on held-out tasks.</p>
+<h3>MiniGPT-4 and the projector-only approach</h3>
+<p>MiniGPT-4 kept the Q-Former but trained only the output linear projection while freezing everything else. Cheap, but cost is quality — the queries were BLIP-2's, not yours. Good for rapid iteration, not the best architecture.</p>
+<h3>Why LLaVA went simpler</h3>
+<p>LLaVA (2023, Lesson 12.05) replaced the Q-Former with a plain 2-layer MLP that projects every ViT patch token into LLM space — 576 tokens per image for a 24x24 grid, all fed to the LLM. Worse compression but lets the LLM attend over raw patches. At the time this was controversial; by late 2023 it was dominant because visual instruction data (LLaVA-Instruct-150k) proved that the MLP could be trained to preserve enough signal. The tradeoff: LLaVA's context fills faster, but it scales naturally to multi-image and video.</p>
+<p>By 2026 the field split: Q-Former survives where token budget matters (long video, many images); MLP projector dominates where raw quality per token is the priority.</p>
+<h3>Gated cross-attention: Flamingo, the ancestor</h3>
+<p>Flamingo (Lesson 12.04) predated BLIP-2 and used the same cross-attention idea but at every frozen LLM layer, not as a single bridge. BLIP-2 showed you can compress to the input layer only and still work. Gemini and Idefics combine both: interleaved input tokens plus optional gated cross-attention for in-context few-shot.</p>
+<h3>The 2026 descendants</h3>
+<ul>
+<li>Q-Former: BLIP-2, InstructBLIP, MiniGPT-4, and most video-language models for token budget reasons.</li>
+<li>Perceiver resampler: Flamingo's variant (Lesson 12.04); Idefics family, Eagle, OmniMAE.</li>
+<li>MLP projector: LLaVA, LLaVA-NeXT, LLaVA-OneVision, Cambrian-1.</li>
+<li>Attention pool: VILA, PaliGemma.</li>
+</ul>
+<p>All four are valid. The deciding question is whether you are constrained on token budget or on quality-per-token.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-8dd7a62d4e40992a9445.png" alt="modality-projection 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Use It</h2>
+<p><code>code/main.py</code> builds a stdlib Q-Former-style cross-attention:</p>
+<ol>
+<li>Simulate 256 image patch tokens (dim 128).</li>
+<li>Instantiate 32 learnable queries (dim 128).</li>
+<li>Run scaled-dot-product cross-attention (Q from queries, K/V from patches).</li>
+<li>Project to LLM-dim (512) via a linear layer.</li>
+<li>Output the 32 LLM-ready visual tokens.</li>
+</ol>
+<p>All math in pure Python (nested loops over vectors). Toy but correct shape. The attention-weight matrix is printed so you can see which patches each query pulled from.</p>
+<h2>Ship It</h2>
+<p>This lesson produces <code>outputs/skill-modality-bridge-picker.md</code>. Given a target VLM configuration (vision encoder token count, LLM context budget, deployment constraints, quality target), it recommends Q-Former vs MLP vs Perceiver resampler with a short justification and a parameter-count estimate for each bridge.</p>
+<h2>Exercises</h2>
+<ol>
+<li>
+<p>Implement the cross-attention block in PyTorch. Verify that with 32 queries and 256 keys/values, the attention-weight matrix is 32 x 256 and each row sums to 1 after softmax.</p>
+</li>
+<li>
+<p>In BLIP-2 stage 1 the Q-Former runs three losses simultaneously: ITC, ITM, ITG. Write the forward signature for each in pseudo-code. Which one requires the text encoder path to be active?</p>
+</li>
+<li>
+<p>Compare parameter counts: Q-Former (12 layers, 768 hidden) vs a 2-layer MLP projector (1408 → 4096, two layers). At what LLM scale does the 188M Q-Former cost pay back in training efficiency?</p>
+</li>
+<li>
+<p>Read Section 3.2 of the BLIP-2 paper (arXiv:2301.12597) on how the Q-Former is initialized. Explain why initializing from BERT-base (not random) accelerates convergence.</p>
+</li>
+<li>
+<p>For a 10-minute video at 1 FPS sampled to 60 frames, compute the per-frame token cost at (Q-Former → 32 tokens/frame) vs (MLP projector → 576 tokens/frame). Which fits into a 128k-token LLM context window?</p>
+</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Q-Former</td>
+<td>&quot;Querying transformer&quot;</td>
+<td>Small transformer with 32 learnable query vectors that cross-attend to frozen ViT features</td>
+</tr>
+<tr>
+<td>Learnable queries</td>
+<td>&quot;Soft prompt for vision&quot;</td>
+<td>A fixed set of parameters that serve as the query side of cross-attention; learned per model, shared across all inputs</td>
+</tr>
+<tr>
+<td>Cross-attention</td>
+<td>&quot;Q from here, K/V from there&quot;</td>
+<td>Attention where query, key, and value come from different sources; how the queries pull from ViT patches</td>
+</tr>
+<tr>
+<td>ITC</td>
+<td>&quot;Image-text contrastive&quot;</td>
+<td>CLIP-style loss applied to Q-Former pooled queries vs text CLS</td>
+</tr>
+<tr>
+<td>ITM</td>
+<td>&quot;Image-text matching&quot;</td>
+<td>Binary classifier on hard-negative-mined pairs; forces the queries to discriminate fine-grained mismatches</td>
+</tr>
+<tr>
+<td>ITG</td>
+<td>&quot;Image-grounded text generation&quot;</td>
+<td>Causal LM loss where text is generated conditioned on queries; forces queries to encode text-decodable content</td>
+</tr>
+<tr>
+<td>Two-stage pretraining</td>
+<td>&quot;Representation then generative&quot;</td>
+<td>Stage 1 trains Q-Former alone (ITC/ITM/ITG); Stage 2 attaches frozen LLM and trains only the projection + Q-Former</td>
+</tr>
+<tr>
+<td>Frozen backbone</td>
+<td>&quot;Do not finetune&quot;</td>
+<td>The vision encoder and LLM weights are fixed; only the bridge trains</td>
+</tr>
+<tr>
+<td>Projection head</td>
+<td>&quot;Linear to LLM dim&quot;</td>
+<td>Final linear layer mapping Q-Former output to the LLM's embedding dimension</td>
+</tr>
+<tr>
+<td>Perceiver resampler</td>
+<td>&quot;Flamingo's version&quot;</td>
+<td>Similar learnable-query cross-attention, used by Flamingo at every layer rather than as a single bridge</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2301.12597" rel="noreferrer" data-network="true">Li et al. — BLIP-2 (arXiv:2301.12597) <small>↗ 需要联网</small></a> — the core paper.</li>
+<li><a href="https://arxiv.org/abs/2201.12086" rel="noreferrer" data-network="true">Li et al. — BLIP (arXiv:2201.12086) <small>↗ 需要联网</small></a> — the predecessor with the ITC/ITM/ITG trio.</li>
+<li><a href="https://arxiv.org/abs/2107.07651" rel="noreferrer" data-network="true">Li et al. — ALBEF (arXiv:2107.07651) <small>↗ 需要联网</small></a> — &quot;align before fuse&quot; — the conceptual ancestor of stage 1 training.</li>
+<li><a href="https://arxiv.org/abs/2305.06500" rel="noreferrer" data-network="true">Dai et al. — InstructBLIP (arXiv:2305.06500) <small>↗ 需要联网</small></a> — instruction-aware Q-Former.</li>
+<li><a href="https://arxiv.org/abs/2304.10592" rel="noreferrer" data-network="true">Zhu et al. — MiniGPT-4 (arXiv:2304.10592) <small>↗ 需要联网</small></a> — projector-only approach.</li>
+<li><a href="https://arxiv.org/abs/2107.14795" rel="noreferrer" data-network="true">Jaegle et al. — Perceiver IO (arXiv:2107.14795) <small>↗ 需要联网</small></a> — general architecture for learnable-query cross-attention.</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-12-multimodal-ai--03-blip2-qformer-bridge.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-12-multimodal-ai--03-blip2-qformer-bridge.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/12-multimodal-ai/03-blip2-qformer-bridge/code/main.py">phases/12-multimodal-ai/03-blip2-qformer-bridge/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Q-Former cross-attention toy — stdlib Python.
+
+Builds a minimal BLIP-2-style modality bridge:
+  - 256 &quot;patch tokens&quot; from a fake ViT
+  - 32 learnable query vectors
+  - one cross-attention block (Q from queries, K/V from patches)
+  - linear projection to an LLM hidden dim
+  - prints attention weights so the reader can see which patch each query
+    pulled from
+
+Pure Python vectors and lists. No numpy, no torch. The arithmetic is slow
+but exact; good for inspecting behaviour.
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import math
+import random
+
+NUM_PATCH = 64
+PATCH_DIM = 16
+NUM_QUERY = 8
+QUERY_DIM = 16
+LLM_DIM = 24
+
+rng = random.Random(42)
+
+
+def vec(n: int) -&gt; list[float]:
+    return [rng.gauss(0, 1) for _ in range(n)]
+
+
+def mat(rows: int, cols: int) -&gt; list[list[float]]:
+    return [vec(cols) for _ in range(rows)]
+
+
+def matmul_vec(M: list[list[float]], v: list[float]) -&gt; list[float]:
+    return [sum(r * x for r, x in zip(row, v)) for row in M]
+
+
+def dot(a: list[float], b: list[float]) -&gt; float:
+    return sum(x * y for x, y in zip(a, b))
+
+
+def softmax(xs: list[float]) -&gt; list[float]:
+    m = max(xs)
+    exps = [math.exp(x - m) for x in xs]
+    z = sum(exps)
+    return [e / z for e in exps]
+
+
+def make_patches() -&gt; list[list[float]]:
+    &quot;&quot;&quot;Fake 64 &#39;patch tokens&#39; of dim 16 from a frozen ViT.&quot;&quot;&quot;
+    return [vec(PATCH_DIM) for _ in range(NUM_PATCH)]
+
+
+def make_queries() -&gt; list[list[float]]:
+    &quot;&quot;&quot;32 learnable query vectors, dim 16.&quot;&quot;&quot;
+    return [vec(QUERY_DIM) for _ in range(NUM_QUERY)]
+
+
+def cross_attention(queries: list[list[float]],
+                    patches: list[list[float]],
+                    W_q: list[list[float]],
+                    W_k: list[list[float]],
+                    W_v: list[list[float]]) -&gt; tuple[list[list[float]], list[list[float]]]:
+    &quot;&quot;&quot;Scaled dot-product cross-attention.
+    queries: (Nq, Dq) -&gt; Q = queries @ W_q^T shape (Nq, D)
+    patches: (Np, Dp) -&gt; K, V
+    returns (attended, attn_weights)
+    &quot;&quot;&quot;
+    Q = [matmul_vec(W_q, q) for q in queries]
+    K = [matmul_vec(W_k, p) for p in patches]
+    V = [matmul_vec(W_v, p) for p in patches]
+    d = len(Q[0])
+    scale = 1.0 / math.sqrt(d)
+
+    attn_weights = []
+    out = []
+    for q in Q:
+        logits = [dot(q, k) * scale for k in K]
+        weights = softmax(logits)
+        attn_weights.append(weights)
+        mixed = [0.0] * d
+        for i, w in enumerate(weights):
+            for j in range(d):
+                mixed[j] += w * V[i][j]
+        out.append(mixed)
+    return out, attn_weights
+
+
+def linear_project(xs: list[list[float]],
+                   W: list[list[float]]) -&gt; list[list[float]]:
+    return [matmul_vec(W, x) for x in xs]
+
+
+def top_patches_per_query(attn: list[list[float]], k: int = 3) -&gt; list[list[int]]:
+    out = []
+    for weights in attn:
+        idxs = sorted(range(len(weights)), key=lambda i: -weights[i])[:k]
+        out.append(idxs)
+    return out
+
+
+def summarize_attention(attn: list[list[float]]) -&gt; None:
+    print(&quot;\nattention-weight summary (softmax over 64 patches)&quot;)
+    print(&quot;-&quot; * 60)
+    top = top_patches_per_query(attn, k=5)
+    entropies = []
+    for weights in attn:
+        e = -sum(w * math.log(w + 1e-12) for w in weights)
+        entropies.append(e)
+    avg_e = sum(entropies) / len(entropies)
+    max_e = math.log(NUM_PATCH)
+    for i, (idxs, e) in enumerate(zip(top, entropies)):
+        top_str = &quot;, &quot;.join(f&quot;p{x:02d}({attn[i][x]:.3f})&quot; for x in idxs[:5])
+        print(f&quot;  query {i}: entropy {e:.3f}/{max_e:.3f}, top-5 {top_str}&quot;)
+    print(f&quot;  mean entropy: {avg_e:.3f}  (uniform baseline: {max_e:.3f})&quot;)
+
+
+def demo_untrained() -&gt; None:
+    print(&quot;\nDEMO: 8 queries attending over 64 patches&quot;)
+    print(&quot;-&quot; * 60)
+    patches = make_patches()
+    queries = make_queries()
+    W_q = mat(QUERY_DIM, QUERY_DIM)
+    W_k = mat(QUERY_DIM, PATCH_DIM)
+    W_v = mat(QUERY_DIM, PATCH_DIM)
+    attended, attn = cross_attention(queries, patches, W_q, W_k, W_v)
+    summarize_attention(attn)
+    W_out = mat(LLM_DIM, QUERY_DIM)
+    projected = linear_project(attended, W_out)
+    print(f&quot;\noutput: {len(projected)} tokens of dim {LLM_DIM} -&gt; ready for LLM&quot;)
+    print(f&quot;first token (trimmed): {[round(x, 2) for x in projected[0][:8]]}&quot;)
+
+
+def demo_biased() -&gt; None:
+    &quot;&quot;&quot;Show that if queries learn to align with specific patches, attention
+    concentrates (lower entropy). Here we simulate by re-using a few patch
+    vectors as the queries themselves.&quot;&quot;&quot;
+    print(&quot;\nDEMO: queries initialized from specific patches -&gt; concentration&quot;)
+    print(&quot;-&quot; * 60)
+    patches = make_patches()
+    favored = [5, 17, 33, 48, 60, 2, 11, 27]
+    queries = [list(patches[i]) for i in favored]
+    W_q = [[1.0 if i == j else 0.0 for j in range(QUERY_DIM)]
+           for i in range(QUERY_DIM)]
+    W_k = [[1.0 if i == j else 0.0 for j in range(PATCH_DIM)]
+           for i in range(QUERY_DIM)]
+    W_v = [[1.0 if i == j else 0.0 for j in range(PATCH_DIM)]
+           for i in range(QUERY_DIM)]
+    _, attn = cross_attention(queries, patches, W_q, W_k, W_v)
+    print(&quot;  query_i should attend highest to patch[favored[i]]:&quot;)
+    for i, weights in enumerate(attn):
+        top = max(range(len(weights)), key=lambda k: weights[k])
+        hit = &quot;YES&quot; if top == favored[i] else &quot;miss&quot;
+        print(f&quot;    query {i}: top patch {top} (favored {favored[i]}) &quot;
+              f&quot;weight {weights[top]:.3f} ({hit})&quot;)
+
+
+def main() -&gt; None:
+    print(&quot;=&quot; * 60)
+    print(&quot;BLIP-2 Q-FORMER CROSS-ATTENTION TOY (Phase 12, Lesson 03)&quot;)
+    print(&quot;=&quot; * 60)
+    demo_untrained()
+    demo_biased()
+    print(&quot;\n&quot; + &quot;=&quot; * 60)
+    print(&quot;TAKEAWAYS&quot;)
+    print(&quot;-&quot; * 60)
+    print(&quot;  · queries are the fixed learnable parameters of the bridge&quot;)
+    print(&quot;  · cross-attention maps (32 queries, 256 patches) -&gt; 32 summaries&quot;)
+    print(&quot;  · project to LLM hidden dim -&gt; prepend to text input&quot;)
+    print(&quot;  · BLIP-2 stage 1 trains bridge with ITC+ITM+ITG; no LLM&quot;)
+    print(&quot;  · BLIP-2 stage 2 trains bridge + projector with LM loss&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/12-multimodal-ai/03-blip2-qformer-bridge/outputs/skill-modality-bridge-picker.md">phases/12-multimodal-ai/03-blip2-qformer-bridge/outputs/skill-modality-bridge-picker.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: modality-bridge-picker
+description: Recommend Q-Former vs MLP projector vs Perceiver resampler for a VLM configuration given token budget, quality target, and training compute.
+version: 1.0.0
+phase: 12
+lesson: 03
+tags: [blip2, qformer, vlm, modality-bridge, architecture]
+---
+
+Given a vision encoder&#39;s token count per image, the LLM&#39;s context budget, the target number of images per prompt, and the training compute budget, recommend which modality bridge to use and justify with parameter counts and token economics.
+
+Produce:
+
+1. Token budget audit. Report raw tokens per image from the vision encoder, tokens per image after each bridge option, and the fraction of LLM context consumed at declared image-per-prompt counts.
+2. Bridge comparison. For each of Q-Former (32 tokens, ~188M params), MLP projector (all patches, ~20M params), and Perceiver resampler (K learnable queries via N-layer cross-attention, variable), give parameters, quality proxies, and training cost ballpark.
+3. Recommendation. Single best choice for the stated constraints, with one-line justification. Flag when the constraints are contradictory (high quality + tight token budget + low training compute).
+4. Two-stage training trace. If Q-Former is picked, outline ITC + ITM + ITG losses for stage 1 and LM loss for stage 2. Name a representative dataset for each (COCO, LAION, Visual Genome).
+5. Ablation checklist. Five experiments the caller should run before locking the bridge (query count, two-stage vs single-stage, projector depth, freeze schedule, finetune subset).
+
+Hard rejects:
+- Any recommendation that ignores the token budget. &quot;Use MLP&quot; with 576 tokens per image fails at 10 images in a 4k context.
+- Claiming Q-Former strictly dominates MLP. At single-image high-quality tasks with unlimited context, MLP wins.
+- Treating Perceiver resampler as equivalent to Q-Former. Flamingo applies it at every LLM layer; BLIP-2 applies it once.
+
+Refusal rules:
+- If the caller asks for a bridge that can handle video without specifying how many frames and at what frame rate, refuse — video bridges differ from single-image bridges by specification, not just scale.
+- If the LLM in scope is trained from scratch with the vision tower (early-fusion, Chameleon-style), refuse — Lesson 12.11 covers that case separately.
+- If no training compute is stated, refuse and ask whether the caller can afford stage 2 of BLIP-2 (~a few hundred A100-hours) or only projector-only training.
+
+Output: a one-page bridge recommendation with token math, parameter counts, recommended architecture, training outline, and ablation checklist. End with a &quot;what to read next&quot; paragraph pointing to Lesson 12.04 (Flamingo) for cross-attention-everywhere, Lesson 12.05 (LLaVA) for MLP-only, or Lesson 12.07 (ablations) for the data-vs-architecture tradeoff.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原课程未提供测验。</p></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/12-multimodal-ai/02-clip-contrastive-pretraining/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/12-multimodal-ai/04-flamingo-gated-cross-attention/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/12-multimodal-ai/03-blip2-qformer-bridge/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

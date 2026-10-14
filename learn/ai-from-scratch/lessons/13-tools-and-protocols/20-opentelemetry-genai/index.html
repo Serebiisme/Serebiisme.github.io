@@ -1,0 +1,580 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>开通通讯技术 GenAI 追踪工具端到端通话 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-13-tools-and-protocols" data-lesson="13-tools-and-protocols/20-opentelemetry-genai" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/13-tools-and-protocols/">工具与协议</a> / LESSON 20</p><h1 class="lesson-title">开通通讯技术 GenAI 追踪工具端到端通话</h1><p>OpenTelemetry GenAI — Tracing Tool Calls End-to-End</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>开通通讯技术 GenAI 追踪工具端到端通话</h1>
+<blockquote>
+<p>一个代理人打电话给五个工具,三个MCP服务器, 你需要一个痕迹. 开通通讯GenAI语义公约 (v1.37及以上的稳定属性) 是2026年标准,由Datadog,Langfuse,Ariz Phoenix,OpenLLMetry和AgentOps本地支持. 这一课列出所需属性,走向跨度层次 (代理 → LLM →工具),并发送一个可以连接到任何OTel出口商的 stdlib跨度发射器.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python (stdlib, OTel span emitter)
+<strong>Prerequisites:</strong> Phase 13 · 07 (MCP server), Phase 13 · 08 (MCP client)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>指定为LLM跨度和工具执行跨度所需的OTel GenAI属性.</li>
+<li>建立一个覆盖代理循环,LLM调用,工具调用和MCP客户端发送的跟踪层次.</li>
+<li>决定要捕获 (选择) 和编辑 (默认) 内容.</li>
+<li>发送到本地收藏器 (Jaeger,Langfuse) 无需重写工具代码.</li>
+</ul>
+<h2>问题</h2>
+<p>2026年2月的一个调试:用户报告&quot;我的代理有时需要30秒来响应;有时需要3秒&quot;.没有痕迹.日志显示了LLM电话,但不是工具发送,不是MCP服务器回路,不是子代理.你猜.最终你发现:一个MCP服务器偶尔挂在冷启动上.</p>
+<p>没有端到端追踪,你就找不到这个.</p>
+<p>根据OpenTelemetry语义会议组,这些公约在2025-2026年结合.它们定义了稳定的属性名称,因此Datadog,Langfuse,Phoenix,OpenLLMetry和AgentOps都分析相同的范围.</p>
+<h2>概念</h2>
+<h3>跨度等级</h3>
+<pre><code>agent.invoke_agent  (top, INTERNAL span)
+ ├── llm.chat       (CLIENT span)
+ ├── tool.execute   (INTERNAL)
+ │    └── mcp.call  (CLIENT span)
+ ├── llm.chat       (CLIENT span)
+ └── subagent.invoke (INTERNAL)
+</code></pre>
+<p>整个东西都在一个痕迹身份证下, 跨度身份证将父母与孩子的关系联系起来.</p>
+<h3>要求属性</h3>
+<p>根据2025-2026年学期:</p>
+<ul>
+<li><code>gen_ai.operation.name</code> <code>&quot;chat&quot;</code>现在<code>&quot;text_completion&quot;</code>现在<code>&quot;embeddings&quot;</code>现在<code>&quot;execute_tool&quot;</code>现在<code>&quot;invoke_agent&quot;</code>现在,我们要去.</li>
+<li><code>gen_ai.provider.name</code> <code>&quot;openai&quot;</code>现在<code>&quot;anthropic&quot;</code>现在<code>&quot;google&quot;</code>现在<code>&quot;azure_openai&quot;</code>现在,我们要去.</li>
+<li><code>gen_ai.request.model</code>要求的模型字符串 (例如 <code>&quot;gpt-4o-2024-08-06&quot;</code>)</li>
+<li><code>gen_ai.response.model</code>模型实际上是服务的.</li>
+<li><code>gen_ai.usage.input_tokens</code>现在,<code>gen_ai.usage.output_tokens</code>现在,我们要去.</li>
+<li><code>gen_ai.response.id</code>提供商响应ID对相关性.</li>
+</ul>
+<p>对于工具跨度:</p>
+<ul>
+<li><code>gen_ai.tool.name</code>工具标识符</li>
+<li><code>gen_ai.tool.call.id</code>具体的呼叫身份.</li>
+<li><code>gen_ai.tool.description</code>工具描述 (可选).</li>
+</ul>
+<p>对于代理范围:</p>
+<ul>
+<li><code>gen_ai.agent.name</code>现在,<code>gen_ai.agent.id</code>现在,<code>gen_ai.agent.description</code>现在,我们要去.</li>
+</ul>
+<h3>子类型</h3>
+<ul>
+<li><code>SpanKind.CLIENT</code>通过进程边界 (LLM提供商,MCP服务器) 的呼叫.</li>
+<li><code>SpanKind.INTERNAL</code>对于代理人的自行循环步骤和工具执行.</li>
+</ul>
+<h3>选择内容捕获</h3>
+<p>默认情况下,跨度载有指标和时间,而不是提示或完成. 大型有效载荷和 PII默认关闭. 设置 <code>OTEL_SEMCONV_STABILITY_OPT_IN=gen_ai_latest_experimental</code>内容的含量,在启用中仔细审查.</p>
+<h3>跨度事件</h3>
+<p>代币级事件可以作为跨度事件添加:</p>
+<ul>
+<li><code>gen_ai.content.prompt</code>输入信息.</li>
+<li><code>gen_ai.content.completion</code>输出消息.</li>
+<li><code>gen_ai.content.tool_call</code> 工具调用记录.</li>
+</ul>
+<p>事件时间顺序在一个时间段内进行详细重播.</p>
+<h3>出口商</h3>
+<p>欧特尔向:</p>
+<ul>
+<li>**Jaeger / Tempo.**局部,现场.</li>
+<li>**Langfuse.**具有可观性特异性;可视化代币使用.</li>
+<li>**Arize Phoenix.**总数: 总数:</li>
+<li>**Datadog.**商业;本地解析<code>gen_ai.*</code>它们的属性.</li>
+<li>**Honeycomb.**专导向; 查询友好.</li>
+</ul>
+<p>它们都用OTLP,电线格式.</p>
+<h3>跨MCP传播</h3>
+<p>当MCP客户端调用服务器时,将W3C追踪头标注入请求中.流式HTTP支持标准头标.Stdio不原生地携带HTTP头标;规范的2026路线图讨论添加一个<code>_meta.traceparent</code>在JSON-RPC调用时的字段.</p>
+<p>加入其后方的 <code>_meta</code>服务器将记录了追踪身份.</p>
+<h3>计量</h3>
+<p>除了跨度之外,GenAI semconv也定义了指标:</p>
+<ul>
+<li><code>gen_ai.client.token.usage</code></li>
+<li><code>gen_ai.client.operation.duration</code></li>
+<li><code>gen_ai.tool.execution.duration</code></li>
+</ul>
+<p>对于不需要每次通话的详细信息的仪表板,使用这些.</p>
+<h3>代理Ops 层</h3>
+<p>代理Ops (成立于2024年) 专注于GenAI可观测性.它包裹着受欢迎的框架 (LangGraph,Pydantic AI,CrewAI) 以自动发射OTel跨度.如果您的堆使用支持的框架,则有用;否则使用手动仪器.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-1a69a4d265055d240843.png" alt="t3-span-waterfall 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>用它</h2>
+<p><code>code/main.py</code>发出OTel形状的跨度到stdout (OTLP-JSON类似格式) 代理调用LLM,发送两个工具,并完成一个MCP回路.没有真正的出口商课程专注于跨度形状和属性集.将输出粘贴到OTLP兼容的观众中或简单地阅读.</p>
+<p>什么要看:</p>
+<ul>
+<li>随着所有区域的测量,</li>
+<li>通过 编码的父母与孩子的链接<code>parentSpanId</code>现在,我们要去.</li>
+<li>需要<code>gen_ai.*</code>属性已被填充.</li>
+<li>默认情况下,内容捕获是关闭的;一个情况通过envvar启动.</li>
+</ul>
+<h2>运送它</h2>
+<p>这一课产生了<code>outputs/skill-otel-genai-instrumentation.md</code>鉴于代理代码基础,技能产生了一个仪器计划:在哪里添加范围,哪些属性被占用,哪些出口者被目标.</p>
+<h2>运动</h2>
+<ol>
+<li>
+<p>跑步<code>code/main.py</code>计算时间,确定哪个是客户与内部.</p>
+</li>
+<li>
+<p>启用内容捕获 (env var) 并确认<code>gen_ai.content.prompt</code>其他<code>gen_ai.content.completion</code>观察对 PII 的影响.</p>
+</li>
+<li>
+<p>添加工具执行指标<code>gen_ai.tool.execution.duration</code>并且以每次通话的 histogram 样本发射.</p>
+</li>
+<li>
+<p>传播一个从母体代理跨度到MCP请求的追踪父母<code>_meta.traceparent</code>检查MCP服务器会看到相同的追踪身份.</p>
+</li>
+<li>
+<p>读取OTel GenAI semconv规范. 确定本课程代码中没有发射的 semconv中列出的一个属性. 添加它.</p>
+</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>OTel</td>
+<td>&quot;OpenTelemetry&quot;</td>
+<td>Open standard for traces, metrics, logs</td>
+</tr>
+<tr>
+<td>GenAI semconv</td>
+<td>&quot;GenAI semantic conventions&quot;</td>
+<td>Stable attribute names for LLM / tool / agent spans</td>
+</tr>
+<tr>
+<td><code>gen_ai.*</code></td>
+<td>&quot;The attribute namespace&quot;</td>
+<td>All GenAI attributes share this prefix</td>
+</tr>
+<tr>
+<td>Span</td>
+<td>&quot;Timed operation&quot;</td>
+<td>A unit of work with a start, end, and attributes</td>
+</tr>
+<tr>
+<td>Trace</td>
+<td>&quot;Cross-span ancestry&quot;</td>
+<td>Tree of spans sharing a trace id</td>
+</tr>
+<tr>
+<td>SpanKind</td>
+<td>&quot;CLIENT / SERVER / INTERNAL&quot;</td>
+<td>Hints about span direction</td>
+</tr>
+<tr>
+<td>OTLP</td>
+<td>&quot;OpenTelemetry Line Protocol&quot;</td>
+<td>Wire format for exporters</td>
+</tr>
+<tr>
+<td>Opt-in content</td>
+<td>&quot;Prompt / completion capture&quot;</td>
+<td>Off by default; env var to enable</td>
+</tr>
+<tr>
+<td>traceparent</td>
+<td>&quot;W3C header&quot;</td>
+<td>Propagates trace context across services</td>
+</tr>
+<tr>
+<td>Exporter</td>
+<td>&quot;Backend-specific shipper&quot;</td>
+<td>Component that sends spans to Jaeger / Datadog / etc.</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://opentelemetry.io/docs/specs/semconv/gen-ai/" rel="noreferrer" data-network="true">OpenTelemetry — GenAI semconv <small>↗ 需要联网</small></a>基因科学界范围,指标和事件的常规公约</li>
+<li><a href="https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-spans/" rel="noreferrer" data-network="true">OpenTelemetry — GenAI spans <small>↗ 需要联网</small></a> LLM和工具执行跨度属性列表</li>
+<li><a href="https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-agent-spans/" rel="noreferrer" data-network="true">OpenTelemetry — GenAI agent spans <small>↗ 需要联网</small></a>代理级<code>invoke_agent</code>跨度</li>
+<li><a href="https://github.com/open-telemetry/semantic-conventions/blob/main/docs/gen-ai/gen-ai-spans.md" rel="noreferrer" data-network="true">open-telemetry/semantic-conventions — GenAI spans <small>↗ 需要联网</small></a> GitHub 托管的真相来源</li>
+<li><a href="https://www.datadoghq.com/blog/llm-otel-semantic-convention/" rel="noreferrer" data-network="true">Datadog — LLM OTel semantic convention <small>↗ 需要联网</small></a>生产集成步行</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>OpenTelemetry GenAI — Tracing Tool Calls End-to-End</h1>
+<blockquote>
+<p>An agent calls five tools, three MCP servers, and two sub-agents. You need one trace across all of it. The OpenTelemetry GenAI semantic conventions (stable attributes in v1.37 and up) are the 2026 standard, natively supported by Datadog, Langfuse, Arize Phoenix, OpenLLMetry, and AgentOps. This lesson names the required attributes, walks the span hierarchy (agent → LLM → tool), and ships a stdlib span emitter you can plug into any OTel exporter.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python (stdlib, OTel span emitter)
+<strong>Prerequisites:</strong> Phase 13 · 07 (MCP server), Phase 13 · 08 (MCP client)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Name the required OTel GenAI attributes for an LLM span and a tool-execution span.</li>
+<li>Build a trace hierarchy that covers agent loop, LLM call, tool call, and MCP client dispatch.</li>
+<li>Decide what content to capture (opt-in) vs redact (defaults).</li>
+<li>Emit spans to a local collector (Jaeger, Langfuse) without rewriting tool code.</li>
+</ul>
+<h2>The Problem</h2>
+<p>A debug from February 2026: user reports &quot;my agent sometimes takes 30 seconds to respond; other times 3 seconds.&quot; No traces. Logs show the LLM call, but not the tool dispatch, not the MCP server round-trip, not the sub-agent. You guess. Eventually you find: one MCP server occasionally hangs on a cold-start.</p>
+<p>Without end-to-end tracing, you cannot find this. OTel GenAI fixes it.</p>
+<p>The conventions settled in 2025-2026 under the OpenTelemetry semantic-conventions group. They define stable attribute names so Datadog, Langfuse, Phoenix, OpenLLMetry, and AgentOps all parse the same spans. Instrument once; ship to any backend.</p>
+<h2>The Concept</h2>
+<h3>Span hierarchy</h3>
+<pre><code>agent.invoke_agent  (top, INTERNAL span)
+ ├── llm.chat       (CLIENT span)
+ ├── tool.execute   (INTERNAL)
+ │    └── mcp.call  (CLIENT span)
+ ├── llm.chat       (CLIENT span)
+ └── subagent.invoke (INTERNAL)
+</code></pre>
+<p>The whole thing nests under one trace id. Span ids link the parent-child relationships.</p>
+<h3>Required attributes</h3>
+<p>Per the 2025-2026 semconv:</p>
+<ul>
+<li><code>gen_ai.operation.name</code> — <code>&quot;chat&quot;</code>, <code>&quot;text_completion&quot;</code>, <code>&quot;embeddings&quot;</code>, <code>&quot;execute_tool&quot;</code>, <code>&quot;invoke_agent&quot;</code>.</li>
+<li><code>gen_ai.provider.name</code> — <code>&quot;openai&quot;</code>, <code>&quot;anthropic&quot;</code>, <code>&quot;google&quot;</code>, <code>&quot;azure_openai&quot;</code>.</li>
+<li><code>gen_ai.request.model</code> — requested model string (e.g. <code>&quot;gpt-4o-2024-08-06&quot;</code>).</li>
+<li><code>gen_ai.response.model</code> — the model actually served.</li>
+<li><code>gen_ai.usage.input_tokens</code> / <code>gen_ai.usage.output_tokens</code>.</li>
+<li><code>gen_ai.response.id</code> — provider response id for correlation.</li>
+</ul>
+<p>For tool spans:</p>
+<ul>
+<li><code>gen_ai.tool.name</code> — tool identifier.</li>
+<li><code>gen_ai.tool.call.id</code> — the specific call id.</li>
+<li><code>gen_ai.tool.description</code> — tool description (optional).</li>
+</ul>
+<p>For agent spans:</p>
+<ul>
+<li><code>gen_ai.agent.name</code> / <code>gen_ai.agent.id</code> / <code>gen_ai.agent.description</code>.</li>
+</ul>
+<h3>Span kinds</h3>
+<ul>
+<li><code>SpanKind.CLIENT</code> for calls crossing a process boundary (LLM provider, MCP server).</li>
+<li><code>SpanKind.INTERNAL</code> for the agent's own loop steps and tool execution.</li>
+</ul>
+<h3>Opt-in content capture</h3>
+<p>By default, spans carry metrics and timing — not prompts or completions. Large payloads and PII are off by default. Set <code>OTEL_SEMCONV_STABILITY_OPT_IN=gen_ai_latest_experimental</code> and specific content-capture env vars to include content. Review carefully before enabling in prod.</p>
+<h3>Events on spans</h3>
+<p>Token-level events can be added as span events:</p>
+<ul>
+<li><code>gen_ai.content.prompt</code> — input messages.</li>
+<li><code>gen_ai.content.completion</code> — output messages.</li>
+<li><code>gen_ai.content.tool_call</code> — tool call as recorded.</li>
+</ul>
+<p>Events time-order within a span for detailed replay.</p>
+<h3>Exporters</h3>
+<p>OTel spans export to:</p>
+<ul>
+<li><strong>Jaeger / Tempo.</strong> OSS, on-prem.</li>
+<li><strong>Langfuse.</strong> LLM-observability-specific; visualizes token usage.</li>
+<li><strong>Arize Phoenix.</strong> Evals + tracing combined.</li>
+<li><strong>Datadog.</strong> Commercial; natively parses <code>gen_ai.*</code> attributes.</li>
+<li><strong>Honeycomb.</strong> Column-oriented; query-friendly.</li>
+</ul>
+<p>All speak OTLP, the wire format. Your code does not care.</p>
+<h3>Propagation across MCP</h3>
+<p>When an MCP client calls a server, inject the W3C traceparent header into the request. Streamable HTTP supports standard headers. Stdio does not carry HTTP headers natively; the spec's 2026 roadmap discusses adding a <code>_meta.traceparent</code> field on JSON-RPC calls.</p>
+<p>Until that ships: include the traceparent in the <code>_meta</code> of every request manually. Server logs the trace id.</p>
+<h3>Metrics</h3>
+<p>Alongside spans, the GenAI semconv defines metrics:</p>
+<ul>
+<li><code>gen_ai.client.token.usage</code> — histogram.</li>
+<li><code>gen_ai.client.operation.duration</code> — histogram.</li>
+<li><code>gen_ai.tool.execution.duration</code> — histogram.</li>
+</ul>
+<p>Use these for dashboards that do not need per-call detail.</p>
+<h3>AgentOps layer</h3>
+<p>AgentOps (founded 2024) specializes in GenAI observability. It wraps popular frameworks (LangGraph, Pydantic AI, CrewAI) to emit OTel spans automatically. Useful if your stack uses a supported framework; use manual instrumentation otherwise.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-1a69a4d265055d240843.png" alt="t3-span-waterfall 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Use It</h2>
+<p><code>code/main.py</code> emits OTel-shaped spans to stdout (in OTLP-JSON-like format) for an agent that calls an LLM, dispatches two tools, and makes one MCP round-trip. No real exporter — the lesson focuses on the span shape and attribute set. Paste the output into an OTLP-compatible viewer or just read it.</p>
+<p>What to look at:</p>
+<ul>
+<li>Trace id is shared across all spans.</li>
+<li>Parent-child links are encoded via <code>parentSpanId</code>.</li>
+<li>Required <code>gen_ai.*</code> attributes are populated.</li>
+<li>Content capture is off by default; one scenario turns it on via env var.</li>
+</ul>
+<h2>Ship It</h2>
+<p>This lesson produces <code>outputs/skill-otel-genai-instrumentation.md</code>. Given an agent codebase, the skill produces an instrumentation plan: where to add spans, which attributes to populate, and which exporters to target.</p>
+<h2>Exercises</h2>
+<ol>
+<li>
+<p>Run <code>code/main.py</code>. Count the spans and identify which is CLIENT vs INTERNAL.</p>
+</li>
+<li>
+<p>Turn on content capture (env var) and confirm <code>gen_ai.content.prompt</code> and <code>gen_ai.content.completion</code> events appear. Note the implications for PII.</p>
+</li>
+<li>
+<p>Add the tool-execution metric <code>gen_ai.tool.execution.duration</code> and emit it as a histogram sample per call.</p>
+</li>
+<li>
+<p>Propagate a traceparent from a parent agent span into an MCP request's <code>_meta.traceparent</code> field. Verify the MCP server would see the same trace id.</p>
+</li>
+<li>
+<p>Read the OTel GenAI semconv spec. Identify one attribute listed in the semconv that this lesson's code does NOT emit. Add it.</p>
+</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>OTel</td>
+<td>&quot;OpenTelemetry&quot;</td>
+<td>Open standard for traces, metrics, logs</td>
+</tr>
+<tr>
+<td>GenAI semconv</td>
+<td>&quot;GenAI semantic conventions&quot;</td>
+<td>Stable attribute names for LLM / tool / agent spans</td>
+</tr>
+<tr>
+<td><code>gen_ai.*</code></td>
+<td>&quot;The attribute namespace&quot;</td>
+<td>All GenAI attributes share this prefix</td>
+</tr>
+<tr>
+<td>Span</td>
+<td>&quot;Timed operation&quot;</td>
+<td>A unit of work with a start, end, and attributes</td>
+</tr>
+<tr>
+<td>Trace</td>
+<td>&quot;Cross-span ancestry&quot;</td>
+<td>Tree of spans sharing a trace id</td>
+</tr>
+<tr>
+<td>SpanKind</td>
+<td>&quot;CLIENT / SERVER / INTERNAL&quot;</td>
+<td>Hints about span direction</td>
+</tr>
+<tr>
+<td>OTLP</td>
+<td>&quot;OpenTelemetry Line Protocol&quot;</td>
+<td>Wire format for exporters</td>
+</tr>
+<tr>
+<td>Opt-in content</td>
+<td>&quot;Prompt / completion capture&quot;</td>
+<td>Off by default; env var to enable</td>
+</tr>
+<tr>
+<td>traceparent</td>
+<td>&quot;W3C header&quot;</td>
+<td>Propagates trace context across services</td>
+</tr>
+<tr>
+<td>Exporter</td>
+<td>&quot;Backend-specific shipper&quot;</td>
+<td>Component that sends spans to Jaeger / Datadog / etc.</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://opentelemetry.io/docs/specs/semconv/gen-ai/" rel="noreferrer" data-network="true">OpenTelemetry — GenAI semconv <small>↗ 需要联网</small></a> — canonical conventions for GenAI spans, metrics, and events</li>
+<li><a href="https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-spans/" rel="noreferrer" data-network="true">OpenTelemetry — GenAI spans <small>↗ 需要联网</small></a> — LLM and tool-execution span attribute list</li>
+<li><a href="https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-agent-spans/" rel="noreferrer" data-network="true">OpenTelemetry — GenAI agent spans <small>↗ 需要联网</small></a> — agent-level <code>invoke_agent</code> span</li>
+<li><a href="https://github.com/open-telemetry/semantic-conventions/blob/main/docs/gen-ai/gen-ai-spans.md" rel="noreferrer" data-network="true">open-telemetry/semantic-conventions — GenAI spans <small>↗ 需要联网</small></a> — GitHub-hosted source of truth</li>
+<li><a href="https://www.datadoghq.com/blog/llm-otel-semantic-convention/" rel="noreferrer" data-network="true">Datadog — LLM OTel semantic convention <small>↗ 需要联网</small></a> — production integration walkthrough</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-13-tools-and-protocols--20-opentelemetry-genai.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-13-tools-and-protocols--20-opentelemetry-genai.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/13-tools-and-protocols/20-opentelemetry-genai/code/main.py">phases/13-tools-and-protocols/20-opentelemetry-genai/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Phase 13 Lesson 20 - OTel GenAI span emitter, stdlib only.
+
+Emits spans in an OTLP-JSON-like format to stdout for an agent that:
+  - invokes an LLM chat (gen_ai.operation.name = &quot;chat&quot;)
+  - dispatches two tools (gen_ai.operation.name = &quot;execute_tool&quot;)
+  - makes one MCP client call (CLIENT span with traceparent propagation)
+
+Content capture (gen_ai.content.prompt / completion) is off by default;
+enable by setting OTEL_CAPTURE_CONTENT=1 before running.
+
+Run: python code/main.py
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import json
+import os
+import random
+import time
+import uuid
+from dataclasses import dataclass, field
+from typing import Any
+
+
+CAPTURE_CONTENT = os.environ.get(&quot;OTEL_CAPTURE_CONTENT&quot;, &quot;0&quot;) == &quot;1&quot;
+
+
+def _hex(n_bytes: int) -&gt; str:
+    return uuid.uuid4().hex[: n_bytes * 2]
+
+
+@dataclass
+class Span:
+    name: str
+    kind: str  # INTERNAL / CLIENT / SERVER
+    trace_id: str
+    span_id: str
+    parent_span_id: str | None = None
+    start_ns: int = 0
+    end_ns: int = 0
+    attrs: dict = field(default_factory=dict)
+    events: list[dict] = field(default_factory=list)
+
+    def finish(self) -&gt; None:
+        self.end_ns = time.time_ns()
+
+    def add_event(self, name: str, attrs: dict) -&gt; None:
+        self.events.append({&quot;time&quot;: time.time_ns(), &quot;name&quot;: name, &quot;attrs&quot;: attrs})
+
+    def to_otlp(self) -&gt; dict:
+        return {
+            &quot;name&quot;: self.name,
+            &quot;kind&quot;: self.kind,
+            &quot;traceId&quot;: self.trace_id,
+            &quot;spanId&quot;: self.span_id,
+            &quot;parentSpanId&quot;: self.parent_span_id,
+            &quot;startTimeUnixNano&quot;: self.start_ns,
+            &quot;endTimeUnixNano&quot;: self.end_ns,
+            &quot;attributes&quot;: self.attrs,
+            &quot;events&quot;: self.events,
+        }
+
+
+SPANS: list[Span] = []
+
+
+def start_span(name: str, kind: str, parent: Span | None = None,
+               attrs: dict | None = None) -&gt; Span:
+    trace_id = parent.trace_id if parent else _hex(16)
+    span = Span(name=name, kind=kind, trace_id=trace_id, span_id=_hex(8),
+                parent_span_id=parent.span_id if parent else None,
+                start_ns=time.time_ns(), attrs=attrs or {})
+    SPANS.append(span)
+    return span
+
+
+def fake_llm_call(span: Span, prompt: str) -&gt; str:
+    time.sleep(0.05)
+    resp_id = f&quot;resp_{uuid.uuid4().hex[:8]}&quot;
+    span.attrs.update({
+        &quot;gen_ai.response.id&quot;: resp_id,
+        &quot;gen_ai.response.model&quot;: &quot;gpt-4o-2024-08-06&quot;,
+        &quot;gen_ai.usage.input_tokens&quot;: len(prompt) // 4,
+        &quot;gen_ai.usage.output_tokens&quot;: random.randint(20, 80),
+    })
+    if CAPTURE_CONTENT:
+        span.add_event(&quot;gen_ai.content.prompt&quot;, {&quot;content&quot;: prompt[:200]})
+        span.add_event(&quot;gen_ai.content.completion&quot;, {&quot;content&quot;: &quot;sample completion&quot;})
+    return &quot;sample completion&quot;
+
+
+def fake_tool_execute(span: Span, tool: str, args: dict) -&gt; dict:
+    time.sleep(0.03)
+    span.attrs.update({
+        &quot;gen_ai.tool.name&quot;: tool,
+        &quot;gen_ai.tool.call.id&quot;: f&quot;call_{uuid.uuid4().hex[:8]}&quot;,
+    })
+    return {&quot;content&quot;: [{&quot;type&quot;: &quot;text&quot;, &quot;text&quot;: f&quot;{tool} ran with {args}&quot;}]}
+
+
+def fake_mcp_call(parent: Span, tool: str) -&gt; dict:
+    mcp_span = start_span(&quot;mcp.call&quot;, &quot;CLIENT&quot;, parent=parent, attrs={
+        &quot;gen_ai.operation.name&quot;: &quot;execute_tool&quot;,
+        &quot;gen_ai.tool.name&quot;: tool,
+        &quot;mcp.server&quot;: &quot;notes&quot;,
+        &quot;mcp.transport&quot;: &quot;stdio&quot;,
+        &quot;net.peer.name&quot;: &quot;child_process&quot;,
+    })
+    traceparent = f&quot;00-{mcp_span.trace_id}-{mcp_span.span_id}-01&quot;
+    mcp_span.attrs[&quot;traceparent&quot;] = traceparent
+    time.sleep(0.04)
+    mcp_span.finish()
+    return {&quot;tool&quot;: tool, &quot;result&quot;: &quot;ok&quot;}
+
+
+def agent_loop() -&gt; None:
+    root = start_span(&quot;agent.invoke_agent&quot;, &quot;INTERNAL&quot;, attrs={
+        &quot;gen_ai.operation.name&quot;: &quot;invoke_agent&quot;,
+        &quot;gen_ai.agent.name&quot;: &quot;research-agent&quot;,
+        &quot;gen_ai.agent.id&quot;: &quot;agent_42&quot;,
+    })
+
+    llm1 = start_span(&quot;llm.chat&quot;, &quot;CLIENT&quot;, parent=root, attrs={
+        &quot;gen_ai.operation.name&quot;: &quot;chat&quot;,
+        &quot;gen_ai.provider.name&quot;: &quot;openai&quot;,
+        &quot;gen_ai.request.model&quot;: &quot;gpt-4o&quot;,
+    })
+    fake_llm_call(llm1, &quot;user wants weather in three cities&quot;)
+    llm1.finish()
+
+    for city in (&quot;Bengaluru&quot;, &quot;Tokyo&quot;, &quot;Zurich&quot;):
+        tool_span = start_span(&quot;tool.execute&quot;, &quot;INTERNAL&quot;, parent=root, attrs={
+            &quot;gen_ai.operation.name&quot;: &quot;execute_tool&quot;,
+        })
+        fake_tool_execute(tool_span, &quot;get_weather&quot;, {&quot;city&quot;: city})
+        fake_mcp_call(tool_span, &quot;get_weather&quot;)
+        tool_span.finish()
+
+    llm2 = start_span(&quot;llm.chat&quot;, &quot;CLIENT&quot;, parent=root, attrs={
+        &quot;gen_ai.operation.name&quot;: &quot;chat&quot;,
+        &quot;gen_ai.provider.name&quot;: &quot;openai&quot;,
+        &quot;gen_ai.request.model&quot;: &quot;gpt-4o&quot;,
+    })
+    fake_llm_call(llm2, &quot;synthesize three weather results&quot;)
+    llm2.finish()
+
+    root.finish()
+
+
+def main() -&gt; None:
+    print(&quot;=&quot; * 72)
+    print(&quot;PHASE 13 LESSON 19 - OTEL GENAI SPAN EMITTER&quot;)
+    print(f&quot;  content capture : {&#39;ON&#39; if CAPTURE_CONTENT else &#39;off (set OTEL_CAPTURE_CONTENT=1)&#39;}&quot;)
+    print(&quot;=&quot; * 72)
+
+    agent_loop()
+
+    print(f&quot;\nemitted {len(SPANS)} spans across 1 trace&quot;)
+    print(f&quot;\nOTLP-JSON-shaped spans:\n&quot;)
+    for span in SPANS:
+        summary = {
+            &quot;name&quot;: span.name,
+            &quot;kind&quot;: span.kind,
+            &quot;trace&quot;: span.trace_id[:8] + &quot;...&quot;,
+            &quot;id&quot;: span.span_id[:6] + &quot;...&quot;,
+            &quot;parent&quot;: (span.parent_span_id or &quot;ROOT&quot;)[:6],
+            &quot;duration_ms&quot;: round((span.end_ns - span.start_ns) / 1_000_000, 2),
+            &quot;attrs&quot;: {k: v for k, v in span.attrs.items() if k.startswith(&quot;gen_ai&quot;)},
+            &quot;events&quot;: len(span.events),
+        }
+        print(json.dumps(summary))
+
+    print(&quot;\ntry: OTEL_CAPTURE_CONTENT=1 python code/main.py&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/13-tools-and-protocols/20-opentelemetry-genai/outputs/skill-otel-genai-instrumentation.md">phases/13-tools-and-protocols/20-opentelemetry-genai/outputs/skill-otel-genai-instrumentation.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: otel-genai-instrumentation
+description: Produce an instrumentation plan for an agent codebase to emit OTel GenAI spans end-to-end.
+version: 1.0.0
+phase: 13
+lesson: 19
+tags: [otel, observability, gen-ai, tracing]
+---
+
+Given an agent codebase (LLM calls, tool dispatch, MCP client, sub-agents), produce an OTel GenAI instrumentation plan.
+
+Produce:
+
+1. Span hierarchy. Root `agent.invoke_agent` (INTERNAL) and children: `llm.chat` (CLIENT), `tool.execute` (INTERNAL), `mcp.call` (CLIENT), `subagent.invoke` (INTERNAL).
+2. Attribute checklist per span. `gen_ai.operation.name`, `gen_ai.provider.name`, `gen_ai.request.model`, `gen_ai.response.model`, `gen_ai.usage.*`, `gen_ai.tool.name`, `gen_ai.agent.name`.
+3. Propagation rule. Inject W3C traceparent on every remote call; for MCP stdio use `_meta.traceparent` as an interim field.
+4. Content capture policy. Off by default; document which env var enables; name PII risks.
+5. Exporter choice. Jaeger / Tempo / Langfuse / Phoenix / Datadog / Honeycomb; OTLP as the wire.
+
+Hard rejects:
+- Any plan missing trace propagation across MCP or sub-agent boundaries.
+- Any plan with content capture on by default. Leaks prompts and PII.
+- Any plan that emits arbitrary custom attributes without the `gen_ai.` or explicit vendor prefix.
+
+Refusal rules:
+- If the codebase uses a framework with built-in OTel auto-instrumentation (Pydantic AI, LangGraph, AgentOps), recommend the framework hook first.
+- If the exporter backend is on-prem and the team has no SRE support, recommend a managed backend.
+- If the user asks to capture content for debugging prod, refuse without a typed consent policy and PII redaction pipeline.
+
+Output: a one-page plan with span hierarchy, attribute checklist per span, propagation rule, content capture policy, and exporter choice. End with the top metric to alert on (typically p95 `gen_ai.client.operation.duration`).
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原课程未提供测验。</p></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/13-tools-and-protocols/19-a2a-protocol/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/13-tools-and-protocols/21-llm-routing-layer/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/13-tools-and-protocols/20-opentelemetry-genai/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

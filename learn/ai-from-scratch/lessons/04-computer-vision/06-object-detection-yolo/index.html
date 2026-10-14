@@ -1,0 +1,1084 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>从零开始检测到物体 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-04-computer-vision" data-lesson="04-computer-vision/06-object-detection-yolo" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/04-computer-vision/">计算机视觉</a> / LESSON 06</p><h1 class="lesson-title">从零开始检测到物体</h1><p>Object Detection — YOLO from Scratch</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>从零开始检测到物体</h1>
+<blockquote>
+<p>检测是分类加回,在特征地图中的每个位置运行,然后通过非最大压缩来清理.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 4 Lesson 03 (CNNs), Phase 4 Lesson 04 (Image Classification), Phase 4 Lesson 05 (Transfer Learning)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>解释了和的设计,使检测成为密集的预测问题,并说明输出子中的每个数字意味着什么</li>
+<li>计算盒子之间的交叉关系,从零开始实现非最大的抑制</li>
+<li>在训练前的脊椎上建立一个最小的YOLO风格头,包括分类,对象性和盒子回归损失</li>
+<li>阅读检测测量表行 (精度@0.5,回忆,mAP@0.5,mAP@0.5:0.95) 并选择下一个按</li>
+</ul>
+<h2>问题</h2>
+<p>分类说:&quot;这个图像是狗&quot;.检测说&quot;在像素 (112, 40, 280, 210),在图像 (400, 180, 560, 310),还有猫. &quot;这个结构变化 预测每张图像的标签而不是一个标签的变量盒子数量 是每个自主系统,每个监控产品,每个文件布局解析器,以及每个工厂视觉线都取决于什么.</p>
+<p>检测也是每一个工程的视觉交易都会出现一次. 你想要准确的框 (回归头),你想要对每个框 (分类头) 的正确类别,你想要模型知道什么时候没有什么可以检测 (对象性分数),你想要每一个真实对象的预测 (非最大压制). 错过任何一个,管道要么错过物体,报告幻觉的盒子,或者预测相同的物体15次,</p>
+<p>2016年,YOLO (You Only Look Once, Redmon et al. 2016) 是通过单个向前传输一个网来实现所有这些实时运行的设计,同样的结构决定仍然是现代探测器 (YOLOv8,YOLOv9,YOLO-NAS,RT-DETR) 的脊柱.</p>
+<h2>概念</h2>
+<h3>检测作为密集预测</h3>
+<p>一个分类器输出每张图像的C号码. 一个YOLO式检测器输出.<code>(S x S x (5 + C))</code>图像的数量,其中S是空间网格的尺寸.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-bf7149603b4e2a68f6b9.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>它们中的每一个<code>S * S</code>电网电池预测<code>B</code>盒子,每盒子:</p>
+<ul>
+<li>描述几何学的4个数字:<code>tx, ty, tw, th</code>现在,我们要去.</li>
+<li>个数是对象性分数:&quot;这个细胞中是否有一个中心的对象?&quot;</li>
+<li>数是类概率.</li>
+</ul>
+<p>总数每一个细胞:<code>B * (5 + C)</code>对于VOC与<code>S=13, B=2, C=20</code>它们的数量是50个.</p>
+<h3>为什么网和</h3>
+<p>简单的回归预测<code>(x, y, w, h)</code>对于每个对象来说,这是一个绝对坐标.对于一个 conv 网络来说,这是很难的,因为翻译图像不应该翻译所有预测的相同数量.每个对象是空间.</p>
+<p>结解决了第二个问题.一个3×3 conv不能轻松退回500像素宽的盒子从16像素接收场特征细胞.<code>B</code>模型学会选择正确的,并推进它,而不是从无处退回.</p>
+<pre><code>Anchor box priors (example for 416x416 input):
+
+  small:   (30,  60)
+  medium:  (75,  170)
+  large:   (200, 380)
+
+At each grid cell, every anchor emits (tx, ty, tw, th, obj, c_1, ..., c_C).
+</code></pre>
+<p>现代探测器通常使用FPN,每个分辨率的具不同具. 低分辨率地图上的小具,低分辨率地图上的大具.</p>
+<h3>解码预测</h3>
+<p>的<code>tx, ty, tw, th</code>它们不是框坐标,而是在绘图之前要转换的回归目标:</p>
+<pre><code>centre x  = (sigmoid(tx) + cell_x) * stride
+centre y  = (sigmoid(ty) + cell_y) * stride
+width     = anchor_w * exp(tw)
+height    = anchor_h * exp(th)
+</code></pre>
+<p><code>sigmoid</code>保持细胞内部的中心偏移. <code>exp</code>允许宽度从杆自由,而不需要标志转换.<code>stride</code>解码步骤是从2版本以来的每一个YOLO版本相同的.</p>
+<h3>其他</h3>
+<p>检测两个盒子之间的普遍相似度指标:</p>
+<pre><code>IoU(A, B) = area(A intersect B) / area(A union B)
+</code></pre>
+<p>预测和基础真相框之间的 IoU 是决定一个预测是否算为真正 (通常是 IoU &gt;=0.5). 两个预测之间的 IoU 是NMS用来分倍的.</p>
+<h3>超出最大压力</h3>
+<p>基于相邻的杆训练的 conv网络通常会预测同一对象的重叠框.NMS保持最高可靠性预测,并删除任何其他预测,如果 IoU 超过门值.</p>
+<pre><code>NMS(boxes, scores, iou_threshold):
+    sort boxes by score descending
+    keep = []
+    while boxes not empty:
+        pick the top-scoring box, add to keep
+        remove every box with IoU &gt; iou_threshold to the picked box
+    return keep
+</code></pre>
+<p>对于对象检测,典型门值为0.45. 最近的检测器取代了标准NMS的<code>soft-NMS</code>现在<code>DIoU-NMS</code>它们的结构性目的是相同的.</p>
+<h3>损失</h3>
+<p>罗损失是三损失加重:</p>
+<pre><code>L = lambda_coord * L_box(pred, target, where obj=1)
+  + lambda_obj   * L_obj(pred, 1,     where obj=1)
+  + lambda_noobj * L_obj(pred, 0,     where obj=0)
+  + lambda_cls   * L_cls(pred, target, where obj=1)
+</code></pre>
+<p>只有包含物体的细胞导致了盒子回归和分类损失. 没有物体的细胞只导致了物体性损失 (教模型保持沉默). <code>lambda_noobj</code>由于绝大多数细胞是空的,否则将占据总损失的主导地位.</p>
+<p>现代变体将MSE盒损失换为CIoU/DIoU (直接优化IoU),使用焦失为类失衡,并平衡对象性与质量焦失.</p>
+<h3>检测指标</h3>
+<p>准确性不会转移到检测.</p>
+<ul>
+<li><strong>Precision@IoU=0.5</strong>的预测被认为是正确的,</li>
+<li><strong>Recall@IoU=0.5</strong>,我们发现了多少的真实物体.</li>
+<li><strong>AP@0.5</strong>精度回忆曲线面积在IOU门值为0.5;每类一个数字.</li>
+<li><strong>mAP@0.5:0.95</strong>平均AP超过IOU门值0.5,0.55, ...,0.95.</li>
+</ul>
+<p>报告四个.在mAP@0.5上强,但在mAP@0.5:0.95上弱的探测器,大致地定位,但不紧密;更好的盒子回归损失;高精度和低回忆的探测器过于保守;降低信任门或增加对象重量.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-b444cff232a480efdaa5.png" alt="object-detection-nms 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<h3>步骤1:</h3>
+<p>整个课程的工作马. 在两个盒子上工作.<code>(x1, y1, x2, y2)</code>格式</p>
+<pre><code class="language-python">import numpy as np
+
+def box_iou(boxes_a, boxes_b):
+    ax1, ay1, ax2, ay2 = boxes_a[:, 0], boxes_a[:, 1], boxes_a[:, 2], boxes_a[:, 3]
+    bx1, by1, bx2, by2 = boxes_b[:, 0], boxes_b[:, 1], boxes_b[:, 2], boxes_b[:, 3]
+
+    inter_x1 = np.maximum(ax1[:, None], bx1[None, :])
+    inter_y1 = np.maximum(ay1[:, None], by1[None, :])
+    inter_x2 = np.minimum(ax2[:, None], bx2[None, :])
+    inter_y2 = np.minimum(ay2[:, None], by2[None, :])
+
+    inter_w = np.clip(inter_x2 - inter_x1, 0, None)
+    inter_h = np.clip(inter_y2 - inter_y1, 0, None)
+    inter = inter_w * inter_h
+
+    area_a = (ax2 - ax1) * (ay2 - ay1)
+    area_b = (bx2 - bx1) * (by2 - by1)
+    union = area_a[:, None] + area_b[None, :] - inter
+    return inter / np.clip(union, 1e-8, None)
+</code></pre>
+<p>返回一个<code>(N_a, N_b)</code>通过使一个数组形状,使用它对抗一个单一的地面真相框.<code>(1, 4)</code>现在,我们要去.</p>
+<h3>步骤2:非最大压缩</h3>
+<pre><code class="language-python">def nms(boxes, scores, iou_threshold=0.45):
+    order = np.argsort(-scores)
+    keep = []
+    while len(order) &gt; 0:
+        i = order[0]
+        keep.append(i)
+        if len(order) == 1:
+            break
+        rest = order[1:]
+        ious = box_iou(boxes[[i]], boxes[rest])[0]
+        order = rest[ious &lt;= iou_threshold]
+    return np.array(keep, dtype=np.int64)
+</code></pre>
+<p>确定性主义者<code>O(N log N)</code>,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,<code>torchvision.ops.nms</code>在相同的输入.</p>
+<h3>步骤3: 框编码和解码</h3>
+<p>转换像素坐标和<code>(tx, ty, tw, th)</code>网络实际上会退缩.</p>
+<pre><code class="language-python">def encode(box_xyxy, cell_x, cell_y, stride, anchor_wh):
+    x1, y1, x2, y2 = box_xyxy
+    cx = 0.5 * (x1 + x2)
+    cy = 0.5 * (y1 + y2)
+    w = x2 - x1
+    h = y2 - y1
+    tx = cx / stride - cell_x
+    ty = cy / stride - cell_y
+    tw = np.log(w / anchor_wh[0] + 1e-8)
+    th = np.log(h / anchor_wh[1] + 1e-8)
+    return np.array([tx, ty, tw, th])
+
+
+def decode(tx_ty_tw_th, cell_x, cell_y, stride, anchor_wh):
+    tx, ty, tw, th = tx_ty_tw_th
+    cx = (sigmoid(tx) + cell_x) * stride
+    cy = (sigmoid(ty) + cell_y) * stride
+    w = anchor_wh[0] * np.exp(tw)
+    h = anchor_wh[1] * np.exp(th)
+    return np.array([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2])
+
+
+def sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-x))
+</code></pre>
+<p>测试:编码一个框,然后解码 你应该得到回来非常接近原始的东西 (直到sigmoid反向不完全可逆时<code>tx</code>没有在sigmoid后的范围中).</p>
+<h3>步骤4:最小的YOLO头</h3>
+<p>图片的1x1集,重塑为<code>(B, S, S, num_anchors, 5 + C)</code>现在,我们要去.</p>
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+class YOLOHead(nn.Module):
+    def __init__(self, in_c, num_anchors, num_classes):
+        super().__init__()
+        self.num_anchors = num_anchors
+        self.num_classes = num_classes
+        self.conv = nn.Conv2d(in_c, num_anchors * (5 + num_classes), kernel_size=1)
+
+    def forward(self, x):
+        n, _, h, w = x.shape
+        y = self.conv(x)
+        y = y.view(n, self.num_anchors, 5 + self.num_classes, h, w)
+        y = y.permute(0, 3, 4, 1, 2).contiguous()
+        return y
+</code></pre>
+<p>输出形状:<code>(N, H, W, num_anchors, 5 + C)</code>最后一个维度是坚持的<code>[tx, ty, tw, th, obj, cls_0, ..., cls_{C-1}]</code>现在,我们要去.</p>
+<h3>第五步: 实践真相</h3>
+<p>对于每一个基本真理盒子,<code>(cell, anchor)</code>负责.</p>
+<pre><code class="language-python">def assign_targets(boxes_xyxy, classes, anchors, stride, grid_size, num_classes):
+    num_anchors = len(anchors)
+    target = np.zeros((grid_size, grid_size, num_anchors, 5 + num_classes), dtype=np.float32)
+    has_obj = np.zeros((grid_size, grid_size, num_anchors), dtype=bool)
+
+    for box, cls in zip(boxes_xyxy, classes):
+        x1, y1, x2, y2 = box
+        cx, cy = 0.5 * (x1 + x2), 0.5 * (y1 + y2)
+        gx, gy = int(cx / stride), int(cy / stride)
+        bw, bh = x2 - x1, y2 - y1
+
+        ious = np.array([
+            (min(bw, aw) * min(bh, ah)) / (bw * bh + aw * ah - min(bw, aw) * min(bh, ah))
+            for aw, ah in anchors
+        ])
+        best = int(np.argmax(ious))
+        aw, ah = anchors[best]
+
+        target[gy, gx, best, 0] = cx / stride - gx
+        target[gy, gx, best, 1] = cy / stride - gy
+        target[gy, gx, best, 2] = np.log(bw / aw + 1e-8)
+        target[gy, gx, best, 3] = np.log(bh / ah + 1e-8)
+        target[gy, gx, best, 4] = 1.0
+        target[gy, gx, best, 5 + cls] = 1.0
+        has_obj[gy, gx, best] = True
+    return target, has_obj
+</code></pre>
+<p>轮选择是&quot;最好的形状 IoU 与地面真相&quot;一个价格便宜的代理,与YOLOv2/v3任务匹配. v5及后者使用更复杂的策略 (任务一致匹配,动态 k) 来完善相同的想法.</p>
+<h3>步骤 6: 三次损失</h3>
+<pre><code class="language-python">def yolo_loss(pred, target, has_obj, lambda_coord=5.0, lambda_obj=1.0, lambda_noobj=0.5, lambda_cls=1.0):
+    has_obj_t = torch.from_numpy(has_obj).bool()
+    target_t = torch.from_numpy(target).float()
+
+    # box-regression loss: only on cells with objects
+    box_pred = pred[..., :4][has_obj_t]
+    box_true = target_t[..., :4][has_obj_t]
+    loss_box = torch.nn.functional.mse_loss(box_pred, box_true, reduction=&quot;sum&quot;)
+
+    # objectness loss
+    obj_pred = pred[..., 4]
+    obj_true = target_t[..., 4]
+    loss_obj_pos = torch.nn.functional.binary_cross_entropy_with_logits(
+        obj_pred[has_obj_t], obj_true[has_obj_t], reduction=&quot;sum&quot;)
+    loss_obj_neg = torch.nn.functional.binary_cross_entropy_with_logits(
+        obj_pred[~has_obj_t], obj_true[~has_obj_t], reduction=&quot;sum&quot;)
+
+    # classification loss on cells with objects
+    cls_pred = pred[..., 5:][has_obj_t]
+    cls_true = target_t[..., 5:][has_obj_t]
+    loss_cls = torch.nn.functional.binary_cross_entropy_with_logits(
+        cls_pred, cls_true, reduction=&quot;sum&quot;)
+
+    total = (lambda_coord * loss_box
+             + lambda_obj * loss_obj_pos
+             + lambda_noobj * loss_obj_neg
+             + lambda_cls * loss_cls)
+    return total, {&quot;box&quot;: loss_box.item(), &quot;obj_pos&quot;: loss_obj_pos.item(),
+                   &quot;obj_neg&quot;: loss_obj_neg.item(), &quot;cls&quot;: loss_cls.item()}
+</code></pre>
+<p>五个超级参数,每个YOLO教程都会硬码或扫描.<code>lambda_coord=5, lambda_noobj=0.5</code>像原始YOLOv1纸样,仍然是合理的默认.</p>
+<h3>步骤7: 推进管道</h3>
+<p>解码原始头输出,应用sigmoid/exp,对象性门和NMS.</p>
+<pre><code class="language-python">def postprocess(pred_tensor, anchors, stride, img_size, conf_threshold=0.25, iou_threshold=0.45):
+    pred = pred_tensor.detach().cpu().numpy()
+    grid_h, grid_w = pred.shape[1], pred.shape[2]
+    num_anchors = len(anchors)
+
+    boxes, scores, classes = [], [], []
+    for gy in range(grid_h):
+        for gx in range(grid_w):
+            for a in range(num_anchors):
+                tx, ty, tw, th, obj, *cls = pred[0, gy, gx, a]
+                score = sigmoid(obj) * sigmoid(np.array(cls)).max()
+                if score &lt; conf_threshold:
+                    continue
+                cls_idx = int(np.argmax(cls))
+                cx = (sigmoid(tx) + gx) * stride
+                cy = (sigmoid(ty) + gy) * stride
+                w = anchors[a][0] * np.exp(tw)
+                h = anchors[a][1] * np.exp(th)
+                boxes.append([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2])
+                scores.append(float(score))
+                classes.append(cls_idx)
+
+    if not boxes:
+        return np.zeros((0, 4)), np.zeros((0,)), np.zeros((0,), dtype=int)
+    boxes = np.array(boxes)
+    scores = np.array(scores)
+    classes = np.array(classes)
+    keep = nms(boxes, scores, iou_threshold)
+    return boxes[keep], scores[keep], classes[keep]
+</code></pre>
+<p>这就是完整的评估路径:头 -&gt; 解码 -&gt; 门 -&gt; NMS.</p>
+<h2>用它</h2>
+<p><code>torchvision.models.detection</code>对于预训练模型,需要三行运载.</p>
+<pre><code class="language-python">import torch
+from torchvision.models.detection import fasterrcnn_resnet50_fpn_v2
+
+model = fasterrcnn_resnet50_fpn_v2(weights=&quot;DEFAULT&quot;)
+model.eval()
+with torch.no_grad():
+    predictions = model([torch.randn(3, 400, 600)])
+print(predictions[0].keys())
+print(f&quot;boxes:  {predictions[0]['boxes'].shape}&quot;)
+print(f&quot;scores: {predictions[0]['scores'].shape}&quot;)
+print(f&quot;labels: {predictions[0]['labels'].shape}&quot;)
+</code></pre>
+<p>对于实时推断管道,<code>ultralytics</code>标准是:<code>from ultralytics import YOLO; model = YOLO('yolov8n.pt'); model(img)</code>模型内部处理解码和NMS,并返回相同的信息.<code>boxes / scores / labels</code>你在上面建造的三倍.</p>
+<h2>运送它</h2>
+<p>这一课产生了:</p>
+<ul>
+<li><code>outputs/prompt-detection-metric-reader.md</code>一个提示,转换一个<code>precision, recall, AP, mAP@0.5:0.95</code>排列一行诊断,然后再进行一个最有用的实验.</li>
+<li><code>outputs/skill-anchor-designer.md</code>一个技能,在基础真相框的数据集中,运行k-means<code>(w, h)</code>返回每个FPN级别的杆设置,加上需要选择正确的杆数量的覆盖统计数据.</li>
+</ul>
+<h2>运动</h2>
+<ol>
+<li>**(Easy)**实施<code>box_iou</code>击它.<code>torchvision.ops.box_iou</code>检查最大绝对差距在以下<code>1e-6</code>现在,我们要去.</li>
+<li>**(Medium)**港口<code>yolo_loss</code>通过使用<code>CIoU</code>在100图像合成数据集上显示,CIoU在同一时间段相比,与MSE相比,接近更好的最终mAP@0.5:0.95.</li>
+<li>**(Hard)**实现多尺度推理:通过模型以三分辨率输送相同的图像,结合盒子预测,并在结尾运行单个NMS. 在一个持久的集合上测量mAP升级与单尺度推理.</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Anchor</td>
+<td>&quot;Box prior&quot;</td>
+<td>A pre-defined box shape at each grid cell from which the network predicts deltas instead of absolute coordinates</td>
+</tr>
+<tr>
+<td>IoU</td>
+<td>&quot;Overlap&quot;</td>
+<td>Intersection-over-union of two boxes; the universal similarity measure in detection</td>
+</tr>
+<tr>
+<td>NMS</td>
+<td>&quot;Deduplicate&quot;</td>
+<td>Greedy algorithm that keeps highest-score predictions and removes overlapping ones above a threshold</td>
+</tr>
+<tr>
+<td>Objectness</td>
+<td>&quot;Is there something here&quot;</td>
+<td>Per-anchor, per-cell scalar predicting whether an object is centred in that cell</td>
+</tr>
+<tr>
+<td>Grid stride</td>
+<td>&quot;Downsample factor&quot;</td>
+<td>Pixels per grid cell; a 416-px input with a 13-grid head has stride 32</td>
+</tr>
+<tr>
+<td>mAP</td>
+<td>&quot;Mean average precision&quot;</td>
+<td>Average of the area under the precision-recall curve, averaged over classes and (for COCO) IoU thresholds</td>
+</tr>
+<tr>
+<td>AP@0.5</td>
+<td>&quot;PASCAL VOC AP&quot;</td>
+<td>Average precision with IoU threshold 0.5; the lenient version of the metric</td>
+</tr>
+<tr>
+<td>mAP@0.5:0.95</td>
+<td>&quot;COCO AP&quot;</td>
+<td>Average over IoU thresholds 0.5..0.95 step 0.05; the strict version and current community standard</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/1506.02640" rel="noreferrer" data-network="true">YOLOv1: You Only Look Once (Redmon et al., 2016) <small>↗ 需要联网</small></a>创建纸;从那以后的每一个YOLO都是这种结构的完善</li>
+<li><a href="https://arxiv.org/abs/1804.02767" rel="noreferrer" data-network="true">YOLOv3 (Redmon &amp; Farhadi, 2018) <small>↗ 需要联网</small></a>引入了多尺度FPN式头的纸;仍然是最清晰的图表</li>
+<li><a href="https://docs.ultralytics.com" rel="noreferrer" data-network="true">Ultralytics YOLOv8 docs <small>↗ 需要联网</small></a>目前的生产参考;涵盖数据集格式,增强,培训食谱</li>
+<li><a href="https://jonathan-hui.medium.com/object-detection-series-24d03a12f904" rel="noreferrer" data-network="true">The Illustrated Guide to Object Detection (Jonathan Hui) <small>↗ 需要联网</small></a>完整的检测动物园的最佳普通英语游览; 对于了解DETR,RetinaNet,FCOS和YOLO的关系,是无价的</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Object Detection — YOLO from Scratch</h1>
+<blockquote>
+<p>Detection is classification plus regression, run at every position in a feature map, then cleaned up with non-maximum suppression.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 4 Lesson 03 (CNNs), Phase 4 Lesson 04 (Image Classification), Phase 4 Lesson 05 (Transfer Learning)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Explain the grid-and-anchor design that turns detection into a dense prediction problem and state what every number in the output tensor means</li>
+<li>Compute Intersection-over-Union between boxes and implement non-maximum suppression from scratch</li>
+<li>Build a minimal YOLO-style head on top of a pretrained backbone, including the classification, objectness, and box-regression losses</li>
+<li>Read a detection metric row (precision@0.5, recall, mAP@0.5, mAP@0.5:0.95) and pick which knob to turn next</li>
+</ul>
+<h2>The Problem</h2>
+<p>Classification says &quot;this image is a dog.&quot; Detection says &quot;there is a dog at pixels (112, 40, 280, 210), there is a cat at (400, 180, 560, 310), and nothing else in the frame.&quot; That one structural change — predicting a variable number of labelled boxes instead of one label per image — is what every autonomous system, every surveillance product, every document layout parser, and every factory vision line depends on.</p>
+<p>Detection is also where every engineering trade-off in vision shows up at once. You want boxes that are accurate (regression head), you want the right class for each box (classification head), you want the model to know when there is nothing to detect (objectness score), and you want exactly one prediction per real object (non-maximum suppression). Miss any of these and the pipeline either misses objects, reports hallucinated boxes, or predicts the same object fifteen times in slightly different positions.</p>
+<p>YOLO (You Only Look Once, Redmon et al. 2016) was the design that made all of this run in real time by doing it with a single forward pass of a conv net, and the same structural decisions are still the backbone of modern detectors (YOLOv8, YOLOv9, YOLO-NAS, RT-DETR). Learn the core and every variant becomes a rearrangement of the same parts.</p>
+<h2>The Concept</h2>
+<h3>Detection as dense prediction</h3>
+<p>A classifier outputs C numbers per image. A YOLO-style detector outputs <code>(S x S x (5 + C))</code> numbers per image, where S is the spatial grid size.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-bf7149603b4e2a68f6b9.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>Each of the <code>S * S</code> grid cells predicts <code>B</code> boxes. For each box:</p>
+<ul>
+<li>4 numbers describe geometry: <code>tx, ty, tw, th</code>.</li>
+<li>1 number is the objectness score: &quot;is there an object centred in this cell?&quot;</li>
+<li>C numbers are class probabilities.</li>
+</ul>
+<p>Total per cell: <code>B * (5 + C)</code>. For VOC with <code>S=13, B=2, C=20</code>, that is 50 numbers per cell.</p>
+<h3>Why grids and anchors</h3>
+<p>Plain regression would predict <code>(x, y, w, h)</code> for every object as an absolute coordinate. That is hard for a conv network because translating the image should not translate all predictions by the same amount — each object is spatially anchored. The grid answers this by assigning each ground-truth box to the grid cell its centre falls in; only that cell is responsible for that object.</p>
+<p>Anchors address a second problem. A 3x3 conv cannot easily regress a 500-pixel-wide box out of a 16-pixel receptive field feature cell. Instead, we pre-define <code>B</code> prior box shapes (anchors) per cell and predict small deltas from each anchor. The model learns to pick the right anchor and nudge it rather than regress from nothing.</p>
+<pre><code>Anchor box priors (example for 416x416 input):
+
+  small:   (30,  60)
+  medium:  (75,  170)
+  large:   (200, 380)
+
+At each grid cell, every anchor emits (tx, ty, tw, th, obj, c_1, ..., c_C).
+</code></pre>
+<p>Modern detectors often use FPN with different anchor sets per resolution — small anchors on shallow high-resolution maps, large anchors on deep low-resolution maps. Same idea, more scales.</p>
+<h3>Decoding predictions</h3>
+<p>The raw <code>tx, ty, tw, th</code> are not box coordinates; they are regression targets to be transformed before plotting:</p>
+<pre><code>centre x  = (sigmoid(tx) + cell_x) * stride
+centre y  = (sigmoid(ty) + cell_y) * stride
+width     = anchor_w * exp(tw)
+height    = anchor_h * exp(th)
+</code></pre>
+<p><code>sigmoid</code> keeps centre offsets inside the cell. <code>exp</code> lets the width scale freely from the anchor without a sign flip. <code>stride</code> scales the grid coordinates back to pixels. This decode step is the same in every YOLO version since v2.</p>
+<h3>IoU</h3>
+<p>Detection's universal similarity metric between two boxes:</p>
+<pre><code>IoU(A, B) = area(A intersect B) / area(A union B)
+</code></pre>
+<p>IoU = 1 means identical; IoU = 0 means no overlap. IoU between the prediction and the ground-truth box is what decides whether a prediction counts as a true positive (typically IoU &gt;= 0.5). IoU between two predictions is what NMS uses to deduplicate.</p>
+<h3>Non-maximum suppression</h3>
+<p>A conv network trained on adjacent anchors will often predict overlapping boxes for the same object. NMS keeps the highest-confidence prediction and deletes any other prediction with IoU above a threshold.</p>
+<pre><code>NMS(boxes, scores, iou_threshold):
+    sort boxes by score descending
+    keep = []
+    while boxes not empty:
+        pick the top-scoring box, add to keep
+        remove every box with IoU &gt; iou_threshold to the picked box
+    return keep
+</code></pre>
+<p>Typical threshold: 0.45 for object detection. Recent detectors replace standard NMS with <code>soft-NMS</code>, <code>DIoU-NMS</code>, or learn the suppression directly (RT-DETR) but the structural purpose is the same.</p>
+<h3>The loss</h3>
+<p>YOLO loss is three losses added with weights:</p>
+<pre><code>L = lambda_coord * L_box(pred, target, where obj=1)
+  + lambda_obj   * L_obj(pred, 1,     where obj=1)
+  + lambda_noobj * L_obj(pred, 0,     where obj=0)
+  + lambda_cls   * L_cls(pred, target, where obj=1)
+</code></pre>
+<p>Only cells that contain an object contribute to the box-regression and classification losses. Cells without objects contribute only to the objectness loss (teaching the model to stay silent). <code>lambda_noobj</code> is usually small (~0.5) because the vast majority of cells are empty and would otherwise dominate the total loss.</p>
+<p>Modern variants swap MSE box loss for CIoU / DIoU (which optimise IoU directly), use focal loss for class imbalance, and balance objectness with quality focal loss. The three-component structure is unchanged.</p>
+<h3>Detection metrics</h3>
+<p>Accuracy does not transfer to detection. Four numbers that do:</p>
+<ul>
+<li><strong>Precision@IoU=0.5</strong> — of the predictions counted as positives, how many are actually correct.</li>
+<li><strong>Recall@IoU=0.5</strong> — of the real objects, how many did we find.</li>
+<li><strong>AP@0.5</strong> — precision-recall curve area at IoU threshold 0.5; one number per class.</li>
+<li><strong>mAP@0.5:0.95</strong> — average of AP over IoU thresholds 0.5, 0.55, ..., 0.95. The COCO metric; strictest and most informative.</li>
+</ul>
+<p>Report all four. A detector that is strong on mAP@0.5 but weak on mAP@0.5:0.95 is localising roughly but not tightly; fix with better box-regression loss. A detector with high precision and low recall is too conservative; lower the confidence threshold or increase the objectness weight.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-b444cff232a480efdaa5.png" alt="object-detection-nms 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<h3>Step 1: IoU</h3>
+<p>The workhorse of the whole lesson. Works on two arrays of boxes in <code>(x1, y1, x2, y2)</code> format.</p>
+<pre><code class="language-python">import numpy as np
+
+def box_iou(boxes_a, boxes_b):
+    ax1, ay1, ax2, ay2 = boxes_a[:, 0], boxes_a[:, 1], boxes_a[:, 2], boxes_a[:, 3]
+    bx1, by1, bx2, by2 = boxes_b[:, 0], boxes_b[:, 1], boxes_b[:, 2], boxes_b[:, 3]
+
+    inter_x1 = np.maximum(ax1[:, None], bx1[None, :])
+    inter_y1 = np.maximum(ay1[:, None], by1[None, :])
+    inter_x2 = np.minimum(ax2[:, None], bx2[None, :])
+    inter_y2 = np.minimum(ay2[:, None], by2[None, :])
+
+    inter_w = np.clip(inter_x2 - inter_x1, 0, None)
+    inter_h = np.clip(inter_y2 - inter_y1, 0, None)
+    inter = inter_w * inter_h
+
+    area_a = (ax2 - ax1) * (ay2 - ay1)
+    area_b = (bx2 - bx1) * (by2 - by1)
+    union = area_a[:, None] + area_b[None, :] - inter
+    return inter / np.clip(union, 1e-8, None)
+</code></pre>
+<p>Returns an <code>(N_a, N_b)</code> matrix of pairwise IoUs. Use it against a single ground-truth box by making one of the arrays shape <code>(1, 4)</code>.</p>
+<h3>Step 2: Non-max suppression</h3>
+<pre><code class="language-python">def nms(boxes, scores, iou_threshold=0.45):
+    order = np.argsort(-scores)
+    keep = []
+    while len(order) &gt; 0:
+        i = order[0]
+        keep.append(i)
+        if len(order) == 1:
+            break
+        rest = order[1:]
+        ious = box_iou(boxes[[i]], boxes[rest])[0]
+        order = rest[ious &lt;= iou_threshold]
+    return np.array(keep, dtype=np.int64)
+</code></pre>
+<p>Deterministic, <code>O(N log N)</code> from the sort, and matches the behaviour of <code>torchvision.ops.nms</code> on identical inputs.</p>
+<h3>Step 3: Box encoding and decoding</h3>
+<p>Convert between pixel coordinates and the <code>(tx, ty, tw, th)</code> targets that the network actually regresses.</p>
+<pre><code class="language-python">def encode(box_xyxy, cell_x, cell_y, stride, anchor_wh):
+    x1, y1, x2, y2 = box_xyxy
+    cx = 0.5 * (x1 + x2)
+    cy = 0.5 * (y1 + y2)
+    w = x2 - x1
+    h = y2 - y1
+    tx = cx / stride - cell_x
+    ty = cy / stride - cell_y
+    tw = np.log(w / anchor_wh[0] + 1e-8)
+    th = np.log(h / anchor_wh[1] + 1e-8)
+    return np.array([tx, ty, tw, th])
+
+
+def decode(tx_ty_tw_th, cell_x, cell_y, stride, anchor_wh):
+    tx, ty, tw, th = tx_ty_tw_th
+    cx = (sigmoid(tx) + cell_x) * stride
+    cy = (sigmoid(ty) + cell_y) * stride
+    w = anchor_wh[0] * np.exp(tw)
+    h = anchor_wh[1] * np.exp(th)
+    return np.array([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2])
+
+
+def sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-x))
+</code></pre>
+<p>Test: encode a box then decode — you should get back something very close to the original (up to the sigmoid inverse not being perfectly invertible when <code>tx</code> is not in the post-sigmoid range).</p>
+<h3>Step 4: A minimal YOLO head</h3>
+<p>One 1x1 conv on a feature map, reshaping to <code>(B, S, S, num_anchors, 5 + C)</code>.</p>
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+class YOLOHead(nn.Module):
+    def __init__(self, in_c, num_anchors, num_classes):
+        super().__init__()
+        self.num_anchors = num_anchors
+        self.num_classes = num_classes
+        self.conv = nn.Conv2d(in_c, num_anchors * (5 + num_classes), kernel_size=1)
+
+    def forward(self, x):
+        n, _, h, w = x.shape
+        y = self.conv(x)
+        y = y.view(n, self.num_anchors, 5 + self.num_classes, h, w)
+        y = y.permute(0, 3, 4, 1, 2).contiguous()
+        return y
+</code></pre>
+<p>Output shape: <code>(N, H, W, num_anchors, 5 + C)</code>. The last dimension holds <code>[tx, ty, tw, th, obj, cls_0, ..., cls_{C-1}]</code>.</p>
+<h3>Step 5: Ground-truth assignment</h3>
+<p>For every ground-truth box, decide which <code>(cell, anchor)</code> is responsible.</p>
+<pre><code class="language-python">def assign_targets(boxes_xyxy, classes, anchors, stride, grid_size, num_classes):
+    num_anchors = len(anchors)
+    target = np.zeros((grid_size, grid_size, num_anchors, 5 + num_classes), dtype=np.float32)
+    has_obj = np.zeros((grid_size, grid_size, num_anchors), dtype=bool)
+
+    for box, cls in zip(boxes_xyxy, classes):
+        x1, y1, x2, y2 = box
+        cx, cy = 0.5 * (x1 + x2), 0.5 * (y1 + y2)
+        gx, gy = int(cx / stride), int(cy / stride)
+        bw, bh = x2 - x1, y2 - y1
+
+        ious = np.array([
+            (min(bw, aw) * min(bh, ah)) / (bw * bh + aw * ah - min(bw, aw) * min(bh, ah))
+            for aw, ah in anchors
+        ])
+        best = int(np.argmax(ious))
+        aw, ah = anchors[best]
+
+        target[gy, gx, best, 0] = cx / stride - gx
+        target[gy, gx, best, 1] = cy / stride - gy
+        target[gy, gx, best, 2] = np.log(bw / aw + 1e-8)
+        target[gy, gx, best, 3] = np.log(bh / ah + 1e-8)
+        target[gy, gx, best, 4] = 1.0
+        target[gy, gx, best, 5 + cls] = 1.0
+        has_obj[gy, gx, best] = True
+    return target, has_obj
+</code></pre>
+<p>Anchor selection is &quot;best shape IoU with the ground truth&quot; — a cheap proxy that matches the YOLOv2/v3 assignment. v5 and later use more sophisticated strategies (task-aligned matching, dynamic k) that refine the same idea.</p>
+<h3>Step 6: The three losses</h3>
+<pre><code class="language-python">def yolo_loss(pred, target, has_obj, lambda_coord=5.0, lambda_obj=1.0, lambda_noobj=0.5, lambda_cls=1.0):
+    has_obj_t = torch.from_numpy(has_obj).bool()
+    target_t = torch.from_numpy(target).float()
+
+    # box-regression loss: only on cells with objects
+    box_pred = pred[..., :4][has_obj_t]
+    box_true = target_t[..., :4][has_obj_t]
+    loss_box = torch.nn.functional.mse_loss(box_pred, box_true, reduction=&quot;sum&quot;)
+
+    # objectness loss
+    obj_pred = pred[..., 4]
+    obj_true = target_t[..., 4]
+    loss_obj_pos = torch.nn.functional.binary_cross_entropy_with_logits(
+        obj_pred[has_obj_t], obj_true[has_obj_t], reduction=&quot;sum&quot;)
+    loss_obj_neg = torch.nn.functional.binary_cross_entropy_with_logits(
+        obj_pred[~has_obj_t], obj_true[~has_obj_t], reduction=&quot;sum&quot;)
+
+    # classification loss on cells with objects
+    cls_pred = pred[..., 5:][has_obj_t]
+    cls_true = target_t[..., 5:][has_obj_t]
+    loss_cls = torch.nn.functional.binary_cross_entropy_with_logits(
+        cls_pred, cls_true, reduction=&quot;sum&quot;)
+
+    total = (lambda_coord * loss_box
+             + lambda_obj * loss_obj_pos
+             + lambda_noobj * loss_obj_neg
+             + lambda_cls * loss_cls)
+    return total, {&quot;box&quot;: loss_box.item(), &quot;obj_pos&quot;: loss_obj_pos.item(),
+                   &quot;obj_neg&quot;: loss_obj_neg.item(), &quot;cls&quot;: loss_cls.item()}
+</code></pre>
+<p>Five hyper-parameters that every YOLO tutorial either hardcodes or sweeps. The ratios matter: <code>lambda_coord=5, lambda_noobj=0.5</code> mirrors the original YOLOv1 paper and still works as a reasonable default.</p>
+<h3>Step 7: Inference pipeline</h3>
+<p>Decode the raw head output, apply sigmoid/exp, threshold on objectness, and NMS.</p>
+<pre><code class="language-python">def postprocess(pred_tensor, anchors, stride, img_size, conf_threshold=0.25, iou_threshold=0.45):
+    pred = pred_tensor.detach().cpu().numpy()
+    grid_h, grid_w = pred.shape[1], pred.shape[2]
+    num_anchors = len(anchors)
+
+    boxes, scores, classes = [], [], []
+    for gy in range(grid_h):
+        for gx in range(grid_w):
+            for a in range(num_anchors):
+                tx, ty, tw, th, obj, *cls = pred[0, gy, gx, a]
+                score = sigmoid(obj) * sigmoid(np.array(cls)).max()
+                if score &lt; conf_threshold:
+                    continue
+                cls_idx = int(np.argmax(cls))
+                cx = (sigmoid(tx) + gx) * stride
+                cy = (sigmoid(ty) + gy) * stride
+                w = anchors[a][0] * np.exp(tw)
+                h = anchors[a][1] * np.exp(th)
+                boxes.append([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2])
+                scores.append(float(score))
+                classes.append(cls_idx)
+
+    if not boxes:
+        return np.zeros((0, 4)), np.zeros((0,)), np.zeros((0,), dtype=int)
+    boxes = np.array(boxes)
+    scores = np.array(scores)
+    classes = np.array(classes)
+    keep = nms(boxes, scores, iou_threshold)
+    return boxes[keep], scores[keep], classes[keep]
+</code></pre>
+<p>That is the complete eval path: head -&gt; decode -&gt; threshold -&gt; NMS.</p>
+<h2>Use It</h2>
+<p><code>torchvision.models.detection</code> ships production detectors with the same conceptual structure. Loading a pretrained model takes three lines.</p>
+<pre><code class="language-python">import torch
+from torchvision.models.detection import fasterrcnn_resnet50_fpn_v2
+
+model = fasterrcnn_resnet50_fpn_v2(weights=&quot;DEFAULT&quot;)
+model.eval()
+with torch.no_grad():
+    predictions = model([torch.randn(3, 400, 600)])
+print(predictions[0].keys())
+print(f&quot;boxes:  {predictions[0]['boxes'].shape}&quot;)
+print(f&quot;scores: {predictions[0]['scores'].shape}&quot;)
+print(f&quot;labels: {predictions[0]['labels'].shape}&quot;)
+</code></pre>
+<p>For real-time inference pipelines, <code>ultralytics</code> (YOLOv8/v9) is the standard: <code>from ultralytics import YOLO; model = YOLO('yolov8n.pt'); model(img)</code>. The model handles decoding and NMS internally and returns the same <code>boxes / scores / labels</code> triple you built above.</p>
+<h2>Ship It</h2>
+<p>This lesson produces:</p>
+<ul>
+<li><code>outputs/prompt-detection-metric-reader.md</code> — a prompt that turns a <code>precision, recall, AP, mAP@0.5:0.95</code> row into a one-line diagnosis and the single most useful next experiment.</li>
+<li><code>outputs/skill-anchor-designer.md</code> — a skill that, given a dataset of ground-truth boxes, runs k-means on <code>(w, h)</code> and returns anchor sets per FPN level plus the coverage statistics you need to pick the right number of anchors.</li>
+</ul>
+<h2>Exercises</h2>
+<ol>
+<li><strong>(Easy)</strong> Implement <code>box_iou</code> and run it against <code>torchvision.ops.box_iou</code> on 1,000 random box pairs. Verify max absolute difference is below <code>1e-6</code>.</li>
+<li><strong>(Medium)</strong> Port <code>yolo_loss</code> to a version that uses <code>CIoU</code> box loss instead of MSE. Show on a 100-image synthetic dataset that CIoU converges to a better final mAP@0.5:0.95 than MSE in the same number of epochs.</li>
+<li><strong>(Hard)</strong> Implement multi-scale inference: feed the same image at three resolutions through the model, union the box predictions, and run a single NMS at the end. Measure the mAP lift vs single-scale inference on a held-out set.</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Anchor</td>
+<td>&quot;Box prior&quot;</td>
+<td>A pre-defined box shape at each grid cell from which the network predicts deltas instead of absolute coordinates</td>
+</tr>
+<tr>
+<td>IoU</td>
+<td>&quot;Overlap&quot;</td>
+<td>Intersection-over-union of two boxes; the universal similarity measure in detection</td>
+</tr>
+<tr>
+<td>NMS</td>
+<td>&quot;Deduplicate&quot;</td>
+<td>Greedy algorithm that keeps highest-score predictions and removes overlapping ones above a threshold</td>
+</tr>
+<tr>
+<td>Objectness</td>
+<td>&quot;Is there something here&quot;</td>
+<td>Per-anchor, per-cell scalar predicting whether an object is centred in that cell</td>
+</tr>
+<tr>
+<td>Grid stride</td>
+<td>&quot;Downsample factor&quot;</td>
+<td>Pixels per grid cell; a 416-px input with a 13-grid head has stride 32</td>
+</tr>
+<tr>
+<td>mAP</td>
+<td>&quot;Mean average precision&quot;</td>
+<td>Average of the area under the precision-recall curve, averaged over classes and (for COCO) IoU thresholds</td>
+</tr>
+<tr>
+<td>AP@0.5</td>
+<td>&quot;PASCAL VOC AP&quot;</td>
+<td>Average precision with IoU threshold 0.5; the lenient version of the metric</td>
+</tr>
+<tr>
+<td>mAP@0.5:0.95</td>
+<td>&quot;COCO AP&quot;</td>
+<td>Average over IoU thresholds 0.5..0.95 step 0.05; the strict version and current community standard</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/1506.02640" rel="noreferrer" data-network="true">YOLOv1: You Only Look Once (Redmon et al., 2016) <small>↗ 需要联网</small></a> — the founding paper; every YOLO since is a refinement of this structure</li>
+<li><a href="https://arxiv.org/abs/1804.02767" rel="noreferrer" data-network="true">YOLOv3 (Redmon &amp; Farhadi, 2018) <small>↗ 需要联网</small></a> — the paper that introduced multi-scale FPN-style heads; still the clearest diagram</li>
+<li><a href="https://docs.ultralytics.com" rel="noreferrer" data-network="true">Ultralytics YOLOv8 docs <small>↗ 需要联网</small></a> — the current production reference; covers dataset formats, augmentations, training recipes</li>
+<li><a href="https://jonathan-hui.medium.com/object-detection-series-24d03a12f904" rel="noreferrer" data-network="true">The Illustrated Guide to Object Detection (Jonathan Hui) <small>↗ 需要联网</small></a> — best plain-English tour of the full detector zoo; priceless for understanding how DETR, RetinaNet, FCOS, and YOLO relate</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-04-computer-vision--06-object-detection-yolo.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-04-computer-vision--06-object-detection-yolo.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/04-computer-vision/06-object-detection-yolo/code/main.py">phases/04-computer-vision/06-object-detection-yolo/code/main.py</a><details><summary>查看原始文本</summary><pre><code>import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+def sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-x))
+
+
+def box_iou(boxes_a, boxes_b):
+    ax1, ay1, ax2, ay2 = boxes_a[:, 0], boxes_a[:, 1], boxes_a[:, 2], boxes_a[:, 3]
+    bx1, by1, bx2, by2 = boxes_b[:, 0], boxes_b[:, 1], boxes_b[:, 2], boxes_b[:, 3]
+
+    inter_x1 = np.maximum(ax1[:, None], bx1[None, :])
+    inter_y1 = np.maximum(ay1[:, None], by1[None, :])
+    inter_x2 = np.minimum(ax2[:, None], bx2[None, :])
+    inter_y2 = np.minimum(ay2[:, None], by2[None, :])
+
+    inter_w = np.clip(inter_x2 - inter_x1, 0, None)
+    inter_h = np.clip(inter_y2 - inter_y1, 0, None)
+    inter = inter_w * inter_h
+
+    area_a = (ax2 - ax1) * (ay2 - ay1)
+    area_b = (bx2 - bx1) * (by2 - by1)
+    union = area_a[:, None] + area_b[None, :] - inter
+    return inter / np.clip(union, 1e-8, None)
+
+
+def nms(boxes, scores, iou_threshold=0.45):
+    order = np.argsort(-scores)
+    keep = []
+    while len(order) &gt; 0:
+        i = order[0]
+        keep.append(int(i))
+        if len(order) == 1:
+            break
+        rest = order[1:]
+        ious = box_iou(boxes[[i]], boxes[rest])[0]
+        order = rest[ious &lt;= iou_threshold]
+    return np.array(keep, dtype=np.int64)
+
+
+def encode(box_xyxy, cell_x, cell_y, stride, anchor_wh):
+    x1, y1, x2, y2 = box_xyxy
+    cx = 0.5 * (x1 + x2)
+    cy = 0.5 * (y1 + y2)
+    w = x2 - x1
+    h = y2 - y1
+    # Offset within the cell in [0, 1], converted to logit so decode(sigmoid(tx)) round-trips.
+    off_x = np.clip(cx / stride - cell_x, 1e-6, 1 - 1e-6)
+    off_y = np.clip(cy / stride - cell_y, 1e-6, 1 - 1e-6)
+    tx = float(np.log(off_x / (1 - off_x)))
+    ty = float(np.log(off_y / (1 - off_y)))
+    tw = np.log(w / anchor_wh[0] + 1e-8)
+    th = np.log(h / anchor_wh[1] + 1e-8)
+    return np.array([tx, ty, tw, th])
+
+
+def decode(tx_ty_tw_th, cell_x, cell_y, stride, anchor_wh):
+    tx, ty, tw, th = tx_ty_tw_th
+    cx = (sigmoid(tx) + cell_x) * stride
+    cy = (sigmoid(ty) + cell_y) * stride
+    w = anchor_wh[0] * np.exp(np.clip(tw, -10.0, 10.0))
+    h = anchor_wh[1] * np.exp(np.clip(th, -10.0, 10.0))
+    return np.array([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2])
+
+
+class YOLOHead(nn.Module):
+    def __init__(self, in_c, num_anchors, num_classes):
+        super().__init__()
+        self.num_anchors = num_anchors
+        self.num_classes = num_classes
+        self.conv = nn.Conv2d(in_c, num_anchors * (5 + num_classes), kernel_size=1)
+
+    def forward(self, x):
+        n, _, h, w = x.shape
+        y = self.conv(x)
+        y = y.view(n, self.num_anchors, 5 + self.num_classes, h, w)
+        y = y.permute(0, 3, 4, 1, 2).contiguous()
+        return y
+
+
+def assign_targets(boxes_xyxy, classes, anchors, stride, grid_size, num_classes):
+    num_anchors = len(anchors)
+    target = np.zeros((grid_size, grid_size, num_anchors, 5 + num_classes), dtype=np.float32)
+    has_obj = np.zeros((grid_size, grid_size, num_anchors), dtype=bool)
+
+    for box, cls in zip(boxes_xyxy, classes):
+        x1, y1, x2, y2 = box
+        cx, cy = 0.5 * (x1 + x2), 0.5 * (y1 + y2)
+        gx_raw, gy_raw = int(cx / stride), int(cy / stride)
+        if not (0 &lt;= gx_raw &lt; grid_size and 0 &lt;= gy_raw &lt; grid_size):
+            continue
+        gx = min(gx_raw, grid_size - 1)
+        gy = min(gy_raw, grid_size - 1)
+        bw, bh = x2 - x1, y2 - y1
+
+        ious = []
+        for aw, ah in anchors:
+            inter = min(bw, aw) * min(bh, ah)
+            union = bw * bh + aw * ah - inter
+            ious.append(inter / max(union, 1e-8))
+        best = int(np.argmax(ious))
+        aw, ah = anchors[best]
+
+        # Store logit(offset) so the network&#39;s raw output matches post-sigmoid
+        # decode. Keeps target space aligned with decode()/postprocess().
+        off_x = np.clip(cx / stride - gx, 1e-6, 1 - 1e-6)
+        off_y = np.clip(cy / stride - gy, 1e-6, 1 - 1e-6)
+        target[gy, gx, best, 0] = np.log(off_x / (1 - off_x))
+        target[gy, gx, best, 1] = np.log(off_y / (1 - off_y))
+        target[gy, gx, best, 2] = np.log(bw / aw + 1e-8)
+        target[gy, gx, best, 3] = np.log(bh / ah + 1e-8)
+        target[gy, gx, best, 4] = 1.0
+        target[gy, gx, best, 5 + cls] = 1.0
+        has_obj[gy, gx, best] = True
+    return target, has_obj
+
+
+def yolo_loss(pred, target, has_obj,
+              lambda_coord=5.0, lambda_obj=1.0, lambda_noobj=0.5, lambda_cls=1.0):
+    has_obj_t = torch.from_numpy(has_obj).bool().to(pred.device)
+    target_t = torch.from_numpy(target).float().to(pred.device)
+    if pred.dim() == 5 and pred.shape[0] == 1:
+        pred = pred[0]
+
+    box_pred = pred[..., :4][has_obj_t]
+    box_true = target_t[..., :4][has_obj_t]
+    loss_box = F.mse_loss(box_pred, box_true, reduction=&quot;sum&quot;) if box_pred.numel() else torch.tensor(0.0)
+
+    obj_pred = pred[..., 4]
+    obj_true = target_t[..., 4]
+    loss_obj_pos = F.binary_cross_entropy_with_logits(
+        obj_pred[has_obj_t], obj_true[has_obj_t], reduction=&quot;sum&quot;
+    ) if has_obj_t.any() else torch.tensor(0.0)
+    loss_obj_neg = F.binary_cross_entropy_with_logits(
+        obj_pred[~has_obj_t], obj_true[~has_obj_t], reduction=&quot;sum&quot;
+    ) if (~has_obj_t).any() else torch.tensor(0.0)
+
+    cls_pred = pred[..., 5:][has_obj_t]
+    cls_true = target_t[..., 5:][has_obj_t]
+    loss_cls = F.binary_cross_entropy_with_logits(
+        cls_pred, cls_true, reduction=&quot;sum&quot;
+    ) if cls_pred.numel() else torch.tensor(0.0)
+
+    total = (lambda_coord * loss_box
+             + lambda_obj * loss_obj_pos
+             + lambda_noobj * loss_obj_neg
+             + lambda_cls * loss_cls)
+    return total, {&quot;box&quot;: float(loss_box), &quot;obj_pos&quot;: float(loss_obj_pos),
+                   &quot;obj_neg&quot;: float(loss_obj_neg), &quot;cls&quot;: float(loss_cls)}
+
+
+def postprocess(pred_tensor, anchors, stride, conf_threshold=0.25, iou_threshold=0.45):
+    pred = pred_tensor.detach().cpu().numpy()
+    _, grid_h, grid_w, num_anchors, _ = pred.shape
+
+    boxes, scores, classes = [], [], []
+    for gy in range(grid_h):
+        for gx in range(grid_w):
+            for a in range(num_anchors):
+                row = pred[0, gy, gx, a]
+                tx, ty, tw, th, obj = row[:5]
+                cls_logits = row[5:]
+                cls_probs = sigmoid(cls_logits)
+                score = float(sigmoid(obj) * cls_probs.max())
+                if score &lt; conf_threshold:
+                    continue
+                cls_idx = int(np.argmax(cls_probs))
+                cx = (sigmoid(tx) + gx) * stride
+                cy = (sigmoid(ty) + gy) * stride
+                # Clamp tw/th to keep exp() finite on wild predictions.
+                w = anchors[a][0] * np.exp(np.clip(tw, -10.0, 10.0))
+                h = anchors[a][1] * np.exp(np.clip(th, -10.0, 10.0))
+                boxes.append([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2])
+                scores.append(score)
+                classes.append(cls_idx)
+
+    if not boxes:
+        return np.zeros((0, 4)), np.zeros((0,)), np.zeros((0,), dtype=int)
+    boxes = np.array(boxes)
+    scores = np.array(scores)
+    classes = np.array(classes)
+    keep = nms(boxes, scores, iou_threshold)
+    return boxes[keep], scores[keep], classes[keep]
+
+
+def main():
+    rng = np.random.default_rng(0)
+
+    print(&quot;[iou] identical boxes should have iou=1&quot;)
+    a = np.array([[10, 10, 50, 50]])
+    b = np.array([[10, 10, 50, 50]])
+    print(f&quot;  iou={box_iou(a, b)[0, 0]:.3f}&quot;)
+
+    print(&quot;\n[iou] half-overlap boxes&quot;)
+    a = np.array([[0, 0, 10, 10]])
+    b = np.array([[5, 0, 15, 10]])
+    print(f&quot;  iou={box_iou(a, b)[0, 0]:.3f}  (expected 1/3 = 0.333)&quot;)
+
+    print(&quot;\n[nms] 5 overlapping boxes -&gt; NMS keeps highest-score non-overlapping set&quot;)
+    boxes = np.array([
+        [0, 0, 10, 10],
+        [1, 1, 11, 11],
+        [2, 2, 12, 12],
+        [20, 20, 30, 30],
+        [21, 21, 31, 31],
+    ], dtype=float)
+    scores = np.array([0.9, 0.8, 0.7, 0.85, 0.6])
+    keep = nms(boxes, scores, iou_threshold=0.4)
+    print(f&quot;  kept indices: {keep.tolist()}  (expected [0, 3])&quot;)
+
+    print(&quot;\n[encode/decode] round-trip error&quot;)
+    anchors = [(30, 60), (75, 170), (200, 380)]
+    stride = 32
+    grid_size = 13
+    num_classes = 5
+    gt_box = (120, 80, 240, 220)
+    anchor = anchors[1]
+    cell_x = int((gt_box[0] + gt_box[2]) / 2 / stride)
+    cell_y = int((gt_box[1] + gt_box[3]) / 2 / stride)
+    enc = encode(gt_box, cell_x, cell_y, stride, anchor)
+    dec = decode(np.array([*enc[:2], enc[2], enc[3]]), cell_x, cell_y, stride, anchor)
+    err = np.max(np.abs(np.array(gt_box) - dec))
+    print(f&quot;  enc  ={enc.round(3)}&quot;)
+    print(f&quot;  decoded={dec.round(2)}  (original {gt_box})&quot;)
+    print(f&quot;  max|diff|={err:.3f}  (should round-trip to ~0 once encode applies logit)&quot;)
+
+    print(&quot;\n[assign + loss] one synthetic image&quot;)
+    gt_boxes = [(100, 80, 200, 220)]
+    gt_classes = [2]
+    target, has_obj = assign_targets(gt_boxes, gt_classes, anchors, stride, grid_size, num_classes)
+
+    torch.manual_seed(0)
+    head = YOLOHead(in_c=128, num_anchors=3, num_classes=num_classes)
+    feat = torch.randn(1, 128, grid_size, grid_size)
+    pred = head(feat)
+    print(f&quot;  pred shape: {tuple(pred.shape)}   target shape: {target.shape}&quot;)
+    loss, parts = yolo_loss(pred, target, has_obj)
+    print(f&quot;  loss={float(loss):.3f}  parts={parts}&quot;)
+
+    print(&quot;\n[postprocess] decode + NMS&quot;)
+    boxes, scores, classes = postprocess(pred, anchors, stride, conf_threshold=0.1)
+    print(f&quot;  predictions after NMS: {len(boxes)}  scores range &quot;
+          f&quot;[{scores.min():.3f}, {scores.max():.3f}]&quot; if len(boxes) else &quot;  no predictions&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/04-computer-vision/06-object-detection-yolo/outputs/prompt-detection-metric-reader.md">phases/04-computer-vision/06-object-detection-yolo/outputs/prompt-detection-metric-reader.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: prompt-detection-metric-reader
+description: Turn a precision/recall/AP/mAP row into a one-line diagnosis and the single most useful next experiment
+phase: 4
+lesson: 6
+---
+
+You are a detection-metrics analyst. Given the row below, return exactly two lines: one diagnosis, one next experiment. Never generic advice.
+
+## Inputs
+
+- `precision`
+- `recall`
+- `AP@0.5` (dataset-level AP at the 0.5 IoU threshold)
+- `mAP@0.5:0.95` (mean AP averaged over IoU thresholds 0.5 to 0.95 in 0.05 steps)
+- Optional: per-class AP dictionary, per-class recall at IoU=0.5, confusion matrix of class confusions at IoU=0.5.
+
+## Decision table
+
+Apply the first matching rule.
+
+1. `AP@0.5 - mAP@0.5:0.95 &gt; 0.35` -&gt; **localisation is loose.**
+   Next: swap MSE/L1 box loss for CIoU or DIoU; consider higher-resolution input or an extra FPN level.
+
+2. `precision &lt; 0.5 and recall &gt; 0.7` -&gt; **over-predicting.**
+   Next: raise `conf_threshold`, add hard-negative mining, balance `lambda_noobj` upward.
+
+3. `precision &gt; 0.7 and recall &lt; 0.4` -&gt; **under-predicting.**
+   Next: lower `conf_threshold`, widen anchor box priors, verify positive-sample assignment (ground-truth centre falls in the right grid cell).
+
+4. `AP@0.5 &gt; 0.6 and mAP@0.5:0.95 &lt; 0.2` -&gt; **boxes are roughly correct but far from tight.**
+   Next: train longer, add multi-scale training, sanity-check anchor widths/heights against the dataset.
+
+5. `recall@IoU=0.5 &lt; 0.5 for only one or two classes, others healthy` -&gt; **per-class imbalance.**
+   Next: oversample the weak class, add class-balanced sampling, verify labels on a sample of that class.
+
+6. `per-class confusion matrix has symmetric off-diagonal pairs between two classes` -&gt; **class ambiguity.**
+   Next: inspect hard examples; consider merging the classes or adding a disambiguating feature (colour, aspect ratio).
+
+7. everything healthy, gap to ceiling is marginal -&gt; **optimisation plateau.**
+   Next: longer schedule, test-time augmentation, or ensemble of two random seeds.
+
+## Output format
+
+Exactly two lines:
+
+```
+diagnosis: &lt;one sentence, references the metric row&gt;
+next:      &lt;one concrete action, not a list&gt;
+```
+
+## Rules
+
+- Quote the exact metric values that triggered the rule.
+- Never recommend more data as the first lever; metrics alone rarely prove the data is the bottleneck.
+- If more than one rule applies, pick the one earliest in the decision table.
+- Do not wrap responses in markdown headings; two lines, plain text.
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/04-computer-vision/06-object-detection-yolo/outputs/skill-anchor-designer.md">phases/04-computer-vision/06-object-detection-yolo/outputs/skill-anchor-designer.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: skill-anchor-designer
+description: Given a dataset of ground-truth boxes, run k-means on (w, h) and return anchor sets per FPN level plus coverage statistics
+version: 1.0.0
+phase: 4
+lesson: 6
+tags: [computer-vision, detection, anchors, kmeans]
+---
+
+# Anchor Designer
+
+Anchors are the single most dataset-specific hyperparameter in an anchor-based detector. Default COCO anchors underperform on cell-culture images, satellite tiles, or small-object surveillance. This skill derives anchors that actually match the target data.
+
+## When to use
+
+- Before a first training run on a new dataset.
+- When recall on very small or very large objects is weak on an otherwise healthy model.
+- After a major dataset expansion where box size distribution may have shifted.
+
+## Inputs
+
+- `boxes`: numpy array of shape (N, 4) in either `(cx, cy, w, h)` or `(x1, y1, x2, y2)` format; at least 1000 positive boxes recommended.
+- `num_anchors_per_level`: usually 3.
+- `num_fpn_levels`: usually 3 (P3, P4, P5) or 4.
+- `input_size`: training-resolution HxW.
+- Optional `strides`: per-level strides; when omitted, take the first `num_fpn_levels` entries of `[8, 16, 32, 64]`. Pass a longer or shorter array explicitly if the detector&#39;s FPN has different strides.
+
+## Steps
+
+1. **Normalise boxes** to `(w, h)` pairs in pixel units at `input_size`. Drop any with w or h &lt; 2 pixels.
+
+2. **Run k-means** on `(w, h)` pairs, with `k = num_anchors_per_level * num_fpn_levels`. Use `1 - IoU(box, cluster)` as the distance function, not Euclidean distance — Euclidean on `(w, h)` collapses thin tall boxes and square boxes together. All boxes contribute equally (unweighted); if you have a class-imbalanced dataset and want larger-box recall, repeat rare-class boxes in the input array rather than passing a weight vector.
+
+3. **Sort clusters by area** ascending. Split into `num_fpn_levels` groups of `num_anchors_per_level`. Smallest areas go to the highest-resolution level (smallest stride).
+
+4. **Compute coverage statistics** per level:
+   - `median IoU` of each ground-truth box to its best anchor at that level.
+   - `recall@IoU=0.5` — percentage of boxes whose best anchor has IoU &gt;= 0.5.
+   - `area coverage` — fraction of boxes whose area falls within `[anchor_min_area / 4, anchor_max_area * 4]` of the level.
+
+5. **Report per-level anchors** and flag levels where `recall@IoU=0.5 &lt; 0.9`; that level&#39;s anchors do not match the data well and should be retuned or the number of anchors per level increased.
+
+## Report format
+
+```
+[anchor-designer]
+  total boxes:         &lt;N&gt;
+  clusters:            &lt;k&gt;
+  distance metric:     1 - IoU
+
+[level P3  stride=8]
+  anchors (w, h):      [(A, B), (C, D), (E, F)]
+  median IoU:          &lt;X&gt;
+  recall@IoU=0.5:      &lt;X&gt;
+  coverage:            &lt;X&gt;
+  flag:                ok | retune
+
+[level P4  stride=16]
+  ...
+
+[summary]
+  overall recall@IoU=0.5: &lt;X&gt;
+  smallest anchor:        &lt;w x h&gt;
+  largest anchor:         &lt;w x h&gt;
+  recommendation:         &lt;one sentence if any level flagged&gt;
+```
+
+## Rules
+
+- Always use IoU-based distance; Euclidean k-means produces visually reasonable but empirically worse anchors.
+- Sort clusters by area, then assign to levels in ascending order.
+- When `num_anchors_per_level = 1`, skip k-means entirely: split boxes into `num_fpn_levels` bins by area quantile (e.g. terciles for 3 levels), and set each level&#39;s anchor to the per-bin median (w, h). This is more robust than running k-means with `k = num_fpn_levels` on small datasets.
+- Never output negative anchor dimensions; clamp at 1.
+- If the dataset has &lt; 200 boxes, warn the user that anchor search is unreliable and recommend using default COCO anchors plus more training data.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. A YOLO detector with grid 13x13, 3 anchors per cell, and 20 classes produces a head output of shape (N, 13, 13, 3, 25). Why is the last dimension 25?</legend><label class="option"><input type="radio" name="q0" value="0"> It is padding to the next power of 2</label><label class="option"><input type="radio" name="q0" value="1"> 25 is the number of classes in COCO</label><label class="option"><input type="radio" name="q0" value="2"> 4 box coords + 1 bias + 20 classes</label><label class="option"><input type="radio" name="q0" value="3"> 4 box coords + 1 objectness + 20 classes = 5 + C</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. Why does YOLO predict tx, ty through a sigmoid before adding the grid cell?</legend><label class="option"><input type="radio" name="q1" value="0"> Sigmoid is required by the convolution</label><label class="option"><input type="radio" name="q1" value="1"> To prevent NaN during training</label><label class="option"><input type="radio" name="q1" value="2"> To normalise them to [0, 1] so the centre stays inside the cell and cannot escape to a neighbouring cell&#39;s territory</label><label class="option"><input type="radio" name="q1" value="3"> To make the box larger</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. Your detector predicts 15 boxes around a single object after the head. You apply NMS with iou_threshold=0.45 and get back 1 box. What did NMS do?</legend><label class="option"><input type="radio" name="q2" value="0"> It averaged all 15 predictions</label><label class="option"><input type="radio" name="q2" value="1"> It sorted the 15 boxes by score, kept the highest-scoring, and deleted every box whose IoU with it exceeded 0.45; the other 14 all overlapped the winner above the threshold so one remained</label><label class="option"><input type="radio" name="q2" value="2"> It picked a random survivor</label><label class="option"><input type="radio" name="q2" value="3"> It merged the boxes geometrically</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. Your model has mAP@0.5 = 0.75 but mAP@0.5:0.95 = 0.32. What is the most accurate interpretation?</legend><label class="option"><input type="radio" name="q3" value="0"> The dataset has too many classes</label><label class="option"><input type="radio" name="q3" value="1"> The model finds the right objects but its boxes are not tightly localised — fine at IoU 0.5, fail at IoU 0.7+</label><label class="option"><input type="radio" name="q3" value="2"> The model is broken; mAP@0.5 must equal mAP@0.5:0.95</label><label class="option"><input type="radio" name="q3" value="3"> The inference threshold is too high</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. YOLO loss weights lambda_coord=5.0 and lambda_noobj=0.5 roughly mirror the original paper. What do these ratios encode?</legend><label class="option"><input type="radio" name="q4" value="0"> The fact that most cells have no object, so the no-object cells must be downweighted or they would dominate the total loss; and the fact that box regression is a smaller-scale loss than cross-entropy, so it needs upweighting to produce comparable gradients</label><label class="option"><input type="radio" name="q4" value="1"> GPU memory trade-offs</label><label class="option"><input type="radio" name="q4" value="2"> The number of anchors per cell</label><label class="option"><input type="radio" name="q4" value="3"> Random choices the authors never justified</label><p data-feedback="4"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/04-computer-vision/05-transfer-learning/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/04-computer-vision/07-semantic-segmentation-unet/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/04-computer-vision/06-object-detection-yolo/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

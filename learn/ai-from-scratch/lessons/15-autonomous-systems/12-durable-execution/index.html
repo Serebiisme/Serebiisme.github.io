@@ -1,0 +1,495 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>长期经营的后台代理人:持续执行 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-15-autonomous-systems" data-lesson="15-autonomous-systems/12-durable-execution" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/15-autonomous-systems/">自主系统</a> / LESSON 12</p><h1 class="lesson-title">长期经营的后台代理人:持续执行</h1><p>Long-Running Background Agents: Durable Execution</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>长期经营的后台代理人:持续执行</h1>
+<blockquote>
+<p>生产长视线代理不运行<code>while True</code>每次LLM电话都会变成一个检查点,重试和重播的活动. Temporal的OpenAI Agents SDK集成完成了2026年3月.Claude Code Routines (Anthropic) 运行定期的Claude Code调用,而没有持续的本地过程.会议暂停了人输入,生存部署,并从最新的检查点重启.<code>thread_id</code>后面是旧模式工作流程配套,其中有一个新的输入:LLM称其为非确定性活动,必须在恢复时进行确定性重演.</p>
+</blockquote>
+<p><strong>Type:</strong> Learn
+<strong>Languages:</strong> Python (stdlib, minimal durable-execution state machine)
+<strong>Prerequisites:</strong> Phase 15 · 10 (Permission modes), Phase 15 · 01 (Long-horizon agents)
+<strong>Time:</strong> ~60 minutes</p>
+<h2>问题</h2>
+<p>想象一下,一个经纪人运行四个小时,他打电话给三个工具,两个次向用户发出提示,四十次进行LLM电话.</p>
+<ul>
+<li>在一个天真的人中<code>while True</code>循环:一切都丢失了.运行从零开始.三个工具调用 (具有真正的副作用) 再次执行.用户再次被要求进行已经批准的东西.40次LLM调用被重新收费.</li>
+<li>通过持久执行:从最近的检查点恢复运行.已经完成的活动不会重新执行;其结果从持久日志中重播.用户不会重新批准已经批准的东西.已经做出的LLM电话不会重新收费.</li>
+</ul>
+<p>这就是十年前的工作流动引擎 (Temporal,Cadence,Uber的Cherami) 的模式. 新的是,LLM电话现在是一种活动,不确定性,昂贵,有副作用,</p>
+<p>课程的主题是:长视野可靠性衰退 (METR观察到&quot;35分钟的降低&quot;成功率与视野相差别下降).耐用执行使运行时间比可靠性配置文件更长,这是一个安全失败的新方法,如果设计是正确的,如果设计是错误的,则是不安全的.</p>
+<h2>概念</h2>
+<h3>活动,工作流程和重播</h3>
+<ul>
+<li><strong>Workflow</strong>定义活动序列,分支,等待.必须是确定性的,以便可以从事件日志中重播而不会出现意外的分歧.</li>
+<li><strong>Activity</strong>任何活动都会被记录在其输入和输出中. 任何活动都会被记录在其输入和输出中.</li>
+<li><strong>Event log</strong>工作过程中,每一个活动都开始,完成,失败,重新尝试,每一个工作流决定都会被记录.</li>
+<li><strong>Replay</strong>:在恢复时,工作流代码从开始重新运行;已经完成的每个活动都会返回记录结果,而不需要重新执行.</li>
+</ul>
+<p>这与React重新呈现虚拟DOM或Git从 commit 中重建一个工作树的形状相同.</p>
+<h3>为什么LLM电话符合模式</h3>
+<p>招聘法师:</p>
+<ul>
+<li>不确定性 (温度 &gt; 0;即使在模型版本中温度 0 波动).</li>
+<li>价格昂贵 (金钱和延迟).</li>
+<li>潜在失败 (利率限制,时间限制).</li>
+<li>副作用 (如果使用工具).</li>
+</ul>
+<p>包装每一次LLM电话作为一个活动,让你重新尝试,</p>
+<h3>通过键键的检查点<code>thread_id</code></h3>
+<p>长度图,微软代理框架,云飞耐用对象和克劳德代码程序都以相同的API形状相结合:<code>thread_id</code>(或相当于) 标识了会议;每个状态转换仍然存在后端 (PostgreSQL默认, dev 的 SQLite,缓存的 Redis); 恢复阅读了最新的检查点.</p>
+<p>后端选择是重要的:</p>
+<ul>
+<li><strong>PostgreSQL</strong>长期使用,可查询,可以使用.</li>
+<li><strong>SQLite</strong>: 只有本地服务器; 输出数据在主机中.</li>
+<li><strong>Redis</strong>:快速但短暂,除非配置AOF/快照.</li>
+<li><strong>Cloudflare Durable Objects</strong>透明分布;使用独特的钥匙进行范围;持续数小时至数周.</li>
+</ul>
+<h3>人类输入作为一流的状态</h3>
+<p>提出后承诺 (课 15) 需要持续的&quot;等待人&quot;状态.工作流动暂停,外部队列将待定请求保留,批准从那个点开始.没有持续性,这是最好的努力;它将在一夜之间获得批准,工作流程将在早上开始.</p>
+<h3>降解时间35分钟</h3>
+<p>测量剂类别的每种类别都显示了持续运行35分钟以上的可靠性衰退. 两倍任务时间大约是四倍的失败率. 耐用执行不会解决这个问题,它允许您运行时间超过可靠性配置文件的支持. 安全模式是将耐用性与重新进入时需要新增HITL的检查站结合起来,以及预算杀死开关 (课 13) 限制了整个计算,不管墙钟时间如何.</p>
+<h3>当持续执行是错误的答案</h3>
+<ul>
+<li>没有人投入的运行时间短于几分钟.</li>
+<li>严格仅阅读信息.</li>
+<li>要求在一个背景窗口内进行端到端的任务 (某些推理任务;一些一次性生成).</li>
+</ul>
+<figure><img src="/learn/ai-from-scratch/figures/figure-76dd76e554d30fbb5b6a.png" alt="memory-consolidation 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>用它</h2>
+<p><code>code/main.py</code>在 stdlib Python 中实现了最小耐用执行引擎. 它支持:</p>
+<ul>
+<li><code>@activity</code>装饰器记录输入和输出到一个JSON事件日志.</li>
+<li>工作流程函数,将活动进行序列.</li>
+<li><code>run_or_replay(workflow, event_log)</code>功能可以重复完成的活动,而不会再执行它们.</li>
+</ul>
+<p>驾驶员模拟了三项活动工作流程,在半途中崩,并显示 (a) 一个简单的重复尝试,</p>
+<h2>运送它</h2>
+<p><code>outputs/skill-durable-execution-review.md</code>审查拟议的长期代理部署以确定有效的持续执行形式:活动,确定性,检查点后台,人力输入状态和HITL在恢复政策.</p>
+<h2>运动</h2>
+<ol>
+<li>
+<p>跑步<code>code/main.py</code>观察无明的重复试验和重复执行数量的差异. 改变崩点,并显示重复数量相应的变化.</p>
+</li>
+<li>
+<p>转换玩具机器使用<code>thread_id</code>模拟两个同时共享引擎的会议,并确认他们的事件日志不会碰撞.</p>
+</li>
+<li>
+<p>举例来说,玩具机器中的一个活动. 引入一个非确定性 (一个工作流程决定中壁表时刻标志). 证明重播时的分歧. 解释真正的机器如何处理这一问题 (副作用记录, <code>Workflow.now()</code>其他类型</p>
+</li>
+<li>
+<p>阅读&quot;生产深度代理后的运行时间&quot;的LangChain帖子.列出运行时间持续的每个状态,并列出每个失败模式.</p>
+</li>
+<li>
+<p>设计一个检查点政策,为一个6小时的自主编码任务.你在哪里检查点?恢复在崩时看起来像什么?需要新的HITL是什么?</p>
+</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Workflow</td>
+<td>&quot;Agent's script&quot;</td>
+<td>Deterministic orchestration code; replayable from event log</td>
+</tr>
+<tr>
+<td>Activity</td>
+<td>&quot;A step&quot;</td>
+<td>Non-deterministic unit (LLM call, tool call); logged before and after</td>
+</tr>
+<tr>
+<td>Event log</td>
+<td>&quot;The backing store&quot;</td>
+<td>Durable record of every state transition</td>
+</tr>
+<tr>
+<td>Replay</td>
+<td>&quot;Resume&quot;</td>
+<td>Re-run workflow; completed activities return logged results without re-execution</td>
+</tr>
+<tr>
+<td>Checkpoint</td>
+<td>&quot;Save point&quot;</td>
+<td>Persisted state keyed by thread_id; latest-wins on resume</td>
+</tr>
+<tr>
+<td>thread_id</td>
+<td>&quot;Session key&quot;</td>
+<td>Identifier that scopes durable state</td>
+</tr>
+<tr>
+<td>35-minute degradation</td>
+<td>&quot;Reliability decay&quot;</td>
+<td>METR: success rate drops ~quadratically with horizon</td>
+</tr>
+<tr>
+<td>Non-determinism</td>
+<td>&quot;Drift on replay&quot;</td>
+<td>Wall clock, random, LLM output; must be registered as side effect</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://code.claude.com/docs/en/agent-sdk/agent-loop" rel="noreferrer" data-network="true">Anthropic — Claude Code Agent SDK: agent loop <small>↗ 需要联网</small></a>预算,转型和恢复语义.</li>
+<li><a href="https://learn.microsoft.com/en-us/agent-framework/workflows/human-in-the-loop" rel="noreferrer" data-network="true">Microsoft — Agent Framework: human-in-the-loop and checkpointing <small>↗ 需要联网</small></a> 请求信息事件形状.</li>
+<li><a href="https://www.langchain.com/conceptual-guides/runtime-behind-production-deep-agents" rel="noreferrer" data-network="true">LangChain — The Runtime Behind Production Deep Agents <small>↗ 需要联网</small></a>具体的运行时间要求.</li>
+<li><a href="https://trigger.dev" rel="noreferrer" data-network="true">OpenAI Agents SDK + Temporal integration (Trigger.dev announcement) <small>↗ 需要联网</small></a> 法学士招生活动形式.</li>
+<li><a href="https://www.anthropic.com/research/measuring-agent-autonomy" rel="noreferrer" data-network="true">Anthropic — Measuring agent autonomy in practice <small>↗ 需要联网</small></a>35分钟的降解参考.</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Long-Running Background Agents: Durable Execution</h1>
+<blockquote>
+<p>Production long-horizon agents do not run in <code>while True</code>. Every LLM call becomes an activity with checkpoint, retry, and replay. Temporal's OpenAI Agents SDK integration went GA March 2026. Claude Code Routines (Anthropic) runs scheduled Claude Code invocations without a persistent local process. Sessions pause on human-input, survive deploys, and resume from the latest checkpoint keyed by <code>thread_id</code>. Behind the new ergonomics sits an old pattern — workflow orchestration — with one new input: LLM calls as non-deterministic activities that must be deterministically replayed on recovery.</p>
+</blockquote>
+<p><strong>Type:</strong> Learn
+<strong>Languages:</strong> Python (stdlib, minimal durable-execution state machine)
+<strong>Prerequisites:</strong> Phase 15 · 10 (Permission modes), Phase 15 · 01 (Long-horizon agents)
+<strong>Time:</strong> ~60 minutes</p>
+<h2>The Problem</h2>
+<p>Consider an agent that runs for four hours. It calls three tools, prompts the user twice, and makes forty LLM calls. Halfway through, the host it is running on reboots. What happens?</p>
+<ul>
+<li>In a naive <code>while True</code> loop: everything is lost. The run restarts from scratch. The three tool calls (with real side effects) execute again. The user is prompted again for things they already approved. Forty LLM calls are re-billed.</li>
+<li>With durable execution: the run resumes from the most recent checkpoint. Already-completed activities are not re-executed; their results are replayed from the durable log. The user does not re-approve things they already approved. The LLM calls already made are not re-billed.</li>
+</ul>
+<p>This is the same pattern workflow engines have shipped for a decade (Temporal, Cadence, Uber's Cherami). What's new is that LLM calls are now a kind of activity — non-deterministic, expensive, with side effects — and they fit this pattern cleanly.</p>
+<p>The running theme of the lesson: long-horizon reliability decays (METR observes a &quot;35-minute degradation&quot; — success rate drops roughly quadratically with horizon). Durable execution enables runs that are longer than the reliability profile supports, which is a new way to fail safely if the design is right and unsafely if the design is wrong.</p>
+<h2>The Concept</h2>
+<h3>Activities, workflows, and replay</h3>
+<ul>
+<li><strong>Workflow</strong>: deterministic orchestration code. Defines the sequence of activities, the branches, the waits. Must be deterministic so it can be replayed from the event log without surprising divergence.</li>
+<li><strong>Activity</strong>: a non-deterministic, potentially failing unit of work. LLM call, tool call, file write, HTTP request. Each activity is logged with its inputs and (once complete) its outputs.</li>
+<li><strong>Event log</strong>: the durable backing store. Every activity start, complete, fail, retry, and every workflow decision is recorded.</li>
+<li><strong>Replay</strong>: on recovery, the workflow code re-runs from the start; every activity that already completed returns its logged result without re-executing. Only activities that had not completed are actually run.</li>
+</ul>
+<p>This is the same shape as React re-rendering against a virtual DOM, or Git rebuilding a working tree from commits. Determinism in the orchestrator is what makes durability cheap.</p>
+<h3>Why LLM calls fit the pattern</h3>
+<p>LLM calls are:</p>
+<ul>
+<li>Non-deterministic (temperature &gt; 0; even temperature 0 drifts across model versions).</li>
+<li>Expensive (money and latency).</li>
+<li>Potentially failing (rate limits, timeouts).</li>
+<li>Side-effectful (if they invoke tools).</li>
+</ul>
+<p>This is exactly the activity profile. Wrapping every LLM call as an activity gives you retry with exponential backoff, checkpointing across restarts, and a replayable trace for debugging.</p>
+<h3>Checkpoints keyed by <code>thread_id</code></h3>
+<p>LangGraph, Microsoft Agent Framework, Cloudflare Durable Objects, and Claude Code Routines all converged on the same API shape: a <code>thread_id</code> (or equivalent) identifies the session; each state transition persists to a backend (PostgreSQL default, SQLite for dev, Redis for cache); resume reads the latest checkpoint.</p>
+<p>The backend choice matters:</p>
+<ul>
+<li><strong>PostgreSQL</strong>: durable, queryable, survives deploys. Default for LangGraph.</li>
+<li><strong>SQLite</strong>: local-dev only; loses data across hosts.</li>
+<li><strong>Redis</strong>: fast but ephemeral unless AOF/snapshot configured.</li>
+<li><strong>Cloudflare Durable Objects</strong>: transparently distributed; scoped by a unique key; survives for hours to weeks.</li>
+</ul>
+<h3>Human-input as a first-class state</h3>
+<p>Propose-then-commit (Lesson 15) requires a durable &quot;waiting on human&quot; state. The workflow pauses, the external queue holds the pending request, and an approval resumes from exactly that point. Without durability this is best-effort; with it, an overnight approval arrives and the workflow picks up in the morning.</p>
+<h3>The 35-minute degradation</h3>
+<p>METR observed that every agent class measured shows reliability decay beyond ~35 minutes of continuous operation. Doubling the task duration roughly quadruples the failure rate. Durable execution does not fix this; it lets you run longer than the reliability profile supports. The safe pattern is to combine durability with checkpoints that require fresh HITL on re-entry, and with budget kill switches (Lesson 13) that cap total compute regardless of wall-clock time.</p>
+<h3>When durable execution is the wrong answer</h3>
+<ul>
+<li>Runs shorter than a few minutes with no human input. Overhead &gt; benefit.</li>
+<li>Strictly read-only information retrieval.</li>
+<li>Tasks where correctness requires end-to-end within one context window (some reasoning tasks; some one-shot generation).</li>
+</ul>
+<figure><img src="/learn/ai-from-scratch/figures/figure-76dd76e554d30fbb5b6a.png" alt="memory-consolidation 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Use It</h2>
+<p><code>code/main.py</code> implements a minimal durable-execution engine in stdlib Python. It supports:</p>
+<ul>
+<li><code>@activity</code> decorator that logs inputs and outputs to a JSON event log.</li>
+<li>A workflow function that sequences activities.</li>
+<li>A <code>run_or_replay(workflow, event_log)</code> function that replays completed activities without re-executing them.</li>
+</ul>
+<p>The driver simulates a three-activity workflow, crashes halfway through, and shows (a) a naive retry re-executing everything versus (b) a replay running only the missing activity.</p>
+<h2>Ship It</h2>
+<p><code>outputs/skill-durable-execution-review.md</code> reviews a proposed long-running agent deployment for correct durable-execution shape: activities, determinism, checkpoint backend, human-input state, and HITL-on-resume policy.</p>
+<h2>Exercises</h2>
+<ol>
+<li>
+<p>Run <code>code/main.py</code>. Observe the difference in activity-execution count between naive retry and replay. Change the crash point and show the replay count changes accordingly.</p>
+</li>
+<li>
+<p>Convert the toy engine to use <code>thread_id</code> explicitly. Simulate two concurrent sessions sharing the engine and confirm their event logs do not collide.</p>
+</li>
+<li>
+<p>Take one activity in the toy engine. Introduce a non-determinism (a wall-clock timestamp inside a workflow decision). Demonstrate the divergence on replay. Explain how real engines handle this (side-effect registration, <code>Workflow.now()</code> APIs).</p>
+</li>
+<li>
+<p>Read the LangChain &quot;Runtime behind production deep agents&quot; post. List every state that the runtime persists and name which failure mode each covers.</p>
+</li>
+<li>
+<p>Design a checkpoint policy for a 6-hour autonomous coding task. Where do you checkpoint? What does resume-on-crash look like? What requires fresh HITL?</p>
+</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Workflow</td>
+<td>&quot;Agent's script&quot;</td>
+<td>Deterministic orchestration code; replayable from event log</td>
+</tr>
+<tr>
+<td>Activity</td>
+<td>&quot;A step&quot;</td>
+<td>Non-deterministic unit (LLM call, tool call); logged before and after</td>
+</tr>
+<tr>
+<td>Event log</td>
+<td>&quot;The backing store&quot;</td>
+<td>Durable record of every state transition</td>
+</tr>
+<tr>
+<td>Replay</td>
+<td>&quot;Resume&quot;</td>
+<td>Re-run workflow; completed activities return logged results without re-execution</td>
+</tr>
+<tr>
+<td>Checkpoint</td>
+<td>&quot;Save point&quot;</td>
+<td>Persisted state keyed by thread_id; latest-wins on resume</td>
+</tr>
+<tr>
+<td>thread_id</td>
+<td>&quot;Session key&quot;</td>
+<td>Identifier that scopes durable state</td>
+</tr>
+<tr>
+<td>35-minute degradation</td>
+<td>&quot;Reliability decay&quot;</td>
+<td>METR: success rate drops ~quadratically with horizon</td>
+</tr>
+<tr>
+<td>Non-determinism</td>
+<td>&quot;Drift on replay&quot;</td>
+<td>Wall clock, random, LLM output; must be registered as side effect</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://code.claude.com/docs/en/agent-sdk/agent-loop" rel="noreferrer" data-network="true">Anthropic — Claude Code Agent SDK: agent loop <small>↗ 需要联网</small></a> — budget, turns, and resume semantics.</li>
+<li><a href="https://learn.microsoft.com/en-us/agent-framework/workflows/human-in-the-loop" rel="noreferrer" data-network="true">Microsoft — Agent Framework: human-in-the-loop and checkpointing <small>↗ 需要联网</small></a> — RequestInfoEvent shape.</li>
+<li><a href="https://www.langchain.com/conceptual-guides/runtime-behind-production-deep-agents" rel="noreferrer" data-network="true">LangChain — The Runtime Behind Production Deep Agents <small>↗ 需要联网</small></a> — concrete runtime requirements.</li>
+<li><a href="https://trigger.dev" rel="noreferrer" data-network="true">OpenAI Agents SDK + Temporal integration (Trigger.dev announcement) <small>↗ 需要联网</small></a> — activity shape for LLM calls.</li>
+<li><a href="https://www.anthropic.com/research/measuring-agent-autonomy" rel="noreferrer" data-network="true">Anthropic — Measuring agent autonomy in practice <small>↗ 需要联网</small></a> — the 35-minute degradation reference.</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-15-autonomous-systems--12-durable-execution.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-15-autonomous-systems--12-durable-execution.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/15-autonomous-systems/12-durable-execution/code/main.py">phases/15-autonomous-systems/12-durable-execution/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Minimal durable-execution engine — stdlib Python.
+
+Models the workflow / activity / event-log pattern used by Temporal, LangGraph
+checkpointing, Microsoft Agent Framework, and Claude Code Routines.
+
+Activities are logged with inputs before execution and outputs after. A
+replay of a workflow re-runs the workflow code but returns cached outputs
+for activities whose event is already in the log. A crash mid-run loses
+only the incomplete activity.
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import functools
+import json
+import os
+import tempfile
+from dataclasses import dataclass
+
+
+# ---------- Event log ----------
+
+@dataclass
+class EventLog:
+    path: str
+
+    def __post_init__(self) -&gt; None:
+        if not os.path.exists(self.path):
+            with open(self.path, &quot;w&quot;) as f:
+                json.dump([], f)
+
+    def events(self) -&gt; list[dict]:
+        with open(self.path) as f:
+            return json.load(f)
+
+    def append(self, ev: dict) -&gt; None:
+        evs = self.events()
+        evs.append(ev)
+        with open(self.path, &quot;w&quot;) as f:
+            json.dump(evs, f)
+
+    def lookup(self, name: str, args: tuple) -&gt; dict | None:
+        for ev in self.events():
+            if ev[&quot;name&quot;] == name and ev[&quot;args&quot;] == list(args) and ev[&quot;status&quot;] == &quot;done&quot;:
+                return ev
+        return None
+
+
+# ---------- Activity decorator ----------
+
+def activity(name: str):
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(log: EventLog, *args):
+            hit = log.lookup(name, args)
+            if hit:
+                print(f&quot;    [replay] {name}({args}) -&gt; {hit[&#39;result&#39;]} (from log)&quot;)
+                return hit[&quot;result&quot;]
+            log.append({&quot;name&quot;: name, &quot;args&quot;: list(args), &quot;status&quot;: &quot;started&quot;})
+            result = fn(*args)
+            log.append({&quot;name&quot;: name, &quot;args&quot;: list(args),
+                        &quot;status&quot;: &quot;done&quot;, &quot;result&quot;: result})
+            print(f&quot;    [run]    {name}({args}) -&gt; {result}&quot;)
+            return result
+        return wrapper
+    return deco
+
+
+# ---------- Example activities ----------
+
+@activity(&quot;fetch_docs&quot;)
+def fetch_docs(query: str) -&gt; int:
+    # Pretend to hit an API; return number of docs.
+    return len(query) * 3
+
+
+@activity(&quot;call_llm&quot;)
+def call_llm(doc_count: int) -&gt; str:
+    # Pretend LLM call; deterministic here for pedagogy.
+    return f&quot;summary({doc_count}_docs)&quot;
+
+
+@activity(&quot;write_report&quot;)
+def write_report(summary: str) -&gt; str:
+    # Pretend tool call with a side effect.
+    return f&quot;report://{summary}&quot;
+
+
+# ---------- Workflow ----------
+
+def workflow(log: EventLog, query: str, crash_after: int = -1) -&gt; str:
+    &quot;&quot;&quot;Three-activity workflow with an optional crash for pedagogy.&quot;&quot;&quot;
+    doc_count = fetch_docs(log, query)
+    if crash_after == 1:
+        raise RuntimeError(&quot;simulated crash after fetch_docs&quot;)
+    summary = call_llm(log, doc_count)
+    if crash_after == 2:
+        raise RuntimeError(&quot;simulated crash after call_llm&quot;)
+    report = write_report(log, summary)
+    return report
+
+
+# ---------- Driver ----------
+
+def reset_log(path: str) -&gt; EventLog:
+    if os.path.exists(path):
+        os.remove(path)
+    return EventLog(path)
+
+
+def count_runs(log: EventLog) -&gt; int:
+    return sum(1 for ev in log.events() if ev[&quot;status&quot;] == &quot;started&quot;)
+
+
+def main() -&gt; None:
+    print(&quot;=&quot; * 70)
+    print(&quot;DURABLE EXECUTION (Phase 15, Lesson 12)&quot;)
+    print(&quot;=&quot; * 70)
+
+    tmpdir = tempfile.mkdtemp()
+
+    # Naive retry: lose the event log on crash. Every restart re-runs
+    # everything.
+    print(&quot;\nNaive retry (no event log persisted)&quot;)
+    print(&quot;-&quot; * 70)
+    for attempt in range(1, 4):
+        log = reset_log(os.path.join(tmpdir, &quot;naive.json&quot;))
+        print(f&quot;  attempt {attempt}:&quot;)
+        try:
+            crash = 2 if attempt == 1 else -1
+            r = workflow(log, &quot;hello&quot;, crash_after=crash)
+            print(f&quot;    -&gt; result {r}&quot;)
+            print(f&quot;    -&gt; {count_runs(log)} activity starts this attempt&quot;)
+            break
+        except RuntimeError as e:
+            print(f&quot;    -&gt; crash: {e}; {count_runs(log)} activity starts wasted&quot;)
+
+    # Durable retry: keep the event log across attempts; replay does not
+    # re-execute completed activities.
+    print(&quot;\nDurable retry (event log preserved across attempts)&quot;)
+    print(&quot;-&quot; * 70)
+    durable_path = os.path.join(tmpdir, &quot;durable.json&quot;)
+    if os.path.exists(durable_path):
+        os.remove(durable_path)
+
+    for attempt in range(1, 4):
+        log = EventLog(durable_path)
+        print(f&quot;  attempt {attempt}:&quot;)
+        try:
+            crash = 2 if attempt == 1 else -1
+            r = workflow(log, &quot;hello&quot;, crash_after=crash)
+            print(f&quot;    -&gt; result {r}&quot;)
+            print(f&quot;    -&gt; {count_runs(log)} total activity starts across attempts&quot;)
+            break
+        except RuntimeError as e:
+            print(f&quot;    -&gt; crash: {e}&quot;)
+
+    print()
+    print(&quot;=&quot; * 70)
+    print(&quot;HEADLINE: durability makes long-horizon runs affordable to fail&quot;)
+    print(&quot;-&quot; * 70)
+    print(&quot;  Naive retry re-executes every activity on every attempt.&quot;)
+    print(&quot;  Durable retry replays completed activities from the log;&quot;)
+    print(&quot;  only the missing activity actually runs. Same design used&quot;)
+    print(&quot;  by Temporal, LangGraph checkpointing, Microsoft Agent&quot;)
+    print(&quot;  Framework, and Claude Code Routines. The LLM call is&quot;)
+    print(&quot;  just another non-deterministic activity in the log.&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/15-autonomous-systems/12-durable-execution/outputs/skill-durable-execution-review.md">phases/15-autonomous-systems/12-durable-execution/outputs/skill-durable-execution-review.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: durable-execution-review
+description: Review a proposed long-running agent deployment for correct durable-execution shape (activities, determinism, checkpoint backend, human-input state, HITL-on-resume).
+version: 1.0.0
+phase: 15
+lesson: 12
+tags: [durable-execution, workflows, checkpointing, temporal, langgraph, agents-sdk]
+---
+
+Given a proposed long-running agent deployment (Temporal + OpenAI Agents SDK, LangGraph with PostgreSQL checkpointer, Microsoft Agent Framework, Claude Code Routines, Cloudflare Durable Objects, or an in-house equivalent), audit the design against the durable-execution pattern.
+
+Produce:
+
+1. **Activity inventory.** List every activity (LLM call, tool call, HTTP request, file write). For each, confirm it is wrapped as an activity with retry policy, timeout, and idempotency key. Raw LLM calls outside the activity envelope are a reliability hole.
+2. **Workflow determinism.** Identify every non-deterministic read inside the workflow code (wall clock, random, external state). Each must be registered as a side-effect activity so replay returns the same value. Hidden non-determinism is the most common cause of replay drift.
+3. **Checkpoint backend.** Name the backend (PostgreSQL, SQLite, Redis, Durable Objects). Confirm it survives deploys. SQLite is dev-only. Redis requires AOF or snapshot config. Cloudflare Durable Objects are transparent but require a unique key discipline.
+4. **Human-input state.** Confirm pauses for HITL are a first-class workflow state, not a polling loop. The workflow should block on an external signal (approval queue, webhook, `interrupt()` primitive) that resumes exactly when the approval arrives.
+5. **HITL-on-resume policy.** For any resume after a crash, state whether fresh HITL is required before executing the next activity. Without this, durable execution plus an approval granted before the crash may re-fire an approved action when the context has changed. Critical for long horizons.
+
+Hard rejects:
+- Agent SDK usage where LLM calls are not wrapped as activities.
+- Checkpoint backends that do not survive a deploy.
+- Workflows that embed wall clock or random without activity wrapping.
+- Human-input modeled as a polling loop rather than a signal.
+- Long-horizon runs (above one hour) with no HITL-on-resume policy.
+- Runs with no budget kill switch (Lesson 13) layered on top of durability.
+
+Refusal rules:
+- If the user proposes a durable workflow with no explicit idempotency on side-effect activities, refuse and require idempotency keys first. Retries will double-execute otherwise.
+- If the user cannot show a replay test (run workflow, crash mid-run, replay, assert no double side effects), refuse and require that test before production.
+- If the user proposes a 24-hour unattended run with no HITL checkpoint, refuse. The 35-minute degradation (Lesson 12 notes) makes this a reliability problem even if durability is correct.
+
+Output format:
+
+Return a design-review memo with:
+- **Activity table** (activity, retry policy, timeout, idempotency key)
+- **Determinism audit** (non-deterministic reads and how each is handled)
+- **Checkpoint backend** (name, survives-deploy y/n, replay-test status)
+- **HITL state shape** (first-class state / polling / missing)
+- **HITL-on-resume policy** (explicit, with rationale)
+- **Readiness** (production / staging / research-only)
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原课程未提供测验。</p></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/15-autonomous-systems/11-browser-agents/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/15-autonomous-systems/13-cost-governors/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/15-autonomous-systems/12-durable-execution/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

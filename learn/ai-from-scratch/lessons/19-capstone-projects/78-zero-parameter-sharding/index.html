@@ -1,0 +1,665 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>罗优化器状态碎片 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-19-capstone-projects" data-lesson="19-capstone-projects/78-zero-parameter-sharding" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/19-capstone-projects/">综合项目</a> / LESSON 78</p><h1 class="lesson-title">罗优化器状态碎片</h1><p>ZeRO Optimizer State Sharding</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>罗优化器状态碎片</h1>
+<blockquote>
+<p>亚当每参数存储两个时刻估计, 具有56GB的优化状态. 泽罗第1阶段将N级别的数量分成零件;每个级别拥有优化器的1/N. 在当地的步骤之后,更新的参数片段回放,每个级别重建完整的模型,下一步开始. 胜利是训练堆中最大的单个分配的线性记忆下降.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 19 Track C lessons 42-49
+<strong>Time:</strong> ~90 min</p>
+<h2>学习目标</h2>
+<ul>
+<li>切片优化状态 (第一时刻,第二时刻,fp32主副本) 在N排列中,因此每个排列拥有1/N.</li>
+<li>使用 reduce_scatter 传递每个级别的分数,然后将所有分数汇集到更新的参数分数中.</li>
+<li>计算第1阶段,第2阶段,第3阶段的存储存储表,与尼拉DP进行计算.</li>
+<li>根据模型大小和带宽预算,捍卫1级与2级与3级的选择.</li>
+</ul>
+<h2>问题</h2>
+<p>尼拉DDP复制了一切:参数,梯度和优化状态在每个级别上都存在.对于fp16中的7B参数模型,这意味着每级别14GB参数,14GB梯度和28GB优化状态.优化状态是最大的术语,而且最容易碎碎片化,因为它只在步骤中触摸,而不是前进或后退.</p>
+<p>RO第一阶段将优化状态缩小. 每个级别都包含亚当时刻的1/N. 后退, ZeRO 没有把全梯度降低,而是把它地步降低,所以每个阶层只能得到其碎片的总梯度. 排名将优化步骤应用到其主要参数的碎片. 更新的参数分片然后全部聚在一起,所以每个级别都有下一个前进的完整模型. 优化器内存下降了N. 每步线路流量与DDP相同:一个减少_散射加一个全部等于一个所有减少带宽. 记忆力胜利,输出力保持.</p>
+<h2>概念</h2>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-c098e2904804a91c528a.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>泽罗的阶段</h3>
+<table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>What is sharded</th>
+<th>Memory per rank</th>
+<th>Comm per step</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>DDP</td>
+<td>nothing</td>
+<td>params + grads + optim</td>
+<td>1x allreduce</td>
+</tr>
+<tr>
+<td>ZeRO-1</td>
+<td>optimiser state</td>
+<td>params + grads + optim/N</td>
+<td>1x reduce_scatter + 1x allgather</td>
+</tr>
+<tr>
+<td>ZeRO-2</td>
+<td>optim + grads</td>
+<td>params + grads/N + optim/N</td>
+<td>1x reduce_scatter + 1x allgather</td>
+</tr>
+<tr>
+<td>ZeRO-3</td>
+<td>optim + grads + params</td>
+<td>params/N + grads/N + optim/N</td>
+<td>1x allgather per layer + 1x reduce_scatter per layer</td>
+</tr>
+</tbody>
+</table>
+<p>阶段1是最便宜的胜利,因为优化状态占据预算.阶段2需要梯度分片积累逻辑,但带宽是相同的.阶段3 (FSDP) 为每一个前后层支付通信,获得参数分片内存下降.课程全面实现阶段1.</p>
+<h3>记忆的数学,实数</h3>
+<p>对于采用 Adam 混合精度训练的P参数模型:</p>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>Vanilla</th>
+<th>ZeRO-1</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>fp16 params</td>
+<td>2P bytes</td>
+<td>2P bytes</td>
+<td>needed for forward</td>
+</tr>
+<tr>
+<td>fp16 grads</td>
+<td>2P bytes</td>
+<td>2P bytes</td>
+<td>needed for backward</td>
+</tr>
+<tr>
+<td>fp32 master copy</td>
+<td>4P bytes</td>
+<td>4P/N bytes</td>
+<td>only the optim uses it</td>
+</tr>
+<tr>
+<td>fp32 first moment</td>
+<td>4P bytes</td>
+<td>4P/N bytes</td>
+<td>only the optim uses it</td>
+</tr>
+<tr>
+<td>fp32 second moment</td>
+<td>4P bytes</td>
+<td>4P/N bytes</td>
+<td>only the optim uses it</td>
+</tr>
+<tr>
+<td>Total</td>
+<td>16P bytes</td>
+<td>4P + 12P/N bytes</td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<p>在N=8时,尼 16P,ZRO-15.5P,下降65%.在N=64时,尼 16P,ZRO-14.19P,下降74%.</p>
+<h3>为什么减_散射击所有减-然后-分</h3>
+<p>总减给每个级别的全部总和梯度. 如果只需要分片r,那么降低的梯度的 (N-1) /N在r级别上会浪费. 降低_散射器提供了每个级别的分片;每级别的字节与allreduce相同 (因为allreduce是 reduce_scatter + allgather),但后面的第二半个部分被参数-shardallgather所取代. 网线与DDP相同,内存是分开的.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-d18f6fa68ab19a819492.png" alt="cd-zero-shard 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<p><code>code/main.py</code>执行:</p>
+<ul>
+<li><code>flatten_params(module)</code>其他<code>unflatten_into(module, flat)</code>单层的布局使得分类分类是一个简单的片段.</li>
+<li><code>ZeroOptimizer(model, world_size, rank, lr)</code>拥有了&quot;大版&quot;和&quot;亚当时刻&quot;的阶级碎片.</li>
+<li><code>step()</code>通过将&quot;Reducer_Scatter&quot;运行在平坦梯度上,将&quot;亚当&quot;应用到排列的碎片上,并将更新的参数收集到.</li>
+<li>演示,训练一个3层的MLP20步骤,并印出每步的内存预算,</li>
+</ul>
+<p>运行它:</p>
+<pre><code class="language-bash">python3 code/main.py
+</code></pre>
+<p>输出:每步损失,显示ZeRO-1的内存表在每个排列中保持1/N的优化状态,而DDP的完整副本.</p>
+<h2>野生生产模式</h2>
+<p>三个模式使Zero足够硬.</p>
+<p>**Sharded checkpointing matters.**泽罗-1的优化状态分为各级;检查点必须记录哪个级别拥有什么.80课程构建了分碎的检查点宣言,重启了同样的世界规模的泽罗运行.没有它,保存的状态是无法读取的重启时.</p>
+<p>**Mixed precision is the point.**采RO是一种混合精度技术; fp32 主版是碎片的.运行 ZeRO 没有混合精度支付了 fp32 主机上的内存税,而没有相应的 fp16 前进胜利.生产运行总是与自动或 bf16 重量对齐 ZeRO.</p>
+<p>**Stage 1 is a near-free win.**通信带宽与DDP相同.存储存储在N中是线性的.唯一的成本是优化器分片的会计管理. 产量堆默认将进入第1阶段,除非参数分片存储也是问题;然后第二或第三阶段交易通信存储.</p>
+<h2>用它</h2>
+<p>生产模式:</p>
+<ul>
+<li>**DeepSpeed ZeRO.**参考实施<code>deepspeed_config.json</code>选择阶段1/3和分区尺寸.</li>
+<li>**PyTorch FSDP.**鱼原生同等.<code>ShardingStrategy.SHARD_GRAD_OP</code>是ZERO-2;<code>FULL_SHARD</code>现在,我们要做什么?</li>
+<li>**HuggingFace Accelerate.**罩着深度速度和FSDP在一个统一的配置.</li>
+</ul>
+<h2>运送它</h2>
+<p>第79课 (管道平行) 是直角分断轴:而不是在同一模型中分断优化状态,管道分断层跨行. 第81课组建了DDP + ZeRO在端到端演示中.</p>
+<h2>运动</h2>
+<ol>
+<li>通过碎片梯度扩展到ZERO-2:每个级别只存储其碎片梯度,通过向后零化非碎片部分来实现.</li>
+<li>添加一个存储器配置文件,将实际的fp32字节使用量在0级与公式预测中打印.</li>
+<li>测量尼拉DDP与ZERO-1的每步墙钟时间,并分解成前进,后退,通信.</li>
+<li>根据 ZeRO-1 实现梯度切割:L2标准必须通过所有碎片计算在地方标准的二方体中.</li>
+<li>通过 allreduce而不是 reduce_scatter 实现&quot;天真 ZeRO&quot;,测量电线时间差异.</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ZeRO-1</td>
+<td>&quot;Shard the optimiser&quot;</td>
+<td>Each rank holds 1/N of fp32 master + Adam moments</td>
+</tr>
+<tr>
+<td>ZeRO-2</td>
+<td>&quot;Shard grads too&quot;</td>
+<td>Each rank also drops the non-shard gradients after reduce_scatter</td>
+</tr>
+<tr>
+<td>ZeRO-3</td>
+<td>&quot;Shard params&quot;</td>
+<td>Each rank holds 1/N of fp16 params; allgather per layer in forward</td>
+</tr>
+<tr>
+<td>Master copy</td>
+<td>&quot;fp32 weights&quot;</td>
+<td>The high-precision parameter copy the optimiser updates</td>
+</tr>
+<tr>
+<td>Reduce_scatter</td>
+<td>&quot;Split the sum&quot;</td>
+<td>Deliver each rank only its shard's summed gradient</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/1910.02054" rel="noreferrer" data-network="true">Rajbhandari et al, ZeRO: Memory Optimizations Toward Training Trillion Parameter Models <small>↗ 需要联网</small></a></li>
+<li><a href="https://www.deepspeed.ai/tutorials/zero/" rel="noreferrer" data-network="true">DeepSpeed ZeRO documentation <small>↗ 需要联网</small></a></li>
+<li><a href="https://pytorch.org/docs/stable/fsdp.html" rel="noreferrer" data-network="true">PyTorch FSDP documentation <small>↗ 需要联网</small></a></li>
+<li>第十九阶段 第七十六课 - 减少_分散和聚合</li>
+<li>阶段19课80 - 切片检查点, ZeRO国家必须使用</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>ZeRO Optimizer State Sharding</h1>
+<blockquote>
+<p>Adam stores two moment estimates per parameter, both in float32. A 7B-parameter model carries 56 GB of optimiser state. ZeRO stage 1 shards that across N ranks; each rank owns 1/N of the optimiser. After the local step the updated parameter shards broadcast back, every rank reconstructs the full model, and the next step begins. The win is a linear memory drop on the largest single allocation in the training stack.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 19 Track C lessons 42-49
+<strong>Time:</strong> ~90 min</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Shard optimiser state (first moment, second moment, fp32 master copy) across N ranks so each rank owns 1/N.</li>
+<li>Use reduce_scatter to deliver each rank only its shard's gradient sum, then allgather to broadcast the updated parameter shards back.</li>
+<li>Compute the memory savings table for stage 1, stage 2, stage 3 against vanilla DDP.</li>
+<li>Defend the choice of stage 1 vs stage 2 vs stage 3 on model size and bandwidth budget.</li>
+</ul>
+<h2>The Problem</h2>
+<p>Vanilla DDP replicates everything: parameters, gradients, and optimiser state are present in full on every rank. For a 7B-parameter model in fp16 that means 14 GB of parameters, 14 GB of gradients, and 28 GB of optimiser state per rank. The optimiser state is the largest term and the easiest to shard because it is only touched during the step, not during forward or backward.</p>
+<p>ZeRO stage 1 shards the optimiser state. Each rank holds 1/N of the Adam moments. After backward, instead of allreducing the full gradient and stepping locally, ZeRO reduce_scatters so each rank receives only its shard's summed gradient. The rank applies the optimiser step to its shard of the master parameters. The updated parameter shards then allgather back so every rank has the full model for the next forward. The optimiser memory drops by N. The wire traffic per step is the same as DDP: one reduce_scatter plus one allgather equals one allreduce by bandwidth. Memory wins, throughput holds.</p>
+<h2>The Concept</h2>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-c098e2904804a91c528a.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>Stages of ZeRO</h3>
+<table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>What is sharded</th>
+<th>Memory per rank</th>
+<th>Comm per step</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>DDP</td>
+<td>nothing</td>
+<td>params + grads + optim</td>
+<td>1x allreduce</td>
+</tr>
+<tr>
+<td>ZeRO-1</td>
+<td>optimiser state</td>
+<td>params + grads + optim/N</td>
+<td>1x reduce_scatter + 1x allgather</td>
+</tr>
+<tr>
+<td>ZeRO-2</td>
+<td>optim + grads</td>
+<td>params + grads/N + optim/N</td>
+<td>1x reduce_scatter + 1x allgather</td>
+</tr>
+<tr>
+<td>ZeRO-3</td>
+<td>optim + grads + params</td>
+<td>params/N + grads/N + optim/N</td>
+<td>1x allgather per layer + 1x reduce_scatter per layer</td>
+</tr>
+</tbody>
+</table>
+<p>Stage 1 is the cheapest win because optimiser state dominates the budget. Stage 2 needs gradient-shard accumulation logic but the bandwidth is the same. Stage 3 (FSDP) pays per-layer comm for every forward and backward, gaining the parameter-shard memory drop. The lesson implements stage 1 in full.</p>
+<h3>The memory math, real numbers</h3>
+<p>For a model with P parameters trained with Adam in mixed precision:</p>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>Vanilla</th>
+<th>ZeRO-1</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>fp16 params</td>
+<td>2P bytes</td>
+<td>2P bytes</td>
+<td>needed for forward</td>
+</tr>
+<tr>
+<td>fp16 grads</td>
+<td>2P bytes</td>
+<td>2P bytes</td>
+<td>needed for backward</td>
+</tr>
+<tr>
+<td>fp32 master copy</td>
+<td>4P bytes</td>
+<td>4P/N bytes</td>
+<td>only the optim uses it</td>
+</tr>
+<tr>
+<td>fp32 first moment</td>
+<td>4P bytes</td>
+<td>4P/N bytes</td>
+<td>only the optim uses it</td>
+</tr>
+<tr>
+<td>fp32 second moment</td>
+<td>4P bytes</td>
+<td>4P/N bytes</td>
+<td>only the optim uses it</td>
+</tr>
+<tr>
+<td>Total</td>
+<td>16P bytes</td>
+<td>4P + 12P/N bytes</td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<p>At N=8: vanilla 16P, ZeRO-1 5.5P, a 65% drop. At N=64: vanilla 16P, ZeRO-1 4.19P, a 74% drop.</p>
+<h3>Why reduce_scatter beats allreduce-then-shard</h3>
+<p>Allreduce gives every rank the full summed gradient. If you only need shard r, the (N-1)/N of the gradient that was reduced is wasted on rank r. Reduce_scatter delivers exactly the shard each rank owns; the per-rank bytes are the same as allreduce (since allreduce is reduce_scatter + allgather) but the second half is replaced by the parameter-shard allgather later. Net wire is identical to DDP, memory is divided.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-d18f6fa68ab19a819492.png" alt="cd-zero-shard 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<p><code>code/main.py</code> implements:</p>
+<ul>
+<li><code>flatten_params(module)</code> and <code>unflatten_into(module, flat)</code> that pack a model's parameters into one contiguous tensor and unpack back. The flat layout is what makes sharding by rank a simple slice.</li>
+<li><code>ZeroOptimizer(model, world_size, rank, lr)</code> that owns the rank's shard of the master copy and Adam moments.</li>
+<li><code>step()</code> that runs reduce_scatter on the flat gradient, applies Adam to the rank's shard, and allgathers the updated parameters back.</li>
+<li>A demo that trains a 3-layer MLP for 20 steps and prints the per-step memory budget alongside a vanilla DDP baseline.</li>
+</ul>
+<p>Run it:</p>
+<pre><code class="language-bash">python3 code/main.py
+</code></pre>
+<p>Output: per-step loss and the memory table that shows ZeRO-1 holds 1/N of the optimiser state on each rank versus DDP's full copy.</p>
+<h2>Production patterns in the wild</h2>
+<p>Three patterns harden ZeRO enough to ship.</p>
+<p><strong>Sharded checkpointing matters.</strong> ZeRO-1's optimiser state is split across ranks; the checkpoint has to record which rank owns what. Lesson 80 builds the sharded checkpoint manifest that resumes a ZeRO run on the same world size. Without it the saved state is unreadable at restart.</p>
+<p><strong>Mixed precision is the point.</strong> ZeRO is a mixed-precision technique; the fp32 master copy is what is sharded. Running ZeRO without mixed precision pays the memory tax on the fp32 master without the corresponding fp16 forward win. Production runs always pair ZeRO with autocast or bf16 weights.</p>
+<p><strong>Stage 1 is a near-free win.</strong> The comm is identical to DDP by bandwidth. The memory savings are linear in N. The only cost is the bookkeeping for the optimiser shard. Production stacks default to stage 1 unless the parameter shard memory is also a problem; then stage 2 or 3 trades comm for memory.</p>
+<h2>Use It</h2>
+<p>Production patterns:</p>
+<ul>
+<li><strong>DeepSpeed ZeRO.</strong> The reference implementation. <code>deepspeed_config.json</code> selects stage 1/2/3 and partition sizes.</li>
+<li><strong>PyTorch FSDP.</strong> The PyTorch-native equivalent. <code>ShardingStrategy.SHARD_GRAD_OP</code> is ZeRO-2; <code>FULL_SHARD</code> is ZeRO-3.</li>
+<li><strong>HuggingFace Accelerate.</strong> Wraps both DeepSpeed and FSDP under a uniform config.</li>
+</ul>
+<h2>Ship It</h2>
+<p>Lesson 79 (pipeline parallel) is the orthogonal sharding axis: instead of sharding optimiser state across the same model, pipeline shards layers across ranks. Lesson 81 composes DDP + ZeRO on the end-to-end demo.</p>
+<h2>Exercises</h2>
+<ol>
+<li>Extend to ZeRO-2 by sharding gradients: each rank only stores the gradient for its shard, achieved by zeroing out the non-shard portion after backward.</li>
+<li>Add a memory profiler that prints actual fp32 byte usage on rank 0 versus the formula prediction.</li>
+<li>Measure the per-step wall-clock time of vanilla DDP versus ZeRO-1 and decompose into forward, backward, comm.</li>
+<li>Implement gradient clipping under ZeRO-1: the L2 norm must be computed across all shards via allreduce of the local norm squared.</li>
+<li>Implement a &quot;naive ZeRO&quot; with allreduce instead of reduce_scatter, measure the wire-time difference. Defend the reduce_scatter choice with numbers.</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ZeRO-1</td>
+<td>&quot;Shard the optimiser&quot;</td>
+<td>Each rank holds 1/N of fp32 master + Adam moments</td>
+</tr>
+<tr>
+<td>ZeRO-2</td>
+<td>&quot;Shard grads too&quot;</td>
+<td>Each rank also drops the non-shard gradients after reduce_scatter</td>
+</tr>
+<tr>
+<td>ZeRO-3</td>
+<td>&quot;Shard params&quot;</td>
+<td>Each rank holds 1/N of fp16 params; allgather per layer in forward</td>
+</tr>
+<tr>
+<td>Master copy</td>
+<td>&quot;fp32 weights&quot;</td>
+<td>The high-precision parameter copy the optimiser updates</td>
+</tr>
+<tr>
+<td>Reduce_scatter</td>
+<td>&quot;Split the sum&quot;</td>
+<td>Deliver each rank only its shard's summed gradient</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/1910.02054" rel="noreferrer" data-network="true">Rajbhandari et al, ZeRO: Memory Optimizations Toward Training Trillion Parameter Models <small>↗ 需要联网</small></a></li>
+<li><a href="https://www.deepspeed.ai/tutorials/zero/" rel="noreferrer" data-network="true">DeepSpeed ZeRO documentation <small>↗ 需要联网</small></a></li>
+<li><a href="https://pytorch.org/docs/stable/fsdp.html" rel="noreferrer" data-network="true">PyTorch FSDP documentation <small>↗ 需要联网</small></a></li>
+<li>Phase 19 Lesson 76 - the reduce_scatter and allgather this lesson stands on</li>
+<li>Phase 19 Lesson 80 - sharded checkpointing the ZeRO state must use</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-19-capstone-projects--78-zero-parameter-sharding.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-19-capstone-projects--78-zero-parameter-sharding.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/78-zero-parameter-sharding/code/main.py">phases/19-capstone-projects/78-zero-parameter-sharding/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;ZeRO stage 1 optimiser state sharding on the gloo backend.
+
+Each rank owns 1/N of the fp32 master parameter copy and 1/N of the Adam
+moments. After backward the full fp16 gradient is reduce_scattered so each
+rank receives only its shard&#39;s summed gradient. Adam updates the rank&#39;s
+shard of the master copy, then the updated fp16 parameter shards are
+allgathered so every rank reconstructs the full model for the next forward.
+
+Run: python3 code/main.py
+
+Compare per-step loss with vanilla DDP (lesson 77) and the per-rank optimiser
+memory drop to confirm the 1/N scaling.
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import multiprocessing as mp
+import os
+import sys
+import tempfile
+
+import torch
+import torch.distributed as dist
+import torch.nn as nn
+
+
+SEED = 13
+WORLD_SIZE = 4
+STEPS = 20
+BATCH = 8
+IN_DIM = 16
+HID_DIM = 32
+OUT_DIM = 4
+
+
+def _loopback_iface() -&gt; str:
+    return &quot;lo0&quot; if sys.platform == &quot;darwin&quot; else &quot;lo&quot;
+
+
+class MiniMLP(nn.Module):
+    def __init__(self, in_dim: int = IN_DIM, hid_dim: int = HID_DIM, out_dim: int = OUT_DIM):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hid_dim),
+            nn.ReLU(),
+            nn.Linear(hid_dim, hid_dim),
+            nn.ReLU(),
+            nn.Linear(hid_dim, out_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -&gt; torch.Tensor:
+        return self.net(x)
+
+
+def flat_param_numel(module: nn.Module) -&gt; int:
+    return sum(p.numel() for p in module.parameters())
+
+
+def gather_flat_params(module: nn.Module) -&gt; torch.Tensor:
+    &quot;&quot;&quot;Concatenate every parameter into one contiguous fp32 vector.&quot;&quot;&quot;
+    return torch.cat([p.detach().to(torch.float32).flatten() for p in module.parameters()])
+
+
+def scatter_flat_to_params(module: nn.Module, flat: torch.Tensor) -&gt; None:
+    &quot;&quot;&quot;Copy a flat fp32 vector back into the module&#39;s fp32 parameters.&quot;&quot;&quot;
+    offset = 0
+    for p in module.parameters():
+        n = p.numel()
+        p.data.copy_(flat[offset:offset + n].reshape(p.shape).to(p.dtype))
+        offset += n
+
+
+def gather_flat_grads(module: nn.Module) -&gt; torch.Tensor:
+    &quot;&quot;&quot;Concatenate every parameter&#39;s gradient into one contiguous fp32 vector.&quot;&quot;&quot;
+    parts = []
+    for p in module.parameters():
+        if p.grad is None:
+            parts.append(torch.zeros_like(p.data, dtype=torch.float32).flatten())
+        else:
+            parts.append(p.grad.detach().to(torch.float32).flatten())
+    return torch.cat(parts)
+
+
+def shard_bounds(total: int, world_size: int, rank: int) -&gt; tuple:
+    &quot;&quot;&quot;Return (start, end) of the rank&#39;s shard in a length-total flat tensor.
+
+    Pads the last shard with zeros if total is not divisible by world_size; the
+    pad is invisible after scatter back because the slice respects total.
+    &quot;&quot;&quot;
+    pad = (-total) % world_size
+    padded = total + pad
+    chunk = padded // world_size
+    start = rank * chunk
+    end = min(start + chunk, total)
+    return start, end, chunk
+
+
+class ZeroOptimizer:
+    &quot;&quot;&quot;Stage-1 sharded Adam.
+
+    Holds a 1/N slice of the fp32 master parameters and the (m, v) Adam
+    moments. The full model parameters in module.parameters() stay full
+    so forward and backward see the whole network; the savings come from
+    only this object&#39;s shard tensors.
+    &quot;&quot;&quot;
+
+    def __init__(self, module: nn.Module, world_size: int, rank: int,
+                 lr: float = 0.05, beta1: float = 0.9, beta2: float = 0.999,
+                 eps: float = 1e-8):
+        self.module = module
+        self.world_size = world_size
+        self.rank = rank
+        self.lr = lr
+        self.beta1 = beta1
+        self.beta2 = beta2
+        self.eps = eps
+        self.step_count = 0
+        total = flat_param_numel(module)
+        self.total = total
+        start, end, chunk = shard_bounds(total, world_size, rank)
+        self.shard_start = start
+        self.shard_end = end
+        self.shard_size = chunk
+        full = gather_flat_params(module)
+        padded = torch.zeros(chunk * world_size, dtype=torch.float32)
+        padded[:total] = full
+        self.master_shard = padded[rank * chunk:(rank + 1) * chunk].clone()
+        self.m_shard = torch.zeros_like(self.master_shard)
+        self.v_shard = torch.zeros_like(self.master_shard)
+
+    def shard_bytes(self) -&gt; int:
+        &quot;&quot;&quot;Bytes of optimiser state held on this rank only.&quot;&quot;&quot;
+        return (self.master_shard.numel()
+                + self.m_shard.numel()
+                + self.v_shard.numel()) * 4
+
+    def step(self) -&gt; None:
+        &quot;&quot;&quot;Reduce_scatter grads to per-rank shards, Adam-step, allgather params back.&quot;&quot;&quot;
+        flat_grad = gather_flat_grads(self.module)
+        pad = (-self.total) % self.world_size
+        padded_grad = torch.zeros(self.total + pad, dtype=torch.float32)
+        padded_grad[:self.total] = flat_grad
+        chunks = list(padded_grad.chunk(self.world_size))
+        chunks = [c.contiguous() for c in chunks]
+        local_grad = torch.zeros_like(chunks[0])
+        dist.reduce_scatter(local_grad, chunks, op=dist.ReduceOp.SUM)
+        local_grad.div_(self.world_size)
+        self.step_count += 1
+        self.m_shard.mul_(self.beta1).add_(local_grad, alpha=1 - self.beta1)
+        self.v_shard.mul_(self.beta2).addcmul_(local_grad, local_grad, value=1 - self.beta2)
+        bc1 = 1 - self.beta1 ** self.step_count
+        bc2 = 1 - self.beta2 ** self.step_count
+        m_hat = self.m_shard / bc1
+        v_hat = self.v_shard / bc2
+        self.master_shard.addcdiv_(m_hat, v_hat.sqrt().add_(self.eps), value=-self.lr)
+        gathered = [torch.zeros_like(self.master_shard) for _ in range(self.world_size)]
+        dist.all_gather(gathered, self.master_shard)
+        flat_full = torch.cat(gathered)[:self.total]
+        scatter_flat_to_params(self.module, flat_full)
+
+    def zero_grad(self) -&gt; None:
+        for p in self.module.parameters():
+            if p.grad is not None:
+                p.grad.detach_()
+                p.grad.zero_()
+
+
+def make_dataset(seed: int, n_total: int) -&gt; tuple:
+    g = torch.Generator().manual_seed(seed)
+    x = torch.randn(n_total, IN_DIM, generator=g)
+    w = torch.randn(IN_DIM, OUT_DIM, generator=g)
+    y = x @ w + 0.1 * torch.randn(n_total, OUT_DIM, generator=g)
+    return x, y
+
+
+def _zero_worker(rank: int, world_size: int, init_file: str, iface: str,
+                 steps: int, batch: int, lr: float, out_queue) -&gt; None:
+    os.environ[&quot;GLOO_SOCKET_IFNAME&quot;] = iface
+    dist.init_process_group(
+        backend=&quot;gloo&quot;, init_method=f&quot;file://{init_file}&quot;,
+        rank=rank, world_size=world_size,
+    )
+    torch.manual_seed(SEED)
+    model = MiniMLP()
+    for p in model.parameters():
+        dist.broadcast(p.data, src=0)
+    optim = ZeroOptimizer(model, world_size=world_size, rank=rank, lr=lr)
+    loss_fn = nn.MSELoss()
+    x_all, y_all = make_dataset(SEED + 1000, n_total=world_size * batch * steps)
+    losses = []
+    for step in range(steps):
+        offset = step * world_size * batch + rank * batch
+        x = x_all[offset:offset + batch]
+        y = y_all[offset:offset + batch]
+        optim.zero_grad()
+        pred = model(x)
+        loss = loss_fn(pred, y)
+        loss.backward()
+        optim.step()
+        losses.append(loss.item())
+    norm = sum(p.detach().pow(2).sum().item() for p in model.parameters()) ** 0.5
+    out_queue.put((rank, losses, norm, optim.shard_bytes()))
+    out_queue.close()
+    out_queue.join_thread()
+    os._exit(0)
+
+
+def run_zero(world_size: int = WORLD_SIZE, steps: int = STEPS,
+             batch: int = BATCH, lr: float = 0.05) -&gt; dict:
+    ctx = mp.get_context(&quot;spawn&quot;)
+    out_queue = ctx.Queue()
+    init_dir = tempfile.mkdtemp(prefix=&quot;aie_zero_&quot;)
+    init_file = os.path.join(init_dir, &quot;rendezvous&quot;)
+    iface = _loopback_iface()
+    procs = []
+    try:
+        for r in range(world_size):
+            p = ctx.Process(
+                target=_zero_worker,
+                args=(r, world_size, init_file, iface, steps, batch, lr, out_queue),
+            )
+            p.start()
+            procs.append(p)
+        results = {}
+        for _ in range(world_size):
+            rank, losses, norm, shard_bytes = out_queue.get(timeout=120)
+            results[rank] = (losses, norm, shard_bytes)
+        return results
+    finally:
+        for p in procs:
+            p.join(timeout=5)
+            if p.is_alive():
+                p.terminate()
+                p.join(timeout=2)
+        try:
+            os.remove(init_file)
+        except FileNotFoundError:
+            pass
+        try:
+            os.rmdir(init_dir)
+        except OSError:
+            pass
+
+
+def memory_table(p_params: int, world_size: int) -&gt; str:
+    &quot;&quot;&quot;Per-rank memory in bytes for vanilla DDP and ZeRO stage 1.
+
+    Mixed precision: fp16 params + fp16 grads + fp32 master + fp32 m + fp32 v.
+    &quot;&quot;&quot;
+    fp16 = 2
+    fp32 = 4
+    vanilla = (fp16 + fp16 + fp32 + fp32 + fp32) * p_params
+    zero1 = (fp16 + fp16) * p_params + (fp32 * 3 * p_params) // world_size
+    drop = 100 * (vanilla - zero1) / vanilla
+    rows = [
+        (&quot;vanilla DDP&quot;, vanilla),
+        (f&quot;ZeRO-1 (N={world_size})&quot;, zero1),
+    ]
+    out = [&quot;per-rank optimiser memory:&quot;]
+    for name, b in rows:
+        out.append(f&quot;  {name:&lt;20} {b:&gt;12} bytes&quot;)
+    out.append(f&quot;  drop: {drop:.1f}%&quot;)
+    return &quot;\n&quot;.join(out)
+
+
+def main() -&gt; int:
+    print(f&quot;world_size={WORLD_SIZE}, steps={STEPS}, batch={BATCH}, model=MiniMLP&quot;)
+    print(&quot;running ZeRO-1 across ranks...&quot;)
+    results = run_zero()
+    print(f&quot;\n{&#39;step&#39;:&lt;6}{&#39;rank0_loss&#39;:&lt;14}{&#39;rank3_loss&#39;:&lt;14}&quot;)
+    r0_losses, r0_norm, r0_bytes = results[0]
+    r3_losses, _, r3_bytes = results[WORLD_SIZE - 1]
+    for s in range(STEPS):
+        print(f&quot;{s:&lt;6}{r0_losses[s]:&lt;14.6f}{r3_losses[s]:&lt;14.6f}&quot;)
+    print(f&quot;\nfinal param norm (must agree across ranks):&quot;)
+    for r in range(WORLD_SIZE):
+        _, norm, shard_bytes = results[r]
+        print(f&quot;  rank {r}: norm={norm:.6f}, optim_shard_bytes={shard_bytes}&quot;)
+    total_params = flat_param_numel(MiniMLP())
+    print()
+    print(memory_table(total_params, WORLD_SIZE))
+    return 0
+
+
+if __name__ == &quot;__main__&quot;:
+    raise SystemExit(main())
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. Why does ZeRO shard optimiser state first instead of parameters?</legend><label class="option"><input type="radio" name="q0" value="0"> Optimiser state is the largest memory term and is only touched during the step, not forward or backward</label><label class="option"><input type="radio" name="q0" value="1"> DeepSpeed mandates it</label><label class="option"><input type="radio" name="q0" value="2"> Optimiser is more important</label><label class="option"><input type="radio" name="q0" value="3"> Parameters are easier</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. What is the per-step wire pattern of ZeRO stage 1?</legend><label class="option"><input type="radio" name="q1" value="0"> Nothing</label><label class="option"><input type="radio" name="q1" value="1"> One broadcast</label><label class="option"><input type="radio" name="q1" value="2"> One allreduce</label><label class="option"><input type="radio" name="q1" value="3"> One reduce_scatter on gradients plus one allgather on updated parameters</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. Why is the per-step bandwidth the same as DDP?</legend><label class="option"><input type="radio" name="q2" value="0"> It is not the same</label><label class="option"><input type="radio" name="q2" value="1"> Magic</label><label class="option"><input type="radio" name="q2" value="2"> ZeRO uses compression</label><label class="option"><input type="radio" name="q2" value="3"> Allreduce equals reduce_scatter plus allgather in bandwidth; ZeRO splits that into two halves on different data</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. For a 7B model with Adam in mixed precision on 8 ranks, what is the memory drop vs vanilla DDP?</legend><label class="option"><input type="radio" name="q3" value="0"> 99%</label><label class="option"><input type="radio" name="q3" value="1"> 0%</label><label class="option"><input type="radio" name="q3" value="2"> 10%</label><label class="option"><input type="radio" name="q3" value="3"> Around 65% (vanilla 16P vs ZeRO-1 4P + 12P/N = 5.5P)</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. What does ZeRO-2 add over ZeRO-1?</legend><label class="option"><input type="radio" name="q4" value="0"> Removes the optimiser</label><label class="option"><input type="radio" name="q4" value="1"> Also drops the non-shard gradients after reduce_scatter, freeing per-rank gradient memory; bandwidth stays the same</label><label class="option"><input type="radio" name="q4" value="2"> Nothing</label><label class="option"><input type="radio" name="q4" value="3"> Switches backend to NCCL</label><p data-feedback="4"></p></fieldset><fieldset><legend>6. Why does ZeRO require the optimiser state checkpoint to record which rank owns which shard?</legend><label class="option"><input type="radio" name="q5" value="0"> It does not</label><label class="option"><input type="radio" name="q5" value="1"> Cosmetic</label><label class="option"><input type="radio" name="q5" value="2"> Compression</label><label class="option"><input type="radio" name="q5" value="3"> Without per-rank ownership the saved state is unreadable at restart; resuming on the same world size needs to put the right shard back on the right rank</label><p data-feedback="5"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/19-capstone-projects/77-data-parallel-ddp/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/19-capstone-projects/79-pipeline-parallel/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/19-capstone-projects/78-zero-parameter-sharding/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

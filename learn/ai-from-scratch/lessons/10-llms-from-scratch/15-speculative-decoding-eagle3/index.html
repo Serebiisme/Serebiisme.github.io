@@ -1,0 +1,758 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>投机解码和3 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-10-llms-from-scratch" data-lesson="10-llms-from-scratch/15-speculative-decoding-eagle3" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/10-llms-from-scratch/">从零构建大语言模型</a> / LESSON 15</p><h1 class="lesson-title">投机解码和3</h1><p>Speculative Decoding and EAGLE-3</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>投机解码和3</h1>
+<blockquote>
+<p>阶段 7 · 第16课证明了数学:利维亚坦拒绝规则确切保存验证器的分布. 这一课是2026年生产投机解码的训练视角. -3将草案模型从廉价近似转化为一个专门构建的小型网络,训练在验证器自己的隐藏状态,然后添加了一个训练时间测试循环, 结果: 3×到 6.5×端到端加快,在聊天中接受的每代币率高于0.9,没有分配权衡. 根据2026年的每一个生产推断堆,</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python (stdlib)
+<strong>Prerequisites:</strong> Phase 7 · 16 (speculative decoding math), Phase 10 · 12 (inference optimization)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>单句说明利维亚坦定理,证明投机循环产生对验证者相同分布的样本.</li>
+<li>走过尼拉规格解码 (Leviathan 2023) 两年的进展,通过Eagle,Eagle-2,Eagle-3,并列出每一步的确切限制.</li>
+<li>计算预期的接受率加速<code>α</code>项目与验证人成本比例<code>c</code>选择最好的草稿长度<code>N</code>对于每一个政权.</li>
+<li>执行从零开始的全部投机循环:从残余中起草,验证,拒绝-样本,在拒绝时将KV缓存重新滚动,在完全接受时发放奖金代币.</li>
+</ul>
+<h2>问题</h2>
+<p>在70B模型上,自动降解码速度在H100上运行时可能为每秒35个代币.GPU几乎没有度.内存带宽是天花板:每个代币都载荷70B的重量从HBM,执行一个步骤的算术,产生一个浮动.计算单位大部分都停留无动.</p>
+<p>实际上,你能解决的吞吐量问题.<code>N</code>标记<code>N</code>验证器在前上运行一次加上所有<code>N</code>核实者在位置上的分布<code>i</code>否则,我们会拒绝并从残余分布中采样一个修正.<code>N+1</code>接受代币而不是一个.</p>
+<p>重要论是利维亚坦,卡尔曼,马蒂亚斯 (ICML 2023):输出分布与验证器直接产生的样本相同.不大致.同样.这就是投机解码在生产中被接受的全部原因.</p>
+<p>七阶段16课给你了数学.这课给你了训练堆.一个好的草稿比一个便宜的草稿值得加快两倍.EAGLE,EAGLE-2,EAGLE-3 (Li等, 20242025) 将&quot;草稿 =同样的模型的较小版本&quot;变成了精确的工程学科. 2026 生产推理服务器默认为EAGLE-3.</p>
+<h2>概念</h2>
+<h3>变体:利维亚坦拒绝样本</h3>
+<p>让我们<code>p(t)</code>给出一个前,并<code>q(t)</code>检查员的. 取样一个标志草案.<code>d ~ p</code>接受一个可能性<code>min(1, q(d) / p(d))</code>弃后,从残留分布中取出样本<code>(q - p)_+ / ||(q - p)_+||_1</code>结果样本分为<code>q</code>这不管是多么糟糕<code>p</code>越糟糕,你越经常拒绝,但结果仍然是准确的.</p>
+<p>子<code>N</code>通过一个验证器传输传输<code>prefix + d_1 + ... + d_N</code>验证器回复<code>q_1, q_2, ..., q_{N+1}</code>随着第一次拒绝,在位置上,<code>j</code>采样<code>residual(q_j, p_j)</code>在完全接受时,请从中抽取一个奖金代币.<code>q_{N+1}</code>现在,我们要去.</p>
+<h3>什么决定了加速</h3>
+<p>让我们<code>α</code>预期的每项预订代币的接受率.<code>c = cost(draft) / cost(verifier)</code>预期的每向验证器接受的代币数量为:</p>
+<pre><code>E[accepted] = (1 - α^(N+1)) / (1 - α)
+</code></pre>
+<p>预期的每个接受的代币的 Wall Time <code>(N * c + 1) / E[accepted]</code>减少对<code>N</code>你会得到一个好处.<code>α = 0.8, c = 0.05</code>优质<code>N</code>速度是3.2x.<code>α = 0.95, c = 0.02</code>优质<code>N</code>速度增长速度是5x.</p>
+<p>唯一最大的杆是<code>α</code>开始的<code>α = 0.6</code>通过&quot;酒草稿&quot;<code>α = 0.9</code>鱼-3号<code>N = 5</code>通过验证器,您将从每个验证器的预期接受代币 2.2 转到 4.1.</p>
+<h3>两年来的进展</h3>
+<p>**Vanilla speculative (Leviathan, 2023).**简单的编程, 简单的编程, 简单的编程,<code>α ≈ 0.6</code>速度最好是2倍.</p>
+<p>**EAGLE-1 (Li et al., 2024).**草案是一个小型变压器,通常是一个或两个层,它将验证器的最后层隐藏状态作为输入,直接预测下一个代币.由于草案看到验证器的特征表示,它的分布更接近验证器的.<code>α</code>升至0.70.8.</p>
+<p>**EAGLE-2 (Li et al., 2024).**增加一个动态的草图树:而不是提出一个单一的序列<code>N</code>通过一个向前传递 (树注意) 给每个选手提出一个小树,并通过一个向前传递 (树注意) 给每个选手提供一个小树.<code>α</code>通过路径的代币升至0.85以上.</p>
+<p>**EAGLE-3 (Li et al., 2025, NeurIPS).**另有两个变化. 首先,完全放弃功能预测损失 EAGLE-1/2 训练了草案来匹配验证器的隐藏状态,这限制了数据有多大帮助. 3直接在预测代币上训练. 第二,训练时间测试 (TTT):在草案训练期间,将草案的以前预测作为多步骤的输入,就像在推断时一样运作. 这将列车和测试分布均整齐,从而阻止错误积累. 测量速度:在聊天中达到6.5x,在H100上SGLang的64批发中增速38%.</p>
+<h3>转换KV缓存</h3>
+<p>验证扩大验证器的KV缓存到 <code>N</code>如果在位置上发生拒绝<code>j</code>缓存内容已过位置<code>j-1</code>现在错了.两个常见的实现:写到一个零缩缓冲器,并在接受时提交 (vLLM,TensorRT-LLM),或者保持物理KV缓存加上逻辑长度和断断.无论如何,反弹成本是每层每头的字节,这是除了前进通过成本之外的微不足道.</p>
+<p>对于EAGLE-2树搜索,验证器使用不因果性面具来运行注意力,该面具尊重树拓.工程很难,但计算是使用自定义面具的标准闪光注意力调用.</p>
+<h3>2026年建筑草案</h3>
+<table>
+<thead>
+<tr>
+<th>Strategy</th>
+<th>Draft type</th>
+<th><code>α</code></th>
+<th>Speedup</th>
+<th>Training cost</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Vanilla</td>
+<td>Separate small LLM</td>
+<td>0.55-0.70</td>
+<td>1.8-2.3×</td>
+<td>None (reuse existing small model)</td>
+</tr>
+<tr>
+<td>Medusa</td>
+<td>Extra LM heads on verifier</td>
+<td>0.65-0.75</td>
+<td>2-3×</td>
+<td>~1B SFT tokens</td>
+</tr>
+<tr>
+<td>EAGLE-1</td>
+<td>1-layer transformer on hidden states</td>
+<td>0.70-0.80</td>
+<td>2.5-3×</td>
+<td>~60B tokens</td>
+</tr>
+<tr>
+<td>EAGLE-2</td>
+<td>EAGLE-1 + dynamic draft tree</td>
+<td>0.80-0.88</td>
+<td>3-4×</td>
+<td>~60B tokens</td>
+</tr>
+<tr>
+<td>EAGLE-3</td>
+<td>Multi-layer feature fusion + TTT</td>
+<td>0.88-0.92</td>
+<td>3.5-6.5×</td>
+<td>~60-200B tokens</td>
+</tr>
+<tr>
+<td>Lookahead</td>
+<td>No draft (Jacobi iteration)</td>
+<td>N/A</td>
+<td>1.3-1.6×</td>
+<td>None</td>
+</tr>
+</tbody>
+</table>
+<p>在2026年生产:vLLM和SGLang默认为EAGLE-3,如果有,则EAGLE-2.TensorRT-LLM为Meta和NVIDIA公共模型提供了最快的Medusa路径. llama.cpp为CPU部署提供了草草稿.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-219d71b0076644142daf.png" alt="l5-spec-decode-eagle 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<p>看到<code>code/main.py</code>这就是全程的利维亚坦投机循环,所有部分:N的草案,验证器的平行通过,每位的拒绝,残余样本采集,奖金代币,KV回滚,以及经验验验证,输出分布与直接样本采集相匹配<code>q</code>现在,我们要去.</p>
+<h3>步骤1:拒绝规则</h3>
+<pre><code class="language-python">def accept(q_prob, p_prob, u):
+    if p_prob &lt;= 0:
+        return True
+    return u &lt; min(1.0, q_prob / p_prob)
+</code></pre>
+<h3>步骤2:残余分布</h3>
+<pre><code class="language-python">def residual(q, p):
+    raw = [max(0.0, qi - pi) for qi, pi in zip(q, p)]
+    s = sum(raw)
+    if s == 0:
+        return list(q)
+    return [r / s for r in raw]
+</code></pre>
+<h3>步骤3:一个完全的投机步骤</h3>
+<p>其他<code>spec_step</code>函数草案<code>N</code>标记<code>p</code>然后在一个平行中验证它们.<code>q</code>对于每一个草案的代币,它应用拒绝规则,在第一个拒绝时,它从残余中取样了修正.如果一切都接受,它会发出一个奖金代币.<code>q_{N+1}</code>现在,我们要去.</p>
+<h3>步骤4:KV回滚账户</h3>
+<p>模拟器跟踪了一个逻辑的<code>kv_length</code>通过&quot;每名工人&quot;的<code>k</code>项目草案<code>kv_length += k</code>关于拒绝职位<code>j</code>现在,预存器已经被写到过去.<code>j</code>按,但逻辑长度设置为<code>prefix_length + j + 1</code>一个经过了纠正符号. 后续读取到逻辑长度.</p>
+<h3>步骤5: 利维亚坦检查</h3>
+<p>运行5万个投机步骤. 计算受理代币的经验分布.<code>q</code>定理在实践中通过.</p>
+<h3>步骤 6:加快与 α</h3>
+<p>通过扰乱扫描质量<code>p</code>远离<code>q</code>测量<code>α</code>按验证器调用的预期代币进行图为 <code>α</code>其他<code>N</code>编码中印出表表,显示了EAGLE-3类草案质量 (<code>α ≈ 0.9</code>) 每次验证者调用时解锁45个代币.</p>
+<h2>用它</h2>
+<p>生产水平<code>vllm serve</code>3:</p>
+<pre><code class="language-bash">vllm serve meta-llama/Llama-3.3-70B-Instruct \
+  --speculative-config '{
+    &quot;model&quot;: &quot;yuhuili/EAGLE3-LLaMA3.3-Instruct-70B&quot;,
+    &quot;num_speculative_tokens&quot;: 5,
+    &quot;method&quot;: &quot;eagle3&quot;
+  }'
+</code></pre>
+<p>轮-3在H100上64批次:大约1.38倍比轮-64的轮解码更高的吞吐量,根据EAGLE-3文件.</p>
+<p>什么时候找到投机解码:</p>
+<ul>
+<li>任何互动聊天工作负载,其中p50延迟比峰值吞吐量更重要.</li>
+<li>编码生成和结构化输出 (JSON,SQL).<code>α</code>由于目标分布很可预测.</li>
+<li>长期代码 (数千个代币) 抵消速度不断支付.</li>
+</ul>
+<p>什么时候不:</p>
+<ul>
+<li>非常小的模型 (&lt;3B). 草稿不比验证器便宜得多.</li>
+<li>简单的批量-1 CPU 部署.</li>
+<li>非常高温的创意采样<code>α</code>它们会崩.</li>
+</ul>
+<h2>运送它</h2>
+<p>这一课产生了<code>outputs/skill-eagle3-tuner.md</code>鉴于推断工作量 (模型,批量大小,目标延迟,任务配置文件),它建议推一个投机式解码策略和调整参数 (草案家族,<code>N</code>树深度,温度意识的切换).</p>
+<h2>运动</h2>
+<ol>
+<li>
+<p>跑步<code>code/main.py</code>确认在5万个样本中,利维亚坦分布检查的千平方统计数据低于95%的关键值.</p>
+</li>
+<li>
+<p>扫描<code>N</code>从1到10<code>α</code>保持在0.9和<code>c</code>查看每次验证器调用预期代币和每次代币的实际墙时间.<code>N</code>解释曲线的形状.</p>
+</li>
+<li>
+<p>修改代码以模拟EAGLE-2树搜索:每一步,草案提出一个形状的树<code>[2, 2, 2]</code>验证器运行一次,最有可能接受的路径获胜.计算<code>α</code>通过同等计算,比较线性链规格解码.</p>
+</li>
+<li>
+<p>执行两个同时序列的KV滚动模拟器.序列A已接受所有草案;序列B在位置2拒绝.<code>kv_length</code>任何工作都不会浪费.</p>
+</li>
+<li>
+<p>阅读EAGLE-3论文第4节 (训练时间测试).用两句话解释为什么无线特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特特</p>
+</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Leviathan rule</td>
+<td>&quot;min(1, q over p)&quot;</td>
+<td>Bernoulli accept/reject with probability <code>min(1, q(d)/p(d))</code>, preserves the verifier distribution exactly when you sample from the residual on rejection</td>
+</tr>
+<tr>
+<td>Residual distribution</td>
+<td>&quot;(q minus p) plus, normalized&quot;</td>
+<td><code>(q - p)_+</code> clamped at zero and renormalized — the correct distribution to sample from on rejection</td>
+</tr>
+<tr>
+<td>Acceptance rate α</td>
+<td>&quot;how often the draft is right&quot;</td>
+<td>Expected per-token Bernoulli-success probability under the rejection rule; governs all speedup math</td>
+</tr>
+<tr>
+<td>EAGLE-1</td>
+<td>&quot;hidden-state draft&quot;</td>
+<td>Tiny transformer draft conditioned on the verifier's last-layer hidden state (Li et al., 2024)</td>
+</tr>
+<tr>
+<td>EAGLE-2</td>
+<td>&quot;dynamic draft tree&quot;</td>
+<td>EAGLE-1 plus a tree of candidate continuations scored with tree attention in one verifier pass</td>
+</tr>
+<tr>
+<td>EAGLE-3</td>
+<td>&quot;training-time test&quot;</td>
+<td>Drops the feature-prediction loss, trains on direct token prediction with the draft fed its own outputs during training</td>
+</tr>
+<tr>
+<td>Training-time test (TTT)</td>
+<td>&quot;exposure bias fix&quot;</td>
+<td>Run the draft autoregressively during training so train and test input distributions match — the direct analog of scheduled sampling</td>
+</tr>
+<tr>
+<td>KV rollback</td>
+<td>&quot;undo rejected drafts&quot;</td>
+<td>Bookkeeping that resets the verifier's KV cache to the accepted-prefix length after a rejection</td>
+</tr>
+<tr>
+<td>Bonus token</td>
+<td>&quot;the free one&quot;</td>
+<td>When all <code>N</code> drafts accept, sample one extra from <code>q_{N+1}</code> at no additional verifier cost</td>
+</tr>
+<tr>
+<td>Tree attention</td>
+<td>&quot;verify many candidates at once&quot;</td>
+<td>Attention with a non-causal mask that respects the topology of a draft tree; computes <code>q_i</code> for every node in the tree in one forward pass</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2211.17192" rel="noreferrer" data-network="true">Leviathan, Kalman, Matias — Fast Inference from Transformers via Speculative Decoding (arXiv:2211.17192, ICML 2023) <small>↗ 需要联网</small></a>基础论文和等效定理</li>
+<li><a href="https://arxiv.org/abs/2302.01318" rel="noreferrer" data-network="true">Chen et al. — Accelerating Large Language Model Decoding with Speculative Sampling (arXiv:2302.01318) <small>↗ 需要联网</small></a>同时独立引入,且有清晰的证明</li>
+<li><a href="https://arxiv.org/abs/2401.15077" rel="noreferrer" data-network="true">Li et al. — EAGLE: Speculative Sampling Requires Rethinking Feature Uncertainty (arXiv:2401.15077) <small>↗ 需要联网</small></a>Eagle-1,隐藏状态的草案</li>
+<li><a href="https://arxiv.org/abs/2406.16858" rel="noreferrer" data-network="true">Li et al. — EAGLE-2: Faster Inference of Language Models with Dynamic Draft Trees (arXiv:2406.16858) <small>↗ 需要联网</small></a>动态树木搜索</li>
+<li><a href="https://arxiv.org/abs/2503.01840" rel="noreferrer" data-network="true">Li et al. — EAGLE-3: Scaling up Inference Acceleration via Training-Time Test (arXiv:2503.01840, NeurIPS 2025) <small>↗ 需要联网</small></a>2026年生产违约</li>
+<li><a href="https://arxiv.org/abs/2401.10774" rel="noreferrer" data-network="true">Cai et al. — Medusa: Multiple Decoding Heads (arXiv:2401.10774) <small>↗ 需要联网</small></a> 另一个无草案的方法</li>
+<li><a href="https://docs.vllm.ai/en/latest/features/spec_decode.html" rel="noreferrer" data-network="true">vLLM Speculative Decoding documentation <small>↗ 需要联网</small></a>可信生产参考,所有战略都连接在一起</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Speculative Decoding and EAGLE-3</h1>
+<blockquote>
+<p>Phase 7 · Lesson 16 proved the math: the Leviathan rejection rule preserves the verifier's distribution exactly. This lesson is the training-stack view of 2026 production speculative decoding. EAGLE-3 turned the draft model from a cheap approximation into a purpose-built tiny network trained on the verifier's own hidden states, then added a training-time test loop that aligns its train and inference distributions. Result: 3× to 6.5× end-to-end speedup, accepted per-token rates above 0.9 on chat, no distributional tradeoff. Every production inference stack in 2026 ships it by default.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python (stdlib)
+<strong>Prerequisites:</strong> Phase 7 · 16 (speculative decoding math), Phase 10 · 12 (inference optimization)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>State the Leviathan theorem in one sentence and prove that the speculative loop produces samples identically distributed to the verifier.</li>
+<li>Walk the two-year progression from vanilla spec-decoding (Leviathan 2023) through EAGLE, EAGLE-2, and EAGLE-3 and name the exact limitation each step removed.</li>
+<li>Compute expected speedup from acceptance rate <code>α</code> and draft-to-verifier cost ratio <code>c</code>, and choose the optimal draft length <code>N</code> for each regime.</li>
+<li>Implement the full speculative loop from scratch: draft, verify, reject-sample from the residual, roll the KV cache back on rejection, emit the bonus token on full acceptance.</li>
+</ul>
+<h2>The Problem</h2>
+<p>Autoregressive decoding on a 70B model runs at maybe 35 tokens per second on an H100. The GPU is nowhere near saturated. Memory bandwidth is the ceiling: every token loads 70B of weights from HBM, does one step of arithmetic, and produces one float. The compute units sit mostly idle.</p>
+<p>Speculative decoding turns that into a throughput problem you can actually solve. A cheap draft proposes <code>N</code> tokens in <code>N</code> small forward passes. The verifier runs once on the prefix plus all <code>N</code> drafts. If the verifier's distribution at position <code>i</code> agrees with the draft (in a statistical sense we will make precise), we accept; if not, we reject and sample a correction from the residual distribution. A single big-model forward produces up to <code>N+1</code> accepted tokens instead of one.</p>
+<p>The theorem that matters is Leviathan, Kalman, Matias (ICML 2023): the output distribution is identical to what sampling from the verifier directly would have produced. Not approximately. Identically. This is the entire reason speculative decoding is acceptable in production — it is a pure latency optimization with no quality tradeoff.</p>
+<p>What Phase 7 · Lesson 16 gave you was the math. What this lesson gives you is the training stack. A good draft is worth 2× more speedup than a cheap draft. EAGLE, EAGLE-2, and EAGLE-3 (Li et al., 2024–2025) turned &quot;draft = smaller version of the same model&quot; into a precise engineering discipline. 2026 production inference servers default to EAGLE-3.</p>
+<h2>The Concept</h2>
+<h3>The invariant: Leviathan rejection sampling</h3>
+<p>Let <code>p(t)</code> be the draft's distribution for the next token given some prefix, and <code>q(t)</code> be the verifier's. Sample a draft token <code>d ~ p</code>. Accept with probability <code>min(1, q(d) / p(d))</code>. On reject, sample from the residual distribution <code>(q - p)_+ / ||(q - p)_+||_1</code>. The resulting samples are distributed according to <code>q</code>. This is true regardless of how bad <code>p</code> is — the worse it is, the more often you reject, but the output remains exact.</p>
+<p>Stack <code>N</code> of these calls back to back using one verifier forward pass on <code>prefix + d_1 + ... + d_N</code>. The verifier returns <code>q_1, q_2, ..., q_{N+1}</code> simultaneously. Walk left to right. On the first rejection at position <code>j</code>, sample from <code>residual(q_j, p_j)</code> and stop. On full acceptance, sample one bonus token from <code>q_{N+1}</code>.</p>
+<h3>What determines speedup</h3>
+<p>Let <code>α</code> be the expected acceptance rate per drafted token. Let <code>c = cost(draft) / cost(verifier)</code> be the cost ratio. The expected number of accepted tokens per verifier forward is:</p>
+<pre><code>E[accepted] = (1 - α^(N+1)) / (1 - α)
+</code></pre>
+<p>The expected total wall time per accepted token is <code>(N * c + 1) / E[accepted]</code>. Minimize that with respect to <code>N</code> and you get the sweet spot. For <code>α = 0.8, c = 0.05</code>: optimal <code>N</code> is around 5–7, speedup is 3.2×. For <code>α = 0.95, c = 0.02</code>: optimal <code>N</code> is around 8–10, speedup pushes 5×.</p>
+<p>The single biggest lever is <code>α</code>. Going from <code>α = 0.6</code> (vanilla draft) to <code>α = 0.9</code> (EAGLE-3) at fixed <code>N = 5</code> takes you from 2.2 expected accepted tokens per verifier forward to 4.1. Nearly 2× more throughput from the same verifier.</p>
+<h3>The two-year progression</h3>
+<p><strong>Vanilla speculative (Leviathan, 2023).</strong> Draft model is an independently trained smaller LLM from the same family. Easy to wire up, <code>α ≈ 0.6</code>, speedup around 2× at best.</p>
+<p><strong>EAGLE-1 (Li et al., 2024).</strong> Draft is a tiny transformer — typically one or two layers — that takes the verifier's last-layer hidden state as input and predicts the next token directly. Because the draft sees the verifier's feature representation, its distribution is much closer to the verifier's. <code>α</code> climbs to 0.7–0.8.</p>
+<p><strong>EAGLE-2 (Li et al., 2024).</strong> Adds a dynamic draft tree: instead of proposing a single sequence of <code>N</code> tokens, propose a small tree of candidates, score each with the verifier in one forward pass (tree attention), and walk the highest-probability path. Draft length becomes adaptive per step. <code>α</code> per accepted-path token climbs above 0.85.</p>
+<p><strong>EAGLE-3 (Li et al., 2025, NeurIPS).</strong> Two more changes. First, drop the feature-prediction loss entirely — EAGLE-1/2 trained the draft to match the verifier's hidden states, which caps how much data helps. EAGLE-3 trains directly on token prediction. Second, training-time test (TTT): during draft training, feed the draft's own previous predictions back as inputs over multiple steps, the same way it operates at inference. This aligns the train and test distributions and stops error accumulation. Measured speedup: up to 6.5× on chat, 38% throughput improvement at batch 64 in SGLang on H100.</p>
+<h3>KV cache rollback</h3>
+<p>Verification extends the verifier's KV cache by <code>N</code> entries in one pass. If rejection happens at position <code>j</code>, the cache contents past position <code>j-1</code> are now wrong. Two common implementations: write to a scratch buffer and commit on acceptance (vLLM, TensorRT-LLM), or keep a physical KV cache plus a logical length and truncate on reject. Either way, the rollback cost is bytes per layer per head, which is negligible next to the forward-pass cost.</p>
+<p>For EAGLE-2 tree search, the verifier runs attention with a non-causal mask that respects tree topology. The engineering is fiddly but the computation is a standard flash-attention call with a custom mask.</p>
+<h3>Draft architectures in 2026</h3>
+<table>
+<thead>
+<tr>
+<th>Strategy</th>
+<th>Draft type</th>
+<th><code>α</code></th>
+<th>Speedup</th>
+<th>Training cost</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Vanilla</td>
+<td>Separate small LLM</td>
+<td>0.55-0.70</td>
+<td>1.8-2.3×</td>
+<td>None (reuse existing small model)</td>
+</tr>
+<tr>
+<td>Medusa</td>
+<td>Extra LM heads on verifier</td>
+<td>0.65-0.75</td>
+<td>2-3×</td>
+<td>~1B SFT tokens</td>
+</tr>
+<tr>
+<td>EAGLE-1</td>
+<td>1-layer transformer on hidden states</td>
+<td>0.70-0.80</td>
+<td>2.5-3×</td>
+<td>~60B tokens</td>
+</tr>
+<tr>
+<td>EAGLE-2</td>
+<td>EAGLE-1 + dynamic draft tree</td>
+<td>0.80-0.88</td>
+<td>3-4×</td>
+<td>~60B tokens</td>
+</tr>
+<tr>
+<td>EAGLE-3</td>
+<td>Multi-layer feature fusion + TTT</td>
+<td>0.88-0.92</td>
+<td>3.5-6.5×</td>
+<td>~60-200B tokens</td>
+</tr>
+<tr>
+<td>Lookahead</td>
+<td>No draft (Jacobi iteration)</td>
+<td>N/A</td>
+<td>1.3-1.6×</td>
+<td>None</td>
+</tr>
+</tbody>
+</table>
+<p>In 2026 production: vLLM and SGLang default to EAGLE-3 when available, EAGLE-2 otherwise. TensorRT-LLM has the fastest Medusa path for Meta and NVIDIA public models. llama.cpp ships vanilla draft for CPU deployments.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-219d71b0076644142daf.png" alt="l5-spec-decode-eagle 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<p>See <code>code/main.py</code>. This is the full Leviathan speculative loop with all the pieces: draft-of-N, verifier parallel pass, per-position rejection, residual sampling, bonus token, KV rollback, and empirical verification that the output distribution matches direct sampling from <code>q</code>.</p>
+<h3>Step 1: the rejection rule</h3>
+<pre><code class="language-python">def accept(q_prob, p_prob, u):
+    if p_prob &lt;= 0:
+        return True
+    return u &lt; min(1.0, q_prob / p_prob)
+</code></pre>
+<h3>Step 2: residual distribution</h3>
+<pre><code class="language-python">def residual(q, p):
+    raw = [max(0.0, qi - pi) for qi, pi in zip(q, p)]
+    s = sum(raw)
+    if s == 0:
+        return list(q)
+    return [r / s for r in raw]
+</code></pre>
+<h3>Step 3: a full speculative step</h3>
+<p>The <code>spec_step</code> function drafts <code>N</code> tokens from <code>p</code>, then verifies all of them in one parallel <code>q</code> evaluation. For each drafted token it applies the rejection rule, and on the first rejection it samples the correction from the residual. If everything accepts, it emits a bonus token from <code>q_{N+1}</code>.</p>
+<h3>Step 4: KV rollback bookkeeping</h3>
+<p>The simulator tracks a logical <code>kv_length</code> per worker. On acceptance of <code>k</code> drafts, <code>kv_length += k</code>. On a rejection at position <code>j</code>, the cache is already written past <code>j</code>, but the logical length is set to <code>prefix_length + j + 1</code> — one past the correction token. Subsequent reads truncate to the logical length.</p>
+<h3>Step 5: the Leviathan check</h3>
+<p>Run 50,000 speculative steps. Count the empirical distribution of accepted tokens. Compare to 50,000 direct samples from <code>q</code>. The chi-square statistic should be well under the critical value. The theorem passes in practice.</p>
+<h3>Step 6: speedup vs. α</h3>
+<p>Sweep the draft quality by perturbing <code>p</code> away from <code>q</code> at different amplitudes. Measure <code>α</code>, then plot expected tokens per verifier call as a function of <code>α</code> and <code>N</code>. The code prints a table showing how EAGLE-3-class draft quality (<code>α ≈ 0.9</code>) unlocks 4–5 tokens per verifier call.</p>
+<h2>Use It</h2>
+<p>Production-level <code>vllm serve</code> with EAGLE-3:</p>
+<pre><code class="language-bash">vllm serve meta-llama/Llama-3.3-70B-Instruct \
+  --speculative-config '{
+    &quot;model&quot;: &quot;yuhuili/EAGLE3-LLaMA3.3-Instruct-70B&quot;,
+    &quot;num_speculative_tokens&quot;: 5,
+    &quot;method&quot;: &quot;eagle3&quot;
+  }'
+</code></pre>
+<p>SGLang with EAGLE-3 at batch 64 on H100: roughly 1.38× more throughput than batch-64 vanilla decoding, per the EAGLE-3 paper.</p>
+<p>When to reach for speculative decoding:</p>
+<ul>
+<li>Any interactive chat workload where p50 latency matters more than peak throughput.</li>
+<li>Code generation and structured output (JSON, SQL). <code>α</code> is above 0.9 because the target distribution is highly predictable.</li>
+<li>Long-form generation (thousands of tokens). The amortized speedup keeps paying.</li>
+</ul>
+<p>When not to:</p>
+<ul>
+<li>Very small models (&lt; 3B). The draft is not that much cheaper than the verifier.</li>
+<li>Tiny batch-1 CPU deployments. Memory overhead of the draft model may not be worth it.</li>
+<li>Very-high-temperature creative sampling where <code>α</code> collapses.</li>
+</ul>
+<h2>Ship It</h2>
+<p>This lesson produces <code>outputs/skill-eagle3-tuner.md</code>. Given an inference workload (model, batch size, target latency, task profile), it recommends a speculative-decoding strategy and tuning parameters (draft family, <code>N</code>, tree depth, temperature-aware switching).</p>
+<h2>Exercises</h2>
+<ol>
+<li>
+<p>Run <code>code/main.py</code>. Confirm the chi-square statistic on the Leviathan distribution check stays below the 95% critical value on 50,000 samples.</p>
+</li>
+<li>
+<p>Sweep <code>N</code> from 1 to 10 with <code>α</code> held at 0.9 and <code>c</code> held at 0.04. Plot expected tokens per verifier call and actual wall time per token. Find the <code>N</code> that minimizes wall time. Explain the shape of the curve.</p>
+</li>
+<li>
+<p>Modify the code to simulate EAGLE-2 tree search: at each step, the draft proposes a tree of shape <code>[2, 2, 2]</code> (eight candidate paths). The verifier runs once, and the highest-probability accepted path wins. Compute <code>α</code> per leaf and total tokens per verifier call. Compare to linear-chain spec-decoding at equivalent compute.</p>
+</li>
+<li>
+<p>Implement a batched KV rollback simulator for two concurrent sequences. Sequence A has all drafts accepted; sequence B rejects at position 2. Show that the correct <code>kv_length</code> is updated per sequence and that no work is wasted.</p>
+</li>
+<li>
+<p>Read the EAGLE-3 paper's Section 4 (Training-Time Test). Explain in two sentences why naive draft training without TTT suffers from exposure bias, and why feeding the draft its own predictions during training fixes it. Connect this to the scheduled-sampling literature in seq2seq.</p>
+</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Leviathan rule</td>
+<td>&quot;min(1, q over p)&quot;</td>
+<td>Bernoulli accept/reject with probability <code>min(1, q(d)/p(d))</code>, preserves the verifier distribution exactly when you sample from the residual on rejection</td>
+</tr>
+<tr>
+<td>Residual distribution</td>
+<td>&quot;(q minus p) plus, normalized&quot;</td>
+<td><code>(q - p)_+</code> clamped at zero and renormalized — the correct distribution to sample from on rejection</td>
+</tr>
+<tr>
+<td>Acceptance rate α</td>
+<td>&quot;how often the draft is right&quot;</td>
+<td>Expected per-token Bernoulli-success probability under the rejection rule; governs all speedup math</td>
+</tr>
+<tr>
+<td>EAGLE-1</td>
+<td>&quot;hidden-state draft&quot;</td>
+<td>Tiny transformer draft conditioned on the verifier's last-layer hidden state (Li et al., 2024)</td>
+</tr>
+<tr>
+<td>EAGLE-2</td>
+<td>&quot;dynamic draft tree&quot;</td>
+<td>EAGLE-1 plus a tree of candidate continuations scored with tree attention in one verifier pass</td>
+</tr>
+<tr>
+<td>EAGLE-3</td>
+<td>&quot;training-time test&quot;</td>
+<td>Drops the feature-prediction loss, trains on direct token prediction with the draft fed its own outputs during training</td>
+</tr>
+<tr>
+<td>Training-time test (TTT)</td>
+<td>&quot;exposure bias fix&quot;</td>
+<td>Run the draft autoregressively during training so train and test input distributions match — the direct analog of scheduled sampling</td>
+</tr>
+<tr>
+<td>KV rollback</td>
+<td>&quot;undo rejected drafts&quot;</td>
+<td>Bookkeeping that resets the verifier's KV cache to the accepted-prefix length after a rejection</td>
+</tr>
+<tr>
+<td>Bonus token</td>
+<td>&quot;the free one&quot;</td>
+<td>When all <code>N</code> drafts accept, sample one extra from <code>q_{N+1}</code> at no additional verifier cost</td>
+</tr>
+<tr>
+<td>Tree attention</td>
+<td>&quot;verify many candidates at once&quot;</td>
+<td>Attention with a non-causal mask that respects the topology of a draft tree; computes <code>q_i</code> for every node in the tree in one forward pass</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2211.17192" rel="noreferrer" data-network="true">Leviathan, Kalman, Matias — Fast Inference from Transformers via Speculative Decoding (arXiv:2211.17192, ICML 2023) <small>↗ 需要联网</small></a> — the foundational paper and equivalence theorem</li>
+<li><a href="https://arxiv.org/abs/2302.01318" rel="noreferrer" data-network="true">Chen et al. — Accelerating Large Language Model Decoding with Speculative Sampling (arXiv:2302.01318) <small>↗ 需要联网</small></a> — concurrent independent introduction with a clean proof</li>
+<li><a href="https://arxiv.org/abs/2401.15077" rel="noreferrer" data-network="true">Li et al. — EAGLE: Speculative Sampling Requires Rethinking Feature Uncertainty (arXiv:2401.15077) <small>↗ 需要联网</small></a> — EAGLE-1, hidden-state-conditioned draft</li>
+<li><a href="https://arxiv.org/abs/2406.16858" rel="noreferrer" data-network="true">Li et al. — EAGLE-2: Faster Inference of Language Models with Dynamic Draft Trees (arXiv:2406.16858) <small>↗ 需要联网</small></a> — dynamic tree search</li>
+<li><a href="https://arxiv.org/abs/2503.01840" rel="noreferrer" data-network="true">Li et al. — EAGLE-3: Scaling up Inference Acceleration via Training-Time Test (arXiv:2503.01840, NeurIPS 2025) <small>↗ 需要联网</small></a> — the 2026 production default</li>
+<li><a href="https://arxiv.org/abs/2401.10774" rel="noreferrer" data-network="true">Cai et al. — Medusa: Multiple Decoding Heads (arXiv:2401.10774) <small>↗ 需要联网</small></a> — alternative draft-free approach</li>
+<li><a href="https://docs.vllm.ai/en/latest/features/spec_decode.html" rel="noreferrer" data-network="true">vLLM Speculative Decoding documentation <small>↗ 需要联网</small></a> — canonical production reference with all strategies wired up</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-10-llms-from-scratch--15-speculative-decoding-eagle3.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-10-llms-from-scratch--15-speculative-decoding-eagle3.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/10-llms-from-scratch/15-speculative-decoding-eagle3/code/main.py">phases/10-llms-from-scratch/15-speculative-decoding-eagle3/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Speculative decoding (Leviathan 2023) with N-token drafts and KV rollback.
+
+Implements the full production speculative-decoding loop:
+  - draft N tokens from p (cheap)
+  - verify N positions in one parallel q forward
+  - rejection rule: accept with min(1, q(d)/p(d))
+  - residual sampling on rejection: (q - p)_+ renormalized
+  - bonus token on full acceptance
+  - KV cache rollback bookkeeping
+
+Stdlib only. Numbers match what Phase 7 · 16 proved mathematically and what
+Phase 10 · 12 described operationally. Here we stitch both together.
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import math
+import random
+from dataclasses import dataclass
+from typing import List
+
+
+def sample(probs: List[float], rng: random.Random) -&gt; int:
+    u = rng.random()
+    acc = 0.0
+    for i, p in enumerate(probs):
+        acc += p
+        if u &lt; acc:
+            return i
+    return len(probs) - 1
+
+
+def residual(q: List[float], p: List[float]) -&gt; List[float]:
+    raw = [max(0.0, qi - pi) for qi, pi in zip(q, p)]
+    s = sum(raw)
+    if s == 0.0:
+        return list(q)
+    return [r / s for r in raw]
+
+
+def kl(q: List[float], p: List[float]) -&gt; float:
+    total = 0.0
+    for qi, pi in zip(q, p):
+        if qi &gt; 0 and pi &gt; 0:
+            total += qi * math.log(qi / pi)
+    return total
+
+
+@dataclass
+class KVBuffer:
+    &quot;&quot;&quot;Tracks logical cache length for verifier. Physical bytes are notional.&quot;&quot;&quot;
+    length: int = 0
+
+    def extend(self, n: int) -&gt; None:
+        self.length += n
+
+    def truncate_to(self, n: int) -&gt; None:
+        self.length = n
+
+
+def spec_step(q: List[float], p: List[float], N: int, kv: KVBuffer,
+              rng: random.Random) -&gt; tuple[List[int], int]:
+    &quot;&quot;&quot;One speculative step: draft N tokens from p, verify with q.
+
+    Returns (tokens_emitted, verifier_forwards_used). verifier_forwards_used
+    is always 1 here — that is the point. tokens_emitted is between 1 and N+1.
+
+    For pedagogical simplicity q and p are context-free distributions shared
+    across positions. The math extends to position-dependent q_i, p_i without
+    changing the loop.
+    &quot;&quot;&quot;
+    prefix_len = kv.length
+    drafts: List[int] = []
+    p_probs: List[float] = []
+    for _ in range(N):
+        d = sample(p, rng)
+        drafts.append(d)
+        p_probs.append(p[d])
+
+    emitted: List[int] = []
+    for i, d in enumerate(drafts):
+        u = rng.random()
+        q_prob = q[d]
+        p_prob = p_probs[i]
+        ratio = q_prob / p_prob if p_prob &gt; 0 else float(&quot;inf&quot;)
+        if u &lt; min(1.0, ratio):
+            emitted.append(d)
+            kv.extend(1)
+        else:
+            correction = sample(residual(q, p), rng)
+            emitted.append(correction)
+            kv.truncate_to(prefix_len + len(emitted))
+            return emitted, 1
+
+    bonus = sample(q, rng)
+    emitted.append(bonus)
+    kv.extend(1)
+    return emitted, 1
+
+
+def direct_sample(q: List[float], n: int, rng: random.Random) -&gt; List[int]:
+    return [sample(q, rng) for _ in range(n)]
+
+
+def distribution_check(q: List[float], p: List[float], n_steps: int,
+                       rng: random.Random) -&gt; tuple[List[int], List[int]]:
+    &quot;&quot;&quot;Check that the FIRST emitted token (the Leviathan-sampled one) is
+    distributed as q. On accept that is the draft; on reject it is the
+    residual correction. The bonus token that follows on full acceptance is
+    also distributed as q but is a second draw and should not be mixed in
+    here.&quot;&quot;&quot;
+    spec_counts = [0] * len(q)
+    direct_counts = [0] * len(q)
+    for _ in range(n_steps):
+        kv = KVBuffer()
+        tokens, _ = spec_step(q, p, N=1, kv=kv, rng=rng)
+        spec_counts[tokens[0]] += 1
+        direct_counts[sample(q, rng)] += 1
+    return spec_counts, direct_counts
+
+
+def chi_square(observed: List[int], expected: List[int]) -&gt; float:
+    total_obs = sum(observed)
+    total_exp = sum(expected)
+    if total_obs == 0 or total_exp == 0:
+        return 0.0
+    result = 0.0
+    for o, e in zip(observed, expected):
+        e_norm = e * total_obs / total_exp
+        if e_norm &gt; 0:
+            result += (o - e_norm) ** 2 / e_norm
+    return result
+
+
+def measure_alpha(q: List[float], p: List[float], n_samples: int,
+                  rng: random.Random) -&gt; float:
+    hits = 0
+    for _ in range(n_samples):
+        d = sample(p, rng)
+        u = rng.random()
+        q_prob = q[d]
+        p_prob = p[d]
+        if p_prob &gt; 0 and u &lt; min(1.0, q_prob / p_prob):
+            hits += 1
+    return hits / n_samples
+
+
+def expected_tokens_per_verify(alpha: float, N: int) -&gt; float:
+    if alpha &gt;= 1.0:
+        return N + 1
+    if alpha &lt;= 0.0:
+        return 1.0
+    return (1.0 - alpha ** (N + 1)) / (1.0 - alpha)
+
+
+def wall_time_per_token(alpha: float, N: int, c: float) -&gt; float:
+    &quot;&quot;&quot;Draft cost is c per token relative to the verifier (cost 1.0).
+
+    Each verifier call costs 1.0 plus N * c for the draft. Expected tokens
+    emitted is (1 - alpha^(N+1)) / (1 - alpha).
+    &quot;&quot;&quot;
+    return (1.0 + N * c) / expected_tokens_per_verify(alpha, N)
+
+
+def perturb(q: List[float], amount: float, rng: random.Random) -&gt; List[float]:
+    p = [max(1e-6, qi + amount * rng.gauss(0, 1)) for qi in q]
+    s = sum(p)
+    return [pi / s for pi in p]
+
+
+def main() -&gt; None:
+    rng = random.Random(42)
+
+    q = [0.30, 0.22, 0.15, 0.10, 0.08, 0.07, 0.05, 0.03]
+    p_eagle3 = perturb(q, amount=0.005, rng=random.Random(1))
+    p_eagle1 = perturb(q, amount=0.02, rng=random.Random(2))
+    p_vanilla = perturb(q, amount=0.08, rng=random.Random(3))
+
+    print(&quot;=&quot; * 70)
+    print(&quot;SPECULATIVE DECODING AND EAGLE-3 (Phase 10, Lesson 15)&quot;)
+    print(&quot;=&quot; * 70)
+    print()
+    print(&quot;verifier q:  &quot; + &quot; &quot;.join(f&quot;{qi:.3f}&quot; for qi in q))
+    print()
+
+    print(&quot;-&quot; * 70)
+    print(&quot;Step 1: Leviathan distribution-equivalence check (N=1, 50000 trials)&quot;)
+    print(&quot;-&quot; * 70)
+    spec_c, direct_c = distribution_check(q, p_eagle1, 50000, rng)
+    chi = chi_square(spec_c, direct_c)
+    print(f&quot;  spec   counts: {spec_c}&quot;)
+    print(f&quot;  direct counts: {direct_c}&quot;)
+    print(f&quot;  chi^2 = {chi:.2f}  (df={len(q) - 1}; 95% crit ~14.07)&quot;)
+    verdict = &quot;PASS&quot; if chi &lt; 14.07 else &quot;CHECK&quot;
+    print(f&quot;  verdict: {verdict}  (spec-decoded distribution matches verifier)&quot;)
+    print()
+
+    print(&quot;-&quot; * 70)
+    print(&quot;Step 2: measured acceptance rate alpha per draft quality&quot;)
+    print(&quot;-&quot; * 70)
+    print(f&quot;  {&#39;draft&#39;:&lt;12} {&#39;KL(q||p)&#39;:&gt;10} {&#39;alpha&#39;:&gt;8}&quot;)
+    for name, p in [(&quot;vanilla&quot;, p_vanilla), (&quot;eagle-1&quot;, p_eagle1),
+                    (&quot;eagle-3&quot;, p_eagle3)]:
+        a = measure_alpha(q, p, 20000, random.Random(7))
+        print(f&quot;  {name:&lt;12} {kl(q, p):&gt;10.4f} {a:&gt;8.3f}&quot;)
+    print()
+
+    print(&quot;-&quot; * 70)
+    print(&quot;Step 3: expected tokens per verifier call (theory)&quot;)
+    print(&quot;-&quot; * 70)
+    Ns = [1, 3, 5, 7, 10]
+    alphas = [0.55, 0.70, 0.80, 0.90, 0.95]
+    print(f&quot;  {&#39;alpha&#39;:&gt;6}  &quot; + &quot;&quot;.join(f&quot;{f&#39;N={N}&#39;:&gt;8}&quot; for N in Ns))
+    for a in alphas:
+        row = f&quot;  {a:&gt;6.2f}  &quot; + &quot;&quot;.join(
+            f&quot;{expected_tokens_per_verify(a, N):&gt;8.2f}&quot; for N in Ns
+        )
+        print(row)
+    print()
+
+    print(&quot;-&quot; * 70)
+    print(&quot;Step 4: wall time per token at c=0.04 (EAGLE-3-class draft cost)&quot;)
+    print(&quot;-&quot; * 70)
+    print(f&quot;  {&#39;alpha&#39;:&gt;6}  &quot; + &quot;&quot;.join(f&quot;{f&#39;N={N}&#39;:&gt;8}&quot; for N in Ns))
+    for a in alphas:
+        row = f&quot;  {a:&gt;6.2f}  &quot; + &quot;&quot;.join(
+            f&quot;{wall_time_per_token(a, N, c=0.04):&gt;8.3f}&quot; for N in Ns
+        )
+        print(row)
+    print(&quot;  (lower = faster. baseline no-spec-decode = 1.000 per token)&quot;)
+    print()
+
+    print(&quot;-&quot; * 70)
+    print(&quot;Step 5: end-to-end simulated run, N=5, draft=eagle-3, 1000 rounds&quot;)
+    print(&quot;-&quot; * 70)
+    kv = KVBuffer()
+    total_tokens = 0
+    total_forwards = 0
+    accepted_per_round: List[int] = []
+    for _ in range(1000):
+        tokens, forwards = spec_step(q, p_eagle3, N=5, kv=kv, rng=rng)
+        total_tokens += len(tokens)
+        total_forwards += forwards
+        accepted_per_round.append(len(tokens))
+    mean_tokens = total_tokens / 1000
+    print(f&quot;  total tokens emitted : {total_tokens}&quot;)
+    print(f&quot;  verifier forwards    : {total_forwards}&quot;)
+    print(f&quot;  mean tokens / forward: {mean_tokens:.2f}&quot;)
+    print(f&quot;  kv logical length    : {kv.length}   (tracks accepted prefix)&quot;)
+    print(f&quot;  expected at alpha=0.95, N=5: &quot;
+          f&quot;{expected_tokens_per_verify(0.95, 5):.2f}&quot;)
+    print()
+
+    print(&quot;takeaway: EAGLE-3 class draft quality (alpha~0.9) at N=5 delivers&quot;)
+    print(&quot;          ~4-5 tokens per verifier forward. The 3-6.5x EAGLE-3 paper&quot;)
+    print(&quot;          number is that ratio plus tree-search and TTT gains.&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/10-llms-from-scratch/15-speculative-decoding-eagle3/outputs/skill-eagle3-tuner.md">phases/10-llms-from-scratch/15-speculative-decoding-eagle3/outputs/skill-eagle3-tuner.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: eagle3-tuner
+description: Pick and tune a speculative decoding strategy (vanilla / Medusa / EAGLE-1/2/3 / lookahead) for a new inference workload.
+version: 1.0.0
+phase: 10
+lesson: 15
+tags: [speculative-decoding, eagle, eagle-3, medusa, inference, vllm, sglang, tensorrt-llm]
+---
+
+Given a production inference target (verifier model, batch size, sequence length profile, target p50/p99 decode latency, accelerator, expected alpha range from telemetry, task mix), recommend a speculative-decoding strategy and tuning parameters. The recommendation must preserve the verifier&#39;s output distribution exactly — no quality tradeoff is acceptable without explicit sign-off.
+
+Produce:
+
+1. Draft family. Pick from vanilla, Medusa, EAGLE-1, EAGLE-2, EAGLE-3, or lookahead. Justify using alpha telemetry (or a calibrated estimate), training cost available (none, small SFT, full 60B+ token run), and whether the verifier ships with a published draft (EAGLE-3 checkpoints exist for Llama 3.1/3.3, DeepSeek-V3, Qwen 2.5, Qwen 3).
+2. Draft length N. Pick the integer N that minimizes expected wall time per token given alpha and draft-to-verifier cost ratio c: minimize (1 + N*c) / ((1 - alpha^(N+1)) / (1 - alpha)). Show the work for three candidate N values around the optimum.
+3. Tree search parameters if EAGLE-2/3. Pick tree depth and branching factor to stay within memory budget. Default to depth 3, branching (4, 2, 2) for batch &lt;=8, depth 2 (4, 2) for batch 16-64, and no tree for batch &gt;64.
+4. Temperature gating. When temperature &gt; 0.8, alpha collapses. Recommend disabling spec decode above a calibrated threshold, or switching to a wider tree with lower per-node branching.
+5. KV rollback plan. Name the specific KV cache implementation (vLLM&#39;s scratch buffer vs TensorRT-LLM&#39;s logical-length per-sequence) and confirm it supports batched rejection at the target concurrency.
+
+Hard rejects:
+- Any recommendation that changes the verifier&#39;s output distribution (e.g., approximate spec-decode, relaxed rejection).
+- Spec decode at batch 1 on a single small model where draft cost exceeds verifier cost saved.
+- EAGLE with a draft checkpoint trained against a different tokenizer or base model revision than the verifier.
+- Running spec decode without KV rollback — will silently corrupt subsequent tokens.
+
+Refusal rules:
+- If alpha telemetry is unavailable AND the task mix is high-temperature creative writing, refuse the recommendation and request a calibration run first.
+- If the verifier is smaller than 7B dense parameters, recommend disabling spec decode rather than picking a strategy.
+- If the serving stack does not support the chosen draft family (e.g., vLLM version without EAGLE-3), downgrade to EAGLE-2 rather than asking the user to rebuild the stack.
+
+Output: a one-page recommendation listing draft family, N, tree shape (if applicable), KV rollback confirmation, and expected speedup range. End with an &quot;alpha telemetry plan&quot; paragraph naming the exact logging hooks the user must add to their inference server to verify the recommendation in the first week of production.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原课程未提供测验。</p></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/10-llms-from-scratch/14-open-models-architecture-walkthroughs/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/10-llms-from-scratch/16-differential-attention-v2/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/10-llms-from-scratch/15-speculative-decoding-eagle3/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

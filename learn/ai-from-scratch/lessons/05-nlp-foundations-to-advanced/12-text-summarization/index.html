@@ -1,0 +1,560 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>文本总结 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-05-nlp-foundations-to-advanced" data-lesson="05-nlp-foundations-to-advanced/12-text-summarization" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/05-nlp-foundations-to-advanced/">自然语言处理</a> / LESSON 12</p><h1 class="lesson-title">文本总结</h1><p>Text Summarization</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>文本总结</h1>
+<blockquote>
+<p>抽象系统告诉你文件中所说的东西,抽象系统告诉你作者是什么意思.不同的任务,不同的陷.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 5 · 02 (BoW + TF-IDF), Phase 5 · 11 (Machine Translation)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>问题</h2>
+<p>您需要120个词来捕捉到的新闻文章.您可以从文章中选出三个最重要的句子 (摘要) 或用您自己的词 (抽象) 重写内容.这两个称为总结.它们是完全不同的问题.</p>
+<p>提取总结是一个排名问题.<code>k</code>输出总是语法性的,因为它被字面上提升.</p>
+<p>抽象总结是一个生成问题.一个变压器产生了新的文本,根据输入条件.输出流动和压缩,但可能会幻觉到未在源头中的事实.风险是自信的制造.</p>
+<p>这一课是建立了两者,每个人都有失败模式.</p>
+<h2>概念</h2>
+<p><img src="/learn/ai-from-scratch/files/phases/05-nlp-foundations-to-advanced/12-text-summarization/assets/summarization.svg" alt="Extractive TextRank vs abstractive transformer" loading="lazy"></p>
+<p>**Extractive.**按照文章的相关性,将文章视为一个图,其中节点是句子,边缘是相似之处. 运行页面排行 (或类似的东西) 在图上,以根据它们与其他一切的联系来评分句子.最高分的句子是总结.<strong>TextRank</strong>尔塞亚和塔拉乌 (2004年).</p>
+<p>**Abstractive.**在文件-总结对上进行变压器编码器-解码器 (BART,T5,Pegasus) 的细调.在推断时,模型会读取文件并通过交叉注意力生成总结代币-代币.Pegasus特别使用一个空隙句子预训目标,使其在没有太多细调的情况下进行总结.</p>
+<p>评估与<strong>ROUGE</strong>红色-1和红色-2分数重叠单格和大格.红色-L分数是最长的常见次数.更高是更好,但40红色-L是&quot;好&quot;和50是&quot;特殊&quot;.每篇报道都报告了三个.使用<code>rouge-score</code>包装.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-57b94f4e6c1d52f11187.png" alt="summarize-collapse 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<h3>步骤1:文字排行 (摘取)</h3>
+<pre><code class="language-python">import math
+import re
+from collections import Counter
+
+
+def sentence_split(text):
+    return re.split(r&quot;(?&lt;=[.!?])\s+&quot;, text.strip())
+
+
+def similarity(s1, s2):
+    w1 = Counter(s1.lower().split())
+    w2 = Counter(s2.lower().split())
+    intersection = sum((w1 &amp; w2).values())
+    denom = math.log(len(w1) + 1) + math.log(len(w2) + 1)
+    if denom == 0:
+        return 0.0
+    return intersection / denom
+
+
+def textrank(text, top_k=3, damping=0.85, iterations=50, epsilon=1e-4):
+    sentences = sentence_split(text)
+    n = len(sentences)
+    if n &lt;= top_k:
+        return sentences
+
+    sim = [[0.0] * n for _ in range(n)]
+    for i in range(n):
+        for j in range(n):
+            if i != j:
+                sim[i][j] = similarity(sentences[i], sentences[j])
+
+    scores = [1.0] * n
+    for _ in range(iterations):
+        new_scores = [1 - damping] * n
+        for i in range(n):
+            total_out = sum(sim[i]) or 1e-9
+            for j in range(n):
+                if sim[i][j] &gt; 0:
+                    new_scores[j] += damping * sim[i][j] / total_out * scores[i]
+        if max(abs(s - ns) for s, ns in zip(scores, new_scores)) &lt; epsilon:
+            scores = new_scores
+            break
+        scores = new_scores
+
+    ranked = sorted(range(n), key=lambda k: scores[k], reverse=True)[:top_k]
+    ranked.sort()
+    return [sentences[i] for i in ranked]
+</code></pre>
+<p>值得命名的两个东西.类似性函数使用日志正常化的词重叠,这是原始的 TextRank 变体. TF-IDF 矢量的可西因也可以运行.缓解因子 0.85 和反复数是 PageRank 默认.</p>
+<h3>步骤2:使用BART抽象</h3>
+<pre><code class="language-python">from transformers import pipeline
+
+summarizer = pipeline(&quot;summarization&quot;, model=&quot;facebook/bart-large-cnn&quot;)
+
+article = &quot;&quot;&quot;(long news article text)&quot;&quot;&quot;
+
+summary = summarizer(article, max_length=120, min_length=60, do_sample=False)
+print(summary[0][&quot;summary_text&quot;])
+</code></pre>
+<p>对于其他领域 (科学论文,对话,法律),使用相应的Pegasus检查点或对目标数据进行细节调整.</p>
+<h3>步骤3:红色评估</h3>
+<pre><code class="language-python">from rouge_score import rouge_scorer
+
+scorer = rouge_scorer.RougeScorer([&quot;rouge1&quot;, &quot;rouge2&quot;, &quot;rougeL&quot;], use_stemmer=True)
+scores = scorer.score(reference_summary, generated_summary)
+print({k: round(v.fmeasure, 3) for k, v in scores.items()})
+</code></pre>
+<p>没有它,&quot;跑&quot;和&quot;跑&quot;都算是不同的词,而Rouge算是不足的.</p>
+<h3>超越红色 (2026年总结评估)</h3>
+<p>红色已经成为主导的总结指标二十年,但在2026年本身不足.</p>
+<ul>
+<li><strong>BERTScore</strong>据报道,目前,在大多数总结论文中,与ROUGE一起报告.</li>
+<li><strong>BARTScore</strong>评估是生成的:根据预先训练的BART将总结分配给来源的可能性,评分总结.</li>
+<li><strong>MoverScore</strong>(Earth Mover's Distance over contextual embeddings) 在2025年总结基准中达到顶点,因为它比ROUGE更好地捕捉了语义重叠.</li>
+<li><strong>FactCC</strong>其他<strong>QA-based faithfulness</strong>现在经常被替换为<strong>G-Eval</strong>(一个GPT-4提示链,该链的结合性,一致性,流利性,与链思维推理相关性).</li>
+<li><strong>G-Eval</strong>类似的LLM法官方法与人判断相匹配.</li>
+</ul>
+<p>产品推:报告 ROUGE-L用于传统的比较,BERTScore用于语义重叠,G-Eval用于一致性和事实性. 根据50-100个标记的人类的总结进行校准.</p>
+<h3>步骤4:事实性问题</h3>
+<p>抽象摘要容易产生幻觉.抽象摘要带来了较低的幻觉风险,因为输出从源头上字面上取出,尽管如果源句子脱文,过时或引用过后,它们仍然可以误导.这是生产系统仍然更喜欢抽取方法的原因.</p>
+<p>幻类型:</p>
+<ul>
+<li>**Entity swap.**来源说&quot;约翰·史密斯&quot;.总结说&quot;约翰·布朗&quot;.</li>
+<li>**Number drift.**来源说25,000. 总结说2500万.</li>
+<li>**Polarity flip.**消息来源说&quot;拒绝了这份报价&quot;.总结说&quot;接受了这份报价&quot;.</li>
+<li>**Fact invention.**消息来源没有提到首席执行官. 总结说首席执行官批准了.</li>
+</ul>
+<p>评估方法:</p>
+<ul>
+<li>**FactCC.**基于源句和总结句之间的关系训练的二进制分类器. 预测事实/非事实.</li>
+<li>**QA-based factuality.**问一个质量评估模型的问题,其答案在源头.如果总结支持不同的答案,请标记.</li>
+<li>**Entity-level F1.**根据本文的内容, 总结中仅有所存在的实体是可疑的.</li>
+</ul>
+<p>对于任何事实性 (新闻,医疗,法律,金融) 的用户面向,抽取是安全的默认.抽象需要循环检查事实性.</p>
+<h2>用它</h2>
+<p>现在,我们要做什么?</p>
+<table>
+<thead>
+<tr>
+<th>Use case</th>
+<th>Recommended</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>News, 3-5 sentence summary, English</td>
+<td><code>facebook/bart-large-cnn</code></td>
+</tr>
+<tr>
+<td>Scientific papers</td>
+<td><code>google/pegasus-pubmed</code> or a tuned T5</td>
+</tr>
+<tr>
+<td>Multi-document, long-form</td>
+<td>Any LLM with 32k+ context, prompted</td>
+</tr>
+<tr>
+<td>Dialog summarization</td>
+<td><code>philschmid/bart-large-cnn-samsum</code></td>
+</tr>
+<tr>
+<td>Extractive, low hallucination risk by construction</td>
+<td>TextRank or <code>sumy</code>'s LSA / LexRank</td>
+</tr>
+</tbody>
+</table>
+<p>长文本的LLM通常在2026年超过专业模型,当计算不是一个限制时. 折衷是成本和可复制性;专业模型提供更一致的输出.</p>
+<h2>运送它</h2>
+<p>保存如<code>outputs/skill-summary-picker.md</code>其他:</p>
+<pre><code class="language-markdown">---
+name: summary-picker
+description: Pick extractive or abstractive, named library, factuality check.
+version: 1.0.0
+phase: 5
+lesson: 12
+tags: [nlp, summarization]
+---
+
+Given a task (document type, compliance requirement, length, compute budget), output:
+
+1. Approach. Extractive or abstractive. Explain in one sentence why.
+2. Starting model / library. Name it. `sumy.TextRankSummarizer`, `facebook/bart-large-cnn`, `google/pegasus-pubmed`, or an LLM prompt.
+3. Evaluation plan. ROUGE-1, ROUGE-2, ROUGE-L (use rouge-score with stemming). Plus factuality check if abstractive.
+4. One failure mode to probe. Entity swap is the most common in abstractive news summarization; flag samples where source entities do not appear in summary.
+
+Refuse abstractive summarization for medical, legal, financial, or regulated content without a factuality gate. Flag input over the model's context window as needing chunked map-reduce summarization (not just truncation).
+</code></pre>
+<h2>运动</h2>
+<ol>
+<li>**Easy.**运行5个新闻文章的文字排名.将前3句子与参考摘要进行比较.测量ROUGE-L.你应该在CNN/DailyMail类型的文章中看到30-45 ROUGE-L.</li>
+<li>**Medium.**实体级实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实实</li>
+<li>**Hard.**根据CNN/DailyMail的50篇文章,比较BART-大CNN与LLM (Claude或GPT-4) 的情况.报告ROUGE-L,事实性 (按实体F1),每次总结的成本.每个获胜的文件.</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Extractive</td>
+<td>Pick sentences</td>
+<td>Return sentences verbatim from the source. Never hallucinates.</td>
+</tr>
+<tr>
+<td>Abstractive</td>
+<td>Rewrite</td>
+<td>Generate new text conditioned on source. Can hallucinate.</td>
+</tr>
+<tr>
+<td>ROUGE</td>
+<td>Summary metric</td>
+<td>N-gram / LCS overlap between system output and reference.</td>
+</tr>
+<tr>
+<td>TextRank</td>
+<td>Graph-based extractive</td>
+<td>PageRank over sentence similarity graph.</td>
+</tr>
+<tr>
+<td>Factuality</td>
+<td>Is it right</td>
+<td>Whether summary claims are supported by the source.</td>
+</tr>
+<tr>
+<td>Hallucination</td>
+<td>Made-up content</td>
+<td>Content in the summary that the source does not support.</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://aclanthology.org/W04-3252/" rel="noreferrer" data-network="true">Mihalcea and Tarau (2004). TextRank: Bringing Order into Texts <small>↗ 需要联网</small></a>提取法典论文.</li>
+<li><a href="https://arxiv.org/abs/1910.13461" rel="noreferrer" data-network="true">Lewis et al. (2019). BART: Denoising Sequence-to-Sequence Pre-training <small>↗ 需要联网</small></a>BART纸.</li>
+<li><a href="https://arxiv.org/abs/1912.08777" rel="noreferrer" data-network="true">Zhang et al. (2019). PEGASUS: Pre-training with Extracted Gap-sentences <small>↗ 需要联网</small></a>佩加索和空白句子目标.</li>
+<li><a href="https://aclanthology.org/W04-1013/" rel="noreferrer" data-network="true">Lin (2004). ROUGE: A Package for Automatic Evaluation of Summaries <small>↗ 需要联网</small></a>红色纸.</li>
+<li><a href="https://arxiv.org/abs/2005.00661" rel="noreferrer" data-network="true">Maynez et al. (2020). On Faithfulness and Factuality in Abstractive Summarization <small>↗ 需要联网</small></a>实况景观论文.</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Text Summarization</h1>
+<blockquote>
+<p>Extractive systems tell you what the document said. Abstractive systems tell you what the author meant. Different tasks, different pitfalls.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 5 · 02 (BoW + TF-IDF), Phase 5 · 11 (Machine Translation)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>The Problem</h2>
+<p>A 2,000-word news article lands in your feed. You need 120 words that capture it. You can either pick the three most important sentences from the article (extractive) or rewrite the content in your own words (abstractive). Both are called summarization. They are completely different problems.</p>
+<p>Extractive summarization is a ranking problem. Score every sentence, return the top-<code>k</code>. The output is always grammatical because it is lifted verbatim. The risk is missing content that is distributed across the article.</p>
+<p>Abstractive summarization is a generation problem. A transformer produces new text conditioned on the input. The output is fluent and compressive but may hallucinate facts that were not in the source. The risk is confident fabrication.</p>
+<p>This lesson builds both, with the failure mode each one owns.</p>
+<h2>The Concept</h2>
+<p><img src="/learn/ai-from-scratch/files/phases/05-nlp-foundations-to-advanced/12-text-summarization/assets/summarization.svg" alt="Extractive TextRank vs abstractive transformer" loading="lazy"></p>
+<p><strong>Extractive.</strong> Treat the article as a graph where nodes are sentences and edges are similarities. Run PageRank (or something like it) over the graph to score sentences by how connected they are to everything else. Highest-scoring sentences are the summary. The canonical implementation is <strong>TextRank</strong> (Mihalcea and Tarau, 2004).</p>
+<p><strong>Abstractive.</strong> Fine-tune a transformer encoder-decoder (BART, T5, Pegasus) on document-summary pairs. At inference, the model reads the document and generates the summary token-by-token via cross-attention. Pegasus in particular uses a gap-sentence pretraining objective that makes it excellent at summarization without much fine-tuning.</p>
+<p>Evaluation with <strong>ROUGE</strong> (Recall-Oriented Understudy for Gisting Evaluation). ROUGE-1 and ROUGE-2 score unigram and bigram overlap. ROUGE-L scores longest common subsequence. Higher is better but 40 ROUGE-L is &quot;good&quot; and 50 is &quot;exceptional.&quot; Every paper reports all three. Use the <code>rouge-score</code> package.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-57b94f4e6c1d52f11187.png" alt="summarize-collapse 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<h3>Step 1: TextRank (extractive)</h3>
+<pre><code class="language-python">import math
+import re
+from collections import Counter
+
+
+def sentence_split(text):
+    return re.split(r&quot;(?&lt;=[.!?])\s+&quot;, text.strip())
+
+
+def similarity(s1, s2):
+    w1 = Counter(s1.lower().split())
+    w2 = Counter(s2.lower().split())
+    intersection = sum((w1 &amp; w2).values())
+    denom = math.log(len(w1) + 1) + math.log(len(w2) + 1)
+    if denom == 0:
+        return 0.0
+    return intersection / denom
+
+
+def textrank(text, top_k=3, damping=0.85, iterations=50, epsilon=1e-4):
+    sentences = sentence_split(text)
+    n = len(sentences)
+    if n &lt;= top_k:
+        return sentences
+
+    sim = [[0.0] * n for _ in range(n)]
+    for i in range(n):
+        for j in range(n):
+            if i != j:
+                sim[i][j] = similarity(sentences[i], sentences[j])
+
+    scores = [1.0] * n
+    for _ in range(iterations):
+        new_scores = [1 - damping] * n
+        for i in range(n):
+            total_out = sum(sim[i]) or 1e-9
+            for j in range(n):
+                if sim[i][j] &gt; 0:
+                    new_scores[j] += damping * sim[i][j] / total_out * scores[i]
+        if max(abs(s - ns) for s, ns in zip(scores, new_scores)) &lt; epsilon:
+            scores = new_scores
+            break
+        scores = new_scores
+
+    ranked = sorted(range(n), key=lambda k: scores[k], reverse=True)[:top_k]
+    ranked.sort()
+    return [sentences[i] for i in ranked]
+</code></pre>
+<p>Two things worth naming. The similarity function uses log-normalized word overlap, which is the original TextRank variant. Cosine of TF-IDF vectors works too. The damping factor 0.85 and iteration count are the PageRank defaults.</p>
+<h3>Step 2: abstractive with BART</h3>
+<pre><code class="language-python">from transformers import pipeline
+
+summarizer = pipeline(&quot;summarization&quot;, model=&quot;facebook/bart-large-cnn&quot;)
+
+article = &quot;&quot;&quot;(long news article text)&quot;&quot;&quot;
+
+summary = summarizer(article, max_length=120, min_length=60, do_sample=False)
+print(summary[0][&quot;summary_text&quot;])
+</code></pre>
+<p>BART-large-CNN is fine-tuned on the CNN/DailyMail corpus. It produces news-style summaries out of the box. For other domains (scientific papers, dialog, legal), use the corresponding Pegasus checkpoint or fine-tune on your target data.</p>
+<h3>Step 3: ROUGE evaluation</h3>
+<pre><code class="language-python">from rouge_score import rouge_scorer
+
+scorer = rouge_scorer.RougeScorer([&quot;rouge1&quot;, &quot;rouge2&quot;, &quot;rougeL&quot;], use_stemmer=True)
+scores = scorer.score(reference_summary, generated_summary)
+print({k: round(v.fmeasure, 3) for k, v in scores.items()})
+</code></pre>
+<p>Always use stemming. Without it, &quot;running&quot; and &quot;run&quot; count as different words and ROUGE undercounts.</p>
+<h3>Beyond ROUGE (2026 summarization eval)</h3>
+<p>ROUGE has been the dominant summarization metric for twenty years and it is insufficient on its own in 2026. A large-scale meta-analysis of NLG papers showed:</p>
+<ul>
+<li><strong>BERTScore</strong> (contextual embedding similarity) gained ground through 2023 and is now reported alongside ROUGE in most summarization papers.</li>
+<li><strong>BARTScore</strong> treats evaluation as generation: score the summary by how likely a pretrained BART assigns it given the source.</li>
+<li><strong>MoverScore</strong> (Earth Mover's Distance over contextual embeddings) reached the top spot in 2025 summarization benchmarks because it captures semantic overlap better than ROUGE.</li>
+<li><strong>FactCC</strong> and <strong>QA-based faithfulness</strong> were common 2021-2023, now often replaced by <strong>G-Eval</strong> (a GPT-4 prompt chain that scores coherence, consistency, fluency, relevance with chain-of-thought reasoning).</li>
+<li><strong>G-Eval</strong> and similar LLM-judge approaches match human judgment ~80% of the time when rubrics are well-designed.</li>
+</ul>
+<p>Production recommendation: report ROUGE-L for legacy comparison, BERTScore for semantic overlap, G-Eval for coherence and factuality. Calibrate against 50-100 human-labeled summaries.</p>
+<h3>Step 4: the factuality problem</h3>
+<p>Abstractive summaries are prone to hallucination. Extractive summaries carry a much lower hallucination risk because the output is lifted verbatim from the source, though they can still mislead if source sentences are decontextualized, outdated, or quoted out of order. This is the single biggest reason production systems still prefer extractive methods for compliance-adjacent content.</p>
+<p>Hallucination types to name:</p>
+<ul>
+<li><strong>Entity swap.</strong> Source says &quot;John Smith.&quot; Summary says &quot;John Brown.&quot;</li>
+<li><strong>Number drift.</strong> Source says &quot;25,000.&quot; Summary says &quot;25 million.&quot;</li>
+<li><strong>Polarity flip.</strong> Source says &quot;rejected the offer.&quot; Summary says &quot;accepted the offer.&quot;</li>
+<li><strong>Fact invention.</strong> Source does not mention the CEO. Summary says the CEO approved.</li>
+</ul>
+<p>Evaluation approaches that work:</p>
+<ul>
+<li><strong>FactCC.</strong> A binary classifier trained on entailment between source sentence and summary sentence. Predicts factual/not-factual.</li>
+<li><strong>QA-based factuality.</strong> Ask a QA model questions whose answers are in the source. If the summary supports different answers, flag.</li>
+<li><strong>Entity-level F1.</strong> Compare named entities in source vs summary. Entities present only in the summary are suspect.</li>
+</ul>
+<p>For anything user-facing where factuality matters (news, medical, legal, financial), extractive is the safer default. Abstractive needs a factuality check in the loop.</p>
+<h2>Use It</h2>
+<p>The 2026 stack:</p>
+<table>
+<thead>
+<tr>
+<th>Use case</th>
+<th>Recommended</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>News, 3-5 sentence summary, English</td>
+<td><code>facebook/bart-large-cnn</code></td>
+</tr>
+<tr>
+<td>Scientific papers</td>
+<td><code>google/pegasus-pubmed</code> or a tuned T5</td>
+</tr>
+<tr>
+<td>Multi-document, long-form</td>
+<td>Any LLM with 32k+ context, prompted</td>
+</tr>
+<tr>
+<td>Dialog summarization</td>
+<td><code>philschmid/bart-large-cnn-samsum</code></td>
+</tr>
+<tr>
+<td>Extractive, low hallucination risk by construction</td>
+<td>TextRank or <code>sumy</code>'s LSA / LexRank</td>
+</tr>
+</tbody>
+</table>
+<p>LLMs with long context often beat specialized models in 2026 when compute is not a constraint. The tradeoff is cost and reproducibility; specialized models give more consistent outputs.</p>
+<h2>Ship It</h2>
+<p>Save as <code>outputs/skill-summary-picker.md</code>:</p>
+<pre><code class="language-markdown">---
+name: summary-picker
+description: Pick extractive or abstractive, named library, factuality check.
+version: 1.0.0
+phase: 5
+lesson: 12
+tags: [nlp, summarization]
+---
+
+Given a task (document type, compliance requirement, length, compute budget), output:
+
+1. Approach. Extractive or abstractive. Explain in one sentence why.
+2. Starting model / library. Name it. `sumy.TextRankSummarizer`, `facebook/bart-large-cnn`, `google/pegasus-pubmed`, or an LLM prompt.
+3. Evaluation plan. ROUGE-1, ROUGE-2, ROUGE-L (use rouge-score with stemming). Plus factuality check if abstractive.
+4. One failure mode to probe. Entity swap is the most common in abstractive news summarization; flag samples where source entities do not appear in summary.
+
+Refuse abstractive summarization for medical, legal, financial, or regulated content without a factuality gate. Flag input over the model's context window as needing chunked map-reduce summarization (not just truncation).
+</code></pre>
+<h2>Exercises</h2>
+<ol>
+<li><strong>Easy.</strong> Run TextRank on 5 news articles. Compare the top-3 sentences to a reference summary. Measure ROUGE-L. You should see 30-45 ROUGE-L on CNN/DailyMail-style articles.</li>
+<li><strong>Medium.</strong> Implement entity-level factuality: extract named entities from source and summary (spaCy), compute recall of source entities in summary and precision of summary entities against source. High precision and low recall mean safe but terse; low precision means hallucinated entities.</li>
+<li><strong>Hard.</strong> Compare BART-large-CNN against an LLM (Claude or GPT-4) on 50 CNN/DailyMail articles. Report ROUGE-L, factuality (by entity F1), and cost per summary. Document where each wins.</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Extractive</td>
+<td>Pick sentences</td>
+<td>Return sentences verbatim from the source. Never hallucinates.</td>
+</tr>
+<tr>
+<td>Abstractive</td>
+<td>Rewrite</td>
+<td>Generate new text conditioned on source. Can hallucinate.</td>
+</tr>
+<tr>
+<td>ROUGE</td>
+<td>Summary metric</td>
+<td>N-gram / LCS overlap between system output and reference.</td>
+</tr>
+<tr>
+<td>TextRank</td>
+<td>Graph-based extractive</td>
+<td>PageRank over sentence similarity graph.</td>
+</tr>
+<tr>
+<td>Factuality</td>
+<td>Is it right</td>
+<td>Whether summary claims are supported by the source.</td>
+</tr>
+<tr>
+<td>Hallucination</td>
+<td>Made-up content</td>
+<td>Content in the summary that the source does not support.</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://aclanthology.org/W04-3252/" rel="noreferrer" data-network="true">Mihalcea and Tarau (2004). TextRank: Bringing Order into Texts <small>↗ 需要联网</small></a> — the extractive canonical paper.</li>
+<li><a href="https://arxiv.org/abs/1910.13461" rel="noreferrer" data-network="true">Lewis et al. (2019). BART: Denoising Sequence-to-Sequence Pre-training <small>↗ 需要联网</small></a> — the BART paper.</li>
+<li><a href="https://arxiv.org/abs/1912.08777" rel="noreferrer" data-network="true">Zhang et al. (2019). PEGASUS: Pre-training with Extracted Gap-sentences <small>↗ 需要联网</small></a> — Pegasus and the gap-sentence objective.</li>
+<li><a href="https://aclanthology.org/W04-1013/" rel="noreferrer" data-network="true">Lin (2004). ROUGE: A Package for Automatic Evaluation of Summaries <small>↗ 需要联网</small></a> — ROUGE paper.</li>
+<li><a href="https://arxiv.org/abs/2005.00661" rel="noreferrer" data-network="true">Maynez et al. (2020). On Faithfulness and Factuality in Abstractive Summarization <small>↗ 需要联网</small></a> — the factuality landscape paper.</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-05-nlp-foundations-to-advanced--12-text-summarization.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-05-nlp-foundations-to-advanced--12-text-summarization.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/05-nlp-foundations-to-advanced/12-text-summarization/code/main.py">phases/05-nlp-foundations-to-advanced/12-text-summarization/code/main.py</a><details><summary>查看原始文本</summary><pre><code>import math
+import re
+from collections import Counter
+
+
+def sentence_split(text):
+    return [s.strip() for s in re.split(r&quot;(?&lt;=[.!?])\s+&quot;, text.strip()) if s.strip()]
+
+
+def similarity(s1, s2):
+    w1 = Counter(s1.lower().split())
+    w2 = Counter(s2.lower().split())
+    intersection = sum((w1 &amp; w2).values())
+    denom = math.log(len(w1) + 1) + math.log(len(w2) + 1)
+    if denom == 0:
+        return 0.0
+    return intersection / denom
+
+
+def textrank(text, top_k=3, damping=0.85, iterations=50, epsilon=1e-4):
+    sentences = sentence_split(text)
+    n = len(sentences)
+    if n &lt;= top_k:
+        return sentences
+
+    sim = [[0.0] * n for _ in range(n)]
+    for i in range(n):
+        for j in range(n):
+            if i != j:
+                sim[i][j] = similarity(sentences[i], sentences[j])
+
+    scores = [1.0] * n
+    for _ in range(iterations):
+        new_scores = [1 - damping] * n
+        for i in range(n):
+            total_out = sum(sim[i]) or 1e-9
+            for j in range(n):
+                if sim[i][j] &gt; 0:
+                    new_scores[j] += damping * sim[i][j] / total_out * scores[i]
+        if max(abs(s - ns) for s, ns in zip(scores, new_scores)) &lt; epsilon:
+            scores = new_scores
+            break
+        scores = new_scores
+
+    ranked = sorted(range(n), key=lambda k: scores[k], reverse=True)[:top_k]
+    ranked.sort()
+    return [sentences[i] for i in ranked]
+
+
+def rouge_n(hyp, ref, n=1):
+    def ngrams(tokens, k):
+        return Counter(tuple(tokens[i:i + k]) for i in range(len(tokens) - k + 1))
+
+    hyp_tokens = hyp.lower().split()
+    ref_tokens = ref.lower().split()
+    hyp_ngrams = ngrams(hyp_tokens, n)
+    ref_ngrams = ngrams(ref_tokens, n)
+    if not ref_ngrams:
+        return 0.0
+    overlap = sum((hyp_ngrams &amp; ref_ngrams).values())
+    total = sum(ref_ngrams.values())
+    return overlap / total
+
+
+def main():
+    article = (
+        &quot;Researchers at a Canadian university published a paper on efficient transformers. &quot;
+        &quot;The paper introduces a new attention variant that runs in linear time. &quot;
+        &quot;The authors trained models up to 1 billion parameters on public data. &quot;
+        &quot;Benchmarks show the new attention matches standard attention on most tasks. &quot;
+        &quot;The authors released training code and weights on GitHub. &quot;
+        &quot;Several research labs have already replicated the main results. &quot;
+        &quot;The paper has been accepted at NeurIPS.&quot;
+    )
+    reference = (
+        &quot;Researchers introduced a linear-time attention variant, trained up to 1B parameters, &quot;
+        &quot;matched standard attention on benchmarks, and released code and weights.&quot;
+    )
+
+    summary = textrank(article, top_k=3)
+    joined = &quot; &quot;.join(summary)
+    print(&quot;=== TextRank summary ===&quot;)
+    for s in summary:
+        print(f&quot;  - {s}&quot;)
+    print()
+
+    print(&quot;=== ROUGE against reference ===&quot;)
+    for n in [1, 2]:
+        score = rouge_n(joined, reference, n=n)
+        print(f&quot;  ROUGE-{n}: {score:.3f}&quot;)
+    print()
+    print(&quot;For production, use the `rouge-score` package with stemming for a proper F-measure.&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/05-nlp-foundations-to-advanced/12-text-summarization/outputs/.gitkeep">phases/05-nlp-foundations-to-advanced/12-text-summarization/outputs/.gitkeep</a><details><summary>查看原始文本</summary><pre><code></code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/05-nlp-foundations-to-advanced/12-text-summarization/outputs/skill-summary-picker.md">phases/05-nlp-foundations-to-advanced/12-text-summarization/outputs/skill-summary-picker.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: summary-picker
+description: Pick extractive or abstractive, name the library, add a factuality check.
+version: 1.0.0
+phase: 5
+lesson: 12
+tags: [nlp, summarization]
+---
+
+Given a task (document type, compliance requirement, length, compute budget), output:
+
+1. Approach. Extractive or abstractive. Explain in one sentence why.
+2. Starting model / library. Name it. `sumy.TextRankSummarizer`, `facebook/bart-large-cnn`, `google/pegasus-pubmed`, or an LLM prompt.
+3. Evaluation plan. ROUGE-1, ROUGE-2, ROUGE-L (use `rouge-score` with stemming). Plus factuality check if abstractive.
+4. One failure mode to probe. Entity swap is the most common in abstractive news summarization; flag samples where source entities do not appear in summary.
+
+Refuse abstractive summarization for medical, legal, financial, or regulated content without a factuality gate. Flag input over the model&#39;s context window as needing chunked map-reduce summarization, not just truncation.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. What is the key behavioral difference between extractive and abstractive summarization?</legend><label class="option"><input type="radio" name="q0" value="0"> Extractive is multilingual only</label><label class="option"><input type="radio" name="q0" value="1"> Extractive returns sentences verbatim from the source; abstractive generates new text and can hallucinate</label><label class="option"><input type="radio" name="q0" value="2"> Extractive uses TF-IDF; abstractive uses Word2Vec</label><label class="option"><input type="radio" name="q0" value="3"> Extractive is slower than abstractive</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. What does ROUGE measure?</legend><label class="option"><input type="radio" name="q1" value="0"> Token-level perplexity</label><label class="option"><input type="radio" name="q1" value="1"> Embedding similarity</label><label class="option"><input type="radio" name="q1" value="2"> N-gram and longest-common-subsequence overlap between system and reference summaries</label><label class="option"><input type="radio" name="q1" value="3"> Reading time</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. How does TextRank score sentences in extractive summarization?</legend><label class="option"><input type="radio" name="q2" value="0"> By running a PageRank-style iteration over a graph where edges are sentence-similarity weights</label><label class="option"><input type="radio" name="q2" value="1"> By embedding cosine to the question</label><label class="option"><input type="radio" name="q2" value="2"> By comparing to a reference summary</label><label class="option"><input type="radio" name="q2" value="3"> By raw word count</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. Why enable stemming when computing ROUGE?</legend><label class="option"><input type="radio" name="q3" value="0"> Without stemming, &#39;running&#39; and &#39;run&#39; count as different tokens and ROUGE undercounts true overlap</label><label class="option"><input type="radio" name="q3" value="1"> Stemming normalizes case</label><label class="option"><input type="radio" name="q3" value="2"> Stemming is required by the rouge-score package</label><label class="option"><input type="radio" name="q3" value="3"> To speed up ROUGE</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. Which 2026 metric is purpose-built to detect summary hallucinations via NLI entailment?</legend><label class="option"><input type="radio" name="q4" value="0"> Faithfulness checks (e.g. FactCC or RAGAS faithfulness) using NLI between source and summary claims</label><label class="option"><input type="radio" name="q4" value="1"> BLEU</label><label class="option"><input type="radio" name="q4" value="2"> chrF</label><label class="option"><input type="radio" name="q4" value="3"> ROUGE-L</label><p data-feedback="4"></p></fieldset><fieldset><legend>6. Why is extractive summarization preferred for compliance-adjacent content?</legend><label class="option"><input type="radio" name="q5" value="0"> Extractive supports longer outputs</label><label class="option"><input type="radio" name="q5" value="1"> Outputs are lifted verbatim from the source, eliminating the abstractive hallucination class</label><label class="option"><input type="radio" name="q5" value="2"> It is faster</label><label class="option"><input type="radio" name="q5" value="3"> ROUGE scores are higher</label><p data-feedback="5"></p></fieldset><fieldset><legend>7. Which of these is an abstractive hallucination type to monitor for?</legend><label class="option"><input type="radio" name="q6" value="0"> Long sentences</label><label class="option"><input type="radio" name="q6" value="1"> Entity swap (e.g. &#39;John Smith&#39; rendered as &#39;John Brown&#39;), number drift, polarity flip, or fact invention</label><label class="option"><input type="radio" name="q6" value="2"> Punctuation drift</label><label class="option"><input type="radio" name="q6" value="3"> Stopword removal</label><p data-feedback="6"></p></fieldset><fieldset><legend>8. When would you reach for a Pegasus checkpoint over BART-large-CNN?</legend><label class="option"><input type="radio" name="q7" value="0"> When evaluating BLEU</label><label class="option"><input type="radio" name="q7" value="1"> When you need extractive output</label><label class="option"><input type="radio" name="q7" value="2"> For domains like scientific abstracts where Pegasus&#39;s gap-sentence pretraining objective is a closer fit</label><label class="option"><input type="radio" name="q7" value="3"> When the input is short</label><p data-feedback="7"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/05-nlp-foundations-to-advanced/11-machine-translation/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/05-nlp-foundations-to-advanced/13-question-answering/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/05-nlp-foundations-to-advanced/12-text-summarization/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

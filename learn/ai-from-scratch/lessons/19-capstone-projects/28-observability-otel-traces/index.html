@@ -1,0 +1,832 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>石28课:使用OTel GenAI跨度和普罗梅斯指标可观察性 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-19-capstone-projects" data-lesson="19-capstone-projects/28-observability-otel-traces" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/19-capstone-projects/">综合项目</a> / LESSON 28</p><h1 class="lesson-title">石28课:使用OTel GenAI跨度和普罗梅斯指标可观察性</h1><p>Capstone Lesson 28: Observability with OTel GenAI Spans and Prometheus Metrics</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>石28课:使用OTel GenAI跨度和普罗梅斯指标可观察性</h1>
+<blockquote>
+<p>无可观察的代理带是花钱的黑盒子.本课程手动滚动一个跨度构造器,它发出符合OpenTelemetry GenAI语义公约的记录,将它们写入一个JSON-Lines文件,每行一个跨度,并暴露了Prometheus文本格式的计数器和历史图.整个东西是Stdlib Python,并运行离线.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python (stdlib)
+<strong>Prerequisites:</strong> Phase 19 · 25 (verification gates), Phase 19 · 26 (sandbox), Phase 19 · 27 (eval harness), Phase 13 · 20 (OpenTelemetry GenAI), Phase 14 · 23 (OTel GenAI conventions)
+<strong>Time:</strong> ~90 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>建立一个以OpenTelemetry GenAI语义公约为形状的跨度数据类.</li>
+<li>实现一个JSONL出口程序,每行写出一个独立的跨度.</li>
+<li>建立标签和Prometheus文本格式曝光的计数器和历史图.</li>
+<li>包装任何调用器在一个记录时间,状态和例外的跨度环境管理器中.</li>
+<li>检查发射的跨度是否回路通过<code>json.loads</code>并且与规格的形状相匹配.</li>
+</ul>
+<h2>问题</h2>
+<p>在生产中,编码代理每次生产三类文物:模型调用,工具执行和验证门决策.</p>
+<p>首先是失败模式是缺失的痕迹.周二发生了一些错误,但唯一记录是500行聊天日志.没有记录哪个工具运行,需要多长时间,多少代币进入提示,或者门是否拒绝任何东西.代理作者必须猜测.</p>
+<p>其他方法是: 子写了跨度,但使用了自己的专用字段名称.Grafana,Honeycomb,Jaeger或本地CLI中没有任何东西能读取它们.团队堆中存在的任何工具都会浪费,因为跨度是不标准的.</p>
+<p>第三种故障模式是未聚合的指标.你可以看到一个缓慢的工具调用在追踪中,但你不能回答&quot;在上个小时内读_文件调用的p95延迟是什么?&quot;因为没有指标,只有痕迹.</p>
+<p>开放Telemetry GenAI语义公约是为了这个.它们定义了一个小组标准属性,在LLM框架中跨度发射者共享.如果你的带写这些属性,每个与OTel兼容的后端都可以读取它们.</p>
+<h2>概念</h2>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-fca77c22b0185c3dcd1b.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>跨度具有一个追踪ID (整个代理调用),一个跨度ID (这个操作),一个名称 (例如 <code>gen_ai.chat</code>现在<code>gen_ai.tool.execution</code>), 基因AI公约的属性,开始和结束时间以及状态.</p>
+<p>基因AI公约标准化了这些属性密钥: <code>gen_ai.system</code>(哪个提供商,例如<code>anthropic</code>现在<code>openai</code>), <code>gen_ai.request.model</code>(模型标识),<code>gen_ai.request.max_tokens</code>现在<code>gen_ai.usage.input_tokens</code>现在<code>gen_ai.usage.output_tokens</code>现在<code>gen_ai.response.model</code>现在<code>gen_ai.response.id</code>现在<code>gen_ai.operation.name</code>另外,工具特定的钥匙<code>gen_ai.tool.name</code>其他<code>gen_ai.tool.call.id</code>现在,我们要去.</p>
+<p>导出者写JSONL.每行一个JSON对象.这是下游工具可以流媒体,抓取和进口的最简单的格式.一个真正的OTel导出者会说OTLP gRPC;课程的JSONL导出者是离线相当的,并且在每个工作站上出发为零.</p>
+<p>工具的每次调用中,一个反增量:<code>tools_called_total{tool=&quot;read_file&quot;}</code>历史图记录观察到的延迟:<code>tool_latency_ms{tool=&quot;read_file&quot;}</code>它们都将串行成Prometheus文本曝光格式,这是基于拉力的指标的实际标准.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-d0078370de3c57679923.png" alt="trace-spans 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建筑</h2>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-8602e1e6d54c5dbb6b16.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>跨度构造商是一个小类的<code>span(name, attrs)</code>文本管理器记录入口开始时间,记录出口结束时间,将一个例外添加,如果一个被提升,并将最终的跨度推向出口商.</p>
+<p>计数是两个指数.<code>{(name, frozen_labels): int}</code>异谱记录原料样本,并将其在暴露时串行到Prometheus异谱桶中.</p>
+<h2>你会建造什么</h2>
+<p><code>main.py</code>船舶:</p>
+<ol>
+<li><code>GenAISpan</code>数据类: trace_id, span_id, parent_span_id,名称,属性, start_unix_nano, end_unix_nano,状态, status_message,事件.</li>
+<li><code>SpanBuilder</code>课程<code>span(name, attrs, parent=None)</code>环境管理者.</li>
+<li><code>JSONLExporter</code>课程<code>export(span)</code>它们的位置是</li>
+<li><code>Counter</code>其他<code>Histogram</code>课程加上<code>MetricsRegistry</code>现在,我们要去.</li>
+<li><code>prometheus_exposition(registry)</code>输出文本格式.</li>
+<li><code>wrap_tool_call(name)</code>装饰器发射跨度,并更新数据.</li>
+<li>演示:合成一个完整的代理调用 (gen_ai.chat跨度在工具跨度周围),写 traces.jsonl,打印Prometheus曝光,退出零.</li>
+</ol>
+<p>跨度ID和跟踪ID是16字节的六字符串,由 <code>os.urandom</code>导出者从来没有扔掉, IO 错误被发现,但带仍然运行.</p>
+<p>历史图表有一个固定的桶集合 (OTel默认的延迟在毫秒: 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, +Inf).样本存储为列表; 曝光按要求计算每桶计数.</p>
+<h2>为什么用手动滚动而不是开放式仪表sdk</h2>
+<p>托特尔 Python SDK 是一个真正的依赖性.它还包括几千行代码,多个过程为OTLP出口商,并有一个运行时间成本,这淹没了课程预算.手动滚动版本教导了线程格式.在生产中,你将相同的属性线程到真正的SDK中,并获得OTLP出口商,批量和资源检测免费.</p>
+<p>课程发射的电线格式将在2030年继续分析,因为OTel从来没有打破GenAI属性名称;他们只添加新的属性.</p>
+<h2>如何与A轨道的其他部分相结合</h2>
+<p>第25课产生了门链. 第26课产生了沙箱. 第27课产生了评估带. 第28课使所有三个都可观看. 第29课将端到端演示的每个步骤包裹成跨度,并在最后打印了普罗梅蒂乌斯文本.</p>
+<h2>运行它</h2>
+<pre><code class="language-bash">cd phases/19-capstone-projects/28-observability-otel-traces
+python3 code/main.py
+python3 -m pytest code/tests/ -v
+</code></pre>
+<p>演示显示一个<code>traces.jsonl</code>在课程工作的 dir (在结束时清洁),然后打印一个三个跨度的样本,然后打印了计数和历史图的普罗梅泰斯曝光.测试验验证,跨度连续回路,可нони性GenAI属性存在,数量正确增加,以及历史图的曝光包含预期的桶数量.</p>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Capstone Lesson 28: Observability with OTel GenAI Spans and Prometheus Metrics</h1>
+<blockquote>
+<p>An agent harness without observability is a black box that costs money. This lesson hand-rolls a span builder that emits records compliant with the OpenTelemetry GenAI semantic conventions, writes them to a JSON-Lines file one span per line, and exposes counters and histograms in Prometheus text format. The whole thing is stdlib Python and runs offline.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python (stdlib)
+<strong>Prerequisites:</strong> Phase 19 · 25 (verification gates), Phase 19 · 26 (sandbox), Phase 19 · 27 (eval harness), Phase 13 · 20 (OpenTelemetry GenAI), Phase 14 · 23 (OTel GenAI conventions)
+<strong>Time:</strong> ~90 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Build a span data class shaped to the OpenTelemetry GenAI semantic conventions.</li>
+<li>Implement a JSONL exporter that writes one self-contained span per line.</li>
+<li>Build counters and histograms with labels and Prometheus text-format exposition.</li>
+<li>Wrap any callable in a span context manager that records duration, status, and exceptions.</li>
+<li>Verify that the emitted spans roundtrip through <code>json.loads</code> and match the spec shape.</li>
+</ul>
+<h2>The Problem</h2>
+<p>A coding agent in production produces three classes of artifact every turn: a model call, a tool execution, and a verification gate decision. None of these are useful without structured telemetry.</p>
+<p>The first failure mode is the missing trace. Something went wrong on Tuesday but the only record is a 500-line chat log. There is no record of which tool ran, how long it took, how many tokens went into the prompt, or whether the gate refused anything. The agent author has to guess.</p>
+<p>The second failure mode is the unparseable trace. The harness wrote spans but used its own ad-hoc field names. Nothing in Grafana, Honeycomb, Jaeger, or the local CLI can read them. Whatever tooling exists in the team's stack is wasted because the spans are non-standard.</p>
+<p>The third failure mode is the unaggregated metric. You can see one slow tool call in the trace, but you cannot answer &quot;what is the p95 latency of read_file calls over the last hour?&quot; because there are no metrics, only traces.</p>
+<p>The OpenTelemetry GenAI semantic conventions exist exactly for this. They define a small set of standard attributes that span emitters across LLM frameworks share. If your harness writes those attributes, every OTel-compatible backend can read them.</p>
+<h2>The Concept</h2>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-fca77c22b0185c3dcd1b.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>Every operation in the harness produces a span. A span has a trace id (the whole agent invocation), a span id (this one operation), a name (e.g. <code>gen_ai.chat</code>, <code>gen_ai.tool.execution</code>), attributes that follow the GenAI conventions, a start and end time, and a status.</p>
+<p>The GenAI conventions standardise these attribute keys: <code>gen_ai.system</code> (which provider, e.g. <code>anthropic</code>, <code>openai</code>), <code>gen_ai.request.model</code> (the model id), <code>gen_ai.request.max_tokens</code>, <code>gen_ai.usage.input_tokens</code>, <code>gen_ai.usage.output_tokens</code>, <code>gen_ai.response.model</code>, <code>gen_ai.response.id</code>, <code>gen_ai.operation.name</code>, plus tool-specific keys <code>gen_ai.tool.name</code> and <code>gen_ai.tool.call.id</code>.</p>
+<p>The exporter writes JSONL. One JSON object per line. This is the simplest possible format that downstream tooling can stream, grep, and import. A real OTel exporter would speak OTLP gRPC; the lesson's JSONL exporter is the offline equivalent and exits zero on every workstation.</p>
+<p>Metrics live next to traces. A counter increments on each tool call: <code>tools_called_total{tool=&quot;read_file&quot;}</code>. A histogram records the observed latency: <code>tool_latency_ms{tool=&quot;read_file&quot;}</code>. Both serialise into Prometheus text exposition format, which is the de-facto standard for pull-based metrics.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-d0078370de3c57679923.png" alt="trace-spans 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Architecture</h2>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-8602e1e6d54c5dbb6b16.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>The span builder is a small class with a <code>span(name, attrs)</code> method that returns a context manager. The context manager records start time on enter, records end time on exit, attaches an exception if one was raised, and pushes the finalised span to the exporter.</p>
+<p>The metrics registry is two dicts. Counters are <code>{(name, frozen_labels): int}</code>. Histograms keep raw samples in a list and serialise to Prometheus histogram buckets at exposition time.</p>
+<h2>What you will build</h2>
+<p><code>main.py</code> ships:</p>
+<ol>
+<li><code>GenAISpan</code> dataclass: trace_id, span_id, parent_span_id, name, attributes, start_unix_nano, end_unix_nano, status, status_message, events.</li>
+<li><code>SpanBuilder</code> class with <code>span(name, attrs, parent=None)</code> context manager.</li>
+<li><code>JSONLExporter</code> class with <code>export(span)</code> that appends one line.</li>
+<li><code>Counter</code> and <code>Histogram</code> classes plus <code>MetricsRegistry</code>.</li>
+<li><code>prometheus_exposition(registry)</code> that produces text-format output.</li>
+<li><code>wrap_tool_call(name)</code> decorator that emits a span and updates metrics.</li>
+<li>Demo: synthesises a complete agent invocation (gen_ai.chat span around tool spans), writes traces.jsonl, prints the Prometheus exposition, exits zero.</li>
+</ol>
+<p>The span id and trace id are 16-byte hex strings, generated from <code>os.urandom</code>. That matches OTel's W3C trace context. The exporter never throws; IO errors are surfaced but the harness keeps running.</p>
+<p>The histogram has a fixed bucket set (the OTel default for latency in milliseconds: 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, +Inf). Samples are stored as a list; exposition computes per-bucket counts on demand.</p>
+<h2>Why hand-rolled instead of opentelemetry-sdk</h2>
+<p>The OTel Python SDK is a real dependency. It is also several thousand lines of code, multiple processes for the OTLP exporter, and a runtime cost that swamps a lesson budget. The hand-rolled version teaches the wire format. In production you wire the same attributes into the real SDK and get the OTLP exporter, batching, and resource detection for free.</p>
+<p>The conventions are stable. The wire format the lesson emits will keep parsing in 2030 because OTel never breaks GenAI attribute names; they only add new ones.</p>
+<h2>How this composes with the rest of Track A</h2>
+<p>Lesson 25 produced the gate chain. Lesson 26 produced the sandbox. Lesson 27 produced the eval harness. Lesson 28 makes all three observable. Lesson 29 wraps every step of the end-to-end demo in spans and prints the Prometheus text at the end.</p>
+<h2>Running it</h2>
+<pre><code class="language-bash">cd phases/19-capstone-projects/28-observability-otel-traces
+python3 code/main.py
+python3 -m pytest code/tests/ -v
+</code></pre>
+<p>The demo emits a <code>traces.jsonl</code> in the lesson's working dir (cleaned up at the end), then prints a sample of three spans, then prints the Prometheus exposition for the counters and histograms. The tests verify that spans serialise round-trip, that the canonical GenAI attributes are present, that counters increment correctly, and that the histogram exposition contains the expected bucket counts.</p>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-19-capstone-projects--28-observability-otel-traces.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-19-capstone-projects--28-observability-otel-traces.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/28-observability-otel-traces/code/main.py">phases/19-capstone-projects/28-observability-otel-traces/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;
+Observability for an agent harness: GenAI spans + Prometheus metrics.
+
+See: phases/19-capstone-projects/28-observability-otel-traces/docs/en.md
+Concept refs:
+  - OpenTelemetry GenAI semantic conventions (gen_ai.* attribute keys).
+  - Prometheus text exposition format (counters and histograms).
+  - W3C Trace Context (16-byte trace_id, 8-byte span_id).
+The demo at the bottom emits spans to a temp jsonl, prints the
+Prometheus exposition, and exits zero.
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import json
+import math
+import os
+import sys
+import tempfile
+import time
+import uuid
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from typing import Any, Iterator
+
+
+# ---------------------------------------------------------------------------
+# OTel semantic-convention keys
+# ---------------------------------------------------------------------------
+
+# Standard GenAI attributes (OpenTelemetry GenAI semantic conventions).
+# These keys are stable; only new keys get added, never renamed.
+GEN_AI_SYSTEM = &quot;gen_ai.system&quot;
+GEN_AI_REQUEST_MODEL = &quot;gen_ai.request.model&quot;
+GEN_AI_REQUEST_MAX_TOKENS = &quot;gen_ai.request.max_tokens&quot;
+GEN_AI_REQUEST_TEMPERATURE = &quot;gen_ai.request.temperature&quot;
+GEN_AI_USAGE_INPUT_TOKENS = &quot;gen_ai.usage.input_tokens&quot;
+GEN_AI_USAGE_OUTPUT_TOKENS = &quot;gen_ai.usage.output_tokens&quot;
+GEN_AI_RESPONSE_MODEL = &quot;gen_ai.response.model&quot;
+GEN_AI_RESPONSE_ID = &quot;gen_ai.response.id&quot;
+GEN_AI_OPERATION_NAME = &quot;gen_ai.operation.name&quot;
+GEN_AI_TOOL_NAME = &quot;gen_ai.tool.name&quot;
+GEN_AI_TOOL_CALL_ID = &quot;gen_ai.tool.call.id&quot;
+GEN_AI_TOOL_RESULT_BYTES = &quot;gen_ai.tool.result.bytes&quot;
+
+# Harness-specific attributes (under a non-conflicting prefix).
+HARNESS_GATE_DECISION = &quot;agent.harness.gate.decision&quot;
+HARNESS_GATE_REASON = &quot;agent.harness.gate.reason&quot;
+
+STATUS_UNSET = &quot;UNSET&quot;
+STATUS_OK = &quot;OK&quot;
+STATUS_ERROR = &quot;ERROR&quot;
+
+
+# ---------------------------------------------------------------------------
+# Span data shape
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class SpanEvent:
+    &quot;&quot;&quot;Discrete event recorded inside a span (per OTel).&quot;&quot;&quot;
+
+    name: str
+    timestamp_unix_nano: int
+    attributes: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -&gt; dict:
+        return {
+            &quot;name&quot;: self.name,
+            &quot;timestamp_unix_nano&quot;: self.timestamp_unix_nano,
+            &quot;attributes&quot;: dict(self.attributes),
+        }
+
+
+@dataclass
+class GenAISpan:
+    &quot;&quot;&quot;A single span shaped to OTel GenAI conventions.&quot;&quot;&quot;
+
+    trace_id: str
+    span_id: str
+    name: str
+    start_unix_nano: int
+    end_unix_nano: int = 0
+    parent_span_id: str = &quot;&quot;
+    attributes: dict[str, Any] = field(default_factory=dict)
+    events: list[SpanEvent] = field(default_factory=list)
+    status: str = STATUS_UNSET
+    status_message: str = &quot;&quot;
+    kind: str = &quot;INTERNAL&quot;
+
+    @property
+    def duration_ms(self) -&gt; float:
+        if self.end_unix_nano &lt;= 0:
+            return 0.0
+        return (self.end_unix_nano - self.start_unix_nano) / 1_000_000.0
+
+    def to_dict(self) -&gt; dict:
+        return {
+            &quot;trace_id&quot;: self.trace_id,
+            &quot;span_id&quot;: self.span_id,
+            &quot;parent_span_id&quot;: self.parent_span_id,
+            &quot;name&quot;: self.name,
+            &quot;kind&quot;: self.kind,
+            &quot;start_unix_nano&quot;: self.start_unix_nano,
+            &quot;end_unix_nano&quot;: self.end_unix_nano,
+            &quot;duration_ms&quot;: round(self.duration_ms, 4),
+            &quot;attributes&quot;: dict(self.attributes),
+            &quot;events&quot;: [e.to_dict() for e in self.events],
+            &quot;status&quot;: {&quot;code&quot;: self.status, &quot;message&quot;: self.status_message},
+        }
+
+
+# ---------------------------------------------------------------------------
+# ID generation
+# ---------------------------------------------------------------------------
+
+
+def new_trace_id() -&gt; str:
+    &quot;&quot;&quot;Random 16-byte hex string. Matches W3C trace context.&quot;&quot;&quot;
+
+    return uuid.uuid4().hex + uuid.uuid4().hex[:0]  # uuid4 hex is already 32 chars
+
+
+def new_span_id() -&gt; str:
+    &quot;&quot;&quot;Random 8-byte hex string. Matches W3C trace context span id.&quot;&quot;&quot;
+
+    return uuid.uuid4().hex[:16]
+
+
+def now_unix_nano() -&gt; int:
+    return time.time_ns()
+
+
+# ---------------------------------------------------------------------------
+# Exporter
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class JSONLExporter:
+    &quot;&quot;&quot;Append-only exporter: one span per JSON line.&quot;&quot;&quot;
+
+    path: str
+    fh: Any = None
+    closed: bool = False
+
+    def _ensure_open(self) -&gt; None:
+        if self.fh is None:
+            os.makedirs(os.path.dirname(self.path) or &quot;.&quot;, exist_ok=True)
+            self.fh = open(self.path, &quot;a&quot;, encoding=&quot;utf-8&quot;)
+
+    def export(self, span: GenAISpan) -&gt; None:
+        self._ensure_open()
+        line = json.dumps(span.to_dict(), separators=(&quot;,&quot;, &quot;:&quot;))
+        self.fh.write(line + &quot;\n&quot;)
+        self.fh.flush()
+
+    def close(self) -&gt; None:
+        if self.fh is not None and not self.closed:
+            self.fh.close()
+            self.closed = True
+
+
+class InMemoryExporter:
+    &quot;&quot;&quot;Test-friendly exporter that keeps spans in a list.&quot;&quot;&quot;
+
+    def __init__(self) -&gt; None:
+        self.spans: list[GenAISpan] = []
+
+    def export(self, span: GenAISpan) -&gt; None:
+        self.spans.append(span)
+
+    def close(self) -&gt; None:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Metrics primitives
+# ---------------------------------------------------------------------------
+
+
+def _label_key(labels: dict[str, str]) -&gt; tuple[tuple[str, str], ...]:
+    return tuple(sorted(labels.items()))
+
+
+def _format_labels(labels: dict[str, str]) -&gt; str:
+    if not labels:
+        return &quot;&quot;
+    parts = []
+    for k, v in sorted(labels.items()):
+        escaped = str(v).replace(&quot;\\&quot;, &quot;\\\\&quot;).replace(&#39;&quot;&#39;, &#39;\\&quot;&#39;).replace(&quot;\n&quot;, &quot;\\n&quot;)
+        parts.append(f&#39;{k}=&quot;{escaped}&quot;&#39;)
+    return &quot;{&quot; + &quot;,&quot;.join(parts) + &quot;}&quot;
+
+
+@dataclass
+class Counter:
+    &quot;&quot;&quot;A simple labelled counter.&quot;&quot;&quot;
+
+    name: str
+    help: str = &quot;&quot;
+    values: dict[tuple[tuple[str, str], ...], float] = field(default_factory=dict)
+
+    def inc(self, labels: dict[str, str] | None = None, by: float = 1.0) -&gt; None:
+        key = _label_key(labels or {})
+        self.values[key] = self.values.get(key, 0.0) + by
+
+    def get(self, labels: dict[str, str] | None = None) -&gt; float:
+        return self.values.get(_label_key(labels or {}), 0.0)
+
+
+@dataclass
+class Histogram:
+    &quot;&quot;&quot;A histogram with explicit buckets, in line with OTel&#39;s default ms set.&quot;&quot;&quot;
+
+    name: str
+    help: str = &quot;&quot;
+    buckets: tuple[float, ...] = (
+        5.0,
+        10.0,
+        25.0,
+        50.0,
+        100.0,
+        250.0,
+        500.0,
+        1000.0,
+        2500.0,
+        5000.0,
+        10000.0,
+    )
+    samples: dict[tuple[tuple[str, str], ...], list[float]] = field(
+        default_factory=dict
+    )
+
+    def observe(self, value: float, labels: dict[str, str] | None = None) -&gt; None:
+        key = _label_key(labels or {})
+        self.samples.setdefault(key, []).append(float(value))
+
+    def bucket_counts(
+        self, labels: dict[str, str] | None = None
+    ) -&gt; dict[float, int]:
+        key = _label_key(labels or {})
+        values = self.samples.get(key, [])
+        counts: dict[float, int] = {}
+        for bound in self.buckets:
+            counts[bound] = sum(1 for v in values if v &lt;= bound)
+        counts[math.inf] = len(values)
+        return counts
+
+    def total_count(self, labels: dict[str, str] | None = None) -&gt; int:
+        return len(self.samples.get(_label_key(labels or {}), []))
+
+    def total_sum(self, labels: dict[str, str] | None = None) -&gt; float:
+        return float(sum(self.samples.get(_label_key(labels or {}), [])))
+
+
+@dataclass
+class MetricsRegistry:
+    counters: dict[str, Counter] = field(default_factory=dict)
+    histograms: dict[str, Histogram] = field(default_factory=dict)
+
+    def counter(self, name: str, help: str = &quot;&quot;) -&gt; Counter:
+        if name not in self.counters:
+            self.counters[name] = Counter(name=name, help=help)
+        return self.counters[name]
+
+    def histogram(self, name: str, help: str = &quot;&quot;) -&gt; Histogram:
+        if name not in self.histograms:
+            self.histograms[name] = Histogram(name=name, help=help)
+        return self.histograms[name]
+
+
+def prometheus_exposition(registry: MetricsRegistry) -&gt; str:
+    &quot;&quot;&quot;Render the registry into Prometheus text exposition format.&quot;&quot;&quot;
+
+    lines: list[str] = []
+    for name in sorted(registry.counters):
+        counter = registry.counters[name]
+        if counter.help:
+            lines.append(f&quot;# HELP {counter.name} {counter.help}&quot;)
+        lines.append(f&quot;# TYPE {counter.name} counter&quot;)
+        if not counter.values:
+            lines.append(f&quot;{counter.name} 0&quot;)
+        for key, value in sorted(counter.values.items()):
+            label_str = _format_labels(dict(key))
+            lines.append(f&quot;{counter.name}{label_str} {value}&quot;)
+    for name in sorted(registry.histograms):
+        hist = registry.histograms[name]
+        if hist.help:
+            lines.append(f&quot;# HELP {hist.name} {hist.help}&quot;)
+        lines.append(f&quot;# TYPE {hist.name} histogram&quot;)
+        keys = list(hist.samples.keys()) or [tuple()]
+        for key in sorted(keys):
+            label_dict = dict(key)
+            counts = hist.bucket_counts(label_dict)
+            for bound in hist.buckets:
+                bucket_labels = {**label_dict, &quot;le&quot;: _format_le(bound)}
+                lines.append(
+                    f&quot;{hist.name}_bucket{_format_labels(bucket_labels)} {counts[bound]}&quot;
+                )
+            inf_labels = {**label_dict, &quot;le&quot;: &quot;+Inf&quot;}
+            lines.append(
+                f&quot;{hist.name}_bucket{_format_labels(inf_labels)} {counts[math.inf]}&quot;
+            )
+            lines.append(
+                f&quot;{hist.name}_sum{_format_labels(label_dict)} &quot;
+                f&quot;{hist.total_sum(label_dict)}&quot;
+            )
+            lines.append(
+                f&quot;{hist.name}_count{_format_labels(label_dict)} &quot;
+                f&quot;{hist.total_count(label_dict)}&quot;
+            )
+    return &quot;\n&quot;.join(lines) + &quot;\n&quot;
+
+
+def _format_le(bound: float) -&gt; str:
+    if bound == int(bound):
+        return str(int(bound))
+    return repr(bound)
+
+
+# ---------------------------------------------------------------------------
+# Span builder
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class SpanBuilder:
+    &quot;&quot;&quot;Owns a trace id and emits spans through one or more exporters.&quot;&quot;&quot;
+
+    trace_id: str = field(default_factory=new_trace_id)
+    exporters: list[Any] = field(default_factory=list)
+    metrics: MetricsRegistry | None = None
+
+    @contextmanager
+    def span(
+        self,
+        name: str,
+        attributes: dict[str, Any] | None = None,
+        parent: GenAISpan | None = None,
+        kind: str = &quot;INTERNAL&quot;,
+    ) -&gt; Iterator[GenAISpan]:
+        span = GenAISpan(
+            trace_id=self.trace_id,
+            span_id=new_span_id(),
+            parent_span_id=parent.span_id if parent else &quot;&quot;,
+            name=name,
+            kind=kind,
+            start_unix_nano=now_unix_nano(),
+            attributes=dict(attributes or {}),
+        )
+        try:
+            yield span
+            span.status = STATUS_OK
+        except BaseException as exc:  # noqa: BLE001
+            span.status = STATUS_ERROR
+            span.status_message = f&quot;{type(exc).__name__}: {exc}&quot;
+            span.events.append(
+                SpanEvent(
+                    name=&quot;exception&quot;,
+                    timestamp_unix_nano=now_unix_nano(),
+                    attributes={
+                        &quot;exception.type&quot;: type(exc).__name__,
+                        &quot;exception.message&quot;: str(exc),
+                    },
+                )
+            )
+            raise
+        finally:
+            span.end_unix_nano = now_unix_nano()
+            for exporter in self.exporters:
+                exporter.export(span)
+            if self.metrics is not None:
+                tool = span.attributes.get(GEN_AI_TOOL_NAME)
+                if tool is not None:
+                    self.metrics.counter(
+                        &quot;tools_called_total&quot;, help=&quot;Total tool calls&quot;
+                    ).inc({&quot;tool&quot;: str(tool)})
+                    self.metrics.histogram(
+                        &quot;tool_latency_ms&quot;,
+                        help=&quot;Tool call latency in milliseconds&quot;,
+                    ).observe(span.duration_ms, {&quot;tool&quot;: str(tool)})
+
+
+# ---------------------------------------------------------------------------
+# Demo
+# ---------------------------------------------------------------------------
+
+
+def run_demo() -&gt; int:
+    tmp_dir = tempfile.mkdtemp(prefix=&quot;otel-demo-&quot;)
+    trace_path = os.path.join(tmp_dir, &quot;traces.jsonl&quot;)
+
+    jsonl = JSONLExporter(path=trace_path)
+    metrics = MetricsRegistry()
+    in_mem = InMemoryExporter()
+    builder = SpanBuilder(exporters=[jsonl, in_mem], metrics=metrics)
+
+    print(&quot;OBSERVABILITY DEMO&quot;)
+    print(f&quot;trace_id={builder.trace_id}&quot;)
+    print(f&quot;writing traces to {trace_path}&quot;)
+
+    # Synthesize an agent turn: a gen_ai.chat span around two tool spans.
+    with builder.span(
+        &quot;gen_ai.chat&quot;,
+        attributes={
+            GEN_AI_SYSTEM: &quot;anthropic&quot;,
+            GEN_AI_REQUEST_MODEL: &quot;claude-track-a&quot;,
+            GEN_AI_REQUEST_MAX_TOKENS: 1024,
+            GEN_AI_REQUEST_TEMPERATURE: 0.0,
+            GEN_AI_OPERATION_NAME: &quot;chat&quot;,
+        },
+        kind=&quot;CLIENT&quot;,
+    ) as chat_span:
+        time.sleep(0.01)
+        chat_span.attributes[GEN_AI_USAGE_INPUT_TOKENS] = 412
+        chat_span.attributes[GEN_AI_USAGE_OUTPUT_TOKENS] = 96
+        chat_span.attributes[GEN_AI_RESPONSE_MODEL] = &quot;claude-track-a-2026-05-25&quot;
+        chat_span.attributes[GEN_AI_RESPONSE_ID] = &quot;msg_&quot; + uuid.uuid4().hex[:8]
+
+        with builder.span(
+            &quot;gen_ai.tool.execution&quot;,
+            parent=chat_span,
+            attributes={
+                GEN_AI_TOOL_NAME: &quot;read_file&quot;,
+                GEN_AI_TOOL_CALL_ID: &quot;call_001&quot;,
+            },
+        ) as tool1:
+            time.sleep(0.005)
+            tool1.attributes[GEN_AI_TOOL_RESULT_BYTES] = 1024
+            tool1.events.append(
+                SpanEvent(
+                    name=&quot;agent.harness.gate.decision&quot;,
+                    timestamp_unix_nano=now_unix_nano(),
+                    attributes={
+                        HARNESS_GATE_DECISION: &quot;ALLOW&quot;,
+                        HARNESS_GATE_REASON: &quot;passed gate chain&quot;,
+                    },
+                )
+            )
+
+        with builder.span(
+            &quot;gen_ai.tool.execution&quot;,
+            parent=chat_span,
+            attributes={
+                GEN_AI_TOOL_NAME: &quot;run_tests&quot;,
+                GEN_AI_TOOL_CALL_ID: &quot;call_002&quot;,
+            },
+        ) as tool2:
+            time.sleep(0.003)
+            tool2.attributes[GEN_AI_TOOL_RESULT_BYTES] = 256
+
+    # A second turn with an intentionally denied gate to exercise an error span.
+    try:
+        with builder.span(
+            &quot;gen_ai.tool.execution&quot;,
+            attributes={
+                GEN_AI_TOOL_NAME: &quot;shell&quot;,
+                GEN_AI_TOOL_CALL_ID: &quot;call_003&quot;,
+            },
+        ) as bad_tool:
+            bad_tool.events.append(
+                SpanEvent(
+                    name=&quot;agent.harness.gate.decision&quot;,
+                    timestamp_unix_nano=now_unix_nano(),
+                    attributes={
+                        HARNESS_GATE_DECISION: &quot;DENY&quot;,
+                        HARNESS_GATE_REASON: &quot;tool not in allow-set&quot;,
+                    },
+                )
+            )
+            raise PermissionError(&quot;tool &#39;shell&#39; not in allow-set&quot;)
+    except PermissionError:
+        pass
+
+    print(&quot;&quot;)
+    print(f&quot;emitted {len(in_mem.spans)} span(s):&quot;)
+    for span in in_mem.spans:
+        attrs_compact = {
+            k: v
+            for k, v in span.attributes.items()
+            if k.startswith(&quot;gen_ai.&quot;)
+        }
+        print(
+            f&quot;  - {span.name:32s} dur={span.duration_ms:7.2f}ms &quot;
+            f&quot;status={span.status} keys={sorted(attrs_compact)[:3]}&quot;
+        )
+
+    print(&quot;&quot;)
+    print(&quot;--- prometheus exposition ---&quot;)
+    print(prometheus_exposition(metrics))
+
+    jsonl.close()
+
+    # Sanity: roundtrip the jsonl file.
+    with open(trace_path, &quot;r&quot;, encoding=&quot;utf-8&quot;) as fh:
+        lines = [json.loads(line) for line in fh if line.strip()]
+    print(f&quot;roundtrip parsed {len(lines)} spans from {trace_path}&quot;)
+
+    return 0
+
+
+if __name__ == &quot;__main__&quot;:
+    sys.exit(run_demo())
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/28-observability-otel-traces/code/tests/test_main.py">phases/19-capstone-projects/28-observability-otel-traces/code/tests/test_main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Tests for the OTel GenAI span builder and Prometheus exposition.&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import json
+import math
+import os
+import sys
+import tempfile
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(HERE))
+
+from main import (  # noqa: E402
+    GEN_AI_REQUEST_MODEL,
+    GEN_AI_RESPONSE_ID,
+    GEN_AI_SYSTEM,
+    GEN_AI_TOOL_NAME,
+    GEN_AI_USAGE_INPUT_TOKENS,
+    STATUS_ERROR,
+    STATUS_OK,
+    Counter,
+    GenAISpan,
+    Histogram,
+    InMemoryExporter,
+    JSONLExporter,
+    MetricsRegistry,
+    SpanBuilder,
+    new_span_id,
+    new_trace_id,
+    prometheus_exposition,
+    run_demo,
+)
+
+
+class IdTests(unittest.TestCase):
+    def test_trace_id_is_32_hex(self) -&gt; None:
+        tid = new_trace_id()
+        self.assertEqual(len(tid), 32)
+        int(tid, 16)
+
+    def test_span_id_is_16_hex(self) -&gt; None:
+        sid = new_span_id()
+        self.assertEqual(len(sid), 16)
+        int(sid, 16)
+
+
+class SpanShapeTests(unittest.TestCase):
+    def test_span_dict_contains_required_keys(self) -&gt; None:
+        span = GenAISpan(
+            trace_id=new_trace_id(),
+            span_id=new_span_id(),
+            name=&quot;gen_ai.chat&quot;,
+            start_unix_nano=10_000,
+            end_unix_nano=15_000_000,
+            attributes={GEN_AI_SYSTEM: &quot;anthropic&quot;},
+        )
+        d = span.to_dict()
+        for key in (
+            &quot;trace_id&quot;,
+            &quot;span_id&quot;,
+            &quot;name&quot;,
+            &quot;kind&quot;,
+            &quot;start_unix_nano&quot;,
+            &quot;end_unix_nano&quot;,
+            &quot;duration_ms&quot;,
+            &quot;attributes&quot;,
+            &quot;events&quot;,
+            &quot;status&quot;,
+        ):
+            self.assertIn(key, d)
+        self.assertEqual(d[&quot;attributes&quot;][GEN_AI_SYSTEM], &quot;anthropic&quot;)
+        self.assertGreater(d[&quot;duration_ms&quot;], 0.0)
+
+    def test_duration_zero_when_not_ended(self) -&gt; None:
+        span = GenAISpan(
+            trace_id=new_trace_id(),
+            span_id=new_span_id(),
+            name=&quot;x&quot;,
+            start_unix_nano=100,
+        )
+        self.assertEqual(span.duration_ms, 0.0)
+
+
+class CounterTests(unittest.TestCase):
+    def test_increment_default(self) -&gt; None:
+        c = Counter(name=&quot;x_total&quot;)
+        c.inc({&quot;tool&quot;: &quot;read_file&quot;})
+        c.inc({&quot;tool&quot;: &quot;read_file&quot;})
+        c.inc({&quot;tool&quot;: &quot;list_dir&quot;})
+        self.assertEqual(c.get({&quot;tool&quot;: &quot;read_file&quot;}), 2)
+        self.assertEqual(c.get({&quot;tool&quot;: &quot;list_dir&quot;}), 1)
+        self.assertEqual(c.get({&quot;tool&quot;: &quot;missing&quot;}), 0)
+
+
+class HistogramTests(unittest.TestCase):
+    def test_bucket_counts_are_cumulative(self) -&gt; None:
+        h = Histogram(name=&quot;lat&quot;, buckets=(10.0, 100.0, 1000.0))
+        for v in (1, 5, 20, 200, 2000):
+            h.observe(v)
+        counts = h.bucket_counts()
+        self.assertEqual(counts[10.0], 2)
+        self.assertEqual(counts[100.0], 3)
+        self.assertEqual(counts[1000.0], 4)
+        self.assertEqual(counts[math.inf], 5)
+        self.assertEqual(h.total_count(), 5)
+        self.assertEqual(h.total_sum(), 2226.0)
+
+
+class PrometheusExpositionTests(unittest.TestCase):
+    def test_counter_exposition(self) -&gt; None:
+        reg = MetricsRegistry()
+        c = reg.counter(&quot;tools_called_total&quot;, help=&quot;Total tool calls&quot;)
+        c.inc({&quot;tool&quot;: &quot;read_file&quot;})
+        c.inc({&quot;tool&quot;: &quot;list_dir&quot;})
+        text = prometheus_exposition(reg)
+        self.assertIn(&quot;# HELP tools_called_total Total tool calls&quot;, text)
+        self.assertIn(&quot;# TYPE tools_called_total counter&quot;, text)
+        self.assertIn(&#39;tools_called_total{tool=&quot;read_file&quot;} 1&#39;, text)
+        self.assertIn(&#39;tools_called_total{tool=&quot;list_dir&quot;} 1&#39;, text)
+
+    def test_histogram_exposition_includes_buckets_sum_count(self) -&gt; None:
+        reg = MetricsRegistry()
+        h = reg.histogram(&quot;lat_ms&quot;, help=&quot;latency&quot;)
+        h.observe(7, {&quot;tool&quot;: &quot;x&quot;})
+        h.observe(300, {&quot;tool&quot;: &quot;x&quot;})
+        text = prometheus_exposition(reg)
+        self.assertIn(&quot;# TYPE lat_ms histogram&quot;, text)
+        self.assertIn(&#39;lat_ms_bucket{le=&quot;10&quot;,tool=&quot;x&quot;} 1&#39;, text)
+        self.assertIn(&#39;lat_ms_bucket{le=&quot;+Inf&quot;,tool=&quot;x&quot;} 2&#39;, text)
+        self.assertIn(&#39;lat_ms_sum{tool=&quot;x&quot;} 307.0&#39;, text)
+        self.assertIn(&#39;lat_ms_count{tool=&quot;x&quot;} 2&#39;, text)
+
+
+class SpanBuilderTests(unittest.TestCase):
+    def test_successful_span_status_ok(self) -&gt; None:
+        exp = InMemoryExporter()
+        builder = SpanBuilder(exporters=[exp])
+        with builder.span(&quot;op&quot;) as span:
+            span.attributes[GEN_AI_USAGE_INPUT_TOKENS] = 100
+        self.assertEqual(len(exp.spans), 1)
+        self.assertEqual(exp.spans[0].status, STATUS_OK)
+        self.assertGreater(exp.spans[0].end_unix_nano, 0)
+
+    def test_exception_records_status_error(self) -&gt; None:
+        exp = InMemoryExporter()
+        builder = SpanBuilder(exporters=[exp])
+        with self.assertRaises(ValueError):
+            with builder.span(&quot;op&quot;):
+                raise ValueError(&quot;boom&quot;)
+        self.assertEqual(exp.spans[0].status, STATUS_ERROR)
+        self.assertIn(&quot;ValueError&quot;, exp.spans[0].status_message)
+        names = [e.name for e in exp.spans[0].events]
+        self.assertIn(&quot;exception&quot;, names)
+
+    def test_parent_child_relationship(self) -&gt; None:
+        exp = InMemoryExporter()
+        builder = SpanBuilder(exporters=[exp])
+        with builder.span(&quot;parent&quot;) as parent:
+            with builder.span(&quot;child&quot;, parent=parent) as child:
+                self.assertEqual(child.parent_span_id, parent.span_id)
+                self.assertEqual(child.trace_id, parent.trace_id)
+        child_span = next(s for s in exp.spans if s.name == &quot;child&quot;)
+        parent_span = next(s for s in exp.spans if s.name == &quot;parent&quot;)
+        self.assertEqual(child_span.parent_span_id, parent_span.span_id)
+
+    def test_tool_span_drives_counter_and_histogram(self) -&gt; None:
+        exp = InMemoryExporter()
+        metrics = MetricsRegistry()
+        builder = SpanBuilder(exporters=[exp], metrics=metrics)
+        for _ in range(3):
+            with builder.span(
+                &quot;gen_ai.tool.execution&quot;,
+                attributes={GEN_AI_TOOL_NAME: &quot;read_file&quot;},
+            ):
+                pass
+        self.assertEqual(
+            metrics.counter(&quot;tools_called_total&quot;).get({&quot;tool&quot;: &quot;read_file&quot;}), 3
+        )
+        self.assertEqual(
+            metrics.histogram(&quot;tool_latency_ms&quot;).total_count({&quot;tool&quot;: &quot;read_file&quot;}),
+            3,
+        )
+
+
+class JSONLRoundtripTests(unittest.TestCase):
+    def test_jsonl_roundtrip(self) -&gt; None:
+        tmp = tempfile.mkdtemp(prefix=&quot;jsonl-test-&quot;)
+        path = os.path.join(tmp, &quot;traces.jsonl&quot;)
+        exporter = JSONLExporter(path=path)
+        builder = SpanBuilder(exporters=[exporter])
+        with builder.span(
+            &quot;gen_ai.chat&quot;,
+            attributes={
+                GEN_AI_SYSTEM: &quot;anthropic&quot;,
+                GEN_AI_REQUEST_MODEL: &quot;claude-track-a&quot;,
+            },
+        ) as span:
+            span.attributes[GEN_AI_RESPONSE_ID] = &quot;msg_abc&quot;
+        exporter.close()
+        with open(path, &quot;r&quot;, encoding=&quot;utf-8&quot;) as fh:
+            lines = [json.loads(line) for line in fh if line.strip()]
+        self.assertEqual(len(lines), 1)
+        d = lines[0]
+        self.assertEqual(d[&quot;name&quot;], &quot;gen_ai.chat&quot;)
+        self.assertEqual(d[&quot;attributes&quot;][GEN_AI_SYSTEM], &quot;anthropic&quot;)
+        self.assertEqual(d[&quot;attributes&quot;][GEN_AI_REQUEST_MODEL], &quot;claude-track-a&quot;)
+        self.assertEqual(d[&quot;status&quot;][&quot;code&quot;], STATUS_OK)
+
+
+class DemoTests(unittest.TestCase):
+    def test_demo_main_exits_zero(self) -&gt; None:
+        self.assertEqual(run_demo(), 0)
+
+
+if __name__ == &quot;__main__&quot;:
+    unittest.main()
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. Before reading the lesson: what is the practical benefit of writing your harness&#39;s spans in the OTel GenAI attribute shape?</legend><label class="option"><input type="radio" name="q0" value="0"> Every OTel-compatible backend can read them without a custom parser.</label><label class="option"><input type="radio" name="q0" value="1"> OTel is a Python-only standard, so the harness gets type hints.</label><label class="option"><input type="radio" name="q0" value="2"> It is required by HIPAA.</label><label class="option"><input type="radio" name="q0" value="3"> OTel spans compress better on disk.</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. An exception is raised inside a SpanBuilder.span() context. What does the lesson&#39;s builder record?</legend><label class="option"><input type="radio" name="q1" value="0"> status remains UNSET and the exception is silently swallowed.</label><label class="option"><input type="radio" name="q1" value="1"> The span is dropped to avoid polluting the trace.</label><label class="option"><input type="radio" name="q1" value="2"> status=ERROR, status_message includes the exception type and message, and an &#39;exception&#39; event is appended.</label><label class="option"><input type="radio" name="q1" value="3"> The span is renamed to &#39;error&#39;.</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. The Prometheus exposition for a histogram includes _bucket, _sum, and _count lines. Why are bucket counts cumulative (each le bucket includes all smaller buckets)?</legend><label class="option"><input type="radio" name="q2" value="0"> Cumulative counts reduce floating-point error.</label><label class="option"><input type="radio" name="q2" value="1"> Cumulative counts let the scraper compute per-bucket counts via subtraction without storing all observations.</label><label class="option"><input type="radio" name="q2" value="2"> Cumulative counts are the only format Grafana supports.</label><label class="option"><input type="radio" name="q2" value="3"> They are not cumulative; the lesson&#39;s exposition is non-standard.</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. The harness wraps a tool execution in a span. Which attribute keys identify it as a tool call under the GenAI conventions?</legend><label class="option"><input type="radio" name="q3" value="0"> operation + tool.name.</label><label class="option"><input type="radio" name="q3" value="1"> agent.harness.tool + agent.harness.call.</label><label class="option"><input type="radio" name="q3" value="2"> gen_ai.system + gen_ai.request.model.</label><label class="option"><input type="radio" name="q3" value="3"> gen_ai.tool.name + gen_ai.tool.call.id.</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. You want to query &#39;what is the p95 latency of read_file calls&#39;. Which artifact do you query?</legend><label class="option"><input type="radio" name="q4" value="0"> The status_message field of the span.</label><label class="option"><input type="radio" name="q4" value="1"> The counter tools_called_total, divided by the time window.</label><label class="option"><input type="radio" name="q4" value="2"> The Prometheus histogram tool_latency_ms{tool=&quot;read_file&quot;} scraped over a window.</label><label class="option"><input type="radio" name="q4" value="3"> Each span&#39;s duration_ms in traces.jsonl, parsed by a script.</label><p data-feedback="4"></p></fieldset><fieldset><legend>6. A reviewer asks why the lesson hand-rolls instead of importing opentelemetry-sdk. Which answer is correct?</legend><label class="option"><input type="radio" name="q5" value="0"> Hand-rolling teaches the wire format; the SDK can drop in later with the same attribute keys.</label><label class="option"><input type="radio" name="q5" value="1"> Hand-rolling is faster at runtime.</label><label class="option"><input type="radio" name="q5" value="2"> The SDK requires a network connection at import time.</label><label class="option"><input type="radio" name="q5" value="3"> The SDK does not support GenAI conventions.</label><p data-feedback="5"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/19-capstone-projects/27-eval-harness-fixture-tasks/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/19-capstone-projects/29-end-to-end-coding-task-demo/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/19-capstone-projects/28-observability-otel-traces/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

@@ -1,0 +1,993 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>建立一个完整的视觉管道  石头 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-04-computer-vision" data-lesson="04-computer-vision/16-vision-pipeline-capstone" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/04-computer-vision/">计算机视觉</a> / LESSON 16</p><h1 class="lesson-title">建立一个完整的视觉管道  石头</h1><p>Build a Complete Vision Pipeline — Capstone</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>建立一个完整的视觉管道  石头</h1>
+<blockquote>
+<p>产品视觉系统是一个由数据合同编织成的模型和规则链.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 4 Lessons 01-15
+<strong>Time:</strong> ~120 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>设计一个产品视觉管道,检测到物体,分类它们,并发出结构化的JSON ,每一个处理失败路径</li>
+<li>连接一个探测器 (面具R-CNN或YOLO),一个分类器 (ConvNeXt-Tiny),以及一个数据合同 (Pydantic) 进入一个服务</li>
+<li>标记端到端管道并确定第一个瓶 (通常是预处理,然后是检测器)</li>
+<li>运送一个最小的FastAPI服务,它接受图像上传,运行管道,并返回分类的检测</li>
+</ul>
+<h2>问题</h2>
+<p>视觉模型是有用的;视觉产品是它们的链.零售货架审计是检测器加上产品分类器加上价格OCR管道.自动驾驶是2D检测器加上3D检测器加上分类器加上跟踪器加上规划器.医疗预显示器是分类器加上区域分类器加上临床 UI.</p>
+<p>连接这些链是分离ML原型与产品的部分. 模型之间的每个接口都是错误的新地方. 每个坐标转换,每一个正常化,每一个面具尺寸变化都是一个沉默失败候选人. 管道是最弱的接口一样强大.</p>
+<p>这块顶石设置了最小可行的管道:检测+分类+结构化输出+服务层.第四阶段的其他所有插槽都进入这个骨架:换面膜R-CNN为YOLOv8,添加OCR头,添加细分分支,添加跟踪器.架构稳定;碎片可插.</p>
+<h2>概念</h2>
+<h3>管道</h3>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-1bd28c1b897c89fa6535.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>两种模型阶段是昂贵的,其他五个阶段是昆虫居住的地方.</p>
+<h3>与Pydantic签订数据合同</h3>
+<p>每个模型边界都变成一个打字的对象,这将沉默的失败变成响的失败.</p>
+<pre><code>Detection(
+    box: tuple[float, float, float, float],   # (x1, y1, x2, y2), absolute pixels
+    score: float,                              # [0, 1]
+    class_id: int,                             # from detector's label map
+    mask: Optional[list[list[int]]],           # RLE-encoded if present
+)
+
+PipelineResult(
+    image_id: str,
+    detections: list[Detection],
+    classifications: list[Classification],
+    inference_ms: float,
+)
+</code></pre>
+<p>当探测器返回盒子时<code>(cx, cy, w, h)</code>没有<code>(x1, y1, x2, y2)</code>通过Pydantic的验证在边界失败,你立即发现,而不是调试下游的作物,</p>
+<h3>延迟时间的发生</h3>
+<p>几乎每个视觉管道都有三个真理:</p>
+<ol>
+<li>**Preprocessing is often the biggest single block.**解码JPEG,转换色域,重新尺寸这些都是CPU绑定的,容易忘记.</li>
+<li>**The detector dominates GPU time.**现在,我们在检测前进传输中使用70到90%的GPU时间.</li>
+<li>**Postprocessing (NMS, RLE encode/decode) is cheap on GPU, expensive on CPU.**总是与实际目标联系在一起.</li>
+</ol>
+<p>了解分布是使优化成为优先事项列表的原因.</p>
+<h3>失败模式</h3>
+<ul>
+<li><strong>Empty detections</strong>返回空清单,不要崩.</li>
+<li><strong>Out-of-bounds boxes</strong>在切割前将图像尺寸固定.</li>
+<li><strong>Tiny crops</strong> 对于小于分类器的最低输入值小的框,跳过分类.</li>
+<li><strong>Corrupt upload</strong> 400个特定错误代码的响应,而不是 500个.</li>
+<li><strong>Model load failure</strong>服务启动时失败,而不是在第一次请求时.</li>
+</ul>
+<p>一个生产管道处理这些,没有写通用.<code>try/except</code>每个失败都会得到一个名字代码和一个反应.</p>
+<h3>批量</h3>
+<p>产品服务服务于多个客户端. 批量检测和分类在请求中乘以吞吐量. 交易:等待批量填充的额外延迟. 典型的设置:收集到20ms的请求,批量在一起,处理,分配响应. <code>torchserve</code>其他<code>triton</code>预测负载的小型服务器自行推出自己的微型批量.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-2b70918d274d6d981137.png" alt="v4-vision-pipeline 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<h3>步骤1:数据合同</h3>
+<pre><code class="language-python">from pydantic import BaseModel, Field
+from typing import List, Optional, Tuple
+
+class Detection(BaseModel):
+    box: Tuple[float, float, float, float]
+    score: float = Field(ge=0, le=1)
+    class_id: int = Field(ge=0)
+    mask_rle: Optional[str] = None
+
+
+class Classification(BaseModel):
+    detection_index: int
+    class_id: int
+    class_name: str
+    score: float = Field(ge=0, le=1)
+
+
+class PipelineResult(BaseModel):
+    image_id: str
+    detections: List[Detection]
+    classifications: List[Classification]
+    inference_ms: float
+</code></pre>
+<p>五秒代码可以节省一个小时的调试任何严重的管道.</p>
+<h3>步骤2:最低管道类</h3>
+<pre><code class="language-python">import time
+import numpy as np
+import torch
+from PIL import Image
+
+class VisionPipeline:
+    def __init__(self, detector, classifier, class_names,
+                 device=&quot;cpu&quot;, min_crop=32):
+        self.detector = detector.to(device).eval()
+        self.classifier = classifier.to(device).eval()
+        self.class_names = class_names
+        self.device = device
+        self.min_crop = min_crop
+
+    def preprocess(self, image):
+        &quot;&quot;&quot;
+        image: PIL.Image or np.ndarray (H, W, 3) uint8
+        returns: CHW float tensor on device
+        &quot;&quot;&quot;
+        if isinstance(image, Image.Image):
+            image = np.asarray(image.convert(&quot;RGB&quot;))
+        tensor = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
+        return tensor.to(self.device)
+
+    @torch.no_grad()
+    def detect(self, image_tensor):
+        return self.detector([image_tensor])[0]
+
+    @torch.no_grad()
+    def classify(self, crops):
+        if len(crops) == 0:
+            return []
+        batch = torch.stack(crops).to(self.device)
+        logits = self.classifier(batch)
+        probs = logits.softmax(-1)
+        scores, cls = probs.max(-1)
+        return list(zip(cls.tolist(), scores.tolist()))
+
+    def run(self, image, image_id=&quot;anonymous&quot;):
+        t0 = time.perf_counter()
+        tensor = self.preprocess(image)
+        det = self.detect(tensor)
+
+        crops = []
+        detections = []
+        valid_indices = []
+        for i, (box, score, cls) in enumerate(zip(det[&quot;boxes&quot;], det[&quot;scores&quot;], det[&quot;labels&quot;])):
+            x1, y1, x2, y2 = [max(0, int(b)) for b in box.tolist()]
+            x2 = min(x2, tensor.shape[-1])
+            y2 = min(y2, tensor.shape[-2])
+            detections.append(Detection(
+                box=(x1, y1, x2, y2),
+                score=float(score),
+                class_id=int(cls),
+            ))
+            if (x2 - x1) &lt; self.min_crop or (y2 - y1) &lt; self.min_crop:
+                continue
+            crop = tensor[:, y1:y2, x1:x2]
+            crop = torch.nn.functional.interpolate(
+                crop.unsqueeze(0),
+                size=(224, 224),
+                mode=&quot;bilinear&quot;,
+                align_corners=False,
+            )[0]
+            crops.append(crop)
+            valid_indices.append(i)
+
+        class_preds = self.classify(crops)
+
+        classifications = []
+        for valid_idx, (cls_id, cls_score) in zip(valid_indices, class_preds):
+            classifications.append(Classification(
+                detection_index=valid_idx,
+                class_id=int(cls_id),
+                class_name=self.class_names[cls_id],
+                score=float(cls_score),
+            ))
+
+        return PipelineResult(
+            image_id=image_id,
+            detections=detections,
+            classifications=classifications,
+            inference_ms=(time.perf_counter() - t0) * 1000,
+        )
+</code></pre>
+<p>每个界面都会被打字,每一个失败路径都有特定的处理决定.</p>
+<h3>步骤3: 连接探测器和分类器</h3>
+<pre><code class="language-python">from torchvision.models.detection import maskrcnn_resnet50_fpn_v2
+from torchvision.models import convnext_tiny
+
+# Use ImageNet-pretrained weights for a realistic pipeline without training
+detector = maskrcnn_resnet50_fpn_v2(weights=&quot;DEFAULT&quot;)
+classifier = convnext_tiny(weights=&quot;DEFAULT&quot;)
+class_names = [f&quot;imagenet_class_{i}&quot; for i in range(1000)]
+
+pipe = VisionPipeline(detector, classifier, class_names)
+
+# Smoke test with a synthetic image
+test_image = (np.random.rand(400, 600, 3) * 255).astype(np.uint8)
+result = pipe.run(test_image, image_id=&quot;demo&quot;)
+print(result.model_dump_json(indent=2)[:500])
+</code></pre>
+<h3>步骤4:快速API服务</h3>
+<pre><code class="language-python">from fastapi import FastAPI, UploadFile, HTTPException
+from io import BytesIO
+
+app = FastAPI()
+pipe = None  # initialised on startup
+
+@app.on_event(&quot;startup&quot;)
+def load():
+    global pipe
+    detector = maskrcnn_resnet50_fpn_v2(weights=&quot;DEFAULT&quot;).eval()
+    classifier = convnext_tiny(weights=&quot;DEFAULT&quot;).eval()
+    pipe = VisionPipeline(detector, classifier, class_names=[f&quot;c{i}&quot; for i in range(1000)])
+
+@app.post(&quot;/detect&quot;)
+async def detect_endpoint(file: UploadFile):
+    if file.content_type not in {&quot;image/jpeg&quot;, &quot;image/png&quot;, &quot;image/webp&quot;}:
+        raise HTTPException(status_code=400, detail=&quot;unsupported image type&quot;)
+    data = await file.read()
+    try:
+        img = Image.open(BytesIO(data)).convert(&quot;RGB&quot;)
+    except Exception:
+        raise HTTPException(status_code=400, detail=&quot;cannot decode image&quot;)
+    result = pipe.run(img, image_id=file.filename or &quot;upload&quot;)
+    return result.model_dump()
+</code></pre>
+<p>走上<code>uvicorn main:app --host 0.0.0.0 --port 8000</code>试验<code>curl -F 'file=@dog.jpg' http://localhost:8000/detect</code>现在,我们要去.</p>
+<h3>步骤5: 标记管道</h3>
+<pre><code class="language-python">import time
+
+def benchmark(pipe, num_runs=20, image_size=(400, 600)):
+    img = (np.random.rand(*image_size, 3) * 255).astype(np.uint8)
+    pipe.run(img)  # warm up
+
+    stages = {&quot;preprocess&quot;: [], &quot;detect&quot;: [], &quot;classify&quot;: [], &quot;total&quot;: []}
+    for _ in range(num_runs):
+        t0 = time.perf_counter()
+        tensor = pipe.preprocess(img)
+        t1 = time.perf_counter()
+        det = pipe.detect(tensor)
+        t2 = time.perf_counter()
+        crops = []
+        for box in det[&quot;boxes&quot;]:
+            x1, y1, x2, y2 = [max(0, int(b)) for b in box.tolist()]
+            x2 = min(x2, tensor.shape[-1])
+            y2 = min(y2, tensor.shape[-2])
+            if (x2 - x1) &gt;= pipe.min_crop and (y2 - y1) &gt;= pipe.min_crop:
+                crop = tensor[:, y1:y2, x1:x2]
+                crop = torch.nn.functional.interpolate(
+                    crop.unsqueeze(0), size=(224, 224), mode=&quot;bilinear&quot;, align_corners=False
+                )[0]
+                crops.append(crop)
+        pipe.classify(crops)
+        t3 = time.perf_counter()
+        stages[&quot;preprocess&quot;].append((t1 - t0) * 1000)
+        stages[&quot;detect&quot;].append((t2 - t1) * 1000)
+        stages[&quot;classify&quot;].append((t3 - t2) * 1000)
+        stages[&quot;total&quot;].append((t3 - t0) * 1000)
+
+    for stage, times in stages.items():
+        times.sort()
+        print(f&quot;{stage:12s}  p50={times[len(times)//2]:7.1f} ms  p95={times[int(len(times)*0.95)]:7.1f} ms&quot;)
+</code></pre>
+<p>在CPU上,典型输出:预处理~3ms,检测300-500ms,分类20-40ms,总数350-550ms.在GPU上,检测是20-40ms,而预处理+分类开始在相对方面更重要.</p>
+<h2>用它</h2>
+<p>生产模板与相同的结构相结合,加上:</p>
+<ul>
+<li><strong>Model versioning</strong> 总是记录模型名称和重量哈希在响应中.</li>
+<li><strong>Per-request trace IDs</strong>记录每个请求的每个阶段时间,以便您可以将缓慢的响应与阶段相关联.</li>
+<li><strong>Fallback path</strong>如果分类器已停止使用,请返回没有分类的检测,而不是完全不执行请求.</li>
+<li><strong>Safety filters</strong> NSFW/PII过器在分类后,在响应离开服务之前运行.</li>
+<li><strong>Batch endpoint</strong>一个<code>/detect_batch</code>接受大量处理的图像URL列表.</li>
+</ul>
+<p>供生产服务<code>torchserve</code>现在<code>Triton Inference Server</code>其他<code>BentoML</code>处理批量,版本,指标和健康检查.<code>FastAPI</code>直接对原型和小型产品来说是很好的.</p>
+<h2>运送它</h2>
+<p>这一课产生了:</p>
+<ul>
+<li><code>outputs/prompt-vision-service-shape-reviewer.md</code>一个提示,检查视觉服务的代码,以查询合同/响应形状违规行为,并命名第一个破解错误.</li>
+<li><code>outputs/skill-pipeline-budget-planner.md</code>一个技能,鉴于目标延迟和吞吐量,将时间预算分配给每个管道阶段,并标记哪个阶段将首先错过预算.</li>
+</ul>
+<h2>运动</h2>
+<ol>
+<li>**(Easy)**运行任何开放数据集中的10张图像的管道. 报告每个阶段的平均时间和每个图像的检测数量的分布.</li>
+<li>**(Medium)**添加一个面具输出字段到<code>Detection</code>检查JSON的容量低于1MB,即使是10个对象图像.</li>
+<li>**(Hard)**在分类器前添加微分量器:收集最大10ms的作物,将它们分类成一个GPU调用,每次请求返回结果.每秒5次同时请求的吞吐量增长量和延迟加量.</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Pipeline</td>
+<td>&quot;The system&quot;</td>
+<td>An ordered chain of preprocessing, inference, and postprocessing steps with a typed interface between each pair</td>
+</tr>
+<tr>
+<td>Data contract</td>
+<td>&quot;The schema&quot;</td>
+<td>Pydantic / dataclass definitions that every stage input and output conforms to; catches integration bugs at the boundary</td>
+</tr>
+<tr>
+<td>Preprocessing</td>
+<td>&quot;Before the model&quot;</td>
+<td>Decoding, colour conversion, resizing, normalising; usually the biggest CPU time sink</td>
+</tr>
+<tr>
+<td>Postprocessing</td>
+<td>&quot;After the model&quot;</td>
+<td>NMS, mask resize, threshold, RLE encode; cheap on GPU, expensive on CPU</td>
+</tr>
+<tr>
+<td>Microbatcher</td>
+<td>&quot;Collect then forward&quot;</td>
+<td>Aggregator that waits a fixed window for multiple requests, runs a single batched forward pass</td>
+</tr>
+<tr>
+<td>Trace ID</td>
+<td>&quot;Request id&quot;</td>
+<td>Per-request identifier logged at every stage so slow requests can be traced end-to-end</td>
+</tr>
+<tr>
+<td>Failure code</td>
+<td>&quot;Named error&quot;</td>
+<td>Specific error code per failure class instead of generic 500; enables client retry logic</td>
+</tr>
+<tr>
+<td>Health check</td>
+<td>&quot;Readiness probe&quot;</td>
+<td>Cheap endpoint that reports whether the service can answer; loadbalancers rely on this</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://fullstackdeeplearning.com/course/2022/lecture-5-deployment/" rel="noreferrer" data-network="true">Full Stack Deep Learning — Deploying Models <small>↗ 需要联网</small></a>生产 ML部署的常规概述</li>
+<li><a href="https://docs.bentoml.com" rel="noreferrer" data-network="true">BentoML docs <small>↗ 需要联网</small></a>服务框架,配套,版本和指标</li>
+<li><a href="https://pytorch.org/serve/" rel="noreferrer" data-network="true">torchserve docs <small>↗ 需要联网</small></a>PyTorch的官方服务图书馆</li>
+<li><a href="https://developer.nvidia.com/triton-inference-server" rel="noreferrer" data-network="true">NVIDIA Triton Inference Server <small>↗ 需要联网</small></a>高吞吐量服务,配套和多型号支持</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Build a Complete Vision Pipeline — Capstone</h1>
+<blockquote>
+<p>A production vision system is a chain of models and rules stitched with data contracts. The pieces are already in this phase; the capstone wires them together end-to-end.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 4 Lessons 01-15
+<strong>Time:</strong> ~120 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Design a production vision pipeline that detects objects, classifies them, and emits structured JSON — with every failure path handled</li>
+<li>Plug a detector (Mask R-CNN or YOLO), a classifier (ConvNeXt-Tiny), and a data contract (Pydantic) into one service</li>
+<li>Benchmark the end-to-end pipeline and identify the first bottleneck (usually preprocessing, then the detector)</li>
+<li>Ship a minimal FastAPI service that accepts an image upload, runs the pipeline, and returns detections with classifications</li>
+</ul>
+<h2>The Problem</h2>
+<p>Individual vision models are useful; vision products are chains of them. A retail shelf audit is a detector plus a product classifier plus a price-OCR pipeline. Autonomous driving is a 2D detector plus a 3D detector plus a segmenter plus a tracker plus a planner. A medical pre-screen is a segmenter plus a region classifier plus a clinician UI.</p>
+<p>Wiring those chains is the part that separates a ML prototype from a product. Every interface between models is a new place for bugs. Every coordinate transform, every normalisation, every mask resize is a silent-failure candidate. A pipeline is as strong as its weakest interface.</p>
+<p>This capstone sets up the minimum viable pipeline: detection + classification + structured output + a serving layer. Everything else in Phase 4 slots into this skeleton: swap Mask R-CNN for YOLOv8, add a OCR head, add a segmentation branch, add a tracker. The architecture is stable; the pieces are pluggable.</p>
+<h2>The Concept</h2>
+<h3>The pipeline</h3>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-1bd28c1b897c89fa6535.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>Seven stages. The two model stages are expensive; the five other stages are where the bugs live.</p>
+<h3>Data contracts with Pydantic</h3>
+<p>Every model boundary becomes a typed object. This turns silent failures into loud ones.</p>
+<pre><code>Detection(
+    box: tuple[float, float, float, float],   # (x1, y1, x2, y2), absolute pixels
+    score: float,                              # [0, 1]
+    class_id: int,                             # from detector's label map
+    mask: Optional[list[list[int]]],           # RLE-encoded if present
+)
+
+PipelineResult(
+    image_id: str,
+    detections: list[Detection],
+    classifications: list[Classification],
+    inference_ms: float,
+)
+</code></pre>
+<p>When a detector returns boxes in <code>(cx, cy, w, h)</code> instead of <code>(x1, y1, x2, y2)</code>, Pydantic's validation fails at the boundary and you find out immediately instead of debugging a downstream crop that silently returns empty regions.</p>
+<h3>Where latency goes</h3>
+<p>Three truths hold in nearly every vision pipeline:</p>
+<ol>
+<li><strong>Preprocessing is often the biggest single block.</strong> Decoding JPEGs, converting colour spaces, resizing — these are CPU-bound and easy to forget.</li>
+<li><strong>The detector dominates GPU time.</strong> 70-90% of GPU time is in the detection forward pass.</li>
+<li><strong>Postprocessing (NMS, RLE encode/decode) is cheap on GPU, expensive on CPU.</strong> Always profile with the actual target.</li>
+</ol>
+<p>Knowing the distribution is what turns optimisation into a prioritised list.</p>
+<h3>Failure modes</h3>
+<ul>
+<li><strong>Empty detections</strong> — return empty list, do not crash. Log.</li>
+<li><strong>Out-of-bounds boxes</strong> — clamp to image size before cropping.</li>
+<li><strong>Tiny crops</strong> — skip classification for boxes smaller than the classifier's minimum input.</li>
+<li><strong>Corrupt upload</strong> — 400 response with a specific error code, not 500.</li>
+<li><strong>Model load failure</strong> — fail at service startup, not at first request.</li>
+</ul>
+<p>A production pipeline handles each of these without writing generic <code>try/except</code> that hides the failure. Every failure gets a named code and a response.</p>
+<h3>Batching</h3>
+<p>A production service serves multiple clients. Batching detections and classifications across requests multiplies throughput. The trade-off: extra latency from waiting for a batch to fill. Typical setup: collect requests for up to 20ms, batch together, process, distribute responses. <code>torchserve</code> and <code>triton</code> do this natively; small services with predictable load roll their own micro-batcher.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-2b70918d274d6d981137.png" alt="v4-vision-pipeline 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<h3>Step 1: Data contracts</h3>
+<pre><code class="language-python">from pydantic import BaseModel, Field
+from typing import List, Optional, Tuple
+
+class Detection(BaseModel):
+    box: Tuple[float, float, float, float]
+    score: float = Field(ge=0, le=1)
+    class_id: int = Field(ge=0)
+    mask_rle: Optional[str] = None
+
+
+class Classification(BaseModel):
+    detection_index: int
+    class_id: int
+    class_name: str
+    score: float = Field(ge=0, le=1)
+
+
+class PipelineResult(BaseModel):
+    image_id: str
+    detections: List[Detection]
+    classifications: List[Classification]
+    inference_ms: float
+</code></pre>
+<p>Five seconds of code saves an hour of debugging on any serious pipeline.</p>
+<h3>Step 2: A minimal Pipeline class</h3>
+<pre><code class="language-python">import time
+import numpy as np
+import torch
+from PIL import Image
+
+class VisionPipeline:
+    def __init__(self, detector, classifier, class_names,
+                 device=&quot;cpu&quot;, min_crop=32):
+        self.detector = detector.to(device).eval()
+        self.classifier = classifier.to(device).eval()
+        self.class_names = class_names
+        self.device = device
+        self.min_crop = min_crop
+
+    def preprocess(self, image):
+        &quot;&quot;&quot;
+        image: PIL.Image or np.ndarray (H, W, 3) uint8
+        returns: CHW float tensor on device
+        &quot;&quot;&quot;
+        if isinstance(image, Image.Image):
+            image = np.asarray(image.convert(&quot;RGB&quot;))
+        tensor = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
+        return tensor.to(self.device)
+
+    @torch.no_grad()
+    def detect(self, image_tensor):
+        return self.detector([image_tensor])[0]
+
+    @torch.no_grad()
+    def classify(self, crops):
+        if len(crops) == 0:
+            return []
+        batch = torch.stack(crops).to(self.device)
+        logits = self.classifier(batch)
+        probs = logits.softmax(-1)
+        scores, cls = probs.max(-1)
+        return list(zip(cls.tolist(), scores.tolist()))
+
+    def run(self, image, image_id=&quot;anonymous&quot;):
+        t0 = time.perf_counter()
+        tensor = self.preprocess(image)
+        det = self.detect(tensor)
+
+        crops = []
+        detections = []
+        valid_indices = []
+        for i, (box, score, cls) in enumerate(zip(det[&quot;boxes&quot;], det[&quot;scores&quot;], det[&quot;labels&quot;])):
+            x1, y1, x2, y2 = [max(0, int(b)) for b in box.tolist()]
+            x2 = min(x2, tensor.shape[-1])
+            y2 = min(y2, tensor.shape[-2])
+            detections.append(Detection(
+                box=(x1, y1, x2, y2),
+                score=float(score),
+                class_id=int(cls),
+            ))
+            if (x2 - x1) &lt; self.min_crop or (y2 - y1) &lt; self.min_crop:
+                continue
+            crop = tensor[:, y1:y2, x1:x2]
+            crop = torch.nn.functional.interpolate(
+                crop.unsqueeze(0),
+                size=(224, 224),
+                mode=&quot;bilinear&quot;,
+                align_corners=False,
+            )[0]
+            crops.append(crop)
+            valid_indices.append(i)
+
+        class_preds = self.classify(crops)
+
+        classifications = []
+        for valid_idx, (cls_id, cls_score) in zip(valid_indices, class_preds):
+            classifications.append(Classification(
+                detection_index=valid_idx,
+                class_id=int(cls_id),
+                class_name=self.class_names[cls_id],
+                score=float(cls_score),
+            ))
+
+        return PipelineResult(
+            image_id=image_id,
+            detections=detections,
+            classifications=classifications,
+            inference_ms=(time.perf_counter() - t0) * 1000,
+        )
+</code></pre>
+<p>Every interface is typed. Every failure path has a specific handling decision.</p>
+<h3>Step 3: Wire a detector and a classifier</h3>
+<pre><code class="language-python">from torchvision.models.detection import maskrcnn_resnet50_fpn_v2
+from torchvision.models import convnext_tiny
+
+# Use ImageNet-pretrained weights for a realistic pipeline without training
+detector = maskrcnn_resnet50_fpn_v2(weights=&quot;DEFAULT&quot;)
+classifier = convnext_tiny(weights=&quot;DEFAULT&quot;)
+class_names = [f&quot;imagenet_class_{i}&quot; for i in range(1000)]
+
+pipe = VisionPipeline(detector, classifier, class_names)
+
+# Smoke test with a synthetic image
+test_image = (np.random.rand(400, 600, 3) * 255).astype(np.uint8)
+result = pipe.run(test_image, image_id=&quot;demo&quot;)
+print(result.model_dump_json(indent=2)[:500])
+</code></pre>
+<h3>Step 4: FastAPI service</h3>
+<pre><code class="language-python">from fastapi import FastAPI, UploadFile, HTTPException
+from io import BytesIO
+
+app = FastAPI()
+pipe = None  # initialised on startup
+
+@app.on_event(&quot;startup&quot;)
+def load():
+    global pipe
+    detector = maskrcnn_resnet50_fpn_v2(weights=&quot;DEFAULT&quot;).eval()
+    classifier = convnext_tiny(weights=&quot;DEFAULT&quot;).eval()
+    pipe = VisionPipeline(detector, classifier, class_names=[f&quot;c{i}&quot; for i in range(1000)])
+
+@app.post(&quot;/detect&quot;)
+async def detect_endpoint(file: UploadFile):
+    if file.content_type not in {&quot;image/jpeg&quot;, &quot;image/png&quot;, &quot;image/webp&quot;}:
+        raise HTTPException(status_code=400, detail=&quot;unsupported image type&quot;)
+    data = await file.read()
+    try:
+        img = Image.open(BytesIO(data)).convert(&quot;RGB&quot;)
+    except Exception:
+        raise HTTPException(status_code=400, detail=&quot;cannot decode image&quot;)
+    result = pipe.run(img, image_id=file.filename or &quot;upload&quot;)
+    return result.model_dump()
+</code></pre>
+<p>Run with <code>uvicorn main:app --host 0.0.0.0 --port 8000</code>. Test with <code>curl -F 'file=@dog.jpg' http://localhost:8000/detect</code>.</p>
+<h3>Step 5: Benchmark the pipeline</h3>
+<pre><code class="language-python">import time
+
+def benchmark(pipe, num_runs=20, image_size=(400, 600)):
+    img = (np.random.rand(*image_size, 3) * 255).astype(np.uint8)
+    pipe.run(img)  # warm up
+
+    stages = {&quot;preprocess&quot;: [], &quot;detect&quot;: [], &quot;classify&quot;: [], &quot;total&quot;: []}
+    for _ in range(num_runs):
+        t0 = time.perf_counter()
+        tensor = pipe.preprocess(img)
+        t1 = time.perf_counter()
+        det = pipe.detect(tensor)
+        t2 = time.perf_counter()
+        crops = []
+        for box in det[&quot;boxes&quot;]:
+            x1, y1, x2, y2 = [max(0, int(b)) for b in box.tolist()]
+            x2 = min(x2, tensor.shape[-1])
+            y2 = min(y2, tensor.shape[-2])
+            if (x2 - x1) &gt;= pipe.min_crop and (y2 - y1) &gt;= pipe.min_crop:
+                crop = tensor[:, y1:y2, x1:x2]
+                crop = torch.nn.functional.interpolate(
+                    crop.unsqueeze(0), size=(224, 224), mode=&quot;bilinear&quot;, align_corners=False
+                )[0]
+                crops.append(crop)
+        pipe.classify(crops)
+        t3 = time.perf_counter()
+        stages[&quot;preprocess&quot;].append((t1 - t0) * 1000)
+        stages[&quot;detect&quot;].append((t2 - t1) * 1000)
+        stages[&quot;classify&quot;].append((t3 - t2) * 1000)
+        stages[&quot;total&quot;].append((t3 - t0) * 1000)
+
+    for stage, times in stages.items():
+        times.sort()
+        print(f&quot;{stage:12s}  p50={times[len(times)//2]:7.1f} ms  p95={times[int(len(times)*0.95)]:7.1f} ms&quot;)
+</code></pre>
+<p>Typical output on CPU: preprocess ~3 ms, detect 300-500 ms, classify 20-40 ms, total 350-550 ms. On GPU, detect is 20-40 ms and the preprocess + classify start to matter more in relative terms.</p>
+<h2>Use It</h2>
+<p>Production templates converge to the same structure, plus:</p>
+<ul>
+<li><strong>Model versioning</strong> — always log the model name and weights hash in the response.</li>
+<li><strong>Per-request trace IDs</strong> — log every stage timing for every request so you can correlate slow responses with stages.</li>
+<li><strong>Fallback path</strong> — if the classifier times out, return detections without classifications rather than failing the whole request.</li>
+<li><strong>Safety filters</strong> — NSFW / PII filters run after classification, before the response leaves the service.</li>
+<li><strong>Batch endpoint</strong> — a <code>/detect_batch</code> accepting a list of image URLs for bulk processing.</li>
+</ul>
+<p>For production serving, <code>torchserve</code>, <code>Triton Inference Server</code>, and <code>BentoML</code> handle batching, versioning, metrics, and health checks out of the box. Running <code>FastAPI</code> directly is fine for prototypes and small-scale products.</p>
+<h2>Ship It</h2>
+<p>This lesson produces:</p>
+<ul>
+<li><code>outputs/prompt-vision-service-shape-reviewer.md</code> — a prompt that reviews a vision service's code for contract/response shape violations and names the first breaking bug.</li>
+<li><code>outputs/skill-pipeline-budget-planner.md</code> — a skill that, given target latency and throughput, assigns a time budget to every pipeline stage and flags which stage will miss its budget first.</li>
+</ul>
+<h2>Exercises</h2>
+<ol>
+<li><strong>(Easy)</strong> Run the pipeline on 10 images from any open dataset. Report the average time per stage and the distribution of detection counts per image.</li>
+<li><strong>(Medium)</strong> Add a mask output field to <code>Detection</code> and encode it as RLE. Verify the JSON stays under 1MB even for a 10-object image.</li>
+<li><strong>(Hard)</strong> Add a micro-batcher in front of the classifier: collect crops for up to 10 ms, classify them all in one GPU call, return results per request. Measure the throughput gain at 5 concurrent requests per second and the latency added.</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Pipeline</td>
+<td>&quot;The system&quot;</td>
+<td>An ordered chain of preprocessing, inference, and postprocessing steps with a typed interface between each pair</td>
+</tr>
+<tr>
+<td>Data contract</td>
+<td>&quot;The schema&quot;</td>
+<td>Pydantic / dataclass definitions that every stage input and output conforms to; catches integration bugs at the boundary</td>
+</tr>
+<tr>
+<td>Preprocessing</td>
+<td>&quot;Before the model&quot;</td>
+<td>Decoding, colour conversion, resizing, normalising; usually the biggest CPU time sink</td>
+</tr>
+<tr>
+<td>Postprocessing</td>
+<td>&quot;After the model&quot;</td>
+<td>NMS, mask resize, threshold, RLE encode; cheap on GPU, expensive on CPU</td>
+</tr>
+<tr>
+<td>Microbatcher</td>
+<td>&quot;Collect then forward&quot;</td>
+<td>Aggregator that waits a fixed window for multiple requests, runs a single batched forward pass</td>
+</tr>
+<tr>
+<td>Trace ID</td>
+<td>&quot;Request id&quot;</td>
+<td>Per-request identifier logged at every stage so slow requests can be traced end-to-end</td>
+</tr>
+<tr>
+<td>Failure code</td>
+<td>&quot;Named error&quot;</td>
+<td>Specific error code per failure class instead of generic 500; enables client retry logic</td>
+</tr>
+<tr>
+<td>Health check</td>
+<td>&quot;Readiness probe&quot;</td>
+<td>Cheap endpoint that reports whether the service can answer; loadbalancers rely on this</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://fullstackdeeplearning.com/course/2022/lecture-5-deployment/" rel="noreferrer" data-network="true">Full Stack Deep Learning — Deploying Models <small>↗ 需要联网</small></a> — the canonical overview of production ML deployment</li>
+<li><a href="https://docs.bentoml.com" rel="noreferrer" data-network="true">BentoML docs <small>↗ 需要联网</small></a> — serving framework with batching, versioning, and metrics</li>
+<li><a href="https://pytorch.org/serve/" rel="noreferrer" data-network="true">torchserve docs <small>↗ 需要联网</small></a> — PyTorch's official serving library</li>
+<li><a href="https://developer.nvidia.com/triton-inference-server" rel="noreferrer" data-network="true">NVIDIA Triton Inference Server <small>↗ 需要联网</small></a> — high-throughput serving with batching and multi-model support</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-04-computer-vision--16-vision-pipeline-capstone.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-04-computer-vision--16-vision-pipeline-capstone.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/04-computer-vision/16-vision-pipeline-capstone/code/main.py">phases/04-computer-vision/16-vision-pipeline-capstone/code/main.py</a><details><summary>查看原始文本</summary><pre><code>import time
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from pydantic import BaseModel, Field
+from typing import List, Optional, Tuple
+
+
+class Detection(BaseModel):
+    box: Tuple[float, float, float, float]
+    score: float = Field(ge=0, le=1)
+    class_id: int = Field(ge=0)
+    mask_rle: Optional[str] = None
+
+
+class Classification(BaseModel):
+    detection_index: int
+    class_id: int
+    class_name: str
+    score: float = Field(ge=0, le=1)
+
+
+class PipelineResult(BaseModel):
+    image_id: str
+    detections: List[Detection]
+    classifications: List[Classification]
+    inference_ms: float
+
+
+class StubDetector(nn.Module):
+    &quot;&quot;&quot;Minimal stand-in for Mask R-CNN that produces a fixed set of detections.&quot;&quot;&quot;
+
+    def __init__(self):
+        super().__init__()
+        self.dummy = nn.Parameter(torch.zeros(1))
+
+    def forward(self, images):
+        results = []
+        for img in images:
+            H, W = img.shape[-2:]
+            boxes = torch.tensor(
+                [
+                    [W * 0.1, H * 0.1, W * 0.4, H * 0.6],
+                    [W * 0.5, H * 0.3, W * 0.9, H * 0.9],
+                    [W * 0.2, H * 0.6, W * 0.45, H * 0.85],
+                ],
+                device=img.device,
+            )
+            scores = torch.tensor([0.92, 0.85, 0.71], device=img.device)
+            labels = torch.tensor([1, 2, 1], device=img.device)
+            results.append({&quot;boxes&quot;: boxes, &quot;scores&quot;: scores, &quot;labels&quot;: labels})
+        return results
+
+
+class StubClassifier(nn.Module):
+    def __init__(self, num_classes=10):
+        super().__init__()
+        self.head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(3, num_classes),
+        )
+
+    def forward(self, x):
+        return self.head(x)
+
+
+class VisionPipeline:
+    def __init__(self, detector, classifier, class_names,
+                 device=&quot;cpu&quot;, min_crop=16):
+        self.detector = detector.to(device).eval()
+        self.classifier = classifier.to(device).eval()
+        self.class_names = class_names
+        self.device = device
+        self.min_crop = min_crop
+
+    def preprocess(self, image):
+        if isinstance(image, np.ndarray):
+            if image.ndim != 3 or image.shape[-1] != 3:
+                raise ValueError(f&quot;expected HxWx3 RGB image, got shape {image.shape}&quot;)
+            tensor = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
+        elif isinstance(image, torch.Tensor):
+            if image.ndim != 3 or image.shape[0] != 3:
+                raise ValueError(f&quot;expected (3, H, W) tensor, got shape {tuple(image.shape)}&quot;)
+            tensor = image.float()
+        else:
+            raise TypeError(f&quot;image must be numpy ndarray or torch Tensor, got {type(image)}&quot;)
+        return tensor.to(self.device)
+
+    @torch.no_grad()
+    def detect(self, image_tensor):
+        return self.detector([image_tensor])[0]
+
+    @torch.no_grad()
+    def classify(self, crops):
+        if len(crops) == 0:
+            return []
+        batch = torch.stack(crops).to(self.device)
+        logits = self.classifier(batch)
+        probs = logits.softmax(-1)
+        scores, cls = probs.max(-1)
+        return list(zip(cls.tolist(), scores.tolist()))
+
+    def run(self, image, image_id=&quot;anonymous&quot;):
+        t0 = time.perf_counter()
+        tensor = self.preprocess(image)
+        det = self.detect(tensor)
+
+        crops = []
+        valid_indices = []
+        detections = []
+        for i, (box, score, cls) in enumerate(
+            zip(det[&quot;boxes&quot;], det[&quot;scores&quot;], det[&quot;labels&quot;])
+        ):
+            x1, y1, x2, y2 = [max(0, int(b)) for b in box.tolist()]
+            x2 = min(x2, tensor.shape[-1])
+            y2 = min(y2, tensor.shape[-2])
+            detections.append(Detection(
+                box=(x1, y1, x2, y2),
+                score=float(score),
+                class_id=int(cls),
+            ))
+            if (x2 - x1) &lt; self.min_crop or (y2 - y1) &lt; self.min_crop:
+                continue
+            crop = tensor[:, y1:y2, x1:x2]
+            crop = F.interpolate(
+                crop.unsqueeze(0), size=(64, 64), mode=&quot;bilinear&quot;, align_corners=False
+            )[0]
+            crops.append(crop)
+            valid_indices.append(i)
+
+        class_preds = self.classify(crops)
+
+        classifications = []
+        for valid_idx, (cls_id, cls_score) in zip(valid_indices, class_preds):
+            classifications.append(Classification(
+                detection_index=valid_idx,
+                class_id=int(cls_id),
+                class_name=self.class_names[cls_id] if cls_id &lt; len(self.class_names) else f&quot;class_{cls_id}&quot;,
+                score=float(cls_score),
+            ))
+
+        return PipelineResult(
+            image_id=image_id,
+            detections=detections,
+            classifications=classifications,
+            inference_ms=(time.perf_counter() - t0) * 1000,
+        )
+
+
+def benchmark(pipe, num_runs=10, image_size=(400, 600)):
+    img = (np.random.rand(*image_size, 3) * 255).astype(np.uint8)
+    pipe.run(img)
+    stages = {&quot;preprocess&quot;: [], &quot;detect&quot;: [], &quot;classify&quot;: [], &quot;total&quot;: []}
+
+    def sync():
+        if pipe.device == &quot;cuda&quot; and torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+    for _ in range(num_runs):
+        sync()
+        t0 = time.perf_counter()
+        tensor = pipe.preprocess(img)
+        sync()
+        t1 = time.perf_counter()
+        det = pipe.detect(tensor)
+        sync()
+        t2 = time.perf_counter()
+        crops = []
+        for box in det[&quot;boxes&quot;]:
+            x1, y1, x2, y2 = [max(0, int(b)) for b in box.tolist()]
+            x2 = min(x2, tensor.shape[-1])
+            y2 = min(y2, tensor.shape[-2])
+            if (x2 - x1) &gt;= pipe.min_crop and (y2 - y1) &gt;= pipe.min_crop:
+                crop = tensor[:, y1:y2, x1:x2]
+                crop = F.interpolate(
+                    crop.unsqueeze(0), size=(64, 64), mode=&quot;bilinear&quot;, align_corners=False
+                )[0]
+                crops.append(crop)
+        pipe.classify(crops)
+        sync()
+        t3 = time.perf_counter()
+        stages[&quot;preprocess&quot;].append((t1 - t0) * 1000)
+        stages[&quot;detect&quot;].append((t2 - t1) * 1000)
+        stages[&quot;classify&quot;].append((t3 - t2) * 1000)
+        stages[&quot;total&quot;].append((t3 - t0) * 1000)
+    for stage, times in stages.items():
+        times.sort()
+        print(f&quot;  {stage:10s}  p50={times[len(times)//2]:7.2f}  p95={times[int(len(times)*0.95)]:7.2f}&quot;)
+
+
+def main():
+    detector = StubDetector()
+    classifier = StubClassifier(num_classes=10)
+    class_names = [f&quot;class_{i}&quot; for i in range(10)]
+    pipe = VisionPipeline(detector, classifier, class_names)
+
+    img = (np.random.rand(400, 600, 3) * 255).astype(np.uint8)
+    result = pipe.run(img, image_id=&quot;demo&quot;)
+    print(&quot;[result]&quot;)
+    print(result.model_dump_json(indent=2)[:400])
+    print(&quot;...&quot;)
+
+    print(&quot;\n[benchmark]&quot;)
+    benchmark(pipe, num_runs=10)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/04-computer-vision/16-vision-pipeline-capstone/outputs/prompt-vision-service-shape-reviewer.md">phases/04-computer-vision/16-vision-pipeline-capstone/outputs/prompt-vision-service-shape-reviewer.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: prompt-vision-service-shape-reviewer
+description: Review a vision service&#39;s code for contract/response shape violations and name the first breaking bug
+phase: 4
+lesson: 16
+---
+
+You are a vision-service reviewer. Given a Python service file, walk it in order and name the first shape/contract bug you find. Stop there.
+
+## Check list (in priority order)
+
+1. **Request body type** — does the endpoint accept the right content type? Flag if `application/json` is expected but body is bytes, or vice versa.
+2. **Image decode** — is the decode wrapped to turn failures into a 4xx response? Flag if a bare `Image.open` can propagate as 500.
+3. **Preprocessing range** — does the tensor end in `[0, 1]` or `[-1, 1]` as the model expects? Flag mismatched normalisation.
+4. **Model input shape** — does the model receive `(N, C, H, W)`? Flag an HWC-to-CHW transpose that is missing or wrong.
+5. **Box coordinate system** — does the output use `(x1, y1, x2, y2)` in absolute pixel units? Flag `(cx, cy, w, h)` or normalised coordinates leaking through.
+6. **Out-of-bounds crops** — are crops clamped to image dimensions before `tensor[y1:y2, x1:x2]`? Flag missing clamps.
+7. **Empty detections** — does the pipeline return a valid response when there are zero detections? Flag crashes on `torch.stack([])`.
+8. **Response schema** — does the returned JSON match the stated schema? Flag missing fields, extra fields, wrong types.
+
+## Output
+
+```
+[review]
+  file:  &lt;path&gt;
+
+[first issue]
+  line:   &lt;int&gt;
+  code:   &lt;quoted verbatim&gt;
+  kind:   &lt;one of the 8 categories&gt;
+  impact: &lt;what breaks downstream&gt;
+  fix:    &lt;one-line concrete change&gt;
+
+[remaining checks]
+  skipped because stopping at first issue.
+```
+
+## Rules
+
+- Quote exact lines; never paraphrase.
+- Stop at the first issue. Subsequent checks are skipped.
+- Do not rewrite the service; propose the minimum change.
+- If there are no issues in the 8 categories, say so explicitly and list &quot;additional checks&quot; (trace IDs, logging, health check) as a follow-up.
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/04-computer-vision/16-vision-pipeline-capstone/outputs/skill-pipeline-budget-planner.md">phases/04-computer-vision/16-vision-pipeline-capstone/outputs/skill-pipeline-budget-planner.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: skill-pipeline-budget-planner
+description: Given target latency and throughput, assign a time budget to every pipeline stage and flag which stage will miss its budget first
+version: 1.0.0
+phase: 4
+lesson: 16
+tags: [vision, pipeline, performance, deployment]
+---
+
+# Pipeline Budget Planner
+
+Turn a latency/throughput target into a stage-by-stage budget so every team member knows what number they are engineering toward.
+
+## When to use
+
+- Before building a new vision service, to set expectations for each stage.
+- After a first benchmark, to see which stage is farthest from its budget.
+- When an SLA changes and budgets need to be renegotiated.
+
+## Inputs
+
+- `p95_latency_target_ms`: per-request budget.
+- `target_qps`: throughput per replica.
+- `stages`: list of `{ name: str, current_ms: float }`.
+
+## Allocation rules
+
+Default allocation across the seven standard stages if no current measurements provided:
+
+| Stage | Share |
+|-------|-------|
+| decode + preprocess | 15% |
+| detector forward | 55% |
+| postprocess detections (NMS, clamp) | 5% |
+| crop + resize for classifier | 5% |
+| classifier forward | 15% |
+| schema validation | &lt;1% |
+| response serialisation | 4% |
+
+On GPU-bound pipelines (cloud), the detector share often rises to 70%. On CPU, preprocessing and classifier batching eat more.
+
+## Report
+
+```
+[budget plan]
+  p95 target:  &lt;ms&gt;
+  throughput:  &lt;qps per replica&gt;
+
+| stage               | target_ms | current_ms | headroom | gate |
+|---------------------|-----------|------------|----------|------|
+| decode+preprocess   | ...       | ...        | ...      | ok|X |
+| detector            | ...       | ...        | ...      | ok|X |
+| ...                 | ...       | ...        | ...      |      |
+
+[bottleneck]
+  stage:  &lt;name&gt;
+  miss:   &lt;ms over budget&gt;
+  lever:  &lt;specific action&gt;
+
+[levers]
+  decode+preprocess:   Pillow-SIMD, libjpeg-turbo, decode on GPU via NVJPEG
+  detector:            smaller backbone, lower input resolution, INT8, TensorRT
+  postprocess:         GPU-side NMS (torchvision.ops), fused masks
+  crop+resize:         GPU crop with grid_sample, batched interpolate
+  classifier:          smaller backbone, INT8, warm cache, batch
+  schema:              skip validation in hot path, validate at boundaries only
+  response:            orjson, stream protobuf
+```
+
+## Rules
+
+- Never recommend dropping schema validation from the production path; propose moving it to the boundary instead.
+- If preprocessing misses its budget, always try Pillow-SIMD or NVJPEG before changing the model.
+- If the detector miss is more than 30% of target, switch models instead of optimising the current one.
+- Flag the gate as `X` when current_ms &gt; 1.1 * target_ms; mark `ok` if within 10% of budget.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. Why do production vision pipelines use Pydantic models (or equivalent) at every stage boundary?</legend><label class="option"><input type="radio" name="q0" value="0"> Pydantic is faster than dict access</label><label class="option"><input type="radio" name="q0" value="1"> It helps with GPU allocation</label><label class="option"><input type="radio" name="q0" value="2"> Pydantic is required by FastAPI</label><label class="option"><input type="radio" name="q0" value="3"> Typed schemas catch interface mismatches at the boundary; a detector returning (cx, cy, w, h) when the downstream expects (x1, y1, x2, y2) fails loudly with a validation error instead of silently producing empty crops</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. On a CPU-only vision pipeline, which stage is most often the biggest latency block?</legend><label class="option"><input type="radio" name="q1" value="0"> Reading the HTTP request body</label><label class="option"><input type="radio" name="q1" value="1"> Image preprocessing (JPEG decode, colour conversion, resize); it is CPU-bound and often dominates when no GPU is involved or when the GPU model is small</label><label class="option"><input type="radio" name="q1" value="2"> Writing the JSON response</label><label class="option"><input type="radio" name="q1" value="3"> The detector&#39;s final NMS</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. The pipeline classifier crashes when a detection has box size 3x4 pixels. What is the correct fix?</legend><label class="option"><input type="radio" name="q2" value="0"> Increase batch size</label><label class="option"><input type="radio" name="q2" value="1"> Retrain the classifier on smaller images</label><label class="option"><input type="radio" name="q2" value="2"> Set a min_crop threshold (e.g. 16 or 32 pixels) and skip classification for detections smaller than that; log the skip and include the detection in the response without a classification field</label><label class="option"><input type="radio" name="q2" value="3"> Add a global try/except and return empty classifications</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. You add batching to the classifier (wait up to 10 ms, batch all pending crops, one GPU forward). What is the expected effect?</legend><label class="option"><input type="radio" name="q3" value="0"> Latency strictly decreases</label><label class="option"><input type="radio" name="q3" value="1"> No effect</label><label class="option"><input type="radio" name="q3" value="2"> Throughput increases significantly, per-request latency increases by up to the batching window (~10ms) plus a smaller amount from larger tensor ops; the right answer depends on whether the service is throughput-bound or latency-bound</label><label class="option"><input type="radio" name="q3" value="3"> Throughput decreases because of the wait</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. Your pipeline response is a 500 error when a user uploads a corrupted JPEG. How should you fix it?</legend><label class="option"><input type="radio" name="q4" value="0"> Ignore it; the user will retry</label><label class="option"><input type="radio" name="q4" value="1"> Catch image-decode failures early in preprocessing, return a 400 with a specific error code like &#39;image_decode_failed&#39; so the client can retry with a different file instead of a 500 that implies server error</label><label class="option"><input type="radio" name="q4" value="2"> Always return 200 with an empty result</label><label class="option"><input type="radio" name="q4" value="3"> Move decoding to the classifier</label><p data-feedback="4"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/04-computer-vision/15-real-time-edge/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/04-computer-vision/17-self-supervised-vision/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/04-computer-vision/16-vision-pipeline-capstone/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

@@ -1,0 +1,591 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>控制网,LORA和空调 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-08-generative-ai" data-lesson="08-generative-ai/08-controlnet-lora-conditioning" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/08-generative-ai/">生成式 AI</a> / LESSON 08</p><h1 class="lesson-title">控制网,LORA和空调</h1><p>ControlNet, LoRA &amp; Conditioning</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>控制网,LORA和空调</h1>
+<blockquote>
+<p>文字本身是一个拙的控制信号.ControlNet允许你克隆预训练的扩散模型,并用深度地图,姿势骨架,形或边缘图像来引导它.LoRA允许你通过训练1000万参数来细节调整2B参数模型.他们一起将稳定扩散从玩具变成了2026年图像管道,将其发送到每个机构.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 8 · 07 (Latent Diffusion), Phase 10 (LLMs from Scratch — for LoRA foundation)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>问题</h2>
+<p>像&quot;一个穿着红色衣服的女人在拥挤的街上散步狗&quot;这样的提示没有给模型提供关于狗在哪里,女人在什么姿势,或者街道的视角的信息.文字注入了你需要的10%左右的图像.其余的图像是视觉的,不能用语言有效地描述.</p>
+<p>训练一个新的条件模型从零开始每一个信号 (姿势,深度,,细分) 是禁止的.你想保持2.6B-param SDXL脊柱结,连接一个小侧网络,读取条件,让它推向脊柱的中间功能.那就是控制网.</p>
+<p>你还想教模型新的概念 (你的脸,你的产品,你的风格) 而不需要重新训练完整的模型.你想要一个100倍小的三角形.那就是LoRA 低级适配器,连接到现有注意力重量.</p>
+<p>控制网+LoRA+文字 = 2026 实践者工具包.大多数生产图像管道层 2-5 LoRA, 1-3 ControlNets,以及 SDXL / SD3 / Flux 基础上一个IP-适配器.</p>
+<h2>概念</h2>
+<p><img src="/learn/ai-from-scratch/files/phases/08-generative-ai/08-controlnet-lora-conditioning/assets/controlnet-lora.svg" alt="ControlNet clones the encoder; LoRA adds low-rank deltas" loading="lazy"></p>
+<h3>控制网 (Zhang等, 2023)</h3>
+<p>除原始的编码器. 除原始的编码器. 训练克隆接受额外的调节输入 (边缘,深度,姿势). 连接克隆回原始的解码器半个使用 <em>零转变</em> 跳转连接 (1×1 连接初始化为零 开始为无操作,学习三角形).</p>
+<pre><code>SD U-Net decoder:   ... ← orig_enc_features + zero_conv(controlnet_enc(condition))
+</code></pre>
+<p>零-conv init意味着控制网开始作为身份即使在训练之前也没有伤害. 1M (快速,条件,图像) 的火车与标准的扩散损失增加了三倍.</p>
+<p>按modality ControlNets 作为小型侧模型 (SDXL 约360M,SD 1.5) 运输.</p>
+<pre><code>features += weight_a * control_a(depth) + weight_b * control_b(pose)
+</code></pre>
+<h3>劳拉 (Hu等,2021年)</h3>
+<p>对于任何线性层<code>W ∈ R^{d×d}</code>在模型中,结<code>W</code>加入一个低级别的三角形:</p>
+<pre><code>W' = W + ΔW,  ΔW = B @ A,  A ∈ R^{r×d},  B ∈ R^{d×r}
+</code></pre>
+<p>随着<code>r &lt;&lt; d</code>排名4-16是注意力标准,排名64-128是重型细调.<code>2 · d · r</code>没有<code>d²</code>为了 SDXL 的关注<code>d=640</code>现在<code>r=16</code>整个模型中:LoRA通常是20-200MB与基 5GB相比.</p>
+<p>在推断下,你可以扩展LORA:<code>W' = W + α · B @ A</code>现在,我们要去.<code>α = 0.5-1.5</code>许多LoRA的堆积量是加上性的 (通常警告的是它们以非线性方式相互作用).</p>
+<h3>适应器 (Ye et al., 2023)</h3>
+<p>通过Clip图像编码器生成图像代币,将它们注入文本代币旁边的交叉注意力. ~ 20MB/基模型. 允许您&quot;生成图像按照本参考的风格&quot;而不用LoRA.</p>
+<h2>复合性矩阵</h2>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>What it controls</th>
+<th>Size</th>
+<th>When to use</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ControlNet</td>
+<td>Spatial structure (pose, depth, edges)</td>
+<td>70-360MB</td>
+<td>Exact layout, composition</td>
+</tr>
+<tr>
+<td>LoRA</td>
+<td>Style, subject, concept</td>
+<td>20-200MB</td>
+<td>Personalization, style</td>
+</tr>
+<tr>
+<td>IP-Adapter</td>
+<td>Style or subject from reference image</td>
+<td>20MB</td>
+<td>No text can describe the look</td>
+</tr>
+<tr>
+<td>Textual Inversion</td>
+<td>Single concept as a new token</td>
+<td>10KB</td>
+<td>Legacy, mostly replaced by LoRA</td>
+</tr>
+<tr>
+<td>DreamBooth</td>
+<td>Full fine-tune on a subject</td>
+<td>2-5GB</td>
+<td>Strong identity, high compute</td>
+</tr>
+<tr>
+<td>T2I-Adapter</td>
+<td>Lighter ControlNet alternative</td>
+<td>70MB</td>
+<td>Edge devices, inference budget</td>
+</tr>
+</tbody>
+</table>
+<p>控制网空间,洛拉语义.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-bd48f23bb020d7fc1b47.png" alt="v4-controlnet-zero 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<p><code>code/main.py</code>在1-D上模拟两个机制:</p>
+<ol>
+<li>
+<p>**LoRA.**预训练的线性层<code>W</code>结它,训练一个低级的<code>B @ A</code>这样.<code>W + BA</code>显示出它是什么?<code>r = 1</code>足以学习一个级-1的纠正.</p>
+</li>
+<li>
+<p>**ControlNet-lite.**预测器&quot;结结结基础&quot;和&quot;侧网络&quot;读取额外信号.侧网络的输出由一个可学习的尺度器启动到零 (我们的零-conv版本). 训练和观察门升.</p>
+</li>
+</ol>
+<h3>步骤1:LoRA数学</h3>
+<pre><code class="language-python">def lora(W, A, B, x, alpha=1.0):
+    # W is frozen; A, B are the trainable low-rank factors.
+    return [W[i][j] * x[j] for i, j in ...] + alpha * (B @ (A @ x))
+</code></pre>
+<h3>步骤2:零点侧网络</h3>
+<pre><code class="language-python">side_out = control_net(x, condition)
+gated = gate * side_out  # gate initialized to 0
+h = base(x) + gated
+</code></pre>
+<p>在步骤0中输出与基础相同.<code>gate</code>慢慢 没有灾难性漂移.</p>
+<h2>陷</h2>
+<ul>
+<li><strong>Over-scaling LoRAs.</strong> <code>α = 2</code>或<code>α = 3</code>果是一个常见的&quot;强化&quot;黑客,<code>α ≤ 1.5</code>现在,我们要去.</li>
+<li>**ControlNet weight conflict.**使用Pose ControlNet在重量1.0和深度控制网在重量1.0通常过分.重量总量≈1.0是安全默认的.</li>
+<li>**LoRA on the wrong base.**由于注意力尺寸不匹配,SDXL LoRA在SD 1.5上默默无闻.</li>
+<li>**Textual Inversion drift.**通过一个检查点训练的代币,在另一个检查点上漂移得很差.</li>
+<li>**LoRA weight-merging and storage.**您可以将LoRA入基模型重量中,以更快地推断 (没有运行时间的增加),但您失去了扩展能力<code>α</code>保持两种版本.</li>
+</ul>
+<h2>用它</h2>
+<table>
+<thead>
+<tr>
+<th>Goal</th>
+<th>2026 pipeline</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Reproduce a brand's art style</td>
+<td>LoRA trained on ~30 curated images at rank 32</td>
+</tr>
+<tr>
+<td>Put my face in a generated image</td>
+<td>DreamBooth or LoRA + IP-Adapter-FaceID</td>
+</tr>
+<tr>
+<td>Specific pose + prompt</td>
+<td>ControlNet-Openpose + SDXL + text</td>
+</tr>
+<tr>
+<td>Depth-aware composition</td>
+<td>ControlNet-Depth + SD3</td>
+</tr>
+<tr>
+<td>Reference + prompt</td>
+<td>IP-Adapter + text</td>
+</tr>
+<tr>
+<td>Exact layout</td>
+<td>ControlNet-Scribble or ControlNet-Canny</td>
+</tr>
+<tr>
+<td>Background replace</td>
+<td>ControlNet-Seg + Inpainting (Lesson 09)</td>
+</tr>
+<tr>
+<td>Fast 1-step style</td>
+<td>LCM-LoRA on SDXL-Turbo</td>
+</tr>
+</tbody>
+</table>
+<h2>运送它</h2>
+<p>保存<code>outputs/skill-sd-toolkit-composer.md</code>技能接收一个任务 (输入资产:即时,可选参考图像,可选姿势,可选深度,可选) 并输出工具堆,权重和可复制的种子协议.</p>
+<h2>运动</h2>
+<ol>
+<li>**Easy.**在<code>code/main.py</code>根据&quot; 洛拉&quot;的排名<code>r</code>在哪个级别的 LoRA 完全匹配到一个级别-2的目标三角形?</li>
+<li>**Medium.**训练两个不同的LoRA在两个目标转换. 加载它们在一起,显示它们的增量相互作用. 相互作用什么时候会打破线性?</li>
+<li>**Hard.**使用扩散器堆叠:SDXL-base + Canny-ControlNet (重量0.8) +风格LoRA (α 0.8) + IP-Adapter (重量0.6).随着堆叠重量变化,测量FID-vs-prompt-adhesion trade-off.</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ControlNet</td>
+<td>&quot;Spatial control&quot;</td>
+<td>Cloned encoder + zero-conv skips; reads a conditioning image.</td>
+</tr>
+<tr>
+<td>Zero convolution</td>
+<td>&quot;Starts as identity&quot;</td>
+<td>1×1 conv initialized to zero; ControlNet starts as no-op.</td>
+</tr>
+<tr>
+<td>LoRA</td>
+<td>&quot;Low-rank adapter&quot;</td>
+<td><code>W + B @ A</code>, <code>r &lt;&lt; d</code>; 100x fewer params than a full fine-tune.</td>
+</tr>
+<tr>
+<td>rank r</td>
+<td>&quot;The knob&quot;</td>
+<td>LoRA compression; 4-16 typical, 64+ for heavy personalization.</td>
+</tr>
+<tr>
+<td>α</td>
+<td>&quot;LoRA strength&quot;</td>
+<td>Runtime scaling of the LoRA delta.</td>
+</tr>
+<tr>
+<td>IP-Adapter</td>
+<td>&quot;Reference image&quot;</td>
+<td>Small image-conditioning adapter via CLIP-image tokens.</td>
+</tr>
+<tr>
+<td>DreamBooth</td>
+<td>&quot;Full subject fine-tune&quot;</td>
+<td>Train the full model on ~30 images of a subject.</td>
+</tr>
+<tr>
+<td>Textual Inversion</td>
+<td>&quot;New token&quot;</td>
+<td>Learn a new word embedding only; legacy, mostly replaced.</td>
+</tr>
+</tbody>
+</table>
+<h2>产品说明:LoRA交换,控制网路线,多租户服务</h2>
+<p>实际的文字到图像SaaS在同一基点上服务数百个LoRA和几十个ControlNets.服务问题看起来非常像LLM多租金 (生产文献涵盖了LLM案例在连续批量和LoRAX / S-LoRA下):</p>
+<ul>
+<li>**Hot-swap LoRAs, do not merge.**合并<code>W' = W + α·B·A</code>入基底,每步推断速度大约3-5%,但结.<code>α</code>保持LORA在VRAM中作为R级的海域;扩散器暴露<code>pipe.load_lora_weights()</code>其他<code>pipe.set_adapters([...], adapter_weights=[...])</code>交换成本是<code>2 · d · r · num_layers</code> MB 尺度,次分.</li>
+<li>**ControlNet as a second attention lane.**克隆编码器与基层并行运行.重量1.0的两个控制网 = 每步额外的两个前进传递,而不是一个合并传递.批量大小的头部空间四旋翼下降.每步的预算为1.5x.</li>
+<li>**Quantized LoRAs too.**如果您量化了基数 (见课07号,Flux在8GB),LoRA三角形也可以清洁地量化到8位或4位.</li>
+</ul>
+<p>流量特定:尼尔斯的Flux-on-8GB笔记本电脑量化了基数为4位;<code>pipe.load_lora_weights(&quot;user/style-lora&quot;)</code>) 在此次定量基础上<code>weight_name=&quot;pytorch_lora_weights.safetensors&quot;</code>这就是大多数SaaS机构在2026年发布的食谱.</p>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2302.05543" rel="noreferrer" data-network="true">Zhang, Rao, Agrawala (2023). Adding Conditional Control to Text-to-Image Diffusion Models <small>↗ 需要联网</small></a>控制网</li>
+<li><a href="https://arxiv.org/abs/2106.09685" rel="noreferrer" data-network="true">Hu et al. (2021). LoRA: Low-Rank Adaptation of Large Language Models <small>↗ 需要联网</small></a> LoRA (原来用于 LLM; 输出口).</li>
+<li><a href="https://arxiv.org/abs/2308.06721" rel="noreferrer" data-network="true">Ye et al. (2023). IP-Adapter: Text Compatible Image Prompt Adapter <small>↗ 需要联网</small></a> IP 适配器</li>
+<li><a href="https://arxiv.org/abs/2302.08453" rel="noreferrer" data-network="true">Mou et al. (2023). T2I-Adapter: Learning Adapters to Dig Out More Controllable Ability <small>↗ 需要联网</small></a>更轻的替代品对控制网.</li>
+<li><a href="https://arxiv.org/abs/2208.12242" rel="noreferrer" data-network="true">Ruiz et al. (2023). DreamBooth: Fine Tuning Text-to-Image Diffusion Models for Subject-Driven Generation <small>↗ 需要联网</small></a>梦幻.</li>
+<li><a href="https://huggingface.co/docs/diffusers/training/controlnet" rel="noreferrer" data-network="true">HuggingFace Diffusers — ControlNet / LoRA / IP-Adapter docs <small>↗ 需要联网</small></a>参考管道.</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>ControlNet, LoRA &amp; Conditioning</h1>
+<blockquote>
+<p>Text alone is a clumsy control signal. ControlNet lets you clone a pretrained diffusion model and steer it with a depth map, pose skeleton, scribble, or edge image. LoRA lets you fine-tune a 2B-parameter model by training 10 million parameters. Together they turned Stable Diffusion from a toy into the 2026 image pipeline that ships at every agency.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 8 · 07 (Latent Diffusion), Phase 10 (LLMs from Scratch — for LoRA foundation)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>The Problem</h2>
+<p>A prompt like &quot;a woman in a red dress walking a dog on a busy street&quot; gives the model no information about <em>where</em> the dog is, <em>what pose</em> the woman is in, or <em>the perspective</em> of the street. Text pins down about 10% of what you need to specify an image. The rest is visual and cannot be described efficiently in words.</p>
+<p>Training a new conditional model from scratch for every signal (pose, depth, canny, segmentation) is prohibitive. You want to keep the 2.6B-param SDXL backbone frozen, attach a small side-network that reads the conditioning, and have it nudge the backbone's intermediate features. That is ControlNet.</p>
+<p>You also want to teach the model new concepts (your face, your product, your style) without retraining the full model. You want a 100x smaller delta. That is LoRA — low-rank adapters that plug into existing attention weights.</p>
+<p>ControlNet + LoRA + text = the 2026 practitioner's toolkit. Most production image pipelines layer 2-5 LoRAs, 1-3 ControlNets, and an IP-Adapter on top of an SDXL / SD3 / Flux base.</p>
+<h2>The Concept</h2>
+<p><img src="/learn/ai-from-scratch/files/phases/08-generative-ai/08-controlnet-lora-conditioning/assets/controlnet-lora.svg" alt="ControlNet clones the encoder; LoRA adds low-rank deltas" loading="lazy"></p>
+<h3>ControlNet (Zhang et al., 2023)</h3>
+<p>Take a pretrained SD. <em>Clone</em> the encoder half of the U-Net. Freeze the original. Train the clone to accept an extra conditioning input (edges, depth, pose). Connect the clone back to the decoder half of the original with <em>zero-convolution</em> skip connections (1×1 convs initialized to zero — start as a no-op, learn a delta).</p>
+<pre><code>SD U-Net decoder:   ... ← orig_enc_features + zero_conv(controlnet_enc(condition))
+</code></pre>
+<p>Zero-conv init means ControlNet starts as identity — no harm even before training. Train on 1M (prompt, condition, image) triples with the standard diffusion loss.</p>
+<p>Per-modality ControlNets ship as small side models (~360M for SDXL, ~70M for SD 1.5). You can compose them at inference:</p>
+<pre><code>features += weight_a * control_a(depth) + weight_b * control_b(pose)
+</code></pre>
+<h3>LoRA (Hu et al., 2021)</h3>
+<p>For any linear layer <code>W ∈ R^{d×d}</code> in the model, freeze <code>W</code> and add a low-rank delta:</p>
+<pre><code>W' = W + ΔW,  ΔW = B @ A,  A ∈ R^{r×d},  B ∈ R^{d×r}
+</code></pre>
+<p>with <code>r &lt;&lt; d</code>. Rank 4-16 is standard for attention, rank 64-128 for heavy fine-tunes. Number of new parameters: <code>2 · d · r</code> instead of <code>d²</code>. For SDXL attention with <code>d=640</code>, <code>r=16</code>: 20k params per adapter instead of 410k — a 20x reduction. Across the whole model: a LoRA is usually 20-200MB vs the base 5GB.</p>
+<p>At inference you can scale the LoRA: <code>W' = W + α · B @ A</code>. <code>α = 0.5-1.5</code> is normal. Multiple LoRAs stack additively (with the usual caveat that they interact in non-linear ways).</p>
+<h3>IP-Adapter (Ye et al., 2023)</h3>
+<p>A tiny adapter that accepts an <em>image</em> as conditioning (alongside text). Uses the CLIP image encoder to produce image tokens, injects them into cross-attention alongside text tokens. ~20MB per base model. Lets you do &quot;generate an image in the style of this reference&quot; without a LoRA.</p>
+<h2>Composability matrix</h2>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>What it controls</th>
+<th>Size</th>
+<th>When to use</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ControlNet</td>
+<td>Spatial structure (pose, depth, edges)</td>
+<td>70-360MB</td>
+<td>Exact layout, composition</td>
+</tr>
+<tr>
+<td>LoRA</td>
+<td>Style, subject, concept</td>
+<td>20-200MB</td>
+<td>Personalization, style</td>
+</tr>
+<tr>
+<td>IP-Adapter</td>
+<td>Style or subject from reference image</td>
+<td>20MB</td>
+<td>No text can describe the look</td>
+</tr>
+<tr>
+<td>Textual Inversion</td>
+<td>Single concept as a new token</td>
+<td>10KB</td>
+<td>Legacy, mostly replaced by LoRA</td>
+</tr>
+<tr>
+<td>DreamBooth</td>
+<td>Full fine-tune on a subject</td>
+<td>2-5GB</td>
+<td>Strong identity, high compute</td>
+</tr>
+<tr>
+<td>T2I-Adapter</td>
+<td>Lighter ControlNet alternative</td>
+<td>70MB</td>
+<td>Edge devices, inference budget</td>
+</tr>
+</tbody>
+</table>
+<p>ControlNet ≈ spatial. LoRA ≈ semantic. Use both.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-bd48f23bb020d7fc1b47.png" alt="v4-controlnet-zero 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<p><code>code/main.py</code> simulates the two mechanisms on 1-D:</p>
+<ol>
+<li>
+<p><strong>LoRA.</strong> A pretrained linear layer <code>W</code>. Freeze it. Train a low-rank <code>B @ A</code> such that <code>W + BA</code> matches a target linear layer. Show that <code>r = 1</code> is enough to learn a rank-1 correction perfectly.</p>
+</li>
+<li>
+<p><strong>ControlNet-lite.</strong> A &quot;frozen base&quot; predictor and a &quot;side network&quot; that reads an extra signal. The side network's output is gated by a learnable scalar initialized to zero (our version of zero-conv). Train and watch the gate ramp up.</p>
+</li>
+</ol>
+<h3>Step 1: LoRA math</h3>
+<pre><code class="language-python">def lora(W, A, B, x, alpha=1.0):
+    # W is frozen; A, B are the trainable low-rank factors.
+    return [W[i][j] * x[j] for i, j in ...] + alpha * (B @ (A @ x))
+</code></pre>
+<h3>Step 2: zero-init side network</h3>
+<pre><code class="language-python">side_out = control_net(x, condition)
+gated = gate * side_out  # gate initialized to 0
+h = base(x) + gated
+</code></pre>
+<p>At step 0 the output is identical to base. Early training updates <code>gate</code> slowly — no catastrophic drift.</p>
+<h2>Pitfalls</h2>
+<ul>
+<li><strong>Over-scaling LoRAs.</strong> <code>α = 2</code> or <code>α = 3</code> is a common &quot;make it stronger&quot; hack that produces over-stylized / broken outputs. Keep <code>α ≤ 1.5</code>.</li>
+<li><strong>ControlNet weight conflict.</strong> Using a Pose ControlNet at weight 1.0 and a Depth ControlNet at weight 1.0 usually overshoots. Sum of weights ≈ 1.0 is a safe default.</li>
+<li><strong>LoRA on the wrong base.</strong> SDXL LoRAs silently no-op on SD 1.5 because the attention dimensions do not match. Diffusers will warn in 0.30+.</li>
+<li><strong>Textual Inversion drift.</strong> Tokens trained on one checkpoint drift badly on another. LoRA is more portable.</li>
+<li><strong>LoRA weight-merging and storage.</strong> You can bake a LoRA into the base model weights for faster inference (no runtime addition), but you lose the ability to scale <code>α</code> at runtime. Keep both versions.</li>
+</ul>
+<h2>Use It</h2>
+<table>
+<thead>
+<tr>
+<th>Goal</th>
+<th>2026 pipeline</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Reproduce a brand's art style</td>
+<td>LoRA trained on ~30 curated images at rank 32</td>
+</tr>
+<tr>
+<td>Put my face in a generated image</td>
+<td>DreamBooth or LoRA + IP-Adapter-FaceID</td>
+</tr>
+<tr>
+<td>Specific pose + prompt</td>
+<td>ControlNet-Openpose + SDXL + text</td>
+</tr>
+<tr>
+<td>Depth-aware composition</td>
+<td>ControlNet-Depth + SD3</td>
+</tr>
+<tr>
+<td>Reference + prompt</td>
+<td>IP-Adapter + text</td>
+</tr>
+<tr>
+<td>Exact layout</td>
+<td>ControlNet-Scribble or ControlNet-Canny</td>
+</tr>
+<tr>
+<td>Background replace</td>
+<td>ControlNet-Seg + Inpainting (Lesson 09)</td>
+</tr>
+<tr>
+<td>Fast 1-step style</td>
+<td>LCM-LoRA on SDXL-Turbo</td>
+</tr>
+</tbody>
+</table>
+<h2>Ship It</h2>
+<p>Save <code>outputs/skill-sd-toolkit-composer.md</code>. Skill takes a task (input assets: prompt, optional reference image, optional pose, optional depth, optional scribble) and outputs the tool stack, weights, and a reproducible seed protocol.</p>
+<h2>Exercises</h2>
+<ol>
+<li><strong>Easy.</strong> In <code>code/main.py</code>, vary the LoRA rank <code>r</code> from 1 to 4. At what rank does the LoRA exactly match a rank-2 target delta?</li>
+<li><strong>Medium.</strong> Train two separate LoRAs on two target transforms. Load them together and show their additive interaction. When does the interaction break linearity?</li>
+<li><strong>Hard.</strong> Use diffusers to stack: SDXL-base + Canny-ControlNet (weight 0.8) + a style LoRA (α 0.8) + IP-Adapter (weight 0.6). Measure FID-vs-prompt-adherence trade-off as the stack weights vary.</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ControlNet</td>
+<td>&quot;Spatial control&quot;</td>
+<td>Cloned encoder + zero-conv skips; reads a conditioning image.</td>
+</tr>
+<tr>
+<td>Zero convolution</td>
+<td>&quot;Starts as identity&quot;</td>
+<td>1×1 conv initialized to zero; ControlNet starts as no-op.</td>
+</tr>
+<tr>
+<td>LoRA</td>
+<td>&quot;Low-rank adapter&quot;</td>
+<td><code>W + B @ A</code>, <code>r &lt;&lt; d</code>; 100x fewer params than a full fine-tune.</td>
+</tr>
+<tr>
+<td>rank r</td>
+<td>&quot;The knob&quot;</td>
+<td>LoRA compression; 4-16 typical, 64+ for heavy personalization.</td>
+</tr>
+<tr>
+<td>α</td>
+<td>&quot;LoRA strength&quot;</td>
+<td>Runtime scaling of the LoRA delta.</td>
+</tr>
+<tr>
+<td>IP-Adapter</td>
+<td>&quot;Reference image&quot;</td>
+<td>Small image-conditioning adapter via CLIP-image tokens.</td>
+</tr>
+<tr>
+<td>DreamBooth</td>
+<td>&quot;Full subject fine-tune&quot;</td>
+<td>Train the full model on ~30 images of a subject.</td>
+</tr>
+<tr>
+<td>Textual Inversion</td>
+<td>&quot;New token&quot;</td>
+<td>Learn a new word embedding only; legacy, mostly replaced.</td>
+</tr>
+</tbody>
+</table>
+<h2>Production note: LoRA swaps, ControlNet lanes, multi-tenant serving</h2>
+<p>A real text-to-image SaaS serves hundreds of LoRAs and a dozen ControlNets over the same base checkpoint. The serving problem looks a lot like LLM multi-tenancy (the production literature covers the LLM case under continuous batching and LoRAX / S-LoRA):</p>
+<ul>
+<li><strong>Hot-swap LoRAs, do not merge.</strong> Merging <code>W' = W + α·B·A</code> into the base gives ~3-5% faster per-step inference but freezes <code>α</code> and the base. Keep LoRAs hot in VRAM as rank-r deltas; diffusers exposes <code>pipe.load_lora_weights()</code> + <code>pipe.set_adapters([...], adapter_weights=[...])</code> for per-request activation. Swap cost is the <code>2 · d · r · num_layers</code> weights — MB-scale, sub-second.</li>
+<li><strong>ControlNet as a second attention lane.</strong> The cloned encoder runs in parallel with the base. Two ControlNets at weight 1.0 each = two extra forward passes per step, not one merged pass. Batch-size headroom drops quadratically. Budget for ~1.5× step cost per active ControlNet.</li>
+<li><strong>Quantized LoRAs too.</strong> If you quantized the base (see Lesson 07, Flux on 8GB), the LoRA delta also quantizes cleanly to 8-bit or 4-bit. QLoRA-style loading lets you stack 5-10 LoRAs on top of a 4-bit Flux base without blowing memory.</li>
+</ul>
+<p>Flux-specific: Niels' Flux-on-8GB notebook quantizes the base to 4-bit; stacking a style LoRA (<code>pipe.load_lora_weights(&quot;user/style-lora&quot;)</code>) on that quantized base at <code>weight_name=&quot;pytorch_lora_weights.safetensors&quot;</code> still works. This is the recipe most SaaS agencies ship in 2026.</p>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2302.05543" rel="noreferrer" data-network="true">Zhang, Rao, Agrawala (2023). Adding Conditional Control to Text-to-Image Diffusion Models <small>↗ 需要联网</small></a> — ControlNet.</li>
+<li><a href="https://arxiv.org/abs/2106.09685" rel="noreferrer" data-network="true">Hu et al. (2021). LoRA: Low-Rank Adaptation of Large Language Models <small>↗ 需要联网</small></a> — LoRA (originally for LLMs; ports to diffusion).</li>
+<li><a href="https://arxiv.org/abs/2308.06721" rel="noreferrer" data-network="true">Ye et al. (2023). IP-Adapter: Text Compatible Image Prompt Adapter <small>↗ 需要联网</small></a> — IP-Adapter.</li>
+<li><a href="https://arxiv.org/abs/2302.08453" rel="noreferrer" data-network="true">Mou et al. (2023). T2I-Adapter: Learning Adapters to Dig Out More Controllable Ability <small>↗ 需要联网</small></a> — lighter alternative to ControlNet.</li>
+<li><a href="https://arxiv.org/abs/2208.12242" rel="noreferrer" data-network="true">Ruiz et al. (2023). DreamBooth: Fine Tuning Text-to-Image Diffusion Models for Subject-Driven Generation <small>↗ 需要联网</small></a> — DreamBooth.</li>
+<li><a href="https://huggingface.co/docs/diffusers/training/controlnet" rel="noreferrer" data-network="true">HuggingFace Diffusers — ControlNet / LoRA / IP-Adapter docs <small>↗ 需要联网</small></a> — reference pipelines.</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-08-generative-ai--08-controlnet-lora-conditioning.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-08-generative-ai--08-controlnet-lora-conditioning.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/08-generative-ai/08-controlnet-lora-conditioning/code/main.py">phases/08-generative-ai/08-controlnet-lora-conditioning/code/main.py</a><details><summary>查看原始文本</summary><pre><code>import math
+import random
+
+
+def matmul_mat_vec(M, v):
+    return [sum(M[i][j] * v[j] for j in range(len(v))) for i in range(len(M))]
+
+
+def outer(u, v):
+    return [[u[i] * v[j] for j in range(len(v))] for i in range(len(u))]
+
+
+def zeros(rows, cols):
+    return [[0.0] * cols for _ in range(rows)]
+
+
+def randn_matrix(rows, cols, rng, scale=0.3):
+    return [[rng.gauss(0, scale) for _ in range(cols)] for _ in range(rows)]
+
+
+def lora_forward(W_frozen, A, B, x, alpha=1.0):
+    &quot;&quot;&quot;Compute (W + alpha * B @ A) @ x.&quot;&quot;&quot;
+    base = matmul_mat_vec(W_frozen, x)
+    Ax = matmul_mat_vec(A, x)
+    BAx = matmul_mat_vec(B, Ax)
+    return [base[i] + alpha * BAx[i] for i in range(len(base))]
+
+
+def train_lora(W_frozen, W_target, r, rng, steps=4000, lr=0.01):
+    d = len(W_frozen)
+    A = randn_matrix(r, d, rng, scale=0.2)
+    B = [[0.0] * r for _ in range(d)]
+    for step in range(steps):
+        x = [rng.gauss(0, 1) for _ in range(d)]
+        target = matmul_mat_vec(W_target, x)
+        pred = lora_forward(W_frozen, A, B, x)
+        err = [pred[i] - target[i] for i in range(d)]
+        Ax = matmul_mat_vec(A, x)
+        for i in range(d):
+            for k in range(r):
+                grad_B = err[i] * Ax[k]
+                B[i][k] -= lr * grad_B
+        for k in range(r):
+            for j in range(d):
+                grad_A = sum(err[i] * B[i][k] for i in range(d)) * x[j]
+                A[k][j] -= lr * grad_A
+    total_err = 0.0
+    n = 500
+    for _ in range(n):
+        x = [rng.gauss(0, 1) for _ in range(d)]
+        target = matmul_mat_vec(W_target, x)
+        pred = lora_forward(W_frozen, A, B, x)
+        total_err += sum((a - b) ** 2 for a, b in zip(target, pred))
+    return total_err / n
+
+
+def controlnet_toy(steps, rng):
+    &quot;&quot;&quot;Learn a gated side-network that conditions on an extra signal.&quot;&quot;&quot;
+    # base: f_base(x) = x  (frozen)
+    # side: f_side(x, c) = c  (learnable weight w_side)
+    # gated: out = f_base + gate * w_side * c
+    w_side = rng.gauss(0, 0.1)
+    gate = 0.0          # zero-conv init
+    lr = 0.03
+    trace = []
+    for step in range(steps):
+        x = rng.gauss(0, 1)
+        c = rng.choice([-1.0, 1.0])
+        target = x + 0.7 * c     # the &quot;true&quot; signal we want
+        pred = x + gate * w_side * c
+        err = pred - target
+        grad_gate = 2 * err * w_side * c
+        grad_wside = 2 * err * gate * c
+        gate -= lr * grad_gate
+        w_side -= lr * grad_wside
+        if (step + 1) % 100 == 0:
+            trace.append((step + 1, gate, w_side))
+    return trace
+
+
+def main():
+    rng = random.Random(17)
+    d = 6
+    W_frozen = randn_matrix(d, d, rng, scale=0.5)
+    delta = rng.choice([1, 2, 3])
+    delta_matrix = zeros(d, d)
+    u = [rng.gauss(0, 1) for _ in range(d)]
+    v = [rng.gauss(0, 1) for _ in range(d)]
+    for i in range(d):
+        for j in range(d):
+            delta_matrix[i][j] = u[i] * v[j] * 0.5
+    W_target = [[W_frozen[i][j] + delta_matrix[i][j] for j in range(d)] for i in range(d)]
+
+    print(&quot;=== LoRA: approximate a known rank-1 delta ===&quot;)
+    for r in [1, 2, 4]:
+        err = train_lora(W_frozen, W_target, r=r, rng=random.Random(2 * r))
+        print(f&quot;  rank r={r}: residual MSE {err:.5f}&quot;)
+
+    print()
+    print(&quot;=== ControlNet-lite: zero-initialized gate on a side signal ===&quot;)
+    trace = controlnet_toy(steps=800, rng=rng)
+    for step, gate, wside in trace[::2][:6]:
+        print(f&quot;  step {step:4d}: gate={gate:+.3f}  w_side={wside:+.3f}&quot;)
+
+    print()
+    print(&quot;takeaway: LoRA needs rank &gt;= true delta rank to converge exactly.&quot;)
+    print(&quot;          ControlNet-lite gate ramps from 0 as the side signal proves useful.&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/08-generative-ai/08-controlnet-lora-conditioning/outputs/skill-sd-toolkit-composer.md">phases/08-generative-ai/08-controlnet-lora-conditioning/outputs/skill-sd-toolkit-composer.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: sd-toolkit-composer
+description: Compose ControlNets, LoRAs, and IP-Adapters on top of an SD / Flux base for a given set of inputs.
+version: 1.0.0
+phase: 8
+lesson: 08
+tags: [controlnet, lora, ip-adapter, diffusion]
+---
+
+Given a task (target image), inputs (prompt, reference image, pose / depth / scribble / seg, subject identity), and base model (SDXL, SD3.5, Flux.1-dev), output:
+
+1. ControlNet stack. Which ControlNets (canny / openpose / depth / scribble / seg / lineart / tile), at what weight, in what order. Max sum of weights &amp;lt;= 1.5.
+2. LoRA stack. Named LoRAs, rank, alpha. Warn when alpha &amp;gt; 1.5 or multiple LoRAs target the same concept.
+3. IP-Adapter. None, plain, or FaceID variant; weight 0.4-0.8 typical.
+4. Text prompt + negative prompt. Keyword order, token budget, negative scaffolding.
+5. Sampler + CFG + seed. Euler A / DPM-Solver++ / LCM; CFG scale tied to base. Reproducible seed protocol.
+6. QA checklist. Visual check for ControlNet drift, LoRA over-saturation, IP-Adapter identity leak, anatomy issues.
+
+Refuse to stack a SD 1.5 LoRA on an SDXL base (dimension mismatch). Refuse to run 3+ ControlNets at weight 1.0 each (feature collision). Flag any SD 1.5 recommendation when the user has GPU budget for SDXL or Flux. Flag LoRA identity training on &amp;lt; 10 images as likely to overfit.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原课程未提供测验。</p></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/08-generative-ai/07-latent-diffusion-stable-diffusion/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/08-generative-ai/09-inpainting-outpainting-editing/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/08-generative-ai/08-controlnet-lora-conditioning/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

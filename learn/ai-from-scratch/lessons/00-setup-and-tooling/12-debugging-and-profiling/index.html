@@ -1,0 +1,982 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>调整和配置文件 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-00-setup-and-tooling" data-lesson="00-setup-and-tooling/12-debugging-and-profiling" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/00-setup-and-tooling/">环境与工具</a> / LESSON 12</p><h1 class="lesson-title">调整和配置文件</h1><p>Debugging and Profiling</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>调整和配置文件</h1>
+<blockquote>
+<p>最糟糕的AI虫不会毁,而是沉默地训练垃圾,并报告一个美丽的损失曲线.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+**Language:**字符串
+<strong>Prerequisites:</strong> Lesson 1 (Dev Environment), basic PyTorch familiarity
+<strong>Time:</strong> ~60 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>使用条件<code>breakpoint()</code>其他<code>debug_print</code>检查子形状,dtype和NaN值在训练中</li>
+<li>配置训练循环与<code>cProfile</code>现在<code>line_profiler</code>其他<code>tracemalloc</code>找瓶</li>
+<li>检测常见的AI错误:形状不匹配,NaN损失,数据泄露和错误设备器</li>
+<li>设置 TensorBoard 可可可查看损失曲线,权重 histogram 和梯度分布</li>
+</ul>
+<h2>问题</h2>
+<p>网络应用程序会出现条失败.一个错误配置的训练循环运行8小时,在GPU时间中燃烧200美元,并产生一个模型,预测每个输入的平均值.代码从来没有错误.错误是错误设备上的子,一个被遗忘的<code>.detach()</code>标签泄露到特征中.</p>
+<p>需要检测这些默默失误的工具,</p>
+<h2>概念</h2>
+<p>人工智能调试在三个层次上运行:</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-33beba843d613ab3b760.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>大多数人直接跳到3级 (看TensorBoard). 但80%的AI bugs生活在1级和2级.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-622c74561435a8132feb.png" alt="s0-flame-hot 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<h3>第一个部分:打印问题 (是的,它可以工作)</h3>
+<p>对于子代码,一个目标打印语句比通过一个调试器进行排错更好,因为你需要同时看到形状,类型和值范围.</p>
+<pre><code class="language-python">def debug_print(name, tensor):
+    print(f&quot;{name}: shape={tensor.shape}, dtype={tensor.dtype}, &quot;
+          f&quot;device={tensor.device}, &quot;
+          f&quot;min={tensor.min().item():.4f}, max={tensor.max().item():.4f}, &quot;
+          f&quot;mean={tensor.mean().item():.4f}, &quot;
+          f&quot;has_nan={tensor.isnan().any().item()}&quot;)
+</code></pre>
+<p>任何可疑的操作后,请打电话,</p>
+<h3>第2部分:Python 调试器 (pdb 和破点)</h3>
+<p>由于人工智能工作,内置的调试器被低估.<code>breakpoint()</code>进入训练循环,并进行互动检查.</p>
+<pre><code class="language-python">def training_step(model, batch, criterion, optimizer):
+    inputs, labels = batch
+    outputs = model(inputs)
+    loss = criterion(outputs, labels)
+
+    if loss.item() &gt; 100 or torch.isnan(loss):
+        breakpoint()
+
+    loss.backward()
+    optimizer.step()
+</code></pre>
+<p>当调试器让你进入时,有用的命令:</p>
+<ul>
+<li><code>p outputs.shape</code>检查形状</li>
+<li><code>p loss.item()</code>查看损失值</li>
+<li><code>p torch.isnan(outputs).sum()</code>计数纳米</li>
+<li><code>p model.fc1.weight.grad</code>检查梯度</li>
+<li><code>c</code>继续,<code>q</code>放弃</li>
+</ul>
+<p>这只是条件调试,你只会停下来当有些东西看起来不对.</p>
+<h3>第三部分:Python记录</h3>
+<p>检查时,将打印声明取代为记录.</p>
+<pre><code class="language-python">import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format=&quot;%(asctime)s [%(levelname)s] %(message)s&quot;,
+    handlers=[
+        logging.FileHandler(&quot;training.log&quot;),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+logger.info(&quot;Starting training: lr=%.4f, batch_size=%d&quot;, lr, batch_size)
+logger.warning(&quot;Loss spike detected: %.4f at step %d&quot;, loss.item(), step)
+logger.error(&quot;NaN loss at step %d, stopping&quot;, step)
+</code></pre>
+<p>登录给你时间标签,严重程度水平和文件输出. 当训练运行在凌晨3点失败时,你需要一个日志文件,而不是终端输出,</p>
+<h3>第四部分:时间代码部分</h3>
+<p>知道时间的发展是优化第一步.</p>
+<pre><code class="language-python">import time
+
+class Timer:
+    def __init__(self, name=&quot;&quot;):
+        self.name = name
+
+    def __enter__(self):
+        self.start = time.perf_counter()
+        return self
+
+    def __exit__(self, *args):
+        elapsed = time.perf_counter() - self.start
+        print(f&quot;[{self.name}] {elapsed:.4f}s&quot;)
+
+with Timer(&quot;data loading&quot;):
+    batch = next(dataloader_iter)
+
+with Timer(&quot;forward pass&quot;):
+    outputs = model(batch)
+
+with Timer(&quot;backward pass&quot;):
+    loss.backward()
+</code></pre>
+<p>常见发现:数据加载需要60%的培训时间.<code>num_workers &gt; 0</code>在你的数据加载器中,而不是更快的GPU.</p>
+<h3>第5部分:cProfile和line_profiiler</h3>
+<p>当你需要不仅仅是手动计时器时:</p>
+<pre><code class="language-bash">python -m cProfile -s cumtime train.py
+</code></pre>
+<p>这显示了每个函数调用按累积时间排序.</p>
+<pre><code class="language-bash">pip install line_profiler
+</code></pre>
+<pre><code class="language-python">@profile
+def train_step(model, data, target):
+    output = model(data)
+    loss = F.cross_entropy(output, target)
+    loss.backward()
+    return loss
+
+# Run with: kernprof -l -v train.py
+</code></pre>
+<h3>第六部分:记忆分析</h3>
+<h4>具有 tracemalloc 的CPU内存</h4>
+<pre><code class="language-python">import tracemalloc
+
+tracemalloc.start()
+
+# your code here
+model = build_model()
+data = load_dataset()
+
+snapshot = tracemalloc.take_snapshot()
+top_stats = snapshot.statistics(&quot;lineno&quot;)
+for stat in top_stats[:10]:
+    print(stat)
+</code></pre>
+<h4>处理器内存与内存_配置文件</h4>
+<pre><code class="language-bash">pip install memory_profiler
+</code></pre>
+<pre><code class="language-python">from memory_profiler import profile
+
+@profile
+def load_data():
+    raw = read_csv(&quot;data.csv&quot;)       # watch memory jump here
+    processed = preprocess(raw)       # and here
+    return processed
+</code></pre>
+<p>走上<code>python -m memory_profiler your_script.py</code>查看一行一行的内存使用.</p>
+<h4>配备PyTorch的GPU内存</h4>
+<pre><code class="language-python">import torch
+
+if torch.cuda.is_available():
+    print(torch.cuda.memory_summary())
+
+    print(f&quot;Allocated: {torch.cuda.memory_allocated() / 1e9:.2f} GB&quot;)
+    print(f&quot;Cached: {torch.cuda.memory_reserved() / 1e9:.2f} GB&quot;)
+</code></pre>
+<p>当你按OOM (Out of Memory) 时:</p>
+<ol>
+<li>减少批量 (首先尝试,总是)</li>
+<li>使用<code>torch.cuda.empty_cache()</code>释放缓存的内存</li>
+<li>使用<code>del tensor</code>接着是<code>torch.cuda.empty_cache()</code>对于大型中间产品</li>
+<li>使用混合精度 (<code>torch.cuda.amp</code>) 减少半个内存使用量</li>
+<li>对于非常深层模型使用梯度检查</li>
+</ol>
+<h3>第7部分:常见的人工智能虫害和如何捕获它们</h3>
+<h4>形状不匹配</h4>
+<p>子有形状.<code>[batch, features]</code>模型预期的时间<code>[batch, channels, height, width]</code>现在,我们要去.</p>
+<pre><code class="language-python">def check_shapes(model, sample_input):
+    print(f&quot;Input: {sample_input.shape}&quot;)
+    hooks = []
+
+    def make_hook(name):
+        def hook(module, inp, out):
+            in_shape = inp[0].shape if isinstance(inp, tuple) else inp.shape
+            out_shape = out.shape if hasattr(out, &quot;shape&quot;) else type(out)
+            print(f&quot;  {name}: {in_shape} -&gt; {out_shape}&quot;)
+        return hook
+
+    for name, module in model.named_modules():
+        hooks.append(module.register_forward_hook(make_hook(name)))
+
+    with torch.no_grad():
+        model(sample_input)
+
+    for h in hooks:
+        h.remove()
+</code></pre>
+<p>试试一次用样本,它将模型中的每个形状转变映射出来.</p>
+<h4>损失</h4>
+<p>子的损失意味着爆炸.</p>
+<ul>
+<li>学习率太高</li>
+<li>关损失中零分</li>
+<li>零或负数的记录</li>
+<li>在RNN中爆炸梯度</li>
+</ul>
+<pre><code class="language-python">def detect_nan(model, loss, step):
+    if torch.isnan(loss):
+        print(f&quot;NaN loss at step {step}&quot;)
+        for name, param in model.named_parameters():
+            if param.grad is not None:
+                if torch.isnan(param.grad).any():
+                    print(f&quot;  NaN gradient in {name}&quot;)
+                if torch.isinf(param.grad).any():
+                    print(f&quot;  Inf gradient in {name}&quot;)
+        return True
+    return False
+</code></pre>
+<h4>数据泄露</h4>
+<p>你的模型在测试组上得到了99%的准确性.听起来很好.这是一个错误.</p>
+<pre><code class="language-python">def check_data_leakage(train_set, test_set, id_column=&quot;id&quot;):
+    train_ids = set(train_set[id_column].tolist())
+    test_ids = set(test_set[id_column].tolist())
+    overlap = train_ids &amp; test_ids
+    if overlap:
+        print(f&quot;DATA LEAKAGE: {len(overlap)} samples in both train and test&quot;)
+        return True
+    return False
+</code></pre>
+<p>通过使用未来数据来预测过去,在分开之前按时间标签进行排序.</p>
+<h4>错误的设备</h4>
+<p>虽然在不同设备 (CPU与GPU) 上的光器会导致运行时间错误.但有时一个光器默默地停留在CPU上,而其他的东西在GPU上,</p>
+<pre><code class="language-python">def check_devices(model, *tensors):
+    model_device = next(model.parameters()).device
+    print(f&quot;Model device: {model_device}&quot;)
+    for i, t in enumerate(tensors):
+        if t.device != model_device:
+            print(f&quot;  WARNING: tensor {i} on {t.device}, model on {model_device}&quot;)
+</code></pre>
+<h3>第8部分:机板的基本原理</h3>
+<p>子板显示了训练过程中的情况.</p>
+<pre><code class="language-bash">pip install tensorboard
+</code></pre>
+<pre><code class="language-python">from torch.utils.tensorboard import SummaryWriter
+
+writer = SummaryWriter(&quot;runs/experiment_1&quot;)
+
+for step in range(num_steps):
+    loss = train_step(model, batch)
+
+    writer.add_scalar(&quot;loss/train&quot;, loss.item(), step)
+    writer.add_scalar(&quot;lr&quot;, optimizer.param_groups[0][&quot;lr&quot;], step)
+
+    if step % 100 == 0:
+        for name, param in model.named_parameters():
+            writer.add_histogram(f&quot;weights/{name}&quot;, param, step)
+            if param.grad is not None:
+                writer.add_histogram(f&quot;grads/{name}&quot;, param.grad, step)
+
+writer.close()
+</code></pre>
+<p>发射:</p>
+<pre><code class="language-bash">tensorboard --logdir=runs
+</code></pre>
+<p>什么要找:</p>
+<ul>
+<li><strong>Loss not decreasing</strong>学习率太低,或模型架构问题</li>
+<li><strong>Loss oscillating wildly</strong>学习率太高</li>
+<li><strong>Loss goes to NaN</strong>: 数字不稳定 (参见上述NAN部分)</li>
+<li><strong>Train loss decreasing, val loss increasing</strong>过度装饰</li>
+<li><strong>Weight histograms collapsing to zero</strong>: 渐变的梯度</li>
+<li><strong>Gradient histograms exploding</strong>需要梯度剪切</li>
+</ul>
+<h3>第9部分: VS代码调试器</h3>
+<p>为了进行交互调试,配置VS代码<code>launch.json</code>其他:</p>
+<pre><code class="language-json">{
+    &quot;version&quot;: &quot;0.2.0&quot;,
+    &quot;configurations&quot;: [
+        {
+            &quot;name&quot;: &quot;Debug Training&quot;,
+            &quot;type&quot;: &quot;debugpy&quot;,
+            &quot;request&quot;: &quot;launch&quot;,
+            &quot;program&quot;: &quot;${file}&quot;,
+            &quot;console&quot;: &quot;integratedTerminal&quot;,
+            &quot;justMyCode&quot;: false
+        }
+    ]
+}
+</code></pre>
+<p>通过点击道设置断点. 使用变量窗口检查子属性. 调试控制台允许在执行中运行任意的Python表达式.</p>
+<p>通过数据预处理管道, 看到每个转换.</p>
+<h2>用它</h2>
+<p>这里是检测大部分人工智能错误的调试工作流程:</p>
+<ol>
+<li><strong>Before training</strong>跑步<code>check_shapes</code>检查输入和输出尺寸符合预期.</li>
+<li><strong>First 10 steps</strong>使用 <code>debug_print</code>确认没有任何 NaN,值在合理的范围内.</li>
+<li><strong>During training</strong>通过TensorBoard进行可视化.</li>
+<li><strong>When something breaks</strong>放下<code>breakpoint()</code>检查电压器的互动性.</li>
+<li><strong>For performance</strong>时间数据加载,前进,后退传输,如果您接近OOM,则配置文件内存.</li>
+</ol>
+<h2>运送它</h2>
+<p>运行调试工具包脚本:</p>
+<pre><code class="language-bash">python phases/00-setup-and-tooling/12-debugging-and-profiling/code/debug_tools.py
+</code></pre>
+<p>看到<code>outputs/prompt-debug-ai-code.md</code>通过一个提示来诊断人工智能特定的错误.</p>
+<h2>运动</h2>
+<ol>
+<li>跑步<code>debug_tools.py</code>修改模特以引入一个NaN (提示:在前进传输中除以零) 并观看探测器抓住它.</li>
+<li>配置一个训练循环<code>cProfile</code>并且确定最慢的函数.</li>
+<li>使用<code>tracemalloc</code>查找数据加载管道中哪条线分配最多的内存.</li>
+<li>设置TensorBoard进行简单的训练, 确定模型是否过度适合.</li>
+<li>使用<code>breakpoint()</code>练习检查子形状,设备和梯度值从调试器提示.</li>
+</ol>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Debugging and Profiling</h1>
+<blockquote>
+<p>The worst AI bugs don't crash. They train silently on garbage and report a beautiful loss curve.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Language:</strong> Python
+<strong>Prerequisites:</strong> Lesson 1 (Dev Environment), basic PyTorch familiarity
+<strong>Time:</strong> ~60 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Use conditional <code>breakpoint()</code> and <code>debug_print</code> to inspect tensor shapes, dtypes, and NaN values mid-training</li>
+<li>Profile training loops with <code>cProfile</code>, <code>line_profiler</code>, and <code>tracemalloc</code> to find bottlenecks</li>
+<li>Detect common AI bugs: shape mismatches, NaN loss, data leakage, and wrong-device tensors</li>
+<li>Set up TensorBoard to visualize loss curves, weight histograms, and gradient distributions</li>
+</ul>
+<h2>The Problem</h2>
+<p>AI code fails differently than regular code. A web app crashes with a stack trace. A misconfigured training loop runs for 8 hours, burns $200 in GPU time, and produces a model that predicts the mean of every input. The code never errored. The bug was a tensor on the wrong device, a forgotten <code>.detach()</code>, or labels leaking into features.</p>
+<p>You need debugging tools that catch these silent failures before they waste your time and compute.</p>
+<h2>The Concept</h2>
+<p>AI debugging operates at three levels:</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-33beba843d613ab3b760.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>Most people jump straight to level 3 (staring at TensorBoard). But 80% of AI bugs live at levels 1 and 2.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-622c74561435a8132feb.png" alt="s0-flame-hot 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<h3>Part 1: Print Debugging (Yes, It Works)</h3>
+<p>Print debugging gets dismissed. It shouldn't. For tensor code, a targeted print statement beats stepping through a debugger because you need to see shapes, dtypes, and value ranges all at once.</p>
+<pre><code class="language-python">def debug_print(name, tensor):
+    print(f&quot;{name}: shape={tensor.shape}, dtype={tensor.dtype}, &quot;
+          f&quot;device={tensor.device}, &quot;
+          f&quot;min={tensor.min().item():.4f}, max={tensor.max().item():.4f}, &quot;
+          f&quot;mean={tensor.mean().item():.4f}, &quot;
+          f&quot;has_nan={tensor.isnan().any().item()}&quot;)
+</code></pre>
+<p>Call this after every suspicious operation. When the bug is found, remove the prints. Simple.</p>
+<h3>Part 2: Python Debugger (pdb and breakpoint)</h3>
+<p>The built-in debugger is underrated for AI work. Drop <code>breakpoint()</code> into your training loop and inspect tensors interactively.</p>
+<pre><code class="language-python">def training_step(model, batch, criterion, optimizer):
+    inputs, labels = batch
+    outputs = model(inputs)
+    loss = criterion(outputs, labels)
+
+    if loss.item() &gt; 100 or torch.isnan(loss):
+        breakpoint()
+
+    loss.backward()
+    optimizer.step()
+</code></pre>
+<p>When the debugger drops you in, useful commands:</p>
+<ul>
+<li><code>p outputs.shape</code> to check shapes</li>
+<li><code>p loss.item()</code> to see the loss value</li>
+<li><code>p torch.isnan(outputs).sum()</code> to count NaNs</li>
+<li><code>p model.fc1.weight.grad</code> to check gradients</li>
+<li><code>c</code> to continue, <code>q</code> to quit</li>
+</ul>
+<p>This is conditional debugging. You only stop when something looks wrong. For a 10,000-step training run, that matters.</p>
+<h3>Part 3: Python Logging</h3>
+<p>Replace print statements with logging when your debugging goes beyond a quick check.</p>
+<pre><code class="language-python">import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format=&quot;%(asctime)s [%(levelname)s] %(message)s&quot;,
+    handlers=[
+        logging.FileHandler(&quot;training.log&quot;),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+logger.info(&quot;Starting training: lr=%.4f, batch_size=%d&quot;, lr, batch_size)
+logger.warning(&quot;Loss spike detected: %.4f at step %d&quot;, loss.item(), step)
+logger.error(&quot;NaN loss at step %d, stopping&quot;, step)
+</code></pre>
+<p>Logging gives you timestamps, severity levels, and file output. When a training run fails at 3 AM, you want a log file, not terminal output that scrolled off screen.</p>
+<h3>Part 4: Timing Code Sections</h3>
+<p>Knowing where time goes is the first step to optimization.</p>
+<pre><code class="language-python">import time
+
+class Timer:
+    def __init__(self, name=&quot;&quot;):
+        self.name = name
+
+    def __enter__(self):
+        self.start = time.perf_counter()
+        return self
+
+    def __exit__(self, *args):
+        elapsed = time.perf_counter() - self.start
+        print(f&quot;[{self.name}] {elapsed:.4f}s&quot;)
+
+with Timer(&quot;data loading&quot;):
+    batch = next(dataloader_iter)
+
+with Timer(&quot;forward pass&quot;):
+    outputs = model(batch)
+
+with Timer(&quot;backward pass&quot;):
+    loss.backward()
+</code></pre>
+<p>Common finding: data loading takes 60% of training time. The fix is <code>num_workers &gt; 0</code> in your DataLoader, not a faster GPU.</p>
+<h3>Part 5: cProfile and line_profiler</h3>
+<p>When you need more than manual timers:</p>
+<pre><code class="language-bash">python -m cProfile -s cumtime train.py
+</code></pre>
+<p>This shows every function call sorted by cumulative time. For line-by-line profiling:</p>
+<pre><code class="language-bash">pip install line_profiler
+</code></pre>
+<pre><code class="language-python">@profile
+def train_step(model, data, target):
+    output = model(data)
+    loss = F.cross_entropy(output, target)
+    loss.backward()
+    return loss
+
+# Run with: kernprof -l -v train.py
+</code></pre>
+<h3>Part 6: Memory Profiling</h3>
+<h4>CPU Memory with tracemalloc</h4>
+<pre><code class="language-python">import tracemalloc
+
+tracemalloc.start()
+
+# your code here
+model = build_model()
+data = load_dataset()
+
+snapshot = tracemalloc.take_snapshot()
+top_stats = snapshot.statistics(&quot;lineno&quot;)
+for stat in top_stats[:10]:
+    print(stat)
+</code></pre>
+<h4>CPU Memory with memory_profiler</h4>
+<pre><code class="language-bash">pip install memory_profiler
+</code></pre>
+<pre><code class="language-python">from memory_profiler import profile
+
+@profile
+def load_data():
+    raw = read_csv(&quot;data.csv&quot;)       # watch memory jump here
+    processed = preprocess(raw)       # and here
+    return processed
+</code></pre>
+<p>Run with <code>python -m memory_profiler your_script.py</code> to see line-by-line memory usage.</p>
+<h4>GPU Memory with PyTorch</h4>
+<pre><code class="language-python">import torch
+
+if torch.cuda.is_available():
+    print(torch.cuda.memory_summary())
+
+    print(f&quot;Allocated: {torch.cuda.memory_allocated() / 1e9:.2f} GB&quot;)
+    print(f&quot;Cached: {torch.cuda.memory_reserved() / 1e9:.2f} GB&quot;)
+</code></pre>
+<p>When you hit OOM (Out of Memory):</p>
+<ol>
+<li>Reduce batch size (first thing to try, always)</li>
+<li>Use <code>torch.cuda.empty_cache()</code> to free cached memory</li>
+<li>Use <code>del tensor</code> followed by <code>torch.cuda.empty_cache()</code> for large intermediates</li>
+<li>Use mixed precision (<code>torch.cuda.amp</code>) to halve memory usage</li>
+<li>Use gradient checkpointing for very deep models</li>
+</ol>
+<h3>Part 7: Common AI Bugs and How to Catch Them</h3>
+<h4>Shape Mismatch</h4>
+<p>The most frequent bug. A tensor has shape <code>[batch, features]</code> when the model expects <code>[batch, channels, height, width]</code>.</p>
+<pre><code class="language-python">def check_shapes(model, sample_input):
+    print(f&quot;Input: {sample_input.shape}&quot;)
+    hooks = []
+
+    def make_hook(name):
+        def hook(module, inp, out):
+            in_shape = inp[0].shape if isinstance(inp, tuple) else inp.shape
+            out_shape = out.shape if hasattr(out, &quot;shape&quot;) else type(out)
+            print(f&quot;  {name}: {in_shape} -&gt; {out_shape}&quot;)
+        return hook
+
+    for name, module in model.named_modules():
+        hooks.append(module.register_forward_hook(make_hook(name)))
+
+    with torch.no_grad():
+        model(sample_input)
+
+    for h in hooks:
+        h.remove()
+</code></pre>
+<p>Run this once with a sample batch. It maps every shape transformation in your model.</p>
+<h4>NaN Loss</h4>
+<p>NaN loss means something exploded. Common causes:</p>
+<ul>
+<li>Learning rate too high</li>
+<li>Division by zero in custom loss</li>
+<li>Log of zero or negative number</li>
+<li>Exploding gradients in RNNs</li>
+</ul>
+<pre><code class="language-python">def detect_nan(model, loss, step):
+    if torch.isnan(loss):
+        print(f&quot;NaN loss at step {step}&quot;)
+        for name, param in model.named_parameters():
+            if param.grad is not None:
+                if torch.isnan(param.grad).any():
+                    print(f&quot;  NaN gradient in {name}&quot;)
+                if torch.isinf(param.grad).any():
+                    print(f&quot;  Inf gradient in {name}&quot;)
+        return True
+    return False
+</code></pre>
+<h4>Data Leakage</h4>
+<p>Your model gets 99% accuracy on the test set. Sounds great. It's a bug.</p>
+<pre><code class="language-python">def check_data_leakage(train_set, test_set, id_column=&quot;id&quot;):
+    train_ids = set(train_set[id_column].tolist())
+    test_ids = set(test_set[id_column].tolist())
+    overlap = train_ids &amp; test_ids
+    if overlap:
+        print(f&quot;DATA LEAKAGE: {len(overlap)} samples in both train and test&quot;)
+        return True
+    return False
+</code></pre>
+<p>Also check for temporal leakage: using future data to predict the past. Sort by timestamp before splitting.</p>
+<h4>Wrong Device</h4>
+<p>Tensors on different devices (CPU vs GPU) cause runtime errors. But sometimes a tensor silently stays on CPU while everything else is on GPU, and training just runs slowly.</p>
+<pre><code class="language-python">def check_devices(model, *tensors):
+    model_device = next(model.parameters()).device
+    print(f&quot;Model device: {model_device}&quot;)
+    for i, t in enumerate(tensors):
+        if t.device != model_device:
+            print(f&quot;  WARNING: tensor {i} on {t.device}, model on {model_device}&quot;)
+</code></pre>
+<h3>Part 8: TensorBoard Basics</h3>
+<p>TensorBoard shows you what's happening inside training over time.</p>
+<pre><code class="language-bash">pip install tensorboard
+</code></pre>
+<pre><code class="language-python">from torch.utils.tensorboard import SummaryWriter
+
+writer = SummaryWriter(&quot;runs/experiment_1&quot;)
+
+for step in range(num_steps):
+    loss = train_step(model, batch)
+
+    writer.add_scalar(&quot;loss/train&quot;, loss.item(), step)
+    writer.add_scalar(&quot;lr&quot;, optimizer.param_groups[0][&quot;lr&quot;], step)
+
+    if step % 100 == 0:
+        for name, param in model.named_parameters():
+            writer.add_histogram(f&quot;weights/{name}&quot;, param, step)
+            if param.grad is not None:
+                writer.add_histogram(f&quot;grads/{name}&quot;, param.grad, step)
+
+writer.close()
+</code></pre>
+<p>Launch it:</p>
+<pre><code class="language-bash">tensorboard --logdir=runs
+</code></pre>
+<p>What to look for:</p>
+<ul>
+<li><strong>Loss not decreasing</strong>: Learning rate too low, or model architecture issue</li>
+<li><strong>Loss oscillating wildly</strong>: Learning rate too high</li>
+<li><strong>Loss goes to NaN</strong>: Numerical instability (see NaN section above)</li>
+<li><strong>Train loss decreasing, val loss increasing</strong>: Overfitting</li>
+<li><strong>Weight histograms collapsing to zero</strong>: Vanishing gradients</li>
+<li><strong>Gradient histograms exploding</strong>: Need gradient clipping</li>
+</ul>
+<h3>Part 9: VS Code Debugger</h3>
+<p>For interactive debugging, configure VS Code with a <code>launch.json</code>:</p>
+<pre><code class="language-json">{
+    &quot;version&quot;: &quot;0.2.0&quot;,
+    &quot;configurations&quot;: [
+        {
+            &quot;name&quot;: &quot;Debug Training&quot;,
+            &quot;type&quot;: &quot;debugpy&quot;,
+            &quot;request&quot;: &quot;launch&quot;,
+            &quot;program&quot;: &quot;${file}&quot;,
+            &quot;console&quot;: &quot;integratedTerminal&quot;,
+            &quot;justMyCode&quot;: false
+        }
+    ]
+}
+</code></pre>
+<p>Set breakpoints by clicking the gutter. Use the Variables pane to inspect tensor properties. The Debug Console lets you run arbitrary Python expressions mid-execution.</p>
+<p>Useful for stepping through data preprocessing pipelines where you want to see each transformation.</p>
+<h2>Use It</h2>
+<p>Here's the debugging workflow that catches most AI bugs:</p>
+<ol>
+<li><strong>Before training</strong>: Run <code>check_shapes</code> with a sample batch. Verify input and output dimensions match expectations.</li>
+<li><strong>First 10 steps</strong>: Use <code>debug_print</code> on loss, outputs, and gradients. Confirm nothing is NaN and values are in reasonable ranges.</li>
+<li><strong>During training</strong>: Log loss, learning rate, and gradient norms. Use TensorBoard for visualization.</li>
+<li><strong>When something breaks</strong>: Drop <code>breakpoint()</code> at the failure point. Inspect tensors interactively.</li>
+<li><strong>For performance</strong>: Time your data loading vs forward vs backward pass. Profile memory if you're near OOM.</li>
+</ol>
+<h2>Ship It</h2>
+<p>Run the debugging toolkit script:</p>
+<pre><code class="language-bash">python phases/00-setup-and-tooling/12-debugging-and-profiling/code/debug_tools.py
+</code></pre>
+<p>See <code>outputs/prompt-debug-ai-code.md</code> for a prompt that helps diagnose AI-specific bugs.</p>
+<h2>Exercises</h2>
+<ol>
+<li>Run <code>debug_tools.py</code> and read through each section's output. Modify the dummy model to introduce a NaN (hint: divide by zero in the forward pass) and watch the detector catch it.</li>
+<li>Profile a training loop with <code>cProfile</code> and identify the slowest function.</li>
+<li>Use <code>tracemalloc</code> to find which line in your data loading pipeline allocates the most memory.</li>
+<li>Set up TensorBoard for a simple training run and identify whether the model is overfitting.</li>
+<li>Use <code>breakpoint()</code> inside a training loop. Practice inspecting tensor shapes, devices, and gradient values from the debugger prompt.</li>
+</ol>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-00-setup-and-tooling--12-debugging-and-profiling.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-00-setup-and-tooling--12-debugging-and-profiling.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/00-setup-and-tooling/12-debugging-and-profiling/code/debug_tools.py">phases/00-setup-and-tooling/12-debugging-and-profiling/code/debug_tools.py</a><details><summary>查看原始文本</summary><pre><code>import sys
+import time
+import tracemalloc
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format=&quot;%(asctime)s [%(levelname)s] %(message)s&quot;,
+)
+logger = logging.getLogger(__name__)
+
+try:
+    import torch
+    import torch.nn as nn
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
+
+
+def debug_print(name, tensor):
+    print(f&quot;  {name}: shape={tensor.shape}, dtype={tensor.dtype}, &quot;
+          f&quot;device={tensor.device}, &quot;
+          f&quot;min={tensor.min().item():.4f}, max={tensor.max().item():.4f}, &quot;
+          f&quot;mean={tensor.mean().item():.4f}, &quot;
+          f&quot;has_nan={tensor.isnan().any().item()}&quot;)
+
+
+class Timer:
+    def __init__(self, name=&quot;&quot;):
+        self.name = name
+        self.elapsed = 0.0
+
+    def __enter__(self):
+        self.start = time.perf_counter()
+        return self
+
+    def __exit__(self, *args):
+        self.elapsed = time.perf_counter() - self.start
+        print(f&quot;  [{self.name}] {self.elapsed:.4f}s&quot;)
+
+
+def check_shapes(model, sample_input):
+    print(f&quot;  Input: {sample_input.shape}&quot;)
+    hooks = []
+
+    def make_hook(name):
+        def hook(module, inp, out):
+            in_shape = inp[0].shape if isinstance(inp, tuple) else inp.shape
+            out_shape = out.shape if hasattr(out, &quot;shape&quot;) else type(out).__name__
+            print(f&quot;    {name}: {in_shape} -&gt; {out_shape}&quot;)
+        return hook
+
+    for name, module in model.named_modules():
+        if name:
+            hooks.append(module.register_forward_hook(make_hook(name)))
+
+    with torch.no_grad():
+        model(sample_input)
+
+    for h in hooks:
+        h.remove()
+
+
+def detect_nan(model, loss, step):
+    if torch.isnan(loss):
+        print(f&quot;  NaN loss detected at step {step}&quot;)
+        for name, param in model.named_parameters():
+            if param.grad is not None:
+                if torch.isnan(param.grad).any():
+                    print(f&quot;    NaN gradient in {name}&quot;)
+                if torch.isinf(param.grad).any():
+                    print(f&quot;    Inf gradient in {name}&quot;)
+        return True
+    return False
+
+
+def check_devices(model, *tensors):
+    model_device = next(model.parameters()).device
+    print(f&quot;  Model device: {model_device}&quot;)
+    for i, t in enumerate(tensors):
+        status = &quot;OK&quot; if t.device == model_device else &quot;MISMATCH&quot;
+        print(f&quot;    Tensor {i}: {t.device} [{status}]&quot;)
+
+
+def check_gradient_health(model):
+    total_norm = 0.0
+    for name, param in model.named_parameters():
+        if param.grad is not None:
+            grad_norm = param.grad.data.norm(2).item()
+            total_norm += grad_norm ** 2
+            if grad_norm &gt; 100:
+                print(f&quot;    WARNING: large gradient in {name}: {grad_norm:.2f}&quot;)
+            if grad_norm == 0:
+                print(f&quot;    WARNING: zero gradient in {name}&quot;)
+    total_norm = total_norm ** 0.5
+    print(f&quot;  Total gradient norm: {total_norm:.4f}&quot;)
+    return total_norm
+
+
+def demo_print_debugging():
+    print(&quot;\n--- 1. Print Debugging for Tensors ---&quot;)
+    x = torch.randn(32, 784)
+    debug_print(&quot;input batch&quot;, x)
+
+    w = torch.randn(784, 128)
+    out = x @ w
+    debug_print(&quot;after matmul&quot;, out)
+
+    with_nan = out.clone()
+    with_nan[0, 0] = float(&quot;nan&quot;)
+    debug_print(&quot;with injected NaN&quot;, with_nan)
+
+
+def demo_timing():
+    print(&quot;\n--- 2. Timing Code Sections ---&quot;)
+
+    with Timer(&quot;matrix multiply 1000x1000&quot;):
+        a = torch.randn(1000, 1000)
+        b = torch.randn(1000, 1000)
+        _ = a @ b
+
+    with Timer(&quot;matrix multiply 5000x5000&quot;):
+        a = torch.randn(5000, 5000)
+        b = torch.randn(5000, 5000)
+        _ = a @ b
+
+
+def demo_memory_tracking():
+    print(&quot;\n--- 3. Memory Tracking (tracemalloc) ---&quot;)
+    tracemalloc.start()
+
+    if HAS_TORCH:
+        data = [torch.randn(100, 100) for _ in range(100)]
+        more_data = torch.randn(1000, 1000)
+    else:
+        data = [bytearray(4 * 100 * 100) for _ in range(100)]
+        more_data = bytearray(4 * 1000 * 1000)
+
+    snapshot = tracemalloc.take_snapshot()
+    top_stats = snapshot.statistics(&quot;lineno&quot;)
+    print(&quot;  Top 5 memory allocations:&quot;)
+    for stat in top_stats[:5]:
+        print(f&quot;    {stat}&quot;)
+
+    del data, more_data
+    tracemalloc.stop()
+
+
+def demo_shape_checking():
+    print(&quot;\n--- 4. Shape Checking Through Model ---&quot;)
+
+    model = nn.Sequential(
+        nn.Linear(784, 256),
+        nn.ReLU(),
+        nn.Linear(256, 64),
+        nn.ReLU(),
+        nn.Linear(64, 10),
+    )
+
+    sample = torch.randn(4, 784)
+    check_shapes(model, sample)
+
+
+def demo_nan_detection():
+    print(&quot;\n--- 5. NaN Detection ---&quot;)
+
+    model = nn.Sequential(
+        nn.Linear(784, 256),
+        nn.ReLU(),
+        nn.Linear(256, 10),
+    )
+
+    x = torch.randn(4, 784)
+    target = torch.randint(0, 10, (4,))
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+
+    optimizer.zero_grad()
+    output = model(x)
+    loss = criterion(output, target)
+    loss.backward()
+    print(f&quot;  Normal loss: {loss.item():.4f}&quot;)
+    nan_found = detect_nan(model, loss, step=0)
+    print(f&quot;  NaN detected: {nan_found}&quot;)
+
+    fake_nan_loss = torch.tensor(float(&quot;nan&quot;))
+    print(f&quot;  Simulated NaN loss: {fake_nan_loss.item()}&quot;)
+    nan_found = detect_nan(model, fake_nan_loss, step=99)
+    print(f&quot;  NaN detected: {nan_found}&quot;)
+
+
+def demo_device_checking():
+    print(&quot;\n--- 6. Device Checking ---&quot;)
+
+    model = nn.Linear(10, 5)
+    t1 = torch.randn(4, 10)
+    t2 = torch.randn(4, 10)
+
+    check_devices(model, t1, t2)
+
+    if torch.cuda.is_available():
+        model_gpu = model.cuda()
+        t_cpu = torch.randn(4, 10)
+        t_gpu = torch.randn(4, 10).cuda()
+        print(&quot;  With mixed devices:&quot;)
+        check_devices(model_gpu, t_cpu, t_gpu)
+
+
+def demo_gradient_health():
+    print(&quot;\n--- 7. Gradient Health Check ---&quot;)
+
+    model = nn.Sequential(
+        nn.Linear(784, 256),
+        nn.ReLU(),
+        nn.Linear(256, 10),
+    )
+
+    x = torch.randn(4, 784)
+    target = torch.randint(0, 10, (4,))
+    criterion = nn.CrossEntropyLoss()
+
+    output = model(x)
+    loss = criterion(output, target)
+    loss.backward()
+    check_gradient_health(model)
+
+
+def demo_gpu_memory():
+    print(&quot;\n--- 8. GPU Memory Summary ---&quot;)
+
+    if not torch.cuda.is_available():
+        print(&quot;  No GPU available. Skipping GPU memory demo.&quot;)
+        print(&quot;  On a GPU machine, torch.cuda.memory_summary() shows:&quot;)
+        print(&quot;    - Allocated memory per block size&quot;)
+        print(&quot;    - Cached (reserved) memory&quot;)
+        print(&quot;    - Peak memory usage&quot;)
+        return
+
+    print(f&quot;  GPU: {torch.cuda.get_device_name(0)}&quot;)
+    print(f&quot;  Allocated: {torch.cuda.memory_allocated() / 1e6:.1f} MB&quot;)
+    print(f&quot;  Cached: {torch.cuda.memory_reserved() / 1e6:.1f} MB&quot;)
+
+    large_tensor = torch.randn(10000, 10000, device=&quot;cuda&quot;)
+    print(f&quot;  After 10k x 10k tensor:&quot;)
+    print(f&quot;    Allocated: {torch.cuda.memory_allocated() / 1e6:.1f} MB&quot;)
+
+    del large_tensor
+    torch.cuda.empty_cache()
+    print(f&quot;  After cleanup:&quot;)
+    print(f&quot;    Allocated: {torch.cuda.memory_allocated() / 1e6:.1f} MB&quot;)
+
+
+def demo_logging():
+    print(&quot;\n--- 9. Structured Logging ---&quot;)
+
+    logger.info(&quot;Training started: lr=0.001, batch_size=32, epochs=10&quot;)
+    logger.info(&quot;Step 100: loss=2.3026, accuracy=0.10&quot;)
+    logger.warning(&quot;Loss spike detected: 15.7 at step 450&quot;)
+    logger.info(&quot;Step 1000: loss=0.4512, accuracy=0.87&quot;)
+    logger.info(&quot;Training complete: best_loss=0.3201&quot;)
+
+
+def demo_conditional_breakpoint():
+    print(&quot;\n--- 10. Conditional Breakpoint Pattern ---&quot;)
+    print(&quot;  In real code, use this pattern:&quot;)
+    print()
+    print(&quot;    for step in range(num_steps):&quot;)
+    print(&quot;        loss = train_step(model, batch)&quot;)
+    print(&quot;        if loss.item() &gt; 10 or torch.isnan(loss):&quot;)
+    print(&quot;            breakpoint()  # drops into pdb&quot;)
+    print()
+    print(&quot;  Useful pdb commands once inside:&quot;)
+    print(&quot;    p tensor.shape       # print shape&quot;)
+    print(&quot;    p tensor.device      # check device&quot;)
+    print(&quot;    p tensor.grad        # inspect gradients&quot;)
+    print(&quot;    p tensor.isnan().sum()  # count NaNs&quot;)
+    print(&quot;    c                    # continue execution&quot;)
+    print(&quot;    q                    # quit debugger&quot;)
+
+
+def main():
+    print(&quot;=&quot; * 60)
+    print(&quot;  AI Debugging and Profiling Toolkit&quot;)
+    print(&quot;  Phase 0, Lesson 12&quot;)
+    print(&quot;=&quot; * 60)
+
+    if not HAS_TORCH:
+        print(&quot;\nPyTorch not installed. Install with:&quot;)
+        print(&quot;  uv pip install torch&quot;)
+        print(&quot;\nRunning non-PyTorch demos only...\n&quot;)
+        demo_memory_tracking()
+        demo_logging()
+        return 1
+
+    demo_print_debugging()
+    demo_timing()
+    demo_memory_tracking()
+    demo_shape_checking()
+    demo_nan_detection()
+    demo_device_checking()
+    demo_gradient_health()
+    demo_gpu_memory()
+    demo_logging()
+    demo_conditional_breakpoint()
+
+    print(&quot;\n&quot; + &quot;=&quot; * 60)
+    print(&quot;  All demos complete.&quot;)
+    print(&quot;  Next: introduce bugs intentionally and practice catching them.&quot;)
+    print(&quot;=&quot; * 60 + &quot;\n&quot;)
+    return 0
+
+
+if __name__ == &quot;__main__&quot;:
+    sys.exit(main())
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/00-setup-and-tooling/12-debugging-and-profiling/outputs/prompt-debug-ai-code.md">phases/00-setup-and-tooling/12-debugging-and-profiling/outputs/prompt-debug-ai-code.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: prompt-debug-ai-code
+description: Diagnose AI-specific bugs including NaN loss, shape errors, training failures, and OOM
+phase: 0
+lesson: 12
+---
+
+You are an AI/ML debugging specialist. The user is training or running a machine learning model and has hit a bug. Your job is to diagnose the root cause and provide the exact fix.
+
+When the user describes a problem, follow this process:
+
+1. Classify the bug into one of these categories:
+   - **NaN/Inf loss**: numerical instability during training
+   - **Shape mismatch**: tensor dimension errors
+   - **Training not converging**: loss not decreasing or stuck
+   - **OOM (Out of Memory)**: GPU or CPU memory exhaustion
+   - **Data issue**: leakage, wrong preprocessing, corrupted inputs
+   - **Device mismatch**: tensors on different devices
+   - **Silent failure**: code runs but model learns nothing
+
+2. Ask for the specific diagnostic output based on the category:
+
+   For **NaN loss**, ask the user to run:
+   ```python
+   for name, param in model.named_parameters():
+       if param.grad is not None:
+           print(f&quot;{name}: grad_norm={param.grad.norm():.4f}, &quot;
+                 f&quot;has_nan={param.grad.isnan().any()}, &quot;
+                 f&quot;has_inf={param.grad.isinf().any()}&quot;)
+   ```
+
+   For **shape mismatch**, ask for:
+   ```python
+   print(f&quot;Input shape: {x.shape}&quot;)
+   print(f&quot;Expected: {model.fc1.in_features}&quot;)
+   print(f&quot;Output shape: {model(x).shape}&quot;)
+   print(f&quot;Target shape: {target.shape}&quot;)
+   ```
+
+   For **training not converging**, ask for:
+   - Learning rate value
+   - Loss values at steps 0, 10, 100, 1000
+   - Whether data is shuffled
+   - Whether gradients are being zeroed each step
+
+   For **OOM**, ask for:
+   ```python
+   print(f&quot;Batch size: {batch_size}&quot;)
+   print(f&quot;Model params: {sum(p.numel() for p in model.parameters()):,}&quot;)
+   print(f&quot;GPU memory: {torch.cuda.memory_allocated()/1e9:.2f} GB / &quot;
+         f&quot;{torch.cuda.get_device_properties(0).total_memory/1e9:.2f} GB&quot;)
+   ```
+
+3. Provide the fix. Be specific. Not &quot;try reducing the learning rate&quot; but &quot;change lr from 0.1 to 0.001&quot; or &quot;add torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) before optimizer.step()&quot;.
+
+Common root causes and their fixes:
+
+- **NaN after a few steps**: Learning rate too high. Reduce by 10x. Add gradient clipping.
+- **NaN immediately**: Log of zero or negative number in loss. Add epsilon: `torch.log(x + 1e-8)`.
+- **NaN in specific layer**: Check for division by zero. BatchNorm with batch_size=1 will NaN.
+- **Loss stuck at ln(num_classes)**: Model predicting uniform distribution. Check that gradients flow (no accidental `.detach()` or `with torch.no_grad()` around the forward pass).
+- **Loss stuck at high value**: Wrong loss function for the task. CrossEntropyLoss expects raw logits, not softmax output.
+- **Loss decreasing then exploding**: Learning rate too high for later training. Use a learning rate scheduler.
+- **Perfect training accuracy, bad test accuracy**: Overfitting. Add dropout, reduce model size, add data augmentation, or get more data.
+- **99% test accuracy on first epoch**: Data leakage. Labels are in the features, or train/test sets overlap.
+- **OOM during forward pass**: Batch size too large or model too big. Halve the batch size. Use mixed precision with `torch.cuda.amp.autocast()`.
+- **OOM during backward pass**: Gradient accumulation without clearing. Call `optimizer.zero_grad()` each step.
+- **RuntimeError about device**: Move all tensors to the same device. Use `model.to(device)` and `tensor.to(device)` consistently.
+- **Slow training, GPU utilization low**: Data loading is the bottleneck. Set `num_workers=4` (or higher) in DataLoader. Use `pin_memory=True`.
+
+Always end with a verification step the user can run to confirm the fix worked.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. What makes debugging AI/ML code fundamentally different from debugging a typical web application?</legend><label class="option"><input type="radio" name="q0" value="0"> AI code always requires a GPU to debug</label><label class="option"><input type="radio" name="q0" value="1"> AI code uses different programming languages</label><label class="option"><input type="radio" name="q0" value="2"> AI bugs often don&#39;t crash -- they silently produce incorrect results with no error messages</label><label class="option"><input type="radio" name="q0" value="3"> AI code cannot be debugged with standard tools like print statements</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. What does a profiler measure?</legend><label class="option"><input type="radio" name="q1" value="0"> How much time and memory each part of the code consumes</label><label class="option"><input type="radio" name="q1" value="1"> How many bugs exist in the codebase</label><label class="option"><input type="radio" name="q1" value="2"> Whether the code produces correct output</label><label class="option"><input type="radio" name="q1" value="3"> The code coverage of unit tests</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. Your model achieves 99% accuracy on the test set. What AI-specific bug should you suspect first?</legend><label class="option"><input type="radio" name="q2" value="0"> The batch size is too large</label><label class="option"><input type="radio" name="q2" value="1"> Data leakage -- test samples may have leaked into the training set</label><label class="option"><input type="radio" name="q2" value="2"> The learning rate is too high</label><label class="option"><input type="radio" name="q2" value="3"> The model has too many parameters</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. What is the most common finding when profiling a training loop&#39;s time breakdown?</legend><label class="option"><input type="radio" name="q3" value="0"> GPU memory allocation is the bottleneck</label><label class="option"><input type="radio" name="q3" value="1"> The backward pass takes 90% of the time</label><label class="option"><input type="radio" name="q3" value="2"> Data loading takes more time than the forward and backward passes combined</label><label class="option"><input type="radio" name="q3" value="3"> Writing logs takes the most time</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. You see NaN loss at step 500. Which approach will help you find the root cause?</legend><label class="option"><input type="radio" name="q4" value="0"> Switch from Adam to SGD optimizer</label><label class="option"><input type="radio" name="q4" value="1"> Restart training from scratch with a different random seed</label><label class="option"><input type="radio" name="q4" value="2"> Increase the batch size to stabilize gradients</label><label class="option"><input type="radio" name="q4" value="3"> Use detect_nan to check for NaN/Inf in gradients and add breakpoint() at the failure point</label><p data-feedback="4"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/00-setup-and-tooling/11-linux-for-ai/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/00-setup-and-tooling/13-python-for-ai-engineering/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/00-setup-and-tooling/12-debugging-and-profiling/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

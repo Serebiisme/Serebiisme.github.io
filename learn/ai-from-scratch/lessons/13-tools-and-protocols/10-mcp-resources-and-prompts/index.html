@@ -1,0 +1,1084 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>无国籍服务器可访问的文本 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-13-tools-and-protocols" data-lesson="13-tools-and-protocols/10-mcp-resources-and-prompts" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/13-tools-and-protocols/">工具与协议</a> / LESSON 10</p><h1 class="lesson-title">无国籍服务器可访问的文本</h1><p>MCP Resources and Prompts: Addressable Context for Stateless Servers</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>无国籍服务器可访问的文本</h1>
+<blockquote>
+<p>工具执行操作.资源暴露可地址的内容.提示用户选择的信息模板.一个好的MCP服务器将这些合同保持分开和可预测.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 13, Lesson 07 (Building an MCP Server), Phase 13, Lesson 09 (MCP Transports)
+<strong>Time:</strong> ~60 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>选择消费者的意图中的工具,资源和提示.</li>
+<li>通过强制性的方式宣传资源和即时地表面<code>server/discover</code>现在,我们要去.</li>
+<li>建立确定性<code>resources/list</code>其他<code>prompts/list</code>结果.</li>
+<li>申请<code>ttlMs</code>其他<code>cacheScope</code>没有泄露用户特定数据.</li>
+<li>返回JSON-RPC错误<code>-32602</code>对于无效或未知资源URI.</li>
+<li>打开一个<code>subscriptions/listen</code>通过订阅ID将每个事件进行 POST-响应流和相关联.</li>
+<li>处理资源内容和提示模板作为不值得信赖的服务器输出.</li>
+</ul>
+<h2>首先要从消费者开始</h2>
+<p>滥用MCP的最简单方法是从实施代码开始.数据库查询成为一个工具,因为功能熟悉.可重复使用的工作流成为资源,因为它存储在文件中.提示成为隐藏的政策,因为主机可以注射它.</p>
+<p>首先要知道谁选择,他们期待什么.</p>
+<table>
+<thead>
+<tr>
+<th>Primitive</th>
+<th>Primary intent</th>
+<th>Selection owner</th>
+<th>Typical result</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Tool</td>
+<td>Perform an operation</td>
+<td>Model or application</td>
+<td>Structured action result</td>
+</tr>
+<tr>
+<td>Resource</td>
+<td>Read content at a URI</td>
+<td>Host, application, or user</td>
+<td>Text or binary content</td>
+</tr>
+<tr>
+<td>Prompt</td>
+<td>Start a reusable message workflow</td>
+<td>User through host UI</td>
+<td>One or more prompt messages</td>
+</tr>
+</tbody>
+</table>
+<p>给我一个笔记<code>notes://note-1</code>由于它是可地址的内容,它是资源. <code>delete_note</code>它们是工具,因为它们改变了状态.<code>review_note</code>是一个提示,因为用户选择了准备的审查工作流程.</p>
+<p>不要把这三项操作都暴露出来,只是为了看起来完整.每一个额外的表面都需要发现,授权,缓存,处理错误,测试和文件.</p>
+<h2>无国籍人包2026-07-28</h2>
+<p>本课程针对MCP协议修订<code>2026-07-28</code>没有启动手握或协议会议.每个请求都包含其协议版本和客户端功能在保留中.<code>_meta</code>关键.</p>
+<pre><code class="language-json">{
+  &quot;jsonrpc&quot;: &quot;2.0&quot;,
+  &quot;id&quot;: 1,
+  &quot;method&quot;: &quot;resources/list&quot;,
+  &quot;params&quot;: {
+    &quot;_meta&quot;: {
+      &quot;io.modelcontextprotocol/protocolVersion&quot;: &quot;2026-07-28&quot;,
+      &quot;io.modelcontextprotocol/clientInfo&quot;: {
+        &quot;name&quot;: &quot;course-client&quot;,
+        &quot;version&quot;: &quot;1.0.0&quot;
+      },
+      &quot;io.modelcontextprotocol/clientCapabilities&quot;: {}
+    }
+  }
+}
+</code></pre>
+<p>服务器必须实现<code>server/discover</code>结果广告支持
+版本,资源和快速功能,实施身份,以及
+客户端可能直接调用另一种方法,但发现给它
+在构建UI之前,需要一个稳定的快照.</p>
+<pre><code class="language-json">{
+  &quot;resultType&quot;: &quot;complete&quot;,
+  &quot;supportedVersions&quot;: [&quot;2026-07-28&quot;],
+  &quot;capabilities&quot;: {
+    &quot;resources&quot;: {&quot;listChanged&quot;: true, &quot;subscribe&quot;: true},
+    &quot;prompts&quot;: {&quot;listChanged&quot;: true}
+  },
+  &quot;ttlMs&quot;: 3600000,
+  &quot;cacheScope&quot;: &quot;public&quot;
+}
+</code></pre>
+<p>结果是正常的<code>&quot;resultType&quot;: &quot;complete&quot;</code>答案<code>_meta</code>确定服务执行的情况<code>io.modelcontextprotocol/serverInfo</code>对于诊断而言,这些信息是有用的.它不是身份验证.<code>-32022</code>要求修改和服务器支持修改.</p>
+<p>无国籍合约改变了您的设计本能.列表不能依赖于一个连接的先前调用.授权可能会改变可见的集合,因为凭证是请求输入,但连接历史不能.</p>
+<h2>资源是稳定的URI合同</h2>
+<p>资源是由URI识别的内容. 在处理器之前设计URI.</p>
+<p>良好的URI特性:</p>
+<ul>
+<li>足以预示或通过请求之间的稳定性.</li>
+<li>给服务器域名空间.</li>
+<li>独立于进程身份证或连接.</li>
+<li>在存储访问前验证.</li>
+<li>在每一次阅读中都得到授权.</li>
+</ul>
+<p><code>notes://note-1</code>没有什么比<code>note-1</code>因为它的名字空间是明确的.<code>file://</code>解决符号链接和相对段落后,它仍然必须检查配置目录边界.</p>
+<p><code>resources/list</code>确定性顺序防止噪音缓存错失,改变快照和主机UI在更新之间跳跃.</p>
+<pre><code class="language-json">{
+  &quot;resultType&quot;: &quot;complete&quot;,
+  &quot;resources&quot;: [
+    {
+      &quot;uri&quot;: &quot;notes://note-1&quot;,
+      &quot;name&quot;: &quot;Architecture decision&quot;,
+      &quot;description&quot;: &quot;Why the service uses a stateless boundary&quot;,
+      &quot;mimeType&quot;: &quot;text/markdown&quot;
+    }
+  ],
+  &quot;ttlMs&quot;: 300000,
+  &quot;cacheScope&quot;: &quot;public&quot;,
+  &quot;_meta&quot;: {
+    &quot;io.modelcontextprotocol/serverInfo&quot;: {
+      &quot;name&quot;: &quot;notes-server&quot;,
+      &quot;version&quot;: &quot;2.0.0&quot;
+    }
+  }
+}
+</code></pre>
+<p><code>resources/read</code>返回一个或多个内容项.未知URI不是成功的空读.当前资源规格将无效或未知资源URI分配给 JSON-RPC无效参数,代码 <code>-32602</code>现在,我们要去.</p>
+<pre><code class="language-json">{
+  &quot;jsonrpc&quot;: &quot;2.0&quot;,
+  &quot;id&quot;: 2,
+  &quot;error&quot;: {
+    &quot;code&quot;: -32602,
+    &quot;message&quot;: &quot;Unknown or invalid resource URI&quot;,
+    &quot;data&quot;: {
+      &quot;uri&quot;: &quot;notes://missing&quot;
+    }
+  }
+}
+</code></pre>
+<p>这种区别使客户端能够将缺席与有效的空文件分开.</p>
+<h3>资源模板</h3>
+<p>资源模板描述了一个参数化的URI家族. 列出每个具体项目时使用一个. 例如,<code>notes://projects/{project}/decisions/{decision}</code>告诉客户如何形成有效地址,而不返回每一个决定.</p>
+<p>模板不会削弱验证.解析变量,应用授权,执行长度和字符限制,并构建使用输入参数的存储查询.永远不要将任意的URI尾巴连接到文件系统路径或数据库声明中.</p>
+<h3>内容不是可信的指令</h3>
+<p>资源文本可能包含即时注射,秘密,误导命令或错误的标记.主机应该保留来源,并将资源内容视为数据.服务器应该限制内容大小,返回准确的MIME类型,编辑调用者无法访问的字段,避免返回无关记录.</p>
+<h2>提示是用户控制的模板</h2>
+<p>简单的MCP提示是为用户选择设计的.主机可以将它们作为切片命令,菜单项或工作流按.协议不需要一个UI.</p>
+<p><code>prompts/list</code>每个提示需要一个稳定的名称,一个有用的描述和参数声明,让主机收集输入之前<code>prompts/get</code>现在,我们要去.</p>
+<pre><code class="language-json">{
+  &quot;resultType&quot;: &quot;complete&quot;,
+  &quot;prompts&quot;: [
+    {
+      &quot;name&quot;: &quot;review_note&quot;,
+      &quot;title&quot;: &quot;Review a note&quot;,
+      &quot;description&quot;: &quot;Review one note for a named concern&quot;,
+      &quot;arguments&quot;: [
+        {
+          &quot;name&quot;: &quot;uri&quot;,
+          &quot;description&quot;: &quot;The note resource URI&quot;,
+          &quot;required&quot;: true
+        }
+      ]
+    }
+  ],
+  &quot;ttlMs&quot;: 600000,
+  &quot;cacheScope&quot;: &quot;public&quot;
+}
+</code></pre>
+<p><code>prompts/get</code>解决参数成消息. 它不取代主机的系统说明.主机决定如何返回消息进入模型背景,并将自己的可信度政策放在更高的优先级.</p>
+<p>验证服务器边界的提示参数.提示URI应通过直接资源阅读的相同授权检查.不要使提示作为资源访问的侧通道.</p>
+<h2>缓存提示是正确的部分</h2>
+<p><code>ttlMs</code>告诉客户,结果可以再使用多久. <code>cacheScope</code>描述谁可能分享存储值.</p>
+<table>
+<thead>
+<tr>
+<th>Scope</th>
+<th>Meaning</th>
+<th>Typical use</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>public</code></td>
+<td>May be reused across users when authorization permits</td>
+<td>Public prompt catalog</td>
+</tr>
+<tr>
+<td><code>private</code></td>
+<td>Bound to the requesting user or credential context</td>
+<td>User-owned note content</td>
+</tr>
+</tbody>
+</table>
+<p>根据数据的变化速度和延迟损害,选择一个TTL.五分钟可能适合公开提示目录.私人笔记阅读可能需要一分钟.</p>
+<p>只有MCP定义了<code>public</code>其他<code>private</code>作为<code>cacheScope</code>对于一个秘密的结果或快速变化的结果,返回<code>cacheScope: &quot;private&quot;</code>随着<code>ttlMs: 0</code>通过&quot;存储器&quot;的方法,<code>no-store</code>本身不是MCP<code>cacheScope</code>价值</p>
+<p>缓存提示永远不会取代授权.缓存密钥必须包含所有改变可见性的请求维度,包括租户,用户,范围,本地和页面化缓冲器.如果共享缓存无法安全表达这些维度,则使用<code>private</code>没有任何店铺政策.</p>
+<h2>订阅使用客户开放的响应流</h2>
+<p>现代订阅模式取代了前一种模式.<code>resources/subscribe</code>通过RPC和旧的HTTP GET事件终点.</p>
+<p>客户发送了<code>subscriptions/listen</code>通过流式HTTP,这是一个POST,其响应仍然作为SSE流开放.<code>notifications</code>服务器不得提供未请求的通知类型.</p>
+<pre><code class="language-json">{
+  &quot;jsonrpc&quot;: &quot;2.0&quot;,
+  &quot;id&quot;: 17,
+  &quot;method&quot;: &quot;subscriptions/listen&quot;,
+  &quot;params&quot;: {
+    &quot;_meta&quot;: {
+      &quot;io.modelcontextprotocol/protocolVersion&quot;: &quot;2026-07-28&quot;,
+      &quot;io.modelcontextprotocol/clientCapabilities&quot;: {},
+      &quot;io.modelcontextprotocol/clientInfo&quot;: {
+        &quot;name&quot;: &quot;course-client&quot;,
+        &quot;version&quot;: &quot;1.0.0&quot;
+      }
+    },
+    &quot;notifications&quot;: {
+      &quot;resourcesListChanged&quot;: true,
+      &quot;promptsListChanged&quot;: true,
+      &quot;resourceSubscriptions&quot;: [
+        &quot;notes://note-1&quot;
+      ]
+    }
+  }
+}
+</code></pre>
+<p>请求 ID 是订阅 ID. 在任何请求事件之前,服务器发送<code>notifications/subscriptions/acknowledged</code>服务器只接受的子集.</p>
+<pre><code class="language-json">{
+  &quot;jsonrpc&quot;: &quot;2.0&quot;,
+  &quot;method&quot;: &quot;notifications/subscriptions/acknowledged&quot;,
+  &quot;params&quot;: {
+    &quot;_meta&quot;: {
+      &quot;io.modelcontextprotocol/subscriptionId&quot;: 17
+    },
+    &quot;notifications&quot;: {
+      &quot;resourcesListChanged&quot;: true,
+      &quot;resourceSubscriptions&quot;: [
+        &quot;notes://note-1&quot;
+      ]
+    }
+  }
+}
+</code></pre>
+<p>后来的每一个事件都包含相同的元数据.</p>
+<pre><code class="language-json">{
+  &quot;jsonrpc&quot;: &quot;2.0&quot;,
+  &quot;method&quot;: &quot;notifications/resources/updated&quot;,
+  &quot;params&quot;: {
+    &quot;_meta&quot;: {
+      &quot;io.modelcontextprotocol/subscriptionId&quot;: 17
+    },
+    &quot;uri&quot;: &quot;notes://note-1&quot;
+  }
+}
+</code></pre>
+<p>客户端再次阅读了它.<code>resources/read</code>根据目前的授权,它不假设事件包含新的文件.</p>
+<p>通过 HTTP,关闭响应流取消订阅.一个结束流的服务器优雅地返回一个最终的 服务器 通过 HTTP 关闭响应流取消订阅.<code>resultType: &quot;complete&quot;</code>与原始请求相关的反应.</p>
+<p>您不能使用订阅流作为协议会议. 后续阅读仍然是完整的请求,可以达到任何健康的服务器实例.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-8c3c97a0c951ced6f794.png" alt="t3-primitive-sort 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>互动实验室</h2>
+<p>使用这个图表来分类一个项目跟踪器的五个功能:问题细节,创建问题,冲刺审查模板,项目政策和关闭问题.然后决定哪些列表可以向公众缓存,哪些列表必须保持私密,哪些资源应该更新通知.</p>
+<p>如果模型执行操作,请使用工具.如果主机阅读了URI地址的内容,请使用资源.如果用户启动一个准备的消息工作流程,请使用提示.</p>
+<h2>实践实验室</h2>
+<p>运行模拟器从存储器根:</p>
+<pre><code class="language-bash">cd phases/13-tools-and-protocols/10-mcp-resources-and-prompts/code
+python3 main.py
+python3 -m unittest discover tests -v
+</code></pre>
+<p>检查转录的顺序:</p>
+<ol>
+<li>确认<code>server/discover</code>广告目前的修改和两项功能.</li>
+<li>确认列表结果均有序,并使用<code>resultType: &quot;complete&quot;</code>现在,我们要去.</li>
+<li>确认列表,并阅读结果带有故意缓存提示.</li>
+<li>改变读取URI为<code>notes://missing</code>观察<code>-32602</code>现在,我们要去.</li>
+<li>确认订阅确认之前的资源事件.</li>
+<li>确认活动,并以优雅的方式关闭,同时携带订阅身份证.<code>5</code>现在,我们要去.</li>
+</ol>
+<p>Python 模型不会打开真正的 HTTP 连接.它代表一个 SDK 必须在请求范围响应流中放置的信息.使用官方 SDK 为框架和输送在生产中.</p>
+<h2>运输的文物</h2>
+<p><code>outputs/skill-primitive-splitter.md</code>是MCP原始选择的可重复使用设计审查.它现在检查了确定性发现,缓存范围,无效的URI行为和现代订阅过器.</p>
+<p>课程也会带来影响.<code>assets/primitive-split.svg</code>对于非线学习,原始和订阅界限的静态版本.</p>
+<h2>检查</h2>
+<pre><code class="language-bash">cd phases/13-tools-and-protocols/10-mcp-resources-and-prompts/code
+python3 main.py
+python3 -m unittest discover tests -v
+</code></pre>
+<p>预期结果:主程序打印一个JSON转录,测试命令报告至少12次通过测试.</p>
+<h2>石连接</h2>
+<p>包含一个确定性目录快照,一个授权资源阅读,一个快速分辨率,一个不有效的URI案例和一个订阅转录.</p>
+<p>您的证据应该表明,没有列表依赖于连接历史,并且订阅事件从来没有允许访问底层资源.</p>
+<h2>运动</h2>
+<ol>
+<li>添加一个<code>notes://projects/{project}/notes/{id}</code>资源模板并验证两个变量.</li>
+<li>添加页面<code>resources/list</code>保持确定性秩序.</li>
+<li>改变一个资源为<code>cacheScope: &quot;private&quot;</code>随着<code>ttlMs: 0</code>添加一个主机级别的禁店政策,并解释了这两个控制的威胁.</li>
+<li>添加提示列表变更订阅,证明当过器遗漏时没有发送事件<code>promptsListChanged</code>现在,我们要去.</li>
+<li>创建两个同时订阅,证明每个事件都包含了正确的请求ID.</li>
+<li>添加一个被读取处理器的权限,证明缓存输入不能跨越主题.</li>
+</ol>
+<h2>关键词</h2>
+<ul>
+<li>**Resource:**通过MCP服务器暴露的URI地址内容.</li>
+<li>**Prompt:**通过MCP服务器暴露的用户控制信息模板.</li>
+<li>**Deterministic list:**发现结果,有稳定的成员和订单相同的请求输入.</li>
+<li>**<code>ttlMs</code>:**缓存新鲜度持续时间在毫秒.</li>
+<li>**<code>cacheScope</code>:**为了缓存结果的共享界限.</li>
+<li>**<code>subscriptions/listen</code>:**长期的请求,其响应流提供了明确过的通知.</li>
+<li>**Subscription ID:**听取请求的原始身份证,在通知元数据中重复.</li>
+<li><strong>Invalid parameters:</strong> JSON-RPC 错误<code>-32602</code>用于无效或未知资源URI.</li>
+<li><strong>Unsupported protocol version:</strong> JSON-RPC 错误<code>-32022</code>包括<code>supported</code>其他<code>requested</code>修订</li>
+<li>**<code>server/discover</code>:**强制性服务器方法,返回支持的修改,功能,身份和可选缓存提示.</li>
+</ul>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://modelcontextprotocol.io/specification/2026-07-28/server/resources" rel="noreferrer" data-network="true">MCP 2026-07-28 Resources <small>↗ 需要联网</small></a></li>
+<li><a href="https://modelcontextprotocol.io/specification/2026-07-28/server/prompts" rel="noreferrer" data-network="true">MCP 2026-07-28 Prompts <small>↗ 需要联网</small></a></li>
+<li><a href="https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/subscriptions" rel="noreferrer" data-network="true">MCP 2026-07-28 Subscriptions <small>↗ 需要联网</small></a></li>
+<li><a href="https://modelcontextprotocol.io/specification/2026-07-28/server/utilities/caching" rel="noreferrer" data-network="true">MCP 2026-07-28 Caching <small>↗ 需要联网</small></a></li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>MCP Resources and Prompts: Addressable Context for Stateless Servers</h1>
+<blockquote>
+<p>Tools perform operations. Resources expose addressable content. Prompts package user-selected message templates. A good MCP server keeps those contracts separate and predictable.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 13, Lesson 07 (Building an MCP Server), Phase 13, Lesson 09 (MCP Transports)
+<strong>Time:</strong> ~60 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Choose among tools, resources, and prompts from the consumer's intent.</li>
+<li>Advertise the resource and prompt surface through mandatory <code>server/discover</code>.</li>
+<li>Build deterministic <code>resources/list</code> and <code>prompts/list</code> results.</li>
+<li>Apply <code>ttlMs</code> and <code>cacheScope</code> without leaking user-specific data.</li>
+<li>Return JSON-RPC error <code>-32602</code> for an invalid or unknown resource URI.</li>
+<li>Open a <code>subscriptions/listen</code> POST-response stream and correlate every event by subscription ID.</li>
+<li>Treat resource content and prompt templates as untrusted server output.</li>
+</ul>
+<h2>Start With the Consumer</h2>
+<p>The easiest way to misuse MCP is to begin with implementation code. A database query becomes a tool because functions are familiar. A reusable workflow becomes a resource because it is stored in a file. A prompt becomes hidden policy because the host can inject it.</p>
+<p>Begin with who chooses and what they expect.</p>
+<table>
+<thead>
+<tr>
+<th>Primitive</th>
+<th>Primary intent</th>
+<th>Selection owner</th>
+<th>Typical result</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Tool</td>
+<td>Perform an operation</td>
+<td>Model or application</td>
+<td>Structured action result</td>
+</tr>
+<tr>
+<td>Resource</td>
+<td>Read content at a URI</td>
+<td>Host, application, or user</td>
+<td>Text or binary content</td>
+</tr>
+<tr>
+<td>Prompt</td>
+<td>Start a reusable message workflow</td>
+<td>User through host UI</td>
+<td>One or more prompt messages</td>
+</tr>
+</tbody>
+</table>
+<p>A note at <code>notes://note-1</code> is a resource because it is addressable content. <code>delete_note</code> is a tool because it changes state. <code>review_note</code> is a prompt because a user chooses a prepared review workflow.</p>
+<p>Do not expose one operation as all three merely to look complete. Each extra surface needs discovery, authorization, caching, error handling, tests, and documentation.</p>
+<h2>The 2026-07-28 Stateless Envelope</h2>
+<p>This lesson targets MCP protocol revision <code>2026-07-28</code>. There is no initialization handshake or protocol session in this profile. Every request carries its protocol version and client capabilities in reserved <code>_meta</code> keys.</p>
+<pre><code class="language-json">{
+  &quot;jsonrpc&quot;: &quot;2.0&quot;,
+  &quot;id&quot;: 1,
+  &quot;method&quot;: &quot;resources/list&quot;,
+  &quot;params&quot;: {
+    &quot;_meta&quot;: {
+      &quot;io.modelcontextprotocol/protocolVersion&quot;: &quot;2026-07-28&quot;,
+      &quot;io.modelcontextprotocol/clientInfo&quot;: {
+        &quot;name&quot;: &quot;course-client&quot;,
+        &quot;version&quot;: &quot;1.0.0&quot;
+      },
+      &quot;io.modelcontextprotocol/clientCapabilities&quot;: {}
+    }
+  }
+}
+</code></pre>
+<p>A server must implement <code>server/discover</code>. Its result advertises supported
+versions, resource and prompt capabilities, implementation identity, and
+cache hints. A client may call another method directly, but discovery gives it
+one stable snapshot before it builds a UI.</p>
+<pre><code class="language-json">{
+  &quot;resultType&quot;: &quot;complete&quot;,
+  &quot;supportedVersions&quot;: [&quot;2026-07-28&quot;],
+  &quot;capabilities&quot;: {
+    &quot;resources&quot;: {&quot;listChanged&quot;: true, &quot;subscribe&quot;: true},
+    &quot;prompts&quot;: {&quot;listChanged&quot;: true}
+  },
+  &quot;ttlMs&quot;: 3600000,
+  &quot;cacheScope&quot;: &quot;public&quot;
+}
+</code></pre>
+<p>A normal result declares <code>&quot;resultType&quot;: &quot;complete&quot;</code>. The response <code>_meta</code> identifies the serving implementation with <code>io.modelcontextprotocol/serverInfo</code>. This information is useful for diagnostics. It is not an authentication identity. A request carrying an unsupported revision returns <code>-32022</code> with both the requested revision and the server's supported revisions.</p>
+<p>The stateless contract changes your design instincts. A list cannot depend on a prior call on one connection. Authorization may change the visible set because credentials are request input, but connection history must not.</p>
+<h2>Resources Are Stable URI Contracts</h2>
+<p>A resource is content identified by a URI. Design the URI before the handler.</p>
+<p>Good URI properties:</p>
+<ul>
+<li>Stable enough to bookmark or pass between requests.</li>
+<li>Namespaced to the server's domain.</li>
+<li>Independent from a process ID or connection.</li>
+<li>Validated before storage access.</li>
+<li>Authorized on every read.</li>
+</ul>
+<p><code>notes://note-1</code> is better than <code>note-1</code> because its namespace is explicit. A file server may use <code>file://</code> URIs, but it must still check configured directory boundaries after resolving symlinks and relative segments.</p>
+<p><code>resources/list</code> returns the resources currently visible to the caller. Sort by a stable key such as URI. Deterministic order prevents noisy cache misses, changing snapshots, and host UIs that jump between refreshes.</p>
+<pre><code class="language-json">{
+  &quot;resultType&quot;: &quot;complete&quot;,
+  &quot;resources&quot;: [
+    {
+      &quot;uri&quot;: &quot;notes://note-1&quot;,
+      &quot;name&quot;: &quot;Architecture decision&quot;,
+      &quot;description&quot;: &quot;Why the service uses a stateless boundary&quot;,
+      &quot;mimeType&quot;: &quot;text/markdown&quot;
+    }
+  ],
+  &quot;ttlMs&quot;: 300000,
+  &quot;cacheScope&quot;: &quot;public&quot;,
+  &quot;_meta&quot;: {
+    &quot;io.modelcontextprotocol/serverInfo&quot;: {
+      &quot;name&quot;: &quot;notes-server&quot;,
+      &quot;version&quot;: &quot;2.0.0&quot;
+    }
+  }
+}
+</code></pre>
+<p><code>resources/read</code> returns one or more content items. An unknown URI is not a successful empty read. The current Resources specification assigns invalid or unknown resource URIs to JSON-RPC invalid parameters, code <code>-32602</code>.</p>
+<pre><code class="language-json">{
+  &quot;jsonrpc&quot;: &quot;2.0&quot;,
+  &quot;id&quot;: 2,
+  &quot;error&quot;: {
+    &quot;code&quot;: -32602,
+    &quot;message&quot;: &quot;Unknown or invalid resource URI&quot;,
+    &quot;data&quot;: {
+      &quot;uri&quot;: &quot;notes://missing&quot;
+    }
+  }
+}
+</code></pre>
+<p>That distinction lets a client separate absence from a valid empty document. It also prevents accidental fallback to a broader lookup.</p>
+<h3>Resource templates</h3>
+<p>A resource template describes a family of parameterized URIs. Use one when listing every concrete item would be expensive or unbounded. For example, <code>notes://projects/{project}/decisions/{decision}</code> tells a client how to form a valid address without returning every decision.</p>
+<p>A template does not weaken validation. Parse variables, apply authorization, enforce length and character limits, and construct storage queries with typed parameters. Never concatenate an arbitrary URI tail into a filesystem path or database statement.</p>
+<h3>Content is not trusted instruction</h3>
+<p>Resource text may contain prompt injection, secrets, misleading commands, or malformed markup. The host should preserve provenance and treat resource content as data. The server should limit content size, return an accurate MIME type, redact fields the caller cannot access, and avoid returning unrelated records.</p>
+<h2>Prompts Are User-Controlled Templates</h2>
+<p>MCP prompts are designed for explicit user selection. A host may render them as slash commands, menu items, or workflow buttons. The protocol does not require one UI.</p>
+<p><code>prompts/list</code> should be deterministic for the same request authorization. Each prompt needs a stable name, a useful description, and argument declarations that let the host collect input before <code>prompts/get</code>.</p>
+<pre><code class="language-json">{
+  &quot;resultType&quot;: &quot;complete&quot;,
+  &quot;prompts&quot;: [
+    {
+      &quot;name&quot;: &quot;review_note&quot;,
+      &quot;title&quot;: &quot;Review a note&quot;,
+      &quot;description&quot;: &quot;Review one note for a named concern&quot;,
+      &quot;arguments&quot;: [
+        {
+          &quot;name&quot;: &quot;uri&quot;,
+          &quot;description&quot;: &quot;The note resource URI&quot;,
+          &quot;required&quot;: true
+        }
+      ]
+    }
+  ],
+  &quot;ttlMs&quot;: 600000,
+  &quot;cacheScope&quot;: &quot;public&quot;
+}
+</code></pre>
+<p><code>prompts/get</code> resolves arguments into messages. It does not replace the host's system instructions. The host decides how returned messages enter model context and keeps its own trusted policy at higher priority.</p>
+<p>Validate prompt arguments at the server boundary. A prompt URI should pass the same authorization check as a direct resource read. Do not make a prompt a side channel around resource access.</p>
+<h2>Cache Hints Are Part of Correctness</h2>
+<p><code>ttlMs</code> tells a client how long a result may be reused. <code>cacheScope</code> describes who may share that cached value.</p>
+<table>
+<thead>
+<tr>
+<th>Scope</th>
+<th>Meaning</th>
+<th>Typical use</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>public</code></td>
+<td>May be reused across users when authorization permits</td>
+<td>Public prompt catalog</td>
+</tr>
+<tr>
+<td><code>private</code></td>
+<td>Bound to the requesting user or credential context</td>
+<td>User-owned note content</td>
+</tr>
+</tbody>
+</table>
+<p>Choose a TTL from the data's change rate and the damage of staleness. Five minutes may suit a public prompt catalog. A private note read may use one minute.</p>
+<p>MCP defines only <code>public</code> and <code>private</code> as <code>cacheScope</code> values. For a secret-bearing or rapidly changing result, return <code>cacheScope: &quot;private&quot;</code> with <code>ttlMs: 0</code>, then apply any stricter no-store rule in the host cache policy. <code>no-store</code> itself is not an MCP <code>cacheScope</code> value.</p>
+<p>Cache hints never replace authorization. A cache key must include every request dimension that changes visibility, including tenant, user, scope, locale, and pagination cursor. If a shared cache cannot express those dimensions safely, use <code>private</code> with a zero TTL and a host-level no-store policy.</p>
+<h2>Subscriptions Use a Client-Opened Response Stream</h2>
+<p>The modern subscription pattern replaces the former <code>resources/subscribe</code> RPC and the old HTTP GET event endpoint.</p>
+<p>The client sends <code>subscriptions/listen</code> as a normal JSON-RPC request. Over Streamable HTTP this is a POST whose response remains open as an SSE stream. The <code>notifications</code> object is an allowlist. A server must not deliver notification types that were not requested.</p>
+<pre><code class="language-json">{
+  &quot;jsonrpc&quot;: &quot;2.0&quot;,
+  &quot;id&quot;: 17,
+  &quot;method&quot;: &quot;subscriptions/listen&quot;,
+  &quot;params&quot;: {
+    &quot;_meta&quot;: {
+      &quot;io.modelcontextprotocol/protocolVersion&quot;: &quot;2026-07-28&quot;,
+      &quot;io.modelcontextprotocol/clientCapabilities&quot;: {},
+      &quot;io.modelcontextprotocol/clientInfo&quot;: {
+        &quot;name&quot;: &quot;course-client&quot;,
+        &quot;version&quot;: &quot;1.0.0&quot;
+      }
+    },
+    &quot;notifications&quot;: {
+      &quot;resourcesListChanged&quot;: true,
+      &quot;promptsListChanged&quot;: true,
+      &quot;resourceSubscriptions&quot;: [
+        &quot;notes://note-1&quot;
+      ]
+    }
+  }
+}
+</code></pre>
+<p>The request ID is the subscription ID. Before any requested event, the server sends <code>notifications/subscriptions/acknowledged</code>. Its filter contains only the subset the server accepted.</p>
+<pre><code class="language-json">{
+  &quot;jsonrpc&quot;: &quot;2.0&quot;,
+  &quot;method&quot;: &quot;notifications/subscriptions/acknowledged&quot;,
+  &quot;params&quot;: {
+    &quot;_meta&quot;: {
+      &quot;io.modelcontextprotocol/subscriptionId&quot;: 17
+    },
+    &quot;notifications&quot;: {
+      &quot;resourcesListChanged&quot;: true,
+      &quot;resourceSubscriptions&quot;: [
+        &quot;notes://note-1&quot;
+      ]
+    }
+  }
+}
+</code></pre>
+<p>Every later event on that stream carries the same metadata.</p>
+<pre><code class="language-json">{
+  &quot;jsonrpc&quot;: &quot;2.0&quot;,
+  &quot;method&quot;: &quot;notifications/resources/updated&quot;,
+  &quot;params&quot;: {
+    &quot;_meta&quot;: {
+      &quot;io.modelcontextprotocol/subscriptionId&quot;: 17
+    },
+    &quot;uri&quot;: &quot;notes://note-1&quot;
+  }
+}
+</code></pre>
+<p>The notification says the resource changed. The client reads it again through <code>resources/read</code>, subject to current authorization. It does not assume the event contains the new document.</p>
+<p>Several subscriptions can share one stdio channel. The subscription ID lets the client demultiplex them. Over HTTP, closing the response stream cancels the subscription. A server that ends the stream gracefully returns a final <code>resultType: &quot;complete&quot;</code> response correlated to the original request.</p>
+<p>Do not use a subscription stream as a protocol session. A later read is still a complete request that can reach any healthy server instance.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-8c3c97a0c951ced6f794.png" alt="t3-primitive-sort 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Interactive Lab</h2>
+<p>Use the figure to classify five capabilities from a project tracker: issue details, create issue, sprint review template, project policy, and close issue. Then decide which lists can be cached publicly, which reads must remain private, and which resources deserve update notifications.</p>
+<p>For every classification, name the chooser. If the model performs an action, use a tool. If a host reads URI-addressed content, use a resource. If the user starts a prepared message workflow, use a prompt.</p>
+<h2>Practice Lab</h2>
+<p>Run the simulator from the repository root:</p>
+<pre><code class="language-bash">cd phases/13-tools-and-protocols/10-mcp-resources-and-prompts/code
+python3 main.py
+python3 -m unittest discover tests -v
+</code></pre>
+<p>Inspect the transcript in this order:</p>
+<ol>
+<li>Confirm <code>server/discover</code> advertises the current revision and both capabilities.</li>
+<li>Confirm both list results are sorted and use <code>resultType: &quot;complete&quot;</code>.</li>
+<li>Confirm the list and read results carry intentional cache hints.</li>
+<li>Change the read URI to <code>notes://missing</code> and observe <code>-32602</code>.</li>
+<li>Confirm the subscription acknowledgment precedes the resource event.</li>
+<li>Confirm the event and graceful close both carry subscription ID <code>5</code>.</li>
+</ol>
+<p>The Python model does not open a real HTTP connection. It represents the messages an SDK must place on the request-scoped response stream. Use an official SDK for framing and transport in production.</p>
+<h2>Shipped Artifact</h2>
+<p><code>outputs/skill-primitive-splitter.md</code> is a reusable design review for MCP primitive selection. It now checks deterministic discovery, cache scope, invalid URI behavior, and modern subscription filters.</p>
+<p>The lesson also ships <code>assets/primitive-split.svg</code>, a static version of the primitive and subscription boundary for offline study.</p>
+<h2>Verify It</h2>
+<pre><code class="language-bash">cd phases/13-tools-and-protocols/10-mcp-resources-and-prompts/code
+python3 main.py
+python3 -m unittest discover tests -v
+</code></pre>
+<p>Expected result: the main program prints a JSON transcript and the test command reports at least twelve passing tests.</p>
+<h2>Capstone Connection</h2>
+<p>Use this contract when your capstone server exposes addressable knowledge beside actions. Include one deterministic catalog snapshot, one authorized resource read, one prompt resolution, one invalid URI case, and one subscription transcript.</p>
+<p>Your evidence should show that no list depends on connection history and that a subscription event never grants access to the underlying resource.</p>
+<h2>Exercises</h2>
+<ol>
+<li>Add a <code>notes://projects/{project}/notes/{id}</code> resource template and validate both variables.</li>
+<li>Add pagination to <code>resources/list</code> while preserving deterministic order.</li>
+<li>Change one resource to <code>cacheScope: &quot;private&quot;</code> with <code>ttlMs: 0</code>, add a host-level no-store policy, and explain the threat that justifies both controls.</li>
+<li>Add a prompt-list change subscription and prove no event is sent when the filter omits <code>promptsListChanged</code>.</li>
+<li>Create two simultaneous subscriptions and prove each event carries the correct request ID.</li>
+<li>Add an authorization subject to the read handler and prove a cache entry cannot cross subjects.</li>
+</ol>
+<h2>Key Terms</h2>
+<ul>
+<li><strong>Resource:</strong> URI-addressed content exposed by an MCP server.</li>
+<li><strong>Prompt:</strong> A user-controlled message template exposed by an MCP server.</li>
+<li><strong>Deterministic list:</strong> A discovery result with stable membership and ordering for the same request inputs.</li>
+<li><strong><code>ttlMs</code>:</strong> Cache freshness duration in milliseconds.</li>
+<li><strong><code>cacheScope</code>:</strong> The sharing boundary for a cached result.</li>
+<li><strong><code>subscriptions/listen</code>:</strong> A long-lived request whose response stream delivers explicitly filtered notifications.</li>
+<li><strong>Subscription ID:</strong> The original listen request ID, repeated in notification metadata.</li>
+<li><strong>Invalid parameters:</strong> JSON-RPC error <code>-32602</code>, used for an invalid or unknown resource URI.</li>
+<li><strong>Unsupported protocol version:</strong> JSON-RPC error <code>-32022</code>, including <code>supported</code> and <code>requested</code> revisions.</li>
+<li><strong><code>server/discover</code>:</strong> Mandatory server method that returns supported revisions, capabilities, identity, and optional cache hints.</li>
+</ul>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://modelcontextprotocol.io/specification/2026-07-28/server/resources" rel="noreferrer" data-network="true">MCP 2026-07-28 Resources <small>↗ 需要联网</small></a></li>
+<li><a href="https://modelcontextprotocol.io/specification/2026-07-28/server/prompts" rel="noreferrer" data-network="true">MCP 2026-07-28 Prompts <small>↗ 需要联网</small></a></li>
+<li><a href="https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/subscriptions" rel="noreferrer" data-network="true">MCP 2026-07-28 Subscriptions <small>↗ 需要联网</small></a></li>
+<li><a href="https://modelcontextprotocol.io/specification/2026-07-28/server/utilities/caching" rel="noreferrer" data-network="true">MCP 2026-07-28 Caching <small>↗ 需要联网</small></a></li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-13-tools-and-protocols--10-mcp-resources-and-prompts.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-13-tools-and-protocols--10-mcp-resources-and-prompts.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/13-tools-and-protocols/10-mcp-resources-and-prompts/code/main.py">phases/13-tools-and-protocols/10-mcp-resources-and-prompts/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Runnable companion to docs/en.md for MCP protocol version 2026-07-28.
+Official resources contract: https://modelcontextprotocol.io/specification/2026-07-28/server/resources
+Official prompts contract: https://modelcontextprotocol.io/specification/2026-07-28/server/prompts
+Official subscription contract: https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/subscriptions
+The simulator keeps transport details small so the wire invariants remain visible.
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from typing import Any
+
+
+PROTOCOL_VERSION = &quot;2026-07-28&quot;
+SERVER_INFO = {&quot;name&quot;: &quot;lesson-resource-server&quot;, &quot;version&quot;: &quot;2.0.0&quot;}
+
+NOTES = {
+    &quot;notes://note-2&quot;: {
+        &quot;name&quot;: &quot;Release checklist&quot;,
+        &quot;description&quot;: &quot;Checks to run before publishing&quot;,
+        &quot;mimeType&quot;: &quot;text/markdown&quot;,
+        &quot;text&quot;: &quot;# Release\n\n- Run tests\n- Confirm the tag&quot;,
+    },
+    &quot;notes://note-1&quot;: {
+        &quot;name&quot;: &quot;Architecture decision&quot;,
+        &quot;description&quot;: &quot;Why the service uses a stateless protocol boundary&quot;,
+        &quot;mimeType&quot;: &quot;text/markdown&quot;,
+        &quot;text&quot;: &quot;# Decision\n\nKeep protocol requests self-contained.&quot;,
+    },
+}
+
+PROMPTS = {
+    &quot;release_brief&quot;: {
+        &quot;title&quot;: &quot;Draft a release brief&quot;,
+        &quot;description&quot;: &quot;Turn release facts into a concise user-facing brief&quot;,
+        &quot;arguments&quot;: [
+            {&quot;name&quot;: &quot;audience&quot;, &quot;description&quot;: &quot;Who will read the brief&quot;, &quot;required&quot;: True}
+        ],
+    },
+    &quot;review_note&quot;: {
+        &quot;title&quot;: &quot;Review a note&quot;,
+        &quot;description&quot;: &quot;Review one note for a named concern&quot;,
+        &quot;arguments&quot;: [
+            {&quot;name&quot;: &quot;uri&quot;, &quot;description&quot;: &quot;The note resource URI&quot;, &quot;required&quot;: True},
+            {&quot;name&quot;: &quot;focus&quot;, &quot;description&quot;: &quot;The review focus&quot;, &quot;required&quot;: False},
+        ],
+    },
+}
+
+
+class RpcError(Exception):
+    def __init__(self, code: int, message: str, data: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.data = data or {}
+
+    def as_json(self) -&gt; dict[str, Any]:
+        error: dict[str, Any] = {&quot;code&quot;: self.code, &quot;message&quot;: self.message}
+        if self.data:
+            error[&quot;data&quot;] = self.data
+        return error
+
+
+def request_meta(client_name: str = &quot;lesson-client&quot;) -&gt; dict[str, Any]:
+    return {
+        &quot;io.modelcontextprotocol/protocolVersion&quot;: PROTOCOL_VERSION,
+        &quot;io.modelcontextprotocol/clientInfo&quot;: {&quot;name&quot;: client_name, &quot;version&quot;: &quot;1.0.0&quot;},
+        &quot;io.modelcontextprotocol/clientCapabilities&quot;: {},
+    }
+
+
+def response_meta() -&gt; dict[str, Any]:
+    return {&quot;io.modelcontextprotocol/serverInfo&quot;: SERVER_INFO.copy()}
+
+
+def complete(**payload: Any) -&gt; dict[str, Any]:
+    return {&quot;resultType&quot;: &quot;complete&quot;, **payload, &quot;_meta&quot;: response_meta()}
+
+
+def validate_request_meta(params: dict[str, Any]) -&gt; None:
+    meta = params.get(&quot;_meta&quot;)
+    if not isinstance(meta, dict):
+        raise RpcError(-32602, &quot;Missing request metadata&quot;)
+    requested = meta.get(&quot;io.modelcontextprotocol/protocolVersion&quot;)
+    if not isinstance(requested, str):
+        raise RpcError(-32602, &quot;Missing or invalid protocol version&quot;)
+    if requested != PROTOCOL_VERSION:
+        raise RpcError(
+            -32022,
+            &quot;Unsupported protocol version&quot;,
+            {&quot;supported&quot;: [PROTOCOL_VERSION], &quot;requested&quot;: requested},
+        )
+    if not isinstance(meta.get(&quot;io.modelcontextprotocol/clientCapabilities&quot;), dict):
+        raise RpcError(-32602, &quot;Missing client capabilities&quot;)
+
+
+def server_discover(_: dict[str, Any]) -&gt; dict[str, Any]:
+    return complete(
+        supportedVersions=[PROTOCOL_VERSION],
+        capabilities={
+            &quot;resources&quot;: {&quot;listChanged&quot;: True, &quot;subscribe&quot;: True},
+            &quot;prompts&quot;: {&quot;listChanged&quot;: True},
+        },
+        instructions=&quot;Read notes by URI and let users select review prompts.&quot;,
+        ttlMs=3_600_000,
+        cacheScope=&quot;public&quot;,
+    )
+
+
+def resources_list(_: dict[str, Any]) -&gt; dict[str, Any]:
+    resources = [
+        {key: value[key] for key in (&quot;name&quot;, &quot;description&quot;, &quot;mimeType&quot;)} | {&quot;uri&quot;: uri}
+        for uri, value in sorted(NOTES.items())
+    ]
+    return complete(resources=resources, ttlMs=300_000, cacheScope=&quot;public&quot;)
+
+
+def resources_read(params: dict[str, Any]) -&gt; dict[str, Any]:
+    uri = params.get(&quot;uri&quot;)
+    if not isinstance(uri, str) or uri not in NOTES:
+        raise RpcError(-32602, &quot;Unknown or invalid resource URI&quot;, {&quot;uri&quot;: uri})
+    note = NOTES[uri]
+    return complete(
+        contents=[{&quot;uri&quot;: uri, &quot;mimeType&quot;: note[&quot;mimeType&quot;], &quot;text&quot;: note[&quot;text&quot;]}],
+        ttlMs=60_000,
+        cacheScope=&quot;private&quot;,
+    )
+
+
+def prompts_list(_: dict[str, Any]) -&gt; dict[str, Any]:
+    prompts = [{&quot;name&quot;: name, **definition} for name, definition in sorted(PROMPTS.items())]
+    return complete(prompts=prompts, ttlMs=600_000, cacheScope=&quot;public&quot;)
+
+
+def prompts_get(params: dict[str, Any]) -&gt; dict[str, Any]:
+    name = params.get(&quot;name&quot;)
+    arguments = params.get(&quot;arguments&quot;, {})
+    if name not in PROMPTS or not isinstance(arguments, dict):
+        raise RpcError(-32602, &quot;Unknown prompt or invalid arguments&quot;, {&quot;name&quot;: name})
+    if name == &quot;review_note&quot;:
+        uri = arguments.get(&quot;uri&quot;)
+        if uri not in NOTES:
+            raise RpcError(-32602, &quot;review_note requires a known resource URI&quot;, {&quot;uri&quot;: uri})
+        focus = arguments.get(&quot;focus&quot;, &quot;correctness&quot;)
+        text = f&quot;Review the resource {uri} for {focus}. Cite the URI in every finding.&quot;
+    else:
+        audience = arguments.get(&quot;audience&quot;)
+        if not isinstance(audience, str) or not audience.strip():
+            raise RpcError(-32602, &quot;release_brief requires audience&quot;)
+        text = f&quot;Draft a release brief for {audience}. Separate verified facts from open questions.&quot;
+    return complete(
+        description=PROMPTS[name][&quot;description&quot;],
+        messages=[{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: {&quot;type&quot;: &quot;text&quot;, &quot;text&quot;: text}}],
+    )
+
+
+SUPPORTED_NOTIFICATION_FIELDS = {
+    &quot;promptsListChanged&quot;,
+    &quot;resourcesListChanged&quot;,
+    &quot;resourceSubscriptions&quot;,
+}
+
+
+@dataclass(frozen=True)
+class SubscriptionStream:
+    subscription_id: int | str
+    notifications: dict[str, Any]
+
+    def _meta(self) -&gt; dict[str, Any]:
+        return {&quot;io.modelcontextprotocol/subscriptionId&quot;: self.subscription_id}
+
+    def acknowledged(self) -&gt; dict[str, Any]:
+        return {
+            &quot;jsonrpc&quot;: &quot;2.0&quot;,
+            &quot;method&quot;: &quot;notifications/subscriptions/acknowledged&quot;,
+            &quot;params&quot;: {&quot;_meta&quot;: self._meta(), &quot;notifications&quot;: self.notifications},
+        }
+
+    def resource_updated(self, uri: str) -&gt; dict[str, Any] | None:
+        if uri not in self.notifications.get(&quot;resourceSubscriptions&quot;, []):
+            return None
+        return {
+            &quot;jsonrpc&quot;: &quot;2.0&quot;,
+            &quot;method&quot;: &quot;notifications/resources/updated&quot;,
+            &quot;params&quot;: {&quot;_meta&quot;: self._meta(), &quot;uri&quot;: uri},
+        }
+
+    def resources_list_changed(self) -&gt; dict[str, Any] | None:
+        if not self.notifications.get(&quot;resourcesListChanged&quot;):
+            return None
+        return {
+            &quot;jsonrpc&quot;: &quot;2.0&quot;,
+            &quot;method&quot;: &quot;notifications/resources/list_changed&quot;,
+            &quot;params&quot;: {&quot;_meta&quot;: self._meta()},
+        }
+
+    def prompts_list_changed(self) -&gt; dict[str, Any] | None:
+        if not self.notifications.get(&quot;promptsListChanged&quot;):
+            return None
+        return {
+            &quot;jsonrpc&quot;: &quot;2.0&quot;,
+            &quot;method&quot;: &quot;notifications/prompts/list_changed&quot;,
+            &quot;params&quot;: {&quot;_meta&quot;: self._meta()},
+        }
+
+    def close(self) -&gt; dict[str, Any]:
+        return {
+            &quot;jsonrpc&quot;: &quot;2.0&quot;,
+            &quot;id&quot;: self.subscription_id,
+            &quot;result&quot;: {
+                &quot;resultType&quot;: &quot;complete&quot;,
+                &quot;_meta&quot;: self._meta() | response_meta(),
+            },
+        }
+
+
+def subscriptions_listen(request_id: int | str, params: dict[str, Any]) -&gt; SubscriptionStream:
+    requested = params.get(&quot;notifications&quot;)
+    if not isinstance(requested, dict):
+        raise RpcError(-32602, &quot;subscriptions/listen requires a notifications filter&quot;)
+    agreed: dict[str, Any] = {}
+    for key in sorted(SUPPORTED_NOTIFICATION_FIELDS):
+        value = requested.get(key)
+        if key == &quot;resourceSubscriptions&quot; and value is not None:
+            if not isinstance(value, list) or not all(isinstance(uri, str) for uri in value):
+                raise RpcError(-32602, &quot;resourceSubscriptions must be an array of URIs&quot;)
+            agreed[key] = sorted(set(value))
+        elif key != &quot;resourceSubscriptions&quot; and value is True:
+            agreed[key] = True
+    return SubscriptionStream(request_id, agreed)
+
+
+HANDLERS = {
+    &quot;server/discover&quot;: server_discover,
+    &quot;resources/list&quot;: resources_list,
+    &quot;resources/read&quot;: resources_read,
+    &quot;prompts/list&quot;: prompts_list,
+    &quot;prompts/get&quot;: prompts_get,
+}
+
+
+def handle(request: dict[str, Any]) -&gt; dict[str, Any] | SubscriptionStream | None:
+    is_notification = &quot;id&quot; not in request
+    request_id = request.get(&quot;id&quot;)
+    method = request.get(&quot;method&quot;)
+    params = request.get(&quot;params&quot;, {})
+    if not isinstance(params, dict):
+        if is_notification:
+            return None
+        error = RpcError(-32602, &quot;params must be an object&quot;)
+        return {&quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;id&quot;: request_id, &quot;error&quot;: error.as_json()}
+    try:
+        validate_request_meta(params)
+        if is_notification:
+            handler = HANDLERS.get(method)
+            if handler is not None:
+                handler(params)
+            return None
+        if method == &quot;subscriptions/listen&quot;:
+            if request_id is None:
+                raise RpcError(-32602, &quot;subscriptions/listen requires a request id&quot;)
+            return subscriptions_listen(request_id, params)
+        handler = HANDLERS.get(method)
+        if handler is None:
+            raise RpcError(-32601, &quot;Method not found&quot;, {&quot;method&quot;: method})
+        return {&quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;id&quot;: request_id, &quot;result&quot;: handler(params)}
+    except RpcError as exc:
+        if is_notification:
+            return None
+        return {&quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;id&quot;: request_id, &quot;error&quot;: exc.as_json()}
+
+
+def rpc_request(request_id: int, method: str, **params: Any) -&gt; dict[str, Any]:
+    return {
+        &quot;jsonrpc&quot;: &quot;2.0&quot;,
+        &quot;id&quot;: request_id,
+        &quot;method&quot;: method,
+        &quot;params&quot;: {**params, &quot;_meta&quot;: request_meta()},
+    }
+
+
+def demo() -&gt; list[dict[str, Any]]:
+    transcript: list[dict[str, Any]] = []
+    transcript.append(handle(rpc_request(0, &quot;server/discover&quot;)))
+    transcript.append(handle(rpc_request(1, &quot;resources/list&quot;)))
+    transcript.append(handle(rpc_request(2, &quot;resources/read&quot;, uri=&quot;notes://note-1&quot;)))
+    transcript.append(handle(rpc_request(3, &quot;prompts/list&quot;)))
+    transcript.append(
+        handle(
+            rpc_request(
+                4,
+                &quot;prompts/get&quot;,
+                name=&quot;review_note&quot;,
+                arguments={&quot;uri&quot;: &quot;notes://note-1&quot;, &quot;focus&quot;: &quot;operational risk&quot;},
+            )
+        )
+    )
+    stream = handle(
+        rpc_request(
+            5,
+            &quot;subscriptions/listen&quot;,
+            notifications={
+                &quot;resourcesListChanged&quot;: True,
+                &quot;resourceSubscriptions&quot;: [&quot;notes://note-1&quot;],
+            },
+        )
+    )
+    assert isinstance(stream, SubscriptionStream)
+    transcript.extend([stream.acknowledged(), stream.resource_updated(&quot;notes://note-1&quot;), stream.close()])
+    return [item for item in transcript if item is not None]
+
+
+if __name__ == &quot;__main__&quot;:
+    print(json.dumps(demo(), indent=2))
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/13-tools-and-protocols/10-mcp-resources-and-prompts/code/tests/test_main.py">phases/13-tools-and-protocols/10-mcp-resources-and-prompts/code/tests/test_main.py</a><details><summary>查看原始文本</summary><pre><code>import sys
+import unittest
+from pathlib import Path
+
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import main
+
+
+class ResourcePromptTests(unittest.TestCase):
+    def result(self, request):
+        response = main.handle(request)
+        self.assertIsInstance(response, dict)
+        self.assertNotIn(&quot;error&quot;, response)
+        return response[&quot;result&quot;]
+
+    def test_resource_list_is_deterministic(self):
+        first = self.result(main.rpc_request(1, &quot;resources/list&quot;))
+        second = self.result(main.rpc_request(2, &quot;resources/list&quot;))
+        self.assertEqual(first[&quot;resources&quot;], second[&quot;resources&quot;])
+        self.assertEqual([item[&quot;uri&quot;] for item in first[&quot;resources&quot;]], sorted(main.NOTES))
+
+    def test_server_discover_advertises_current_capabilities(self):
+        result = self.result(main.rpc_request(0, &quot;server/discover&quot;))
+        self.assertEqual(result[&quot;supportedVersions&quot;], [main.PROTOCOL_VERSION])
+        self.assertEqual(
+            set(result[&quot;capabilities&quot;]),
+            {&quot;resources&quot;, &quot;prompts&quot;},
+        )
+        self.assertTrue(result[&quot;capabilities&quot;][&quot;resources&quot;][&quot;subscribe&quot;])
+
+    def test_missing_protocol_version_is_invalid_params(self):
+        request = main.rpc_request(0, &quot;resources/list&quot;)
+        del request[&quot;params&quot;][&quot;_meta&quot;][&quot;io.modelcontextprotocol/protocolVersion&quot;]
+        response = main.handle(request)
+        self.assertEqual(response[&quot;error&quot;][&quot;code&quot;], -32602)
+
+    def test_unsupported_version_uses_current_protocol_error(self):
+        request = main.rpc_request(0, &quot;resources/list&quot;)
+        request[&quot;params&quot;][&quot;_meta&quot;][
+            &quot;io.modelcontextprotocol/protocolVersion&quot;
+        ] = &quot;2025-11-25&quot;
+        response = main.handle(request)
+        self.assertEqual(response[&quot;error&quot;][&quot;code&quot;], -32022)
+        self.assertEqual(response[&quot;error&quot;][&quot;data&quot;][&quot;supported&quot;], [main.PROTOCOL_VERSION])
+        self.assertEqual(response[&quot;error&quot;][&quot;data&quot;][&quot;requested&quot;], &quot;2025-11-25&quot;)
+
+    def test_resource_list_has_public_cache_hints(self):
+        result = self.result(main.rpc_request(1, &quot;resources/list&quot;))
+        self.assertEqual(result[&quot;resultType&quot;], &quot;complete&quot;)
+        self.assertEqual(result[&quot;ttlMs&quot;], 300_000)
+        self.assertEqual(result[&quot;cacheScope&quot;], &quot;public&quot;)
+
+    def test_resource_read_has_private_cache_hints(self):
+        result = self.result(main.rpc_request(1, &quot;resources/read&quot;, uri=&quot;notes://note-1&quot;))
+        self.assertEqual(result[&quot;ttlMs&quot;], 60_000)
+        self.assertEqual(result[&quot;cacheScope&quot;], &quot;private&quot;)
+
+    def test_unknown_resource_uses_invalid_params(self):
+        response = main.handle(main.rpc_request(1, &quot;resources/read&quot;, uri=&quot;notes://missing&quot;))
+        self.assertEqual(response[&quot;error&quot;][&quot;code&quot;], -32602)
+
+    def test_prompt_list_is_deterministic_and_cacheable(self):
+        result = self.result(main.rpc_request(1, &quot;prompts/list&quot;))
+        self.assertEqual([item[&quot;name&quot;] for item in result[&quot;prompts&quot;]], sorted(main.PROMPTS))
+        self.assertEqual((result[&quot;ttlMs&quot;], result[&quot;cacheScope&quot;]), (600_000, &quot;public&quot;))
+
+    def test_prompt_get_validates_required_argument(self):
+        response = main.handle(main.rpc_request(1, &quot;prompts/get&quot;, name=&quot;release_brief&quot;, arguments={}))
+        self.assertEqual(response[&quot;error&quot;][&quot;code&quot;], -32602)
+
+    def test_subscription_acknowledgment_is_first_message(self):
+        stream = main.handle(
+            main.rpc_request(
+                17,
+                &quot;subscriptions/listen&quot;,
+                notifications={&quot;resourceSubscriptions&quot;: [&quot;notes://note-1&quot;]},
+            )
+        )
+        self.assertIsInstance(stream, main.SubscriptionStream)
+        acknowledgment = stream.acknowledged()
+        self.assertEqual(acknowledgment[&quot;method&quot;], &quot;notifications/subscriptions/acknowledged&quot;)
+        self.assertEqual(acknowledgment[&quot;params&quot;][&quot;_meta&quot;][&quot;io.modelcontextprotocol/subscriptionId&quot;], 17)
+
+    def test_subscription_filters_and_correlates_updates(self):
+        stream = main.subscriptions_listen(
+            22, {&quot;notifications&quot;: {&quot;resourceSubscriptions&quot;: [&quot;notes://note-1&quot;]}}
+        )
+        self.assertIsNone(stream.resource_updated(&quot;notes://note-2&quot;))
+        event = stream.resource_updated(&quot;notes://note-1&quot;)
+        self.assertEqual(event[&quot;params&quot;][&quot;_meta&quot;][&quot;io.modelcontextprotocol/subscriptionId&quot;], 22)
+
+    def test_legacy_subscription_methods_are_not_exposed(self):
+        self.assertNotIn(&quot;resources/subscribe&quot;, main.HANDLERS)
+        self.assertNotIn(&quot;resources/unsubscribe&quot;, main.HANDLERS)
+
+    def test_every_complete_result_identifies_server(self):
+        result = self.result(main.rpc_request(1, &quot;resources/list&quot;))
+        self.assertEqual(result[&quot;_meta&quot;][&quot;io.modelcontextprotocol/serverInfo&quot;], main.SERVER_INFO)
+
+    def test_json_rpc_notification_receives_no_response(self):
+        request = main.rpc_request(1, &quot;resources/list&quot;)
+        del request[&quot;id&quot;]
+        self.assertIsNone(main.handle(request))
+
+
+if __name__ == &quot;__main__&quot;:
+    unittest.main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/13-tools-and-protocols/10-mcp-resources-and-prompts/outputs/skill-primitive-splitter.md">phases/13-tools-and-protocols/10-mcp-resources-and-prompts/outputs/skill-primitive-splitter.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: primitive-splitter
+description: Review an MCP server design and separate tools, resources, prompts, caching, and subscriptions using the 2026-07-28 contract.
+version: 2.0.0
+phase: 13
+lesson: 10
+tags: [mcp, resources, prompts, subscriptions, caching]
+---
+
+Review a proposed MCP server from the consumer&#39;s point of view.
+
+Produce:
+
+1. A `server/discover` result advertising revision `2026-07-28` and the exact resource and prompt capabilities.
+2. A table with `name`, `chooser`, `primitive`, and `reason`.
+3. Stable resource URI schemes and any bounded resource templates.
+4. Prompt names, descriptions, and required or optional arguments.
+5. A deterministic ordering rule for every list method.
+6. A cache policy with `ttlMs` and `cacheScope` for each cacheable result.
+7. A `subscriptions/listen` filter for resources or list changes that need updates.
+8. One invalid-resource example that returns JSON-RPC `-32602`, plus an unsupported-revision example that returns `-32022` with `supported` and `requested`.
+
+Use these decision rules:
+
+- A model-selected operation is a tool.
+- Host-readable URI-addressed content is a resource.
+- A user-selected message workflow is a prompt.
+- An update stream is client-opened through `subscriptions/listen`.
+- The listen request ID becomes `io.modelcontextprotocol/subscriptionId`.
+- The acknowledgment must precede all events on that subscription.
+- A notification never bypasses authorization for a later read.
+- `server/discover` is mandatory even when a client chooses to call another method first.
+
+Reject a design when:
+
+- A list varies because of connection history.
+- A private result is placed in a public cache.
+- A resource URI is accepted without parsing, authorization, and boundary checks.
+- The design uses `resources/subscribe` or treats a subscription as a protocol session.
+- A prompt is allowed to override trusted host instructions.
+
+Return a one-page contract review. End with the highest-risk primitive, cache, or subscription mistake and the smallest correction.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. A host needs to retrieve a stable architecture note by URI. Which MCP primitive fits best?</legend><label class="option"><input type="radio" name="q0" value="0"> A resource</label><label class="option"><input type="radio" name="q0" value="1"> A cancellation notification</label><label class="option"><input type="radio" name="q0" value="2"> A protocol session</label><label class="option"><input type="radio" name="q0" value="3"> A destructive tool</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. What should a 2026-07-28 server return when resources/read receives an unknown resource URI?</legend><label class="option"><input type="radio" name="q1" value="0"> A resources/list_changed notification</label><label class="option"><input type="radio" name="q1" value="1"> JSON-RPC error -32601</label><label class="option"><input type="radio" name="q1" value="2"> An empty successful contents array</label><label class="option"><input type="radio" name="q1" value="3"> JSON-RPC error -32602</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. Which cache policy is safest for a user-owned note returned by resources/read?</legend><label class="option"><input type="radio" name="q2" value="0"> Public because the URI is stable</label><label class="option"><input type="radio" name="q2" value="1"> Shared across users when the MIME type matches</label><label class="option"><input type="radio" name="q2" value="2"> Private with a bounded TTL</label><label class="option"><input type="radio" name="q2" value="3"> Public with an unlimited TTL</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. What identifies every notification on a subscriptions/listen response stream?</legend><label class="option"><input type="radio" name="q3" value="0"> The original listen request ID in subscription metadata</label><label class="option"><input type="radio" name="q3" value="1"> The resource MIME type</label><label class="option"><input type="radio" name="q3" value="2"> A newly generated protocol session</label><label class="option"><input type="radio" name="q3" value="3"> The server process ID</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. Why must resources/list and prompts/list be deterministic for the same request inputs?</legend><label class="option"><input type="radio" name="q4" value="0"> To grant public access to all returned entries</label><label class="option"><input type="radio" name="q4" value="1"> To avoid validating pagination cursors</label><label class="option"><input type="radio" name="q4" value="2"> To stabilize caches, snapshots, and host interfaces</label><label class="option"><input type="radio" name="q4" value="3"> To make list membership depend on a prior read</label><p data-feedback="4"></p></fieldset><fieldset><legend>6. What must a current MCP server expose even when clients may call resources/list directly?</legend><label class="option"><input type="radio" name="q5" value="0"> A resources/subscribe method for every URI</label><label class="option"><input type="radio" name="q5" value="1"> An initialize method that creates a protocol session</label><label class="option"><input type="radio" name="q5" value="2"> A standalone HTTP GET event stream</label><label class="option"><input type="radio" name="q5" value="3"> server/discover with supported revisions and capabilities</label><p data-feedback="5"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/13-tools-and-protocols/09-mcp-transports/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/13-tools-and-protocols/11-mcp-sampling/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/13-tools-and-protocols/10-mcp-resources-and-prompts/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

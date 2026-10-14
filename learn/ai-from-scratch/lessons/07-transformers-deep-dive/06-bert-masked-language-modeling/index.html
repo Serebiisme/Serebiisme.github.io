@@ -1,0 +1,588 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>面具语言建模 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-07-transformers-deep-dive" data-lesson="07-transformers-deep-dive/06-bert-masked-language-modeling" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/07-transformers-deep-dive/">深入 Transformer</a> / LESSON 06</p><h1 class="lesson-title">面具语言建模</h1><p>BERT — Masked Language Modeling</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>面具语言建模</h1>
+<blockquote>
+<p>预测下一个字,预测一个缺失的字,一个句子的差异,一个半十年的嵌入式形状.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 7 · 05 (Full Transformer), Phase 5 · 02 (Text Representation)
+<strong>Time:</strong> ~45 minutes</p>
+<h2>问题</h2>
+<p>2018年,每一个NLP任务都从零开始训练了自己的模型,使用自己的标签数据.没有预训练的&quot;理解英语&quot;检查点,你可以调整.ELMo (2018) 显示你可以预训练背景嵌入式使用双向LSTM;它帮助但没有通用化.</p>
+<p>伯特 (Devlin et al. 2018) 问:如果我们拿一个变压器编码器,训练它在互联网上的每句话,并强迫它预测两个方面缺失的语境中的单词呢?</p>
+<p>结果:在18个月内,BERT及其变体 (RoBERTa,ALBERT,ELECTRA) 占据了所有现有的NLP排名榜.到2020年,地球上每一个搜索引擎,内容调节管道和语义搜索系统都拥有BERT.</p>
+<p>2026年仅使用编码器的模型仍然是分类,检索和结构化提取的合适工具.它们比解码器更快510x,其嵌入式是每个现代检索堆的骨干.ModernBERT (2024年12月) 通过Flash Attention + RoPE + GeGLU将架构推向8K文本.</p>
+<h2>概念</h2>
+<p><img src="/learn/ai-from-scratch/files/phases/07-transformers-deep-dive/06-bert-masked-language-modeling/assets/bert-mlm.svg" alt="Masked language modeling: pick tokens, mask them, predict originals" loading="lazy"></p>
+<h3>训练信号</h3>
+<p>拿一个句子:<code>the quick brown fox jumps over the lazy dog</code>现在,我们要去.</p>
+<p>随机地出15%的代币:</p>
+<pre><code>input:  the [MASK] brown fox jumps [MASK] the lazy dog
+target: the  quick brown fox jumps  over  the lazy dog
+</code></pre>
+<p>训练模型以预测原始代币在隐藏位置. 因为编码器是双向,预测<code>[MASK]</code>在位置1可以使用<code>brown fox jumps</code>现在,我们在2+位置上做了什么?</p>
+<h3>关于BERT面具的规则</h3>
+<p>预测选择的15%的代币:</p>
+<ul>
+<li>80% 则被替换为<code>[MASK]</code>现在,我们要去.</li>
+<li>10% 则被随机代币取代.</li>
+<li>只有10%的情况保持不变.</li>
+</ul>
+<p>为什么不总是<code>[MASK]</code>因为<code>[MASK]</code>训练模型以预期<code>[MASK]</code>假设在100%的面具位置,预训练和细调之间会产生分布转变.10%的随机加上10%的变化保持模型的诚实性.</p>
+<h3>下一句预测 (NSP) ,为什么它被放弃</h3>
+<p>原始BERT也在NSP上训练:给了两个句子A和B,预测如果B跟随A.RoBERTa (2019) 删除了它并显示NSP受伤,没有帮助.现代编码器跳过它.</p>
+<h3>2026年发生了什么变化:ModernBERT</h3>
+<p>根据2026年的原始模型,</p>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Original BERT (2018)</th>
+<th>ModernBERT (2024)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Positional</td>
+<td>Learned absolute</td>
+<td>RoPE</td>
+</tr>
+<tr>
+<td>Activation</td>
+<td>GELU</td>
+<td>GeGLU</td>
+</tr>
+<tr>
+<td>Normalization</td>
+<td>LayerNorm</td>
+<td>Pre-norm RMSNorm</td>
+</tr>
+<tr>
+<td>Attention</td>
+<td>Full dense</td>
+<td>Alternating local (128) + global</td>
+</tr>
+<tr>
+<td>Context length</td>
+<td>512</td>
+<td>8192</td>
+</tr>
+<tr>
+<td>Tokenizer</td>
+<td>WordPiece</td>
+<td>BPE</td>
+</tr>
+</tbody>
+</table>
+<p>与2018年的堆不同,它是闪光注意力原生.在序列长度8K时,传输速度比DeBERTa-v3更快,GLU比分更好.</p>
+<h3>在2026年仍会选择编码器的使用案例</h3>
+<table>
+<thead>
+<tr>
+<th>Task</th>
+<th>Why encoder beats decoder</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Retrieval / semantic search embeddings</td>
+<td>Bidirectional context = better embedding quality per token</td>
+</tr>
+<tr>
+<td>Classification (sentiment, intent, toxicity)</td>
+<td>One forward pass; no generation overhead</td>
+</tr>
+<tr>
+<td>NER / token labeling</td>
+<td>Per-position output, natively bidirectional</td>
+</tr>
+<tr>
+<td>Zero-shot entailment (NLI)</td>
+<td>Classifier head on top of encoder</td>
+</tr>
+<tr>
+<td>Reranker for RAG</td>
+<td>Cross-encoder scoring, 10x faster than LLM rerankers</td>
+</tr>
+</tbody>
+</table>
+<figure><img src="/learn/ai-from-scratch/figures/figure-65e906dabb6af7aa6f82.png" alt="transformer-residual 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<h3>步骤1:掩盖逻辑</h3>
+<p>看到<code>code/main.py</code>功能<code>create_mlm_batch</code>返回输入 ID (面具应用) 和标签 (仅在面具位置, -100其他地方  PyTorch 忽略索引公约).</p>
+<pre><code class="language-python">def create_mlm_batch(tokens, vocab_size, mask_prob=0.15, rng=None):
+    input_ids = list(tokens)
+    labels = [-100] * len(tokens)
+    for i, t in enumerate(tokens):
+        if rng.random() &lt; mask_prob:
+            labels[i] = t
+            r = rng.random()
+            if r &lt; 0.8:
+                input_ids[i] = MASK_ID
+            elif r &lt; 0.9:
+                input_ids[i] = rng.randrange(vocab_size)
+            # else: keep original
+    return input_ids, labels
+</code></pre>
+<h3>步骤2:在一个小的体积上运行MLM预测</h3>
+<p>训练一个2层编码器+MLM头,用20个字,200个句子的词汇.没有梯度.我们做了前进通过的智力检查. 需要 PyTorch的全面训练.</p>
+<h3>步骤3:比较面具类型</h3>
+<p>展示三向规则如何使模型可以使用<code>[MASK]</code>预测一个未蒙面的句子和一个蒙面的句子. 两者都应该产生合理的符号分布,因为模型在训练中看到了两种模式.</p>
+<h3>步骤4:细调头</h3>
+<p>换一个玩具感觉数据集上的MLM头部以分类头部. 只有头部,编码器被结. 每个BERT应用程序都遵循这种模式.</p>
+<h2>用它</h2>
+<pre><code class="language-python">from transformers import AutoModel, AutoTokenizer
+
+tok = AutoTokenizer.from_pretrained(&quot;answerdotai/ModernBERT-base&quot;)
+model = AutoModel.from_pretrained(&quot;answerdotai/ModernBERT-base&quot;)
+
+text = &quot;Attention is all you need.&quot;
+inputs = tok(text, return_tensors=&quot;pt&quot;)
+out = model(**inputs).last_hidden_state   # (1, N, 768)
+</code></pre>
+<p><strong>Embedding models are fine-tuned BERT.</strong> <code>sentence-transformers</code>模型<code>all-MiniLM-L6-v2</code>它们的编码器是相同的,损失发生了变化.</p>
+<p>**Cross-encoder rerankers are also fine-tuned BERT.**双对分类<code>[CLS] query [SEP] doc [SEP]</code>查询和文档之间的双向关注正是交叉编码器对双码器的质量优势.</p>
+<p>**When not to pick BERT in 2026.**任何生成性.编码器没有任何合理的方式来自动降低生成代币.</p>
+<h2>运送它</h2>
+<p>看到<code>outputs/skill-bert-finetuner.md</code>技能范围为一个新的分类或提取任务进行BERT细调 (背骨选择,头部规格,数据,评估,停止).</p>
+<h2>运动</h2>
+<ol>
+<li>**Easy.**跑步<code>code/main.py</code>确认15%是选定的,其中80%是<code>[MASK]</code>现在,我们要去.</li>
+<li>**Medium.**实施全字掩饰:如果一个词被标记成子词,把所有子词都掩盖在一起或没有.测量这是否提高了500句子的MLM准确性.</li>
+<li>**Hard.**训练一个小的 (2层,d=64) BERT从公共数据集中的1万句子.<code>[CLS]</code>比较与匹配的参数中只有解码器的基线.</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>MLM</td>
+<td>&quot;Masked language modeling&quot;</td>
+<td>Training signal: randomly replace 15% of tokens with <code>[MASK]</code>, predict the originals.</td>
+</tr>
+<tr>
+<td>Bidirectional</td>
+<td>&quot;Looks both ways&quot;</td>
+<td>Encoder attention has no causal mask — every position sees every other position.</td>
+</tr>
+<tr>
+<td><code>[CLS]</code></td>
+<td>&quot;The pooler token&quot;</td>
+<td>A special token prepended to every sequence; its final embedding is used as the sentence-level representation.</td>
+</tr>
+<tr>
+<td><code>[SEP]</code></td>
+<td>&quot;Segment separator&quot;</td>
+<td>Separates paired sequences (e.g. query/doc, sentence A/B).</td>
+</tr>
+<tr>
+<td>NSP</td>
+<td>&quot;Next sentence prediction&quot;</td>
+<td>BERT's second pretraining task; shown to be useless in RoBERTa, dropped after 2019.</td>
+</tr>
+<tr>
+<td>Fine-tuning</td>
+<td>&quot;Adapt to a task&quot;</td>
+<td>Keep the encoder mostly frozen; train a small head on top for the downstream task.</td>
+</tr>
+<tr>
+<td>Cross-encoder</td>
+<td>&quot;A reranker&quot;</td>
+<td>A BERT that takes both query and doc as input, outputs a relevance score.</td>
+</tr>
+<tr>
+<td>ModernBERT</td>
+<td>&quot;2024 refresh&quot;</td>
+<td>Encoder rebuilt with RoPE, RMSNorm, GeGLU, alternating local/global attention, 8K context.</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/1810.04805" rel="noreferrer" data-network="true">Devlin et al. (2018). BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding <small>↗ 需要联网</small></a>原始的纸.</li>
+<li><a href="https://arxiv.org/abs/1907.11692" rel="noreferrer" data-network="true">Liu et al. (2019). RoBERTa: A Robustly Optimized BERT Pretraining Approach <small>↗ 需要联网</small></a>如何正确训练BERT;杀死NSP.</li>
+<li><a href="https://arxiv.org/abs/2003.10555" rel="noreferrer" data-network="true">Clark et al. (2020). ELECTRA: Pre-training Text Encoders as Discriminators Rather Than Generators <small>↗ 需要联网</small></a>替换代代币检测在匹配计算时超过MLM.</li>
+<li><a href="https://arxiv.org/abs/2412.13663" rel="noreferrer" data-network="true">Warner et al. (2024). Smarter, Better, Faster, Longer: A Modern Bidirectional Encoder <small>↗ 需要联网</small></a>现代BERT纸.</li>
+<li><a href="https://github.com/huggingface/transformers/blob/main/src/transformers/models/bert/modeling_bert.py" rel="noreferrer" data-network="true">HuggingFace <code>modeling_bert.py</code> <small>↗ 需要联网</small></a>可нони化编码器参考.</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>BERT — Masked Language Modeling</h1>
+<blockquote>
+<p>GPT predicts the next word. BERT predicts a missing word. One sentence of difference — and half a decade of everything embedding-shaped.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 7 · 05 (Full Transformer), Phase 5 · 02 (Text Representation)
+<strong>Time:</strong> ~45 minutes</p>
+<h2>The Problem</h2>
+<p>In 2018 every NLP task — sentiment, NER, QA, entailment — trained its own model from scratch on its own labeled data. There was no pre-trained &quot;understand English&quot; checkpoint you could fine-tune. ELMo (2018) showed you could pre-train contextual embeddings with a bidirectional LSTM; it helped but did not generalize.</p>
+<p>BERT (Devlin et al. 2018) asked: what if we took a transformer encoder, trained it on every sentence on the internet, and forced it to predict missing words from context on both sides? Then you fine-tune one head on your downstream task. Parameter efficiency was a revelation.</p>
+<p>The result: within 18 months BERT and its variants (RoBERTa, ALBERT, ELECTRA) dominated every NLP leaderboard that existed. By 2020 every search engine, content moderation pipeline, and semantic-search system on earth had a BERT inside.</p>
+<p>In 2026 encoder-only models are still the right tool for classification, retrieval, and structured extraction — they run 5–10× faster per token than decoders and their embeddings are the backbone of every modern retrieval stack. ModernBERT (Dec 2024) pushed the architecture to 8K context with Flash Attention + RoPE + GeGLU.</p>
+<h2>The Concept</h2>
+<p><img src="/learn/ai-from-scratch/files/phases/07-transformers-deep-dive/06-bert-masked-language-modeling/assets/bert-mlm.svg" alt="Masked language modeling: pick tokens, mask them, predict originals" loading="lazy"></p>
+<h3>The training signal</h3>
+<p>Take a sentence: <code>the quick brown fox jumps over the lazy dog</code>.</p>
+<p>Mask 15% of tokens randomly:</p>
+<pre><code>input:  the [MASK] brown fox jumps [MASK] the lazy dog
+target: the  quick brown fox jumps  over  the lazy dog
+</code></pre>
+<p>Train the model to predict the original tokens at masked positions. Because the encoder is bidirectional, predicting <code>[MASK]</code> at position 1 can use <code>brown fox jumps</code> at positions 2+. That is the thing GPT cannot do.</p>
+<h3>The BERT mask rules</h3>
+<p>Of the 15% of tokens selected for prediction:</p>
+<ul>
+<li>80% are replaced with <code>[MASK]</code>.</li>
+<li>10% are replaced with a random token.</li>
+<li>10% are left unchanged.</li>
+</ul>
+<p>Why not always <code>[MASK]</code>? Because <code>[MASK]</code> never appears at inference time. Training the model to expect <code>[MASK]</code> at 100% of masked positions would create a distribution shift between pretraining and fine-tuning. The 10% random + 10% unchanged keeps the model honest.</p>
+<h3>Next Sentence Prediction (NSP) — and why it was dropped</h3>
+<p>Original BERT also trained on NSP: given two sentences A and B, predict if B follows A. RoBERTa (2019) ablated it and showed NSP hurt, not helped. Modern encoders skip it.</p>
+<h3>What changed in 2026: ModernBERT</h3>
+<p>The 2024 ModernBERT paper rebuilt the block with 2026 primitives:</p>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Original BERT (2018)</th>
+<th>ModernBERT (2024)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Positional</td>
+<td>Learned absolute</td>
+<td>RoPE</td>
+</tr>
+<tr>
+<td>Activation</td>
+<td>GELU</td>
+<td>GeGLU</td>
+</tr>
+<tr>
+<td>Normalization</td>
+<td>LayerNorm</td>
+<td>Pre-norm RMSNorm</td>
+</tr>
+<tr>
+<td>Attention</td>
+<td>Full dense</td>
+<td>Alternating local (128) + global</td>
+</tr>
+<tr>
+<td>Context length</td>
+<td>512</td>
+<td>8192</td>
+</tr>
+<tr>
+<td>Tokenizer</td>
+<td>WordPiece</td>
+<td>BPE</td>
+</tr>
+</tbody>
+</table>
+<p>And unlike the 2018 stack, it is Flash-Attention-native. Inference is 2–3× faster at sequence length 8K than DeBERTa-v3 with better GLUE scores.</p>
+<h3>Use cases that still pick an encoder in 2026</h3>
+<table>
+<thead>
+<tr>
+<th>Task</th>
+<th>Why encoder beats decoder</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Retrieval / semantic search embeddings</td>
+<td>Bidirectional context = better embedding quality per token</td>
+</tr>
+<tr>
+<td>Classification (sentiment, intent, toxicity)</td>
+<td>One forward pass; no generation overhead</td>
+</tr>
+<tr>
+<td>NER / token labeling</td>
+<td>Per-position output, natively bidirectional</td>
+</tr>
+<tr>
+<td>Zero-shot entailment (NLI)</td>
+<td>Classifier head on top of encoder</td>
+</tr>
+<tr>
+<td>Reranker for RAG</td>
+<td>Cross-encoder scoring, 10x faster than LLM rerankers</td>
+</tr>
+</tbody>
+</table>
+<figure><img src="/learn/ai-from-scratch/figures/figure-65e906dabb6af7aa6f82.png" alt="transformer-residual 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<h3>Step 1: masking logic</h3>
+<p>See <code>code/main.py</code>. The function <code>create_mlm_batch</code> takes a list of token IDs, a vocab size, and a mask probability. Returns input IDs (with masks applied) and labels (only at masked positions, -100 elsewhere — PyTorch's ignore index convention).</p>
+<pre><code class="language-python">def create_mlm_batch(tokens, vocab_size, mask_prob=0.15, rng=None):
+    input_ids = list(tokens)
+    labels = [-100] * len(tokens)
+    for i, t in enumerate(tokens):
+        if rng.random() &lt; mask_prob:
+            labels[i] = t
+            r = rng.random()
+            if r &lt; 0.8:
+                input_ids[i] = MASK_ID
+            elif r &lt; 0.9:
+                input_ids[i] = rng.randrange(vocab_size)
+            # else: keep original
+    return input_ids, labels
+</code></pre>
+<h3>Step 2: run MLM prediction on a tiny corpus</h3>
+<p>Train a 2-layer encoder + MLM head on a vocabulary of 20 words, 200 sentences. No gradient — we do forward-pass sanity checks. Full training needs PyTorch.</p>
+<h3>Step 3: compare mask types</h3>
+<p>Show how the three-way rule keeps the model usable without <code>[MASK]</code>. Predict on an unmasked sentence and on a masked sentence. Both should produce reasonable token distributions because the model saw both patterns in training.</p>
+<h3>Step 4: fine-tune head</h3>
+<p>Replace the MLM head with a classification head on a toy sentiment dataset. Only the head trains; the encoder is frozen. This is the pattern every BERT application follows.</p>
+<h2>Use It</h2>
+<pre><code class="language-python">from transformers import AutoModel, AutoTokenizer
+
+tok = AutoTokenizer.from_pretrained(&quot;answerdotai/ModernBERT-base&quot;)
+model = AutoModel.from_pretrained(&quot;answerdotai/ModernBERT-base&quot;)
+
+text = &quot;Attention is all you need.&quot;
+inputs = tok(text, return_tensors=&quot;pt&quot;)
+out = model(**inputs).last_hidden_state   # (1, N, 768)
+</code></pre>
+<p><strong>Embedding models are fine-tuned BERT.</strong> <code>sentence-transformers</code> models like <code>all-MiniLM-L6-v2</code> are BERTs trained with contrastive loss. The encoder is the same. The loss changed.</p>
+<p><strong>Cross-encoder rerankers are also fine-tuned BERT.</strong> Pair-classification on <code>[CLS] query [SEP] doc [SEP]</code>. The bidirectional attention between query and doc is exactly what gives cross-encoders their quality edge over biencoders.</p>
+<p><strong>When not to pick BERT in 2026.</strong> Anything generative. The encoder has no sensible way to autoregressively produce tokens. Also: anything under 1B params where a small decoder can match quality with more flexibility (Phi-3-Mini, Qwen2-1.5B).</p>
+<h2>Ship It</h2>
+<p>See <code>outputs/skill-bert-finetuner.md</code>. The skill scopes a BERT fine-tune (backbone choice, head spec, data, eval, stopping) for a new classification or extraction task.</p>
+<h2>Exercises</h2>
+<ol>
+<li><strong>Easy.</strong> Run <code>code/main.py</code> and print the mask distribution across 10,000 tokens. Confirm ~15% are selected, and of those ~80% become <code>[MASK]</code>.</li>
+<li><strong>Medium.</strong> Implement whole-word masking: if a word is tokenized into subwords, mask all subwords together or none. Measure whether this improves MLM accuracy on a 500-sentence corpus.</li>
+<li><strong>Hard.</strong> Train a tiny (2-layer, d=64) BERT on 10,000 sentences from a public dataset. Fine-tune the <code>[CLS]</code> token for SST-2 sentiment. Compare against a decoder-only baseline at matched params — which wins?</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>MLM</td>
+<td>&quot;Masked language modeling&quot;</td>
+<td>Training signal: randomly replace 15% of tokens with <code>[MASK]</code>, predict the originals.</td>
+</tr>
+<tr>
+<td>Bidirectional</td>
+<td>&quot;Looks both ways&quot;</td>
+<td>Encoder attention has no causal mask — every position sees every other position.</td>
+</tr>
+<tr>
+<td><code>[CLS]</code></td>
+<td>&quot;The pooler token&quot;</td>
+<td>A special token prepended to every sequence; its final embedding is used as the sentence-level representation.</td>
+</tr>
+<tr>
+<td><code>[SEP]</code></td>
+<td>&quot;Segment separator&quot;</td>
+<td>Separates paired sequences (e.g. query/doc, sentence A/B).</td>
+</tr>
+<tr>
+<td>NSP</td>
+<td>&quot;Next sentence prediction&quot;</td>
+<td>BERT's second pretraining task; shown to be useless in RoBERTa, dropped after 2019.</td>
+</tr>
+<tr>
+<td>Fine-tuning</td>
+<td>&quot;Adapt to a task&quot;</td>
+<td>Keep the encoder mostly frozen; train a small head on top for the downstream task.</td>
+</tr>
+<tr>
+<td>Cross-encoder</td>
+<td>&quot;A reranker&quot;</td>
+<td>A BERT that takes both query and doc as input, outputs a relevance score.</td>
+</tr>
+<tr>
+<td>ModernBERT</td>
+<td>&quot;2024 refresh&quot;</td>
+<td>Encoder rebuilt with RoPE, RMSNorm, GeGLU, alternating local/global attention, 8K context.</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/1810.04805" rel="noreferrer" data-network="true">Devlin et al. (2018). BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding <small>↗ 需要联网</small></a> — original paper.</li>
+<li><a href="https://arxiv.org/abs/1907.11692" rel="noreferrer" data-network="true">Liu et al. (2019). RoBERTa: A Robustly Optimized BERT Pretraining Approach <small>↗ 需要联网</small></a> — how to train BERT right; kills NSP.</li>
+<li><a href="https://arxiv.org/abs/2003.10555" rel="noreferrer" data-network="true">Clark et al. (2020). ELECTRA: Pre-training Text Encoders as Discriminators Rather Than Generators <small>↗ 需要联网</small></a> — replaced-token detection beats MLM at matched compute.</li>
+<li><a href="https://arxiv.org/abs/2412.13663" rel="noreferrer" data-network="true">Warner et al. (2024). Smarter, Better, Faster, Longer: A Modern Bidirectional Encoder <small>↗ 需要联网</small></a> — ModernBERT paper.</li>
+<li><a href="https://github.com/huggingface/transformers/blob/main/src/transformers/models/bert/modeling_bert.py" rel="noreferrer" data-network="true">HuggingFace <code>modeling_bert.py</code> <small>↗ 需要联网</small></a> — canonical encoder reference.</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-07-transformers-deep-dive--06-bert-masked-language-modeling.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-07-transformers-deep-dive--06-bert-masked-language-modeling.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/07-transformers-deep-dive/06-bert-masked-language-modeling/code/main.py">phases/07-transformers-deep-dive/06-bert-masked-language-modeling/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;BERT-style masked language modeling — the masking rules demystified.
+
+Pure stdlib. Shows the 80/10/10 rule, whole-word masking, and
+distribution sanity checks over a large batch of tokens.
+&quot;&quot;&quot;
+
+import random
+from collections import Counter
+
+
+MASK_ID = 0  # reserve id 0 for [MASK] in this toy vocab
+CLS_ID = 1
+SEP_ID = 2
+SPECIAL_IDS = {MASK_ID, CLS_ID, SEP_ID}
+IGNORE_INDEX = -100
+
+
+def create_mlm_batch(tokens, vocab_size, mask_prob=0.15, rng=None):
+    &quot;&quot;&quot;Apply BERT masking.
+
+    Returns (input_ids, labels). labels[i] = original token if position was
+    selected for prediction, IGNORE_INDEX otherwise.
+    &quot;&quot;&quot;
+    if rng is None:
+        rng = random.Random()
+    input_ids = list(tokens)
+    labels = [IGNORE_INDEX] * len(tokens)
+    for i, t in enumerate(tokens):
+        if t in SPECIAL_IDS:
+            continue
+        if rng.random() &gt;= mask_prob:
+            continue
+        labels[i] = t
+        r = rng.random()
+        if r &lt; 0.8:
+            input_ids[i] = MASK_ID
+        elif r &lt; 0.9:
+            rand_id = t
+            while rand_id in SPECIAL_IDS or rand_id == t:
+                rand_id = rng.randrange(vocab_size)
+            input_ids[i] = rand_id
+    return input_ids, labels
+
+
+def whole_word_mlm(tokens, word_spans, vocab_size, mask_prob=0.15, rng=None):
+    &quot;&quot;&quot;Mask whole words: if any subword in a span is selected, mask all.
+
+    word_spans: list of (start, end) half-open ranges into tokens.
+    &quot;&quot;&quot;
+    if rng is None:
+        rng = random.Random()
+    input_ids = list(tokens)
+    labels = [IGNORE_INDEX] * len(tokens)
+    for start, end in word_spans:
+        if any(tokens[i] in SPECIAL_IDS for i in range(start, end)):
+            continue
+        if rng.random() &gt;= mask_prob:
+            continue
+        r = rng.random()
+        if r &lt; 0.8:
+            for i in range(start, end):
+                labels[i] = tokens[i]
+                input_ids[i] = MASK_ID
+        elif r &lt; 0.9:
+            for i in range(start, end):
+                labels[i] = tokens[i]
+                rand_id = tokens[i]
+                while rand_id in SPECIAL_IDS or rand_id == tokens[i]:
+                    rand_id = rng.randrange(vocab_size)
+                input_ids[i] = rand_id
+        else:
+            for i in range(start, end):
+                labels[i] = tokens[i]
+    return input_ids, labels
+
+
+def distribution_check(n_tokens, vocab_size, mask_prob=0.15, seed=42):
+    rng = random.Random(seed)
+    tokens = [rng.randrange(3, vocab_size) for _ in range(n_tokens)]
+    input_ids, labels = create_mlm_batch(tokens, vocab_size, mask_prob, rng)
+
+    selected = sum(1 for l in labels if l != IGNORE_INDEX)
+    masked = sum(1 for t, l in zip(input_ids, labels) if l != IGNORE_INDEX and t == MASK_ID)
+    randomized = sum(1 for t, l in zip(input_ids, labels) if l != IGNORE_INDEX and t != MASK_ID and t != l)
+    unchanged = sum(1 for t, l in zip(input_ids, labels) if l != IGNORE_INDEX and t == l)
+
+    return {
+        &quot;tokens&quot;: n_tokens,
+        &quot;selected&quot;: selected,
+        &quot;selected_pct&quot;: 100 * selected / n_tokens,
+        &quot;masked_of_selected_pct&quot;: 100 * masked / selected if selected else 0.0,
+        &quot;random_of_selected_pct&quot;: 100 * randomized / selected if selected else 0.0,
+        &quot;unchanged_of_selected_pct&quot;: 100 * unchanged / selected if selected else 0.0,
+    }
+
+
+def toy_predict(masked_inputs, vocab):
+    &quot;&quot;&quot;Pretend MLM head: returns a uniform distribution over vocab.
+    Real BERT uses the encoder output at each position, projected to vocab.
+    &quot;&quot;&quot;
+    V = len(vocab)
+    return [[1.0 / V for _ in range(V)] for _ in masked_inputs]
+
+
+def main():
+    vocab_words = [
+        &quot;[MASK]&quot;, &quot;[CLS]&quot;, &quot;[SEP]&quot;,
+        &quot;the&quot;, &quot;quick&quot;, &quot;brown&quot;, &quot;fox&quot;, &quot;jumps&quot;, &quot;over&quot;,
+        &quot;lazy&quot;, &quot;dog&quot;, &quot;a&quot;, &quot;stitch&quot;, &quot;in&quot;, &quot;time&quot;,
+        &quot;saves&quot;, &quot;nine&quot;, &quot;sat&quot;, &quot;on&quot;, &quot;mat&quot;,
+    ]
+    vocab_size = len(vocab_words)
+    id_of = {w: i for i, w in enumerate(vocab_words)}
+
+    sentence = [&quot;[CLS]&quot;, &quot;the&quot;, &quot;quick&quot;, &quot;brown&quot;, &quot;fox&quot;, &quot;jumps&quot;, &quot;over&quot;, &quot;the&quot;, &quot;lazy&quot;, &quot;dog&quot;, &quot;[SEP]&quot;]
+    tokens = [id_of[w] for w in sentence]
+    rng = random.Random(42)
+    inp, labels = create_mlm_batch(tokens, vocab_size, mask_prob=0.5, rng=rng)
+
+    print(&quot;=== MLM masking demo (prob=0.5 so you can see it) ===&quot;)
+    print(f&quot;{&#39;idx&#39;:&gt;4}  {&#39;word&#39;:&gt;9}  {&#39;input_id&#39;:&gt;9}  {&#39;input_word&#39;:&gt;11}  {&#39;label&#39;:&gt;6}&quot;)
+    for i, (t_in, t_orig, lab) in enumerate(zip(inp, tokens, labels)):
+        print(f&quot;{i:&gt;4}  {vocab_words[t_orig]:&gt;9}  {t_in:&gt;9}  {vocab_words[t_in]:&gt;11}  {lab:&gt;6}&quot;)
+
+    print()
+    print(&quot;=== 80/10/10 distribution over 100k random tokens ===&quot;)
+    stats = distribution_check(n_tokens=100_000, vocab_size=vocab_size, mask_prob=0.15)
+    print(f&quot;selected:                   {stats[&#39;selected_pct&#39;]:.2f}%   (target 15.0%)&quot;)
+    print(f&quot;  -&gt; replaced with [MASK]:  {stats[&#39;masked_of_selected_pct&#39;]:.2f}%   (target 80.0%)&quot;)
+    print(f&quot;  -&gt; replaced with random:  {stats[&#39;random_of_selected_pct&#39;]:.2f}%   (target 10.0%)&quot;)
+    print(f&quot;  -&gt; left unchanged:        {stats[&#39;unchanged_of_selected_pct&#39;]:.2f}%   (target 10.0%)&quot;)
+
+    print()
+    print(&quot;=== whole-word masking demo ===&quot;)
+    # Treat &quot;quick brown&quot; and &quot;lazy dog&quot; as two-subword words for demo
+    tokens2 = [id_of[w] for w in sentence]
+    spans = [(0, 1), (1, 2), (2, 4), (4, 5), (5, 6), (6, 7), (7, 8), (8, 10), (10, 11)]
+    rng2 = random.Random(7)
+    inp2, labels2 = whole_word_mlm(tokens2, spans, vocab_size, mask_prob=0.5, rng=rng2)
+    print(&quot;spans:        &quot; + &quot; &quot;.join(f&quot;[{s}:{e}]&quot; for s, e in spans))
+    print(&quot;input words:  &quot; + &quot; &quot;.join(vocab_words[t] for t in inp2))
+    print(&quot;label mask:   &quot; + &quot; &quot;.join((&quot;P&quot; if l != IGNORE_INDEX else &quot;.&quot;) for l in labels2))
+    print(&quot;P = position has a label, . = ignored&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/07-transformers-deep-dive/06-bert-masked-language-modeling/outputs/skill-bert-finetuner.md">phases/07-transformers-deep-dive/06-bert-masked-language-modeling/outputs/skill-bert-finetuner.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: bert-finetuner
+description: Scope a BERT fine-tune for a new classification, extraction, or retrieval task.
+version: 1.0.0
+phase: 7
+lesson: 6
+tags: [bert, fine-tuning, nlp]
+---
+
+Given a downstream task (classification / NER / retrieval / reranking / NLI), labeled data size, and deployment constraints (latency, device), output:
+
+1. Backbone choice. Model name (ModernBERT-base / large, DeBERTa-v3, multilingual-e5, etc.) with a one-sentence reason. Prefer ModernBERT for English tasks requiring ≤8K context.
+2. Head spec. Classification: `[CLS]` → dropout → linear(num_classes). NER: per-token linear + CRF optional. Retrieval: mean-pool + contrastive loss.
+3. Training recipe. Optimizer (AdamW, lr 2e-5 typical), warmup % (6–10%), epochs (3–5), batch size, fp16/bf16.
+4. Eval plan. Task-appropriate metrics (accuracy + F1 for classification, entity-level F1 for NER, MRR/NDCG for retrieval). Held-out split size.
+5. Failure mode check. One named risk: label leakage, class imbalance, context truncation, tokenizer mismatch between pretrain and fine-tune corpora.
+
+Refuse to fine-tune a BERT on generative output (text generation) — recommend a decoder-only instead. Refuse to ship a fine-tune without class-stratified eval when the minority class is below 10%. Flag any fine-tune that unfreezes the full backbone with &lt;1,000 labeled examples as likely overfit.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原课程未提供测验。</p></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/07-transformers-deep-dive/05-full-transformer/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/07-transformers-deep-dive/07-gpt-causal-language-modeling/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/07-transformers-deep-dive/06-bert-masked-language-modeling/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

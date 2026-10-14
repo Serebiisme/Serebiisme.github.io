@@ -1,0 +1,681 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>从零开始的集体行动 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-19-capstone-projects" data-lesson="19-capstone-projects/76-collective-ops-from-scratch" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/19-capstone-projects/">综合项目</a> / LESSON 76</p><h1 class="lesson-title">从零开始的集体行动</h1><p>Collective Ops From Scratch</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>从零开始的集体行动</h1>
+<blockquote>
+<p>其他原始的培训框架提供了一个包裹. 建立它们一次在一个<code>multiprocessing.Queue</code>线,对它们进行检验,然后其余的轨道变成管道.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 19 Track C lessons 42-49
+<strong>Time:</strong> ~90 min</p>
+<h2>学习目标</h2>
+<ul>
+<li>实现环所有减少在两个通过 (减少分散然后全部集合) 并证明每级通信量为2(N-1) /N字节/元素.</li>
+<li>建立广播,收集,并减少_散播点到点发送的顶部<code>multiprocessing.Queue</code>现在,我们要去.</li>
+<li>检查每一个原始的对比<code>torch.distributed</code>对于相同输入的参考数据.</li>
+<li>保护圆与树的选择,以集群形状,延迟地板和带宽天花板.</li>
+</ul>
+<h2>问题</h2>
+<p>一个天真的全减值在N数列上将N乘以子发送到根,并将N乘以回传输. 带宽尺寸为O(N) 每级,根成为瓶,墙钟地板是最慢的链接乘以N. 环全缩小到2 ((N-1) 块的尺寸T/N,因此每级字节降至2T ((N-1) /N,不论集群尺寸如何. 树全减小N和高延迟链接中获胜,因为深度是log2(N) 跳转而不是2(N-1). 选择错误的拓形态,最慢的GPU决定了步骤时间.</p>
+<p>每个分布式训练框架,你会读到这个轨道,都取决于这些四个原始. 鱼DDP同步梯度,每个参数桶都能减少一个. 通过减少_散射,ZERO通过allgather进行更新参数的节目来缩小优化状态. FSDP将全向转换为allgather加减散. 管道并行需要在各阶段组之间进行激活的广播. 如果不能实现四个集体,你不能解释为什么训练停顿,为什么梯度不匹配在3级,或者为什么管道泡翻倍当你交换拓.</p>
+<h2>概念</h2>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-b0c378af3e1f0a53d913.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>环全减2次</h3>
+<p>按数值为 0..N-1的 N 个等数分. 每个级别都有一个等级的分数指数. 通过1,减少散射,运行N-1步骤. 在步骤s,r级 r将分数 (r - s) 调用 N 调用 (r + 1) 调用 N,并从分数 (r - s - 1) 调用 N 调用 N 调用 (r - 1) 调用 N,并将接收的分数积累到本地副本中. 在N-1步骤之后,r级拥有r部分的全部总数. 通过2,全部集合,再走N-1步骤,然后旋转完成的块环绕,直到每个排列都包含了每个块的全部总和.</p>
+<table>
+<thead>
+<tr>
+<th>Primitive</th>
+<th>Per-rank bytes</th>
+<th>Steps</th>
+<th>When to use</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Ring allreduce</td>
+<td>2T(N-1)/N</td>
+<td>2(N-1)</td>
+<td>Large T, fat-pipe homogeneous cluster</td>
+</tr>
+<tr>
+<td>Tree allreduce</td>
+<td>T log2(N)</td>
+<td>2 log2(N)</td>
+<td>Small T or high-latency links</td>
+</tr>
+<tr>
+<td>Broadcast</td>
+<td>T</td>
+<td>log2(N) tree</td>
+<td>Parameter init, scalar config</td>
+</tr>
+<tr>
+<td>Allgather</td>
+<td>T(N-1)/N</td>
+<td>N-1</td>
+<td>Sharded forward, ZeRO unshard</td>
+</tr>
+<tr>
+<td>Reduce_scatter</td>
+<td>T(N-1)/N</td>
+<td>N-1</td>
+<td>ZeRO gradient sharding</td>
+</tr>
+</tbody>
+</table>
+<h3>排队网作为NCCL的替代</h3>
+<p>对于 CPU 来说,你没有这种情况.<code>multiprocessing.Queue</code>通过每个环边线,您可以在单个生产商和单个消费者之间进行点到点交付. 减少发生在用户空间中,因此您支付Python的费用,但线程图案与NCCL环全减相同. 原因在排队版本上的正确性和集群行为下面.</p>
+<h3>检查对黑色</h3>
+<p>每个原始人都会通过一个单位测试来比较其产量<code>torch.distributed</code>如果您的环全减差于光超过 float32 epsilon,测试失败.对参考实现进行验证是不可谈判的;如果没有它,原始的看起来是正确的,直到真正的训练运行的10000步.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-937adf999e83b8ea706d.png" alt="ci-ring-allreduce 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<p><code>code/main.py</code>执行:</p>
+<ul>
+<li><code>Mesh</code>连接N的类<code>multiprocessing.Queue</code>入一个环,并暴露<code>send(dst, tensor)</code>其他<code>recv(src)</code>根据一个级别.</li>
+<li><code>ring_allreduce(mesh, rank, world_size, tensor)</code>运行两个通行算法.</li>
+<li><code>broadcast(mesh, rank, world_size, tensor, src)</code>在一个高数树上.</li>
+<li><code>allgather(mesh, rank, world_size, tensor)</code>使用N-1旋转.</li>
+<li><code>reduce_scatter(mesh, rank, world_size, tensor)</code>作为&quot;全减&quot;的第一半.</li>
+<li><code>_gloo_reference(op, world_size, tensor)</code>通过相同的输入<code>torch.distributed</code>对于比较的字节等值,</li>
+</ul>
+<p>运行它:</p>
+<pre><code class="language-bash">python3 code/main.py
+</code></pre>
+<p>输出:每次初始验证表对排列网和光线输出进行比较,随后是每次位数字节计数,证明2T(N-1) /N扩展.</p>
+<h2>野生生产模式</h2>
+<p>三个模式使原始人硬得足以运输.</p>
+<p>**Bucket gradients before allreduce.**一个1B参数模型有数万个梯度子.每子的一个减缓器支付延迟地板N倍.DDP桶梯度成25MB块,并发出一个减缓器;小子在大的后面上.没有减缓延迟的上层主导步骤.</p>
+<p>**Overlap communication with computation.**后方计算梯度层次按层次按反行顺序.当最后层梯度准备好时,启动其全减,而下层继续计算. PyTorch DDP 用桶式子线程进行计算.网络惰时,重叠将可见的通信时间减少一半.</p>
+<p>**Pick ring or tree by message size, not religion.**NCCL发送一个拓学探测器,它选择了超过1MB的消息的环,下面的树.交叉式是带宽与延迟:在1MB以上,带宽术语2T(N-1) /N占主导地位,并且带赢得;在1MB以下,log2(N) 跳跃数量赢得.硬编码一个拓学成本错误的消息大小的吞吐量.</p>
+<h2>用它</h2>
+<p>生产模式:</p>
+<ul>
+<li>**PyTorch DDP.**电话<code>dist.all_reduce</code>后向的桶梯度.桶尺寸可以调整;默认25MB对于100Gbit以太网是合理的.</li>
+<li>**DeepSpeed ZeRO.**课程的原始性是 ZeRO 的呼叫.</li>
+<li>**FSDP.**进步开始于allgather去解散层次,计算,然后减少到 reduce_scatter,然后丢弃了解散.</li>
+</ul>
+<h2>运送它</h2>
+<p>在77-81课时使用排列网原始式.77课时,所有线程都减少到DDP.78课时,所有线程都减少到ZeRO.79课时,所有线程都将播放到管道激活中.81课时,所有线程都将被组建成端到端演示.</p>
+<h2>运动</h2>
+<ol>
+<li>根据消息大小,将树变量减小,然后按环和树变换.</li>
+<li>添加一个<code>recv_timeout_ms</code>置的排名会出现截止日期错误,而不是永远挂在.</li>
+<li>取代<code>multiprocessing.Queue</code>测试的结果是相同的,真实线.</li>
+<li>添加一个带宽仪器,以使每位字节计数记录到JSONL.</li>
+<li>对于1KB,1MB,16MB的子,比较环与树的墙钟时间4行.</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Allreduce</td>
+<td>&quot;Sum across ranks&quot;</td>
+<td>After the call every rank holds the same reduced tensor</td>
+</tr>
+<tr>
+<td>Ring</td>
+<td>&quot;The fast topology&quot;</td>
+<td>N-1 chunks of size T/N flow around the cycle twice</td>
+</tr>
+<tr>
+<td>Tree</td>
+<td>&quot;The log topology&quot;</td>
+<td>Reduction follows a binary tree; depth is log2(N) hops</td>
+</tr>
+<tr>
+<td>Allgather</td>
+<td>&quot;Concatenate shards&quot;</td>
+<td>Every rank ends with every other rank's shard</td>
+</tr>
+<tr>
+<td>Reduce_scatter</td>
+<td>&quot;Split the sum&quot;</td>
+<td>Each rank ends with the sum of one chunk only</td>
+</tr>
+<tr>
+<td>Bucket</td>
+<td>&quot;Fuse small tensors&quot;</td>
+<td>Coalesce N small allreduces into one large one</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://pytorch.org/docs/stable/distributed.html#collective-functions" rel="noreferrer" data-network="true">PyTorch Distributed: NCCL collectives <small>↗ 需要联网</small></a></li>
+<li><a href="https://arxiv.org/abs/1802.05799" rel="noreferrer" data-network="true">Horovod ring allreduce paper <small>↗ 需要联网</small></a></li>
+<li><a href="https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/index.html" rel="noreferrer" data-network="true">NCCL topology and algorithm selection <small>↗ 需要联网</small></a></li>
+<li><a href="https://www.cs.fsu.edu/~xyuan/paper/09jpdc.pdf" rel="noreferrer" data-network="true">Patarasuk and Yuan, Bandwidth optimal allreduce algorithms <small>↗ 需要联网</small></a></li>
+<li>第十阶段05课 - 分布培训概述</li>
+<li>第19阶段 第77课 - - DDP线上这些原始</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Collective Ops From Scratch</h1>
+<blockquote>
+<p>The four collective operations that hold distributed training together are allreduce, broadcast, allgather, and reduce_scatter. Every other primitive a training framework offers is a wrapper around these. Build them once over a <code>multiprocessing.Queue</code> mesh, verify them against a reference implementation, and the rest of the track becomes plumbing.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 19 Track C lessons 42-49
+<strong>Time:</strong> ~90 min</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Implement ring allreduce in two passes (reduce-scatter then allgather) and prove the per-rank communication volume is 2(N-1)/N bytes per element.</li>
+<li>Build broadcast, allgather, and reduce_scatter on top of point-to-point sends over <code>multiprocessing.Queue</code>.</li>
+<li>Verify every primitive against a <code>torch.distributed</code> gloo reference for the same input.</li>
+<li>Defend the choice of ring versus tree on cluster shape, latency floor, and bandwidth ceiling.</li>
+</ul>
+<h2>The Problem</h2>
+<p>A naive allreduce over N ranks sends N times the tensor to a root and broadcasts N times back. Bandwidth scales as O(N) per rank, the root becomes a bottleneck, and the wall-clock floor is the slowest link times N. Ring allreduce flattens that into 2(N-1) chunks of size T/N, so per-rank bytes drop to 2T(N-1)/N independent of cluster size. Tree allreduce wins on small N and high-latency links because depth is log2(N) hops instead of 2(N-1). Pick the wrong topology for the cluster shape and the slowest GPU dictates step time.</p>
+<p>Every distributed training framework you will read this track depends on these four primitives. PyTorch DDP synchronises gradients with one allreduce per parameter bucket. ZeRO shards optimiser state by reduce_scatter and broadcasts updated parameters by allgather. FSDP turns the full forward into allgather plus reduce_scatter. Pipeline parallel needs broadcast for activations across stage groups. If you cannot implement the four collectives, you cannot reason about why training stalls, why the gradient mismatch shows up at rank 3, or why the pipeline bubble doubles when you swap topologies.</p>
+<h2>The Concept</h2>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-b0c378af3e1f0a53d913.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>Ring allreduce in two passes</h3>
+<p>Split the tensor into N equal chunks indexed 0..N-1. Each rank owns chunk index equal to its rank. Pass 1, reduce-scatter, runs N-1 steps. At step s, rank r sends chunk (r - s) mod N to rank (r + 1) mod N and receives chunk (r - s - 1) mod N from rank (r - 1) mod N, accumulating the received chunk into its local copy. After N-1 steps, rank r owns the full sum for chunk r. Pass 2, allgather, runs another N-1 steps and rotates the finished chunks around the ring until every rank holds the full sum for every chunk.</p>
+<table>
+<thead>
+<tr>
+<th>Primitive</th>
+<th>Per-rank bytes</th>
+<th>Steps</th>
+<th>When to use</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Ring allreduce</td>
+<td>2T(N-1)/N</td>
+<td>2(N-1)</td>
+<td>Large T, fat-pipe homogeneous cluster</td>
+</tr>
+<tr>
+<td>Tree allreduce</td>
+<td>T log2(N)</td>
+<td>2 log2(N)</td>
+<td>Small T or high-latency links</td>
+</tr>
+<tr>
+<td>Broadcast</td>
+<td>T</td>
+<td>log2(N) tree</td>
+<td>Parameter init, scalar config</td>
+</tr>
+<tr>
+<td>Allgather</td>
+<td>T(N-1)/N</td>
+<td>N-1</td>
+<td>Sharded forward, ZeRO unshard</td>
+</tr>
+<tr>
+<td>Reduce_scatter</td>
+<td>T(N-1)/N</td>
+<td>N-1</td>
+<td>ZeRO gradient sharding</td>
+</tr>
+</tbody>
+</table>
+<h3>Queue mesh as a stand-in for NCCL</h3>
+<p>NCCL runs over PCIe and NVLink with hardware-offloaded reductions. On CPU you do not have that. A <code>multiprocessing.Queue</code> per ring edge gives you ordered point-to-point delivery with a single producer and single consumer. The reduction happens in user space, so you pay Python overhead, but the wire pattern is identical to NCCL ring allreduce. Reason about correctness on the queue version and the cluster behaviour follows.</p>
+<h3>Verify against gloo</h3>
+<p>Every primitive lands with a unit test that compares its output against <code>torch.distributed</code> initialised with the gloo backend on the same tensor across the same world size. If your ring allreduce diverges from gloo by more than float32 epsilon, the test fails. Verification against a reference implementation is non-negotiable; without it the primitive looks correct until step 10000 of a real training run.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-937adf999e83b8ea706d.png" alt="ci-ring-allreduce 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<p><code>code/main.py</code> implements:</p>
+<ul>
+<li><code>Mesh</code> class that wires N <code>multiprocessing.Queue</code> instances into a ring and exposes <code>send(dst, tensor)</code> and <code>recv(src)</code> per rank.</li>
+<li><code>ring_allreduce(mesh, rank, world_size, tensor)</code> running the two-pass algorithm.</li>
+<li><code>broadcast(mesh, rank, world_size, tensor, src)</code> over a logarithmic tree.</li>
+<li><code>allgather(mesh, rank, world_size, tensor)</code> using N-1 rotations.</li>
+<li><code>reduce_scatter(mesh, rank, world_size, tensor)</code> as the first half of allreduce.</li>
+<li><code>_gloo_reference(op, world_size, tensor)</code> that runs the same input through <code>torch.distributed</code> with gloo for byte-equal comparison.</li>
+</ul>
+<p>Run it:</p>
+<pre><code class="language-bash">python3 code/main.py
+</code></pre>
+<p>Output: per-primitive verification table comparing queue-mesh and gloo outputs, followed by a per-rank byte counter that proves the 2T(N-1)/N scaling.</p>
+<h2>Production patterns in the wild</h2>
+<p>Three patterns harden the primitives enough to ship.</p>
+<p><strong>Bucket gradients before allreduce.</strong> A 1B-parameter model has tens of thousands of gradient tensors. One allreduce per tensor pays the latency floor N times. DDP buckets gradients into ~25 MB chunks and issues one allreduce per bucket; the small tensors ride on the back of the big ones. Without bucketing the latency overhead dominates the step.</p>
+<p><strong>Overlap communication with computation.</strong> Backward computes gradients layer by layer in reverse order. The moment the last layer's gradient is ready, kick off its allreduce while the next layer keeps computing. PyTorch DDP wires this with bucket-ready hooks. The overlap halves visible communication time when the network has slack.</p>
+<p><strong>Pick ring or tree by message size, not religion.</strong> NCCL ships a topology detector that picks ring for messages above ~1 MB and tree below. The crossover is bandwidth-versus-latency: above 1 MB, the bandwidth term 2T(N-1)/N dominates and ring wins; below 1 MB, the log2(N) hop count wins. Hard-coding one topology costs throughput on the wrong message size.</p>
+<h2>Use It</h2>
+<p>Production patterns:</p>
+<ul>
+<li><strong>PyTorch DDP.</strong> Calls <code>dist.all_reduce</code> on bucketed gradients after backward. The bucket size is tunable; default 25 MB is reasonable for 100Gbit Ethernet.</li>
+<li><strong>DeepSpeed ZeRO.</strong> Issues reduce_scatter to shard gradients and allgather to reconstruct full parameters before forward. The lesson's primitives are exactly the calls ZeRO makes.</li>
+<li><strong>FSDP.</strong> Forward begins with allgather to unshard the layer, computes, then reduces with reduce_scatter and discards the unshard. Same primitives, different schedule.</li>
+</ul>
+<h2>Ship It</h2>
+<p>Use the queue-mesh primitives in lessons 77-81. Lesson 77 wires allreduce into DDP. Lesson 78 wires reduce_scatter into ZeRO. Lesson 79 wires broadcast into pipeline activations. Lesson 81 composes all four into the end-to-end demo.</p>
+<h2>Exercises</h2>
+<ol>
+<li>Add a tree allreduce variant and switch between ring and tree by message size. Measure the crossover.</li>
+<li>Add a <code>recv_timeout_ms</code> so a stalled rank surfaces a deadline error instead of hanging forever.</li>
+<li>Replace <code>multiprocessing.Queue</code> with TCP sockets for the four primitives. Same tests, real wire.</li>
+<li>Add a bandwidth instrumentation hook so the per-rank byte counter logs to JSONL.</li>
+<li>Compare wall-clock time of ring versus tree on 4 ranks for tensors of size 1KB, 1MB, 16MB. Defend the crossover empirically.</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Allreduce</td>
+<td>&quot;Sum across ranks&quot;</td>
+<td>After the call every rank holds the same reduced tensor</td>
+</tr>
+<tr>
+<td>Ring</td>
+<td>&quot;The fast topology&quot;</td>
+<td>N-1 chunks of size T/N flow around the cycle twice</td>
+</tr>
+<tr>
+<td>Tree</td>
+<td>&quot;The log topology&quot;</td>
+<td>Reduction follows a binary tree; depth is log2(N) hops</td>
+</tr>
+<tr>
+<td>Allgather</td>
+<td>&quot;Concatenate shards&quot;</td>
+<td>Every rank ends with every other rank's shard</td>
+</tr>
+<tr>
+<td>Reduce_scatter</td>
+<td>&quot;Split the sum&quot;</td>
+<td>Each rank ends with the sum of one chunk only</td>
+</tr>
+<tr>
+<td>Bucket</td>
+<td>&quot;Fuse small tensors&quot;</td>
+<td>Coalesce N small allreduces into one large one</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://pytorch.org/docs/stable/distributed.html#collective-functions" rel="noreferrer" data-network="true">PyTorch Distributed: NCCL collectives <small>↗ 需要联网</small></a></li>
+<li><a href="https://arxiv.org/abs/1802.05799" rel="noreferrer" data-network="true">Horovod ring allreduce paper <small>↗ 需要联网</small></a></li>
+<li><a href="https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/index.html" rel="noreferrer" data-network="true">NCCL topology and algorithm selection <small>↗ 需要联网</small></a></li>
+<li><a href="https://www.cs.fsu.edu/~xyuan/paper/09jpdc.pdf" rel="noreferrer" data-network="true">Patarasuk and Yuan, Bandwidth optimal allreduce algorithms <small>↗ 需要联网</small></a></li>
+<li>Phase 10 Lesson 05 - distributed training overview</li>
+<li>Phase 19 Lesson 77 - DDP wired on top of these primitives</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-19-capstone-projects--76-collective-ops-from-scratch.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-19-capstone-projects--76-collective-ops-from-scratch.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/76-collective-ops-from-scratch/code/main.py">phases/19-capstone-projects/76-collective-ops-from-scratch/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Collective communication primitives over multiprocessing.Queue, verified against gloo.
+
+Implements ring allreduce, tree broadcast, allgather, reduce_scatter on a queue
+mesh that wires N ranks into a ring. Every primitive is checked byte-for-byte
+against torch.distributed initialised with the gloo backend on the same tensor
+and the same world size. The per-rank byte counter proves the 2T(N-1)/N
+scaling of ring allreduce.
+
+Run: python3 code/main.py
+
+The mesh workers use the &#39;fork&#39; multiprocessing context so child processes
+inherit Queue file descriptors without pickling. The gloo reference workers
+use &#39;spawn&#39; because torch.distributed needs a clean process. Both contexts
+ship in stdlib multiprocessing.
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import multiprocessing as mp
+import os
+import tempfile
+from dataclasses import dataclass
+
+import torch
+import torch.distributed as dist
+
+
+PRIMITIVES = (&quot;allreduce&quot;, &quot;broadcast&quot;, &quot;allgather&quot;, &quot;reduce_scatter&quot;)
+RECV_TIMEOUT_S = 30.0
+
+
+def _loopback_iface() -&gt; str:
+    &quot;&quot;&quot;Return the loopback interface name; macOS uses lo0, Linux uses lo.&quot;&quot;&quot;
+    import sys as _sys
+    return &quot;lo0&quot; if _sys.platform == &quot;darwin&quot; else &quot;lo&quot;
+
+
+@dataclass
+class Mesh:
+    &quot;&quot;&quot;A point-to-point mesh wired as a fully-connected graph of queues.
+
+    Each rank holds out_queues[dst] and in_queues[src]. The ring algorithms
+    only use neighbour edges; the full mesh keeps the API general so future
+    lessons can experiment with tree topologies without rewiring.
+    &quot;&quot;&quot;
+
+    rank: int
+    world_size: int
+    out_queues: list
+    in_queues: list
+    byte_counter: object = None
+
+    def send(self, dst: int, tensor: torch.Tensor) -&gt; None:
+        if dst == self.rank:
+            raise ValueError(&quot;rank cannot send to itself&quot;)
+        payload = tensor.detach().clone().contiguous()
+        nbytes = payload.numel() * payload.element_size()
+        if self.byte_counter is not None:
+            with self.byte_counter.get_lock():
+                self.byte_counter.value += nbytes
+        self.out_queues[dst].put(payload)
+
+    def recv(self, src: int) -&gt; torch.Tensor:
+        if src == self.rank:
+            raise ValueError(&quot;rank cannot recv from itself&quot;)
+        return self.in_queues[src].get(timeout=RECV_TIMEOUT_S)
+
+
+def build_queue_grid(ctx, world_size: int):
+    &quot;&quot;&quot;Allocate a (world_size, world_size) grid of queues using the given context.&quot;&quot;&quot;
+    grid = [[None] * world_size for _ in range(world_size)]
+    for src in range(world_size):
+        for dst in range(world_size):
+            if src != dst:
+                grid[src][dst] = ctx.Queue()
+    return grid
+
+
+def mesh_from_grid(rank: int, world_size: int, grid, byte_counter) -&gt; Mesh:
+    out_qs = [grid[rank][d] for d in range(world_size)]
+    in_qs = [grid[s][rank] for s in range(world_size)]
+    return Mesh(rank=rank, world_size=world_size,
+                out_queues=out_qs, in_queues=in_qs,
+                byte_counter=byte_counter)
+
+
+def ring_allreduce(mesh: Mesh, tensor: torch.Tensor) -&gt; torch.Tensor:
+    &quot;&quot;&quot;Ring allreduce in two passes (reduce-scatter then allgather).
+
+    Splits the tensor into world_size equal chunks (padding with zeros so the
+    chunk count divides evenly). After the call every rank holds the same
+    summed tensor at the original shape.
+    &quot;&quot;&quot;
+    w = mesh.world_size
+    r = mesh.rank
+    if w == 1:
+        return tensor.clone()
+    n = tensor.numel()
+    pad = (-n) % w
+    flat = torch.zeros(n + pad, dtype=tensor.dtype)
+    flat[:n] = tensor.flatten()
+    chunks = [c.clone() for c in flat.chunk(w)]
+    next_rank = (r + 1) % w
+    prev_rank = (r - 1) % w
+    for step in range(w - 1):
+        send_idx = (r - step) % w
+        recv_idx = (r - step - 1) % w
+        mesh.send(next_rank, chunks[send_idx])
+        incoming = mesh.recv(prev_rank)
+        chunks[recv_idx] = chunks[recv_idx] + incoming
+    for step in range(w - 1):
+        send_idx = (r - step + 1) % w
+        recv_idx = (r - step) % w
+        mesh.send(next_rank, chunks[send_idx])
+        incoming = mesh.recv(prev_rank)
+        chunks[recv_idx] = incoming
+    return torch.cat(chunks)[:n].reshape(tensor.shape)
+
+
+def broadcast(mesh: Mesh, tensor: torch.Tensor, src: int) -&gt; torch.Tensor:
+    &quot;&quot;&quot;Tree broadcast in ceil(log2(world_size)) hops.
+
+    At round r, the set of ranks that hold the value doubles. Source rank
+    seeds the value; non-source ranks ignore their input and receive from
+    a peer that already holds it.
+    &quot;&quot;&quot;
+    w = mesh.world_size
+    r = mesh.rank
+    if w == 1:
+        return tensor.clone()
+    has_value = {src}
+    out = tensor.clone() if r == src else torch.zeros_like(tensor)
+    round_idx = 0
+    while len(has_value) &lt; w:
+        new_holders = set()
+        for h in sorted(has_value):
+            partner = h + (1 &lt;&lt; round_idx)
+            if partner &lt; w and partner not in has_value:
+                if r == h:
+                    mesh.send(partner, out)
+                elif r == partner:
+                    out = mesh.recv(h)
+                new_holders.add(partner)
+        has_value |= new_holders
+        round_idx += 1
+    return out
+
+
+def allgather(mesh: Mesh, tensor: torch.Tensor) -&gt; torch.Tensor:
+    &quot;&quot;&quot;Allgather via N-1 ring rotations.
+
+    Each rank inputs one shard of length T and outputs all shards concatenated
+    in rank order with total length T * world_size.
+    &quot;&quot;&quot;
+    w = mesh.world_size
+    r = mesh.rank
+    if w == 1:
+        return tensor.clone()
+    shards = [torch.zeros_like(tensor) for _ in range(w)]
+    shards[r] = tensor.clone()
+    next_rank = (r + 1) % w
+    prev_rank = (r - 1) % w
+    for step in range(w - 1):
+        send_idx = (r - step) % w
+        recv_idx = (r - step - 1) % w
+        mesh.send(next_rank, shards[send_idx])
+        shards[recv_idx] = mesh.recv(prev_rank)
+    return torch.cat(shards)
+
+
+def reduce_scatter(mesh: Mesh, tensor: torch.Tensor) -&gt; torch.Tensor:
+    &quot;&quot;&quot;Reduce-scatter as the first half of ring allreduce.
+
+    Input is a tensor of length world_size * T. Output is the rank&#39;s chunk of
+    length T holding the sum across all ranks for that index range. The
+    underlying ring algorithm parks the full sum at index (r + 1) % W; we
+    return that chunk and label it as rank r&#39;s output to match
+    torch.distributed&#39;s contract that rank r owns chunks[r].
+    &quot;&quot;&quot;
+    w = mesh.world_size
+    r = mesh.rank
+    n = tensor.numel()
+    if n % w != 0:
+        raise ValueError(f&quot;reduce_scatter needs numel divisible by world_size, got {n} / {w}&quot;)
+    if w == 1:
+        return tensor.clone()
+    rotated = list(tensor.chunk(w))
+    rotated = [rotated[(i - 1) % w].clone() for i in range(w)]
+    chunks = rotated
+    next_rank = (r + 1) % w
+    prev_rank = (r - 1) % w
+    for step in range(w - 1):
+        send_idx = (r - step) % w
+        recv_idx = (r - step - 1) % w
+        mesh.send(next_rank, chunks[send_idx])
+        incoming = mesh.recv(prev_rank)
+        chunks[recv_idx] = chunks[recv_idx] + incoming
+    return chunks[(r + 1) % w]
+
+
+def _gloo_worker(rank: int, world_size: int, op: str, tensor_bytes: bytes,
+                 shape, dtype_str: str, init_file: str,
+                 iface: str, out_queue) -&gt; None:
+    os.environ[&quot;GLOO_SOCKET_IFNAME&quot;] = iface
+    dist.init_process_group(
+        backend=&quot;gloo&quot;,
+        init_method=f&quot;file://{init_file}&quot;,
+        rank=rank,
+        world_size=world_size,
+    )
+    dtype = getattr(torch, dtype_str)
+    tensor = torch.frombuffer(bytearray(tensor_bytes), dtype=dtype).reshape(shape).clone()
+    if op == &quot;allreduce&quot;:
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        out = tensor
+    elif op == &quot;broadcast&quot;:
+        dist.broadcast(tensor, src=0)
+        out = tensor
+    elif op == &quot;allgather&quot;:
+        gathered = [torch.zeros_like(tensor) for _ in range(world_size)]
+        dist.all_gather(gathered, tensor)
+        out = torch.cat(gathered)
+    elif op == &quot;reduce_scatter&quot;:
+        chunks = [c.contiguous() for c in tensor.chunk(world_size)]
+        recv = torch.zeros_like(chunks[0])
+        dist.reduce_scatter(recv, chunks, op=dist.ReduceOp.SUM)
+        out = recv
+    else:
+        raise ValueError(f&quot;unknown op {op}&quot;)
+    out_queue.put((rank, out.clone()))
+    out_queue.close()
+    out_queue.join_thread()
+    os._exit(0)
+
+
+def gloo_reference(op: str, world_size: int,
+                   per_rank_tensors: list) -&gt; list:
+    &quot;&quot;&quot;Run the same operation through torch.distributed gloo for verification.
+
+    Uses file-based init (file:// URI) because TCP init through libuv has
+    known issues on macOS with concurrent process group creation.
+    &quot;&quot;&quot;
+    ctx = mp.get_context(&quot;spawn&quot;)
+    out_queue = ctx.Queue()
+    init_dir = tempfile.mkdtemp(prefix=&quot;aie_gloo_&quot;)
+    init_file = os.path.join(init_dir, &quot;rendezvous&quot;)
+    iface = _loopback_iface()
+    procs = []
+    try:
+        for r in range(world_size):
+            t = per_rank_tensors[r].contiguous()
+            p = ctx.Process(
+                target=_gloo_worker,
+                args=(r, world_size, op, bytes(t.numpy().tobytes()),
+                      tuple(t.shape), str(t.dtype).split(&quot;.&quot;)[-1],
+                      init_file, iface, out_queue),
+            )
+            p.start()
+            procs.append(p)
+        results = {}
+        for _ in range(world_size):
+            rank, tensor = out_queue.get(timeout=60)
+            results[rank] = tensor
+        return [results[r] for r in range(world_size)]
+    finally:
+        for p in procs:
+            p.join(timeout=5)
+            if p.is_alive():
+                p.terminate()
+                p.join(timeout=2)
+        try:
+            os.remove(init_file)
+        except FileNotFoundError:
+            pass
+        try:
+            os.rmdir(init_dir)
+        except OSError:
+            pass
+
+
+def _mesh_worker(rank: int, world_size: int, op: str,
+                 grid, byte_counter, tensor_bytes: bytes,
+                 shape, dtype_str: str, src: int, out_queue) -&gt; None:
+    mesh = mesh_from_grid(rank, world_size, grid, byte_counter)
+    dtype = getattr(torch, dtype_str)
+    tensor = torch.frombuffer(bytearray(tensor_bytes), dtype=dtype).reshape(shape).clone()
+    if op == &quot;allreduce&quot;:
+        result = ring_allreduce(mesh, tensor)
+    elif op == &quot;broadcast&quot;:
+        result = broadcast(mesh, tensor, src=src)
+    elif op == &quot;allgather&quot;:
+        result = allgather(mesh, tensor)
+    elif op == &quot;reduce_scatter&quot;:
+        result = reduce_scatter(mesh, tensor)
+    else:
+        raise ValueError(f&quot;unknown op {op}&quot;)
+    out_queue.put((rank, result))
+
+
+def run_mesh(op: str, world_size: int,
+             per_rank_tensors: list,
+             src: int = 0) -&gt; tuple:
+    &quot;&quot;&quot;Run the chosen primitive on the queue mesh and return per-rank outputs plus byte total.&quot;&quot;&quot;
+    ctx = mp.get_context(&quot;fork&quot;)
+    grid = build_queue_grid(ctx, world_size)
+    byte_counter = ctx.Value(&quot;q&quot;, 0)
+    out_queue = ctx.Queue()
+    procs = []
+    try:
+        for r in range(world_size):
+            t = per_rank_tensors[r].contiguous()
+            p = ctx.Process(
+                target=_mesh_worker,
+                args=(r, world_size, op, grid, byte_counter,
+                      bytes(t.numpy().tobytes()), tuple(t.shape),
+                      str(t.dtype).split(&quot;.&quot;)[-1], src, out_queue),
+            )
+            p.start()
+            procs.append(p)
+        results = {}
+        for _ in range(world_size):
+            rank, tensor = out_queue.get(timeout=60)
+            results[rank] = tensor
+        return [results[r] for r in range(world_size)], byte_counter.value
+    finally:
+        for p in procs:
+            p.join(timeout=30)
+            if p.is_alive():
+                p.terminate()
+                p.join(timeout=2)
+
+
+def verify_against_gloo(op: str, world_size: int,
+                        per_rank_tensors: list) -&gt; tuple:
+    &quot;&quot;&quot;Compare mesh implementation against gloo reference, return (match, max_abs_diff).&quot;&quot;&quot;
+    mesh_out, _ = run_mesh(op, world_size, per_rank_tensors)
+    gloo_out = gloo_reference(op, world_size, per_rank_tensors)
+    max_diff = 0.0
+    for m, g in zip(mesh_out, gloo_out):
+        diff = (m - g).abs().max().item()
+        if diff &gt; max_diff:
+            max_diff = diff
+    return max_diff &lt; 1e-5, max_diff
+
+
+def main() -&gt; int:
+    world_size = 4
+    n = 64
+    torch.manual_seed(7)
+    per_rank = [torch.randn(n, dtype=torch.float32) for _ in range(world_size)]
+    print(f&quot;world_size={world_size}, tensor_len={n}, dtype=float32&quot;)
+    print(f&quot;{&#39;op&#39;:&lt;16} {&#39;gloo_match&#39;:&lt;12} {&#39;max_abs_diff&#39;:&lt;14}&quot;)
+    for op in PRIMITIVES:
+        if op == &quot;broadcast&quot;:
+            inputs = [per_rank[0].clone() if r == 0 else torch.zeros(n) for r in range(world_size)]
+        elif op == &quot;reduce_scatter&quot;:
+            inputs = [torch.randn(n * world_size, dtype=torch.float32) for _ in range(world_size)]
+        else:
+            inputs = per_rank
+        match, diff = verify_against_gloo(op, world_size, inputs)
+        print(f&quot;{op:&lt;16} {str(match):&lt;12} {diff:&lt;14.3e}&quot;)
+    expected_per_rank_bytes = 2 * (world_size - 1) * (n // world_size) * 4
+    _, total_bytes = run_mesh(&quot;allreduce&quot;, world_size, per_rank)
+    per_rank_bytes = total_bytes / world_size
+    print(f&quot;\nallreduce per-rank bytes: measured={per_rank_bytes:.0f} &quot;
+          f&quot;expected={expected_per_rank_bytes} &quot;
+          f&quot;formula=2T(N-1)/N with T={n*4} bytes&quot;)
+    return 0
+
+
+if __name__ == &quot;__main__&quot;:
+    raise SystemExit(main())
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. What is the per-rank bandwidth cost of ring allreduce for a tensor of T bytes on N ranks?</legend><label class="option"><input type="radio" name="q0" value="0"> N * T bytes</label><label class="option"><input type="radio" name="q0" value="1"> T log2(N) bytes</label><label class="option"><input type="radio" name="q0" value="2"> T bytes</label><label class="option"><input type="radio" name="q0" value="3"> 2T(N-1)/N bytes</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. Why is the queue mesh in this lesson an honest stand-in for NCCL on a real cluster?</legend><label class="option"><input type="radio" name="q1" value="0"> It hardware-offloads reductions</label><label class="option"><input type="radio" name="q1" value="1"> It runs on CUDA cores</label><label class="option"><input type="radio" name="q1" value="2"> It implements the same wire pattern (ordered point-to-point sends around a ring), only the medium differs</label><label class="option"><input type="radio" name="q1" value="3"> It compresses messages</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. After the reduce-scatter half of ring allreduce, what does rank r hold?</legend><label class="option"><input type="radio" name="q2" value="0"> The reduced sum for one chunk (one Nth of the tensor)</label><label class="option"><input type="radio" name="q2" value="1"> The reduced sum for two chunks</label><label class="option"><input type="radio" name="q2" value="2"> The full tensor unreduced</label><label class="option"><input type="radio" name="q2" value="3"> Nothing</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. Why use tree broadcast instead of N-1 direct sends from the source?</legend><label class="option"><input type="radio" name="q3" value="0"> Trees are mandatory in PyTorch</label><label class="option"><input type="radio" name="q3" value="1"> Direct sends drop packets</label><label class="option"><input type="radio" name="q3" value="2"> Trees double the holder set per round; depth is log2(N) so latency scales as log not N</label><label class="option"><input type="radio" name="q3" value="3"> Trees use less memory</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. Why verify against torch.distributed gloo on the same input?</legend><label class="option"><input type="radio" name="q4" value="0"> Gloo is faster</label><label class="option"><input type="radio" name="q4" value="1"> Gloo is the legal reference for collective semantics; byte-equal output proves your algorithm agrees with the spec before it runs on a real cluster</label><label class="option"><input type="radio" name="q4" value="2"> Gloo requires no setup</label><label class="option"><input type="radio" name="q4" value="3"> Gloo writes JSONL automatically</label><p data-feedback="4"></p></fieldset><fieldset><legend>6. When does tree allreduce win over ring allreduce?</legend><label class="option"><input type="radio" name="q5" value="0"> Always</label><label class="option"><input type="radio" name="q5" value="1"> When messages are large</label><label class="option"><input type="radio" name="q5" value="2"> Small messages or high-latency links; the log2(N) hop count beats the bandwidth term 2T(N-1)/N below the crossover</label><label class="option"><input type="radio" name="q5" value="3"> Never</label><p data-feedback="5"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/19-capstone-projects/75-end-to-end-eval-runner/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/19-capstone-projects/77-data-parallel-ddp/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/19-capstone-projects/76-collective-ops-from-scratch/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

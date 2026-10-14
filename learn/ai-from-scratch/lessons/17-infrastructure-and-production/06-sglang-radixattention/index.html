@@ -1,0 +1,483 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>预写缓存服务  激素注意力和KV重复使用 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-17-infrastructure-and-production" data-lesson="17-infrastructure-and-production/06-sglang-radixattention" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/17-infrastructure-and-production/">基础设施与生产</a> / LESSON 06</p><h1 class="lesson-title">预写缓存服务  激素注意力和KV重复使用</h1><p>Prefix-Cache Serving — RadixAttention and KV Reuse</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>预写缓存服务  激素注意力和KV重复使用</h1>
+<blockquote>
+<p>处理KV缓存作为一个在基层树中存储的第一类,可重复使用的资源,并与它一起进行调度变化:而不是FCFS (首次来,首次服务) 作为vLLM时间表,一个缓存知性调度器优先考虑使用更长的共享前置器的请求. 轮是引擎,它围绕着这个想法构建. 在Llama 3.1 8B上,SGLang达到16,200个/秒,达到vLLM的12,500个,占比29%. 在前重的RAG工作负载上,优势达到6.4倍. 在语音克隆式工作负载上,缓存击中率已清除了86%. 在2026年将部署在xAI,LinkedIn,Cursor,Oracle,GCP,Azure,AWS等400,000+个GPU上. 序列是工程师的杆.</p>
+</blockquote>
+<p><strong>Type:</strong> Learn
+<strong>Languages:</strong> Python (stdlib, toy radix-tree cache + cache-aware scheduler)
+<strong>Prerequisites:</strong> Phase 17 · 04 (Serving Engine Internals), Phase 14 (Agentic RAG)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>图表Radix注意:如何在一个基因树中存储前置,以及如何在同一分支根基的序列中共享KV块.</li>
+<li>解释缓存预示的时间表以及为什么FCFS对预写量较高的流量是错误的.</li>
+<li>计算预期工作负载加快,以预先缓存击率和快速长度分布为基础.</li>
+<li>给出一个即时订单的纪律,使6.4x数量是真实的,而不是丢失的上.</li>
+</ul>
+<h2>问题</h2>
+<p>经典服务处理每个请求的提示是不透明的.即使5000个RAG请求都以相同的2000个代币系统提示加上相同的检索序言开始,vLLM将2000个代币前填写5000次.GPU一遍又一遍.</p>
+<p>观察:代理和RAG工作负载中的提示几乎总是共享长个预写.系统提示,工具方案,几次示例,检索标题,对话历史记录 所有请求都重复.如果你一次存储了该预写的KV缓存,然后再使用它,你不会再预写.</p>
+<p>根源注意力执行了这一点.代币在根源树中被索引;每个节点拥有从根开始的代币序列的KV块.一个新的请求通过树:任何与代币匹配的节点都会重复使用该节点的KV块.预填成本变得与&quot;新&quot;后音相比例,而不是完整提示.</p>
+<p>挑战是安排.如果两个请求共享2000个代币前,而第三个只共享200个代币,你想将两个长共享的请求一起服务,以便长前保持在HBM中.FCFS做相反的它服务了谁来第一,可能在下一个长前请求碰到之前驱逐热分支.</p>
+<h2>概念</h2>
+<h3>作为KV指数的基底树</h3>
+<p>基底树 (紧的三角形) 存储代币序列.每个节点拥有代币范围,KV区块为该范围计算.孩子们将序列扩展到一个或多个代币.</p>
+<pre><code>root
+ |- &quot;You are a helpful assistant...&quot;  (2,000 tokens, 124 KV blocks)
+      |- &quot;Context: &lt;doc A&gt;...&quot;        (500 tokens, 31 blocks)
+           |- &quot;Question: Alice...&quot;    (80 tokens, 5 blocks)
+           |- &quot;Question: Bob...&quot;      (95 tokens, 6 blocks)
+      |- &quot;Context: &lt;doc B&gt;...&quot;        (520 tokens, 33 blocks)
+</code></pre>
+<p>系统提示+&quot;文本: &lt;doc A&gt;&quot;+&quot;问题: Carol&quot;的新请求. 编程程序运行:系统前匹配 (124个块重复使用),doc-A分支匹配 (31个块重复使用),然后仅为&quot;问题: Carol&quot; (4个块) 分配新块.预填成本: 4个块新代币.没有树: 160 块. ~40倍的预填节省.</p>
+<h3>缓存预定时间</h3>
+<p>假如缓存出现故障,Radix树支持的重复使用是无意义的.</p>
+<ol>
+<li><strong>Depth-first dispatch</strong>在排列中选择下一个请求时, 优先选择与当前运行集相同的分支的请求. 这将保持热分支的固定.</li>
+<li><strong>LRU at branch level, not block level</strong>消除整个分支 (从最短使用的叶子开始),而不是单个块,以便缓存形状与基底形状相匹配.</li>
+</ol>
+<p>要求共享2000个代币,是50个代币的请求背后,然后2000个代币的分支被驱逐出境,</p>
+<h3>您应该记住的基准号码</h3>
+<ul>
+<li>拉马 3.1 8B,H100,ShareGPT 1K提示:SGLang ~16,200个时/秒对VLLM ~12,500 (~29%的边缘).</li>
+<li>预写重的RAG (相同的系统 +相同的文件,不同的问题):在SGLang上高达6.4x.</li>
+<li>语音克隆工作量:前置缓存击中率为86.4%.</li>
+<li>产量打击率在SGLang客户中:50-99%取决于迅速的纪律.</li>
+<li>在2026年将部署在400,000+的GPU上.</li>
+</ul>
+<h3>订单给你了</h3>
+<p>如果您的客户端构建提示如<code>[system, tools, context, history, question]</code>在某些请求中,<code>[system, context, tools, history, question]</code>树木不能找到一个共同的前. 树木的两个不同的序列,</p>
+<p>工程师的杆:您的提示模板是一个缓存键. 修复顺序. 首先把不可变的东西 (系统,工具,方案) 放在第一位. 接下来放回文本. 排名用户问题. 不要把动态内容插入预写中.</p>
+<p>实际情况:从可缓存的前中移动动动态内容,在一个变化中,从7%到74%的缓存击中率.</p>
+<h3>雷迪克斯注意力赢得和输掉的地方</h3>
+<p>获奖:</p>
+<ul>
+<li>总结:</li>
+<li>代理 (相同的工具方案,不同的查询).</li>
+<li>聊天长系统提示.</li>
+<li>语音/视觉工作负载,重复序言.</li>
+</ul>
+<p>输出 (返回vLLM级输出):</p>
+<ul>
+<li>单次生成,具有独特的提示 (编码完成,无系统提示的开放式聊天).</li>
+<li>动态提示,每个请求都将独特的内容插入预सर्ग中.</li>
+</ul>
+<h3>为什么这是一个调度器问题,而不是一个核心问题</h3>
+<p>您可以将KV重复使用作为一个内核技巧.SGLang的见解是,重复使用只会付出,如果调节器保持热分支居民.一个天真的&quot;如果可用&quot;政策将在混合负载下乱缓存. 基因树索引调度器是使内核技巧成为29%的生产边缘.</p>
+<h3>与vLLM相互作用</h3>
+<p>两种系统并非严格的竞争对手.<code>--enable-prefix-caching</code></p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-d3249e6ff52bc1390d8a.png" alt="roofline 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>用它</h2>
+<p><code>code/main.py</code>运行相同的工作负载通过两个,报告预先缓存击率和吞吐量德尔塔.然后运行一个&quot;缩订&quot;工作负载显示6.4x崩.</p>
+<h2>运送它</h2>
+<p>这一课产生了<code>outputs/skill-radix-scheduler-advisor.md</code>鉴于工作负载描述 (即时模板形状,检索模式,同时租户数量),它产生了即时订单的处方和SGLang采用的无需处方.</p>
+<h2>运动</h2>
+<ol>
+<li>跑步<code>code/main.py</code>根据FCFS和缓存意识的相同工作负载进行比较. 预填储蓄,解码储蓄或排队延迟的达尔塔来自哪里?</li>
+<li>修改工作负载,让提示随机转移<code>[system, tools, context]</code>什么会发生在撞击率?</li>
+<li>计算HBM的成本,以将2000个代币系统提示居民作为一个基底分支在Llama 3.1 8B上. 与没有预写重复使用的16个序列批次的成本进行比较.</li>
+<li>阅读SGLang RadixAttention论文. 用三句话解释为什么树状LRU驱逐器在前重负载下比块状LRU更好.</li>
+<li>给出三个可能的原因和你会为每一个用户进行的诊断.</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>RadixAttention</td>
+<td>&quot;the SGLang thing&quot;</td>
+<td>KV cache indexed as a radix tree so shared prefixes reuse blocks</td>
+</tr>
+<tr>
+<td>Radix tree</td>
+<td>&quot;compact trie&quot;</td>
+<td>Tree where each node owns a token range and its KV blocks</td>
+</tr>
+<tr>
+<td>Cache-aware scheduler</td>
+<td>&quot;hot-branch-first&quot;</td>
+<td>Scheduler that prefers requests sharing the resident branch</td>
+</tr>
+<tr>
+<td>Prefix-cache hit rate</td>
+<td>&quot;how much of your prompt was free&quot;</td>
+<td>Fraction of prompt tokens served from reused KV blocks</td>
+</tr>
+<tr>
+<td>FCFS</td>
+<td>&quot;first-come first-served&quot;</td>
+<td>Default scheduling that breaks prefix locality</td>
+</tr>
+<tr>
+<td>Branch-level LRU</td>
+<td>&quot;evict the leaf&quot;</td>
+<td>Eviction policy matched to radix shape</td>
+</tr>
+<tr>
+<td>Prompt template ordering</td>
+<td>&quot;the cache key&quot;</td>
+<td>The prompt's component order determines what the tree can share</td>
+</tr>
+<tr>
+<td>System prompt pinning</td>
+<td>&quot;resident prefix&quot;</td>
+<td>Keep the immutable system portion pinned to avoid eviction thrash</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://github.com/sgl-project/sglang" rel="noreferrer" data-network="true">SGLang GitHub <small>↗ 需要联网</small></a>来源和文件.</li>
+<li><a href="https://sgl-project.github.io/" rel="noreferrer" data-network="true">SGLang documentation <small>↗ 需要联网</small></a></li>
+<li><a href="https://arxiv.org/abs/2312.07104" rel="noreferrer" data-network="true">SGLang paper — Efficiently Programming Large Language Models (arXiv:2312.07104) <small>↗ 需要联网</small></a>设计参考.</li>
+<li><a href="https://www.lmsys.org/blog/2024-01-17-sglang/" rel="noreferrer" data-network="true">LMSYS blog — SGLang with RadixAttention <small>↗ 需要联网</small></a>基准数字和时间表理性.</li>
+<li><a href="https://docs.vllm.ai/en/latest/features/automatic_prefix_caching/" rel="noreferrer" data-network="true">vLLM — Prefix Caching <small>↗ 需要联网</small></a> vLLM自己的基像实施,比较.</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Prefix-Cache Serving — RadixAttention and KV Reuse</h1>
+<blockquote>
+<p>Treat the KV cache as a first-class, reusable resource stored in a radix tree, and scheduling changes with it: instead of FCFS (first-come, first-served) as vLLM schedules, a cache-aware scheduler prioritizes requests with longer shared prefixes — effectively a depth-first radix traversal so hot branches stay resident in HBM. SGLang is the engine that built serving around this idea. On Llama 3.1 8B with ShareGPT-like 1K prompts, SGLang hits ~16,200 tok/s to vLLM's ~12,500, a ~29% edge. On prefix-heavy RAG workloads the advantage reaches 6.4x. On voice-cloning-shaped workloads cache hit rate cleared 86%. Deployed on 400,000+ GPUs in 2026 across xAI, LinkedIn, Cursor, Oracle, GCP, Azure, AWS. The gotcha is that the 6.4x number evaporates when prefix ordering is inconsistent — ordering is the engineer's lever.</p>
+</blockquote>
+<p><strong>Type:</strong> Learn
+<strong>Languages:</strong> Python (stdlib, toy radix-tree cache + cache-aware scheduler)
+<strong>Prerequisites:</strong> Phase 17 · 04 (Serving Engine Internals), Phase 14 (Agentic RAG)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Diagram RadixAttention: how prefixes are stored in a radix tree and how KV blocks are shared across sequences rooted at the same branch.</li>
+<li>Explain cache-aware scheduling and why FCFS is wrong for prefix-heavy traffic.</li>
+<li>Compute expected speedup for a workload given prefix-cache hit rate and prompt length distribution.</li>
+<li>Name the prompt-ordering discipline that makes the 6.4x number real vs a lost upside.</li>
+</ul>
+<h2>The Problem</h2>
+<p>Classic serving treats each request's prompt as opaque. Even when 5,000 RAG requests all start with the same 2,000-token system prompt plus same retrieval preamble, vLLM prefills that 2,000-token prefix 5,000 times. The GPU does the same work over and over.</p>
+<p>The observation: prompts in agentic and RAG workloads share long prefixes almost always. System prompt, tool schemas, few-shot examples, retrieval headers, conversation history — all repeat across requests. If you stored the KV cache for that prefix once and reused it, you would not prefill it again.</p>
+<p>RadixAttention does exactly this. Tokens are indexed in a radix tree; each node owns KV blocks for the token sequence on its path from root. A new request walks the tree: any node whose token matches re-uses that node's KV blocks. Prefill cost becomes proportional to the &quot;new&quot; suffix, not the full prompt.</p>
+<p>The challenge is scheduling. If two requests share a 2,000-token prefix and a third shares only 200 tokens of the same prefix, you want to serve the two long-shared requests together so the long prefix stays in HBM. FCFS does the opposite — it serves whoever arrived first, potentially evicting the hot branch before the next long-prefix request hits.</p>
+<h2>The Concept</h2>
+<h3>The radix tree as a KV index</h3>
+<p>A radix tree (compact trie) stores token sequences. Each node owns a token range and the KV blocks computed for that range. Children extend the sequence one or more tokens.</p>
+<pre><code>root
+ |- &quot;You are a helpful assistant...&quot;  (2,000 tokens, 124 KV blocks)
+      |- &quot;Context: &lt;doc A&gt;...&quot;        (500 tokens, 31 blocks)
+           |- &quot;Question: Alice...&quot;    (80 tokens, 5 blocks)
+           |- &quot;Question: Bob...&quot;      (95 tokens, 6 blocks)
+      |- &quot;Context: &lt;doc B&gt;...&quot;        (520 tokens, 33 blocks)
+</code></pre>
+<p>A new request comes in with system prompt + &quot;Context: &lt;doc A&gt;&quot; + &quot;Question: Carol&quot;. The scheduler walks: system prefix matches (124 blocks reused), doc-A branch matches (31 blocks reused), then allocates fresh blocks only for &quot;Question: Carol&quot; (4 blocks). Prefill cost: 4 blocks of new tokens. Without the tree: 160 blocks. ~40x savings on prefill.</p>
+<h3>Cache-aware scheduling</h3>
+<p>Radix-tree-backed reuse is pointless if the cache churns. Two key policies:</p>
+<ol>
+<li><strong>Depth-first dispatch</strong>. When picking the next request from the queue, prefer requests rooted at the same branch as the current running set. This keeps the hot branch pinned.</li>
+<li><strong>LRU at branch level, not block level</strong>. Evict whole branches (starting from shortest-used leaves) rather than individual blocks, so cache shape matches radix shape.</li>
+</ol>
+<p>FCFS violates both. A request sharing 2,000 tokens sits behind a request sharing 50, then the 2,000-token branch gets evicted to admit the 50-token one.</p>
+<h3>Benchmark numbers you should memorize</h3>
+<ul>
+<li>Llama 3.1 8B, H100, ShareGPT 1K prompts: SGLang ~16,200 tok/s vs vLLM ~12,500 (~29% edge).</li>
+<li>Prefix-heavy RAG (same system + same doc, varying question): up to 6.4x on SGLang.</li>
+<li>Voice cloning workloads: 86.4% prefix-cache hit rate.</li>
+<li>Production hit rates across SGLang customers: 50-99% depending on prompt discipline.</li>
+<li>Deployed on 400,000+ GPUs in 2026.</li>
+</ul>
+<h3>The ordering gotcha</h3>
+<p>The 6.4x number relies on consistent prompt-template ordering. If your client constructs prompts as <code>[system, tools, context, history, question]</code> in some requests and <code>[system, context, tools, history, question]</code> in others, the tree cannot find the shared prefix. What looks like a shared prefix to a human is two distinct sequences to the radix tree.</p>
+<p>Engineer's lever: your prompt template is a cache key. Fix the order. Put everything immutable (system, tools, schemas) first. Put retrieval context next. Put user question last. Do not interleave dynamic content into the prefix.</p>
+<p>Real case from the research: moving dynamic content out of the cacheable prefix took one deployment from 7% to 74% cache hit rate in one change.</p>
+<h3>Where RadixAttention wins and loses</h3>
+<p>Wins:</p>
+<ul>
+<li>RAG (same retrieval preamble, varying question).</li>
+<li>Agents (same tool schemas, varying query).</li>
+<li>Chat with long system prompt.</li>
+<li>Voice / vision workloads with repeated preambles.</li>
+</ul>
+<p>Loses (returns to vLLM-level throughput):</p>
+<ul>
+<li>Single-shot generation with unique prompts (code completion, open-ended chat without system prompt).</li>
+<li>Dynamic prompts where every request interleaves unique content into the prefix.</li>
+</ul>
+<h3>Why this is a scheduler problem, not just a kernel problem</h3>
+<p>You can implement KV reuse as a kernel trick. SGLang's insight is that reuse only pays if the scheduler keeps the hot branch resident. A naive &quot;reuse if available&quot; policy will churn the cache under mixed load. The radix-tree-indexed scheduler is what turns the kernel trick into a 29% production edge.</p>
+<h3>Interplay with vLLM</h3>
+<p>The two systems are not strict competitors. In 2026 vLLM added prefix caching (<code>--enable-prefix-caching</code>) and a cache-aware router (vLLM Router in Rust). The gap closed but did not fully disappear — SGLang's whole stack is radix-first; vLLM grafted it on. For workloads dominated by prefix reuse, SGLang remains the default. For general-purpose serving without strong prefix patterns, vLLM remains equal or better.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-d3249e6ff52bc1390d8a.png" alt="roofline 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Use It</h2>
+<p><code>code/main.py</code> implements a toy radix-tree KV cache plus a scheduler with two policies: FCFS and cache-aware. Runs the same workload through both, reports prefix-cache hit rate and throughput delta. Then runs a &quot;scrambled ordering&quot; workload to show the 6.4x collapse.</p>
+<h2>Ship It</h2>
+<p>This lesson produces <code>outputs/skill-radix-scheduler-advisor.md</code>. Given a workload description (prompt-template shape, retrieval pattern, number of concurrent tenants), it produces a prompt-ordering prescription and a go/no-go for SGLang adoption.</p>
+<h2>Exercises</h2>
+<ol>
+<li>Run <code>code/main.py</code>. Compare FCFS and cache-aware on the same workload. Where does the delta come from — prefill savings, decode savings, or queue delay?</li>
+<li>Modify the workload so prompts randomly permute <code>[system, tools, context]</code>. Re-run. What happens to hit rate? Why?</li>
+<li>Compute the HBM cost of keeping a 2,000-token system prompt resident as one radix branch on Llama 3.1 8B. Compare to the cost of a 16-sequence batch without prefix reuse.</li>
+<li>Read the SGLang RadixAttention paper. Explain in three sentences why tree-shaped LRU eviction beats block-shaped LRU under prefix-heavy load.</li>
+<li>A customer reports only 8% cache hit rate. Name three likely causes and the diagnostic you would run for each.</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>RadixAttention</td>
+<td>&quot;the SGLang thing&quot;</td>
+<td>KV cache indexed as a radix tree so shared prefixes reuse blocks</td>
+</tr>
+<tr>
+<td>Radix tree</td>
+<td>&quot;compact trie&quot;</td>
+<td>Tree where each node owns a token range and its KV blocks</td>
+</tr>
+<tr>
+<td>Cache-aware scheduler</td>
+<td>&quot;hot-branch-first&quot;</td>
+<td>Scheduler that prefers requests sharing the resident branch</td>
+</tr>
+<tr>
+<td>Prefix-cache hit rate</td>
+<td>&quot;how much of your prompt was free&quot;</td>
+<td>Fraction of prompt tokens served from reused KV blocks</td>
+</tr>
+<tr>
+<td>FCFS</td>
+<td>&quot;first-come first-served&quot;</td>
+<td>Default scheduling that breaks prefix locality</td>
+</tr>
+<tr>
+<td>Branch-level LRU</td>
+<td>&quot;evict the leaf&quot;</td>
+<td>Eviction policy matched to radix shape</td>
+</tr>
+<tr>
+<td>Prompt template ordering</td>
+<td>&quot;the cache key&quot;</td>
+<td>The prompt's component order determines what the tree can share</td>
+</tr>
+<tr>
+<td>System prompt pinning</td>
+<td>&quot;resident prefix&quot;</td>
+<td>Keep the immutable system portion pinned to avoid eviction thrash</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://github.com/sgl-project/sglang" rel="noreferrer" data-network="true">SGLang GitHub <small>↗ 需要联网</small></a> — source and docs.</li>
+<li><a href="https://sgl-project.github.io/" rel="noreferrer" data-network="true">SGLang documentation <small>↗ 需要联网</small></a> — RadixAttention and scheduling details.</li>
+<li><a href="https://arxiv.org/abs/2312.07104" rel="noreferrer" data-network="true">SGLang paper — Efficiently Programming Large Language Models (arXiv:2312.07104) <small>↗ 需要联网</small></a> — the design reference.</li>
+<li><a href="https://www.lmsys.org/blog/2024-01-17-sglang/" rel="noreferrer" data-network="true">LMSYS blog — SGLang with RadixAttention <small>↗ 需要联网</small></a> — benchmark numbers and scheduler rationale.</li>
+<li><a href="https://docs.vllm.ai/en/latest/features/automatic_prefix_caching/" rel="noreferrer" data-network="true">vLLM — Prefix Caching <small>↗ 需要联网</small></a> — vLLM's own radix-like implementation, for comparison.</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-17-infrastructure-and-production--06-sglang-radixattention.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-17-infrastructure-and-production--06-sglang-radixattention.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/17-infrastructure-and-production/06-sglang-radixattention/code/main.py">phases/17-infrastructure-and-production/06-sglang-radixattention/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Toy RadixAttention scheduler — stdlib Python.
+
+Simulate an SGLang-style radix-tree KV cache plus two schedulers:
+  FCFS         : naive first-come first-served
+  CACHE_AWARE  : depth-first dispatch on hottest branch
+
+Also show how scrambled prompt ordering collapses hit rate. Pedagogical
+constants — the shape matches the published numbers, not the absolute
+latencies.
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from collections import defaultdict
+import random
+
+
+KV_BUDGET_BLOCKS = 160    # small budget so eviction bites under FCFS
+BLOCK_TOKENS = 16
+
+
+def token_count(seg: str) -&gt; int:
+    if seg == &quot;SYSTEM&quot;:
+        return 2000
+    if seg.startswith(&quot;DOC_&quot;):
+        return 500
+    if seg.startswith(&quot;Q_&quot;):
+        return 60
+    if seg == &quot;TOOLS&quot;:
+        return 300
+    return 100
+
+
+@dataclass
+class Request:
+    rid: int
+    segments: list[str]
+
+
+class RadixCache:
+    &quot;&quot;&quot;Represent the tree as a dict: path_tuple -&gt; blocks (last_used).&quot;&quot;&quot;
+
+    def __init__(self, budget_blocks: int = KV_BUDGET_BLOCKS):
+        self.budget = budget_blocks
+        self.used = 0
+        self.time = 0
+        # key: tuple of segments. value: (blocks, last_used)
+        self.nodes: dict[tuple[str, ...], list[int]] = {}
+
+    def walk(self, segments: list[str]) -&gt; int:
+        &quot;&quot;&quot;Return number of tokens that are already cached at the longest matching
+        prefix, bumping last_used along the path.&quot;&quot;&quot;
+        reused = 0
+        self.time += 1
+        for i in range(1, len(segments) + 1):
+            key = tuple(segments[:i])
+            if key in self.nodes:
+                reused += token_count(segments[i - 1])
+                self.nodes[key][1] = self.time
+            else:
+                break
+        return reused
+
+    def insert(self, segments: list[str]) -&gt; None:
+        &quot;&quot;&quot;Insert any missing segments on the path, evicting LRU leaves if over budget.&quot;&quot;&quot;
+        for i in range(1, len(segments) + 1):
+            key = tuple(segments[:i])
+            if key in self.nodes:
+                continue
+            blocks = (token_count(segments[i - 1]) + BLOCK_TOKENS - 1) // BLOCK_TOKENS
+            while self.used + blocks &gt; self.budget and self._evict_one():
+                pass
+            self.nodes[key] = [blocks, self.time]
+            self.used += blocks
+
+    def _evict_one(self) -&gt; bool:
+        leaves = [k for k in self.nodes if not any(
+            other != k and other[: len(k)] == k for other in self.nodes)]
+        if not leaves:
+            return False
+        victim = min(leaves, key=lambda k: self.nodes[k][1])
+        self.used -= self.nodes.pop(victim)[0]
+        return True
+
+
+def simulate(requests: list[Request], scheduler: str) -&gt; dict:
+    cache = RadixCache()
+
+    if scheduler == &quot;CACHE_AWARE&quot;:
+        branch_count: dict[tuple[str, ...], int] = defaultdict(int)
+        for r in requests:
+            for i in range(1, len(r.segments) + 1):
+                branch_count[tuple(r.segments[:i])] += 1
+
+        def score(r: Request) -&gt; int:
+            return max(branch_count[tuple(r.segments[:i])] * sum(
+                token_count(s) for s in r.segments[:i])
+                for i in range(1, len(r.segments) + 1))
+        order = sorted(requests, key=score, reverse=True)
+    else:
+        order = list(requests)
+
+    saved = 0
+    total = 0
+    for r in order:
+        prompt_tokens = sum(token_count(s) for s in r.segments)
+        total += prompt_tokens
+        reused = cache.walk(r.segments)
+        saved += reused
+        cache.insert(r.segments)
+
+    return {
+        &quot;hit_rate&quot;: saved / total if total else 0,
+        &quot;saved&quot;: saved,
+        &quot;total&quot;: total,
+        &quot;reqs&quot;: len(requests),
+    }
+
+
+def workload_rag(n: int = 80, docs: int = 4, seed: int = 1) -&gt; list[Request]:
+    rng = random.Random(seed)
+    reqs = []
+    for i in range(n):
+        doc = f&quot;DOC_{rng.randrange(docs)}&quot;
+        q = f&quot;Q_{i}&quot;
+        reqs.append(Request(i, [&quot;SYSTEM&quot;, &quot;TOOLS&quot;, doc, q]))
+    rng.shuffle(reqs)
+    return reqs
+
+
+def workload_scrambled(n: int = 80, docs: int = 4, seed: int = 1) -&gt; list[Request]:
+    &quot;&quot;&quot;Prompts reorder [SYSTEM, TOOLS, DOC] randomly. Tree cannot share the prefix.&quot;&quot;&quot;
+    rng = random.Random(seed)
+    reqs = []
+    for i in range(n):
+        doc = f&quot;DOC_{rng.randrange(docs)}&quot;
+        q = f&quot;Q_{i}&quot;
+        prefix = [&quot;SYSTEM&quot;, &quot;TOOLS&quot;, doc]
+        rng.shuffle(prefix)
+        reqs.append(Request(i, prefix + [q]))
+    rng.shuffle(reqs)
+    return reqs
+
+
+def report(label: str, res: dict) -&gt; None:
+    print(f&quot;{label:44}  hit_rate={res[&#39;hit_rate&#39;]:6.1%}   &quot;
+          f&quot;saved={res[&#39;saved&#39;]:&gt;6}/{res[&#39;total&#39;]:&lt;6} tok   reqs={res[&#39;reqs&#39;]}&quot;)
+
+
+def main() -&gt; None:
+    print(&quot;=&quot; * 88)
+    print(&quot;TOY RADIX CACHE — cache hit rate across schedulers and orderings&quot;)
+    print(&quot;=&quot; * 88)
+
+    rag = workload_rag()
+    report(&quot;RAG workload | FCFS&quot;, simulate(rag, &quot;FCFS&quot;))
+    report(&quot;RAG workload | CACHE_AWARE&quot;, simulate(rag, &quot;CACHE_AWARE&quot;))
+
+    scrambled = workload_scrambled()
+    report(&quot;RAG scrambled prefix | FCFS&quot;, simulate(scrambled, &quot;FCFS&quot;))
+    report(&quot;RAG scrambled prefix | CACHE_AWARE&quot;, simulate(scrambled, &quot;CACHE_AWARE&quot;))
+
+    print()
+    print(&quot;=&quot; * 88)
+    print(&quot;KEY FINDING&quot;)
+    print(&quot;-&quot; * 88)
+    print(&quot;  Fixed ordering + cache-aware scheduler : hit rate clears 80% on RAG.&quot;)
+    print(&quot;  Scrambled prefix order : hit rate collapses — the tree cannot find shared paths.&quot;)
+    print(&quot;  Real cases: 7% -&gt; 74% hit rate by moving dynamic content out of the prefix.&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/17-infrastructure-and-production/06-sglang-radixattention/outputs/skill-radix-scheduler-advisor.md">phases/17-infrastructure-and-production/06-sglang-radixattention/outputs/skill-radix-scheduler-advisor.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: radix-scheduler-advisor
+description: Advise on SGLang adoption and prompt-ordering discipline for prefix-heavy workloads that want RadixAttention&#39;s cache reuse.
+version: 1.0.0
+phase: 17
+lesson: 06
+tags: [sglang, radixattention, prefix-caching, scheduler, prompt-ordering]
+---
+
+Given a workload description (prompt-template shape, retrieval pattern, conversation length, number of concurrent tenants, hardware), produce an SGLang / RadixAttention adoption advisory.
+
+Produce:
+
+1. Workload fingerprint. Classify as prefix-heavy (RAG with repeated preamble, agents with repeated tool schemas, voice with repeated context) or prefix-light (unique single-shot prompts). Name the shared prefix length and the repetition rate.
+2. Prompt-ordering audit. Walk the current prompt template top to bottom. Flag any dynamic content interleaved into the immutable section. Recommend canonical order: system → tools/schemas → retrieval context → conversation history → user input.
+3. Expected hit rate. From workload fingerprint, estimate achievable cache hit rate. General chat 10-30%. RAG with consistent template 60-85%. Voice/vision with fixed preamble 80-95%.
+4. SGLang vs vLLM decision. If expected hit rate &gt; 40% and workload is not single-shot, recommend SGLang. If &lt; 30%, vLLM with `--enable-prefix-caching` is simpler. If 30-40%, run both on a sample and pick.
+5. Rollout plan. 48-hour shadow benchmark on SGLang with current prompt template. Log hit rate. Fix prompt-ordering issues. Re-benchmark. Ship if hit rate clears target.
+
+Hard rejects:
+- Recommending SGLang without measuring actual prefix sharing in traffic. Refuse.
+- Claiming the 6.4x number without citing workload shape. The number is workload-specific.
+- Ignoring prompt-ordering discipline. The template is the cache key; without it the scheduler cannot help.
+
+Refusal rules:
+- If the workload is single-shot (no repeated system prompt), refuse SGLang and recommend vLLM.
+- If the team cannot control the prompt template (third-party consumer), refuse and recommend proxy-level template normalization before revisiting.
+- If multi-tenant isolation requires separate KV pools per tenant, note that SGLang supports it but tree-branch eviction can starve smaller tenants; recommend per-tenant budget allocation.
+
+Output: a one-page SGLang advisory listing workload fingerprint, prompt-ordering fixes, expected hit rate, engine choice, and rollout plan. End with a &quot;what to read next&quot; paragraph pointing to the SGLang paper, vLLM prefix-caching docs, or the prompt-ordering exercise in this lesson depending on the biggest gap.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. What core data structure backs SGLang&#39;s KV cache reuse?</legend><label class="option"><input type="radio" name="q0" value="0"> A radix tree where each node owns a token range and its KV blocks</label><label class="option"><input type="radio" name="q0" value="1"> A skip list keyed by request id</label><label class="option"><input type="radio" name="q0" value="2"> A hash table keyed by full prompt</label><label class="option"><input type="radio" name="q0" value="3"> A B-tree of attention scores</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. Why is FCFS scheduling wrong for prefix-heavy traffic on SGLang?</legend><label class="option"><input type="radio" name="q1" value="0"> FCFS is the recommended SGLang policy</label><label class="option"><input type="radio" name="q1" value="1"> FCFS can evict a hot prefix branch before the next long-prefix request hits, breaking radix-tree reuse</label><label class="option"><input type="radio" name="q1" value="2"> FCFS only works on AMD GPUs</label><label class="option"><input type="radio" name="q1" value="3"> FCFS is incompatible with PagedAttention</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. What eviction granularity does SGLang&#39;s cache-aware scheduler use to match radix shape?</legend><label class="option"><input type="radio" name="q2" value="0"> Per-request only</label><label class="option"><input type="radio" name="q2" value="1"> Random eviction</label><label class="option"><input type="radio" name="q2" value="2"> Single tokens</label><label class="option"><input type="radio" name="q2" value="3"> Whole branches, starting from shortest-used leaves</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. What is the most direct engineer&#39;s lever for keeping the radix-tree shared prefix discoverable?</legend><label class="option"><input type="radio" name="q3" value="0"> Always use static batching</label><label class="option"><input type="radio" name="q3" value="1"> Fix prompt-template ordering so immutable content (system, tools, schemas) is always first</label><label class="option"><input type="radio" name="q3" value="2"> Lower the GPU memory utilization knob</label><label class="option"><input type="radio" name="q3" value="3"> Disable continuous batching</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. Which workload pattern does the lesson NOT expect RadixAttention to win on?</legend><label class="option"><input type="radio" name="q4" value="0"> Agents with shared tool schemas</label><label class="option"><input type="radio" name="q4" value="1"> Single-shot generation with unique prompts and no shared system prompt</label><label class="option"><input type="radio" name="q4" value="2"> RAG with a shared retrieval preamble</label><label class="option"><input type="radio" name="q4" value="3"> Voice workloads with repeated preambles</label><p data-feedback="4"></p></fieldset><fieldset><legend>6. ProjectDiscovery&#39;s deployment moved from 7% to 74% prefix-cache hit rate by doing what?</legend><label class="option"><input type="radio" name="q5" value="0"> Increasing GPU count from 8 to 16</label><label class="option"><input type="radio" name="q5" value="1"> Disabling continuous batching</label><label class="option"><input type="radio" name="q5" value="2"> Moving dynamic content out of the cacheable prefix</label><label class="option"><input type="radio" name="q5" value="3"> Switching from vLLM to SGLang without any prompt changes</label><p data-feedback="5"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/17-infrastructure-and-production/05-eagle3-speculative-decoding/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/17-infrastructure-and-production/07-tensorrt-llm-blackwell/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/17-infrastructure-and-production/06-sglang-radixattention/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

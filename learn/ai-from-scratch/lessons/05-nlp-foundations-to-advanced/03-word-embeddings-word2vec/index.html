@@ -1,0 +1,625 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>从零开始 Word2Vec 嵌入式 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-05-nlp-foundations-to-advanced" data-lesson="05-nlp-foundations-to-advanced/03-word-embeddings-word2vec" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/05-nlp-foundations-to-advanced/">自然语言处理</a> / LESSON 03</p><h1 class="lesson-title">从零开始 Word2Vec 嵌入式</h1><p>Word Embeddings — Word2Vec from Scratch</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>从零开始 Word2Vec 嵌入式</h1>
+<blockquote>
+<p>对于这个想法,就会有微小的网络,而几何则会掉下来.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 5 · 02 (BoW + TF-IDF), Phase 3 · 03 (Backpropagation from Scratch)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>问题</h2>
+<p>国际特种基金会知道<code>dog</code>其他<code>puppy</code>它们几乎意味着同一个东西.<code>dog</code>无法将其总体化为关于<code>puppy</code>您可以通过列出同义词来记录下这一点, 但这在罕见的术语,域名语和你不预料的每一种语言上都失败了.</p>
+<p>你想要一个代表,<code>dog</code>其他<code>puppy</code>太空中的陆地.<code>king - man + woman</code>附近的土地<code>queen</code>模型在哪里训练<code>dog</code>传输一些信号到<code>puppy</code>免费的.</p>
+<p>Word2Vec给了我们这个空间. 两个层神经网络,数万亿代币的训练运行,发表于2013年. 架构几乎是令人尬的简单.</p>
+<h2>概念</h2>
+<p><strong>Distributional hypothesis</strong>&quot;你会从一个词的朋友中知道&quot; (第一个,1957年).</p>
+<p>两种风味,两种利用这个想法.</p>
+<ul>
+<li>**Skip-gram.**给一个中心词,预测周围的词.<code>cat -&gt; (the, sat, on)</code>窗口尺寸2</li>
+<li>**CBOW (continuous bag of words).**根据周围的词汇,预测中心.<code>(the, sat, on) -&gt; cat</code>现在,我们要去.</li>
+</ul>
+<p>跳转语法训练速度较慢,但处理稀有词语更好.</p>
+<p>网络有一个隐藏的层,没有线性.输入是词汇上的一个热向量.输出是词汇上的软最大.训练后,你扔掉输出层.隐藏的层重量是嵌入.</p>
+<pre><code>one-hot(center) ── W ──▶ hidden (d-dim) ── W' ──▶ softmax(vocab)
+                          ^
+                          this is the embedding
+</code></pre>
+<p>软max超过100万字是非常昂贵的.<strong>negative sampling</strong>预测&quot;这个文本词是否出现在这个中文字附近,是的或是的&quot;. 通过每一个训练对的少数负面 (非同发生) 字样,而不是计算整个词汇中的软max.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-756231348662bfae2267.png" alt="word-vector-arithmetic 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<h3>步骤1:从一个体内训练对</h3>
+<pre><code class="language-python">def skipgram_pairs(docs, window=2):
+    pairs = []
+    for doc in docs:
+        for i, center in enumerate(doc):
+            for j in range(max(0, i - window), min(len(doc), i + window + 1)):
+                if i == j:
+                    continue
+                pairs.append((center, doc[j]))
+    return pairs
+</code></pre>
+<pre><code class="language-python">&gt;&gt;&gt; skipgram_pairs([[&quot;the&quot;, &quot;cat&quot;, &quot;sat&quot;, &quot;on&quot;, &quot;mat&quot;]], window=2)
+[('the', 'cat'), ('the', 'sat'),
+ ('cat', 'the'), ('cat', 'sat'), ('cat', 'on'),
+ ('sat', 'the'), ('sat', 'cat'), ('sat', 'on'), ('sat', 'mat'),
+ ...]
+</code></pre>
+<p>每个窗口中的 (中心,背景) 双是积极的训练例子.</p>
+<h3>步骤 2:嵌入表</h3>
+<p>两个矩阵.<code>W</code>是一个中文字嵌入表 (你保留的表).<code>W'</code>文本词表 (通常被丢弃,有时平均为<code>W</code>)</p>
+<pre><code class="language-python">import numpy as np
+
+
+def init_embeddings(vocab_size, dim, seed=0):
+    rng = np.random.default_rng(seed)
+    W = rng.normal(0, 0.1, size=(vocab_size, dim))
+    W_prime = rng.normal(0, 0.1, size=(vocab_size, dim))
+    return W, W_prime
+</code></pre>
+<p>字母大小10k和色100是现实的;用于教学,50字母×16色足以看到几何.</p>
+<h3>步骤3:负样本目标</h3>
+<p>对于每一个正数对<code>(center, context)</code>样本<code>k</code>训练模型,所以点产量<code>W[center] · W'[context]</code>对于积极的情况来说,高,对于负面的情况来说,低.</p>
+<pre><code class="language-python">def sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-np.clip(x, -20, 20)))
+
+
+def train_pair(W, W_prime, center_idx, context_idx, negative_indices, lr):
+    v_c = W[center_idx]
+    u_pos = W_prime[context_idx]
+    u_negs = W_prime[negative_indices]
+
+    pos_score = sigmoid(v_c @ u_pos)
+    neg_scores = sigmoid(u_negs @ v_c)
+
+    grad_center = (pos_score - 1) * u_pos
+    for i, u in enumerate(u_negs):
+        grad_center += neg_scores[i] * u
+
+    W[context_idx] = W[context_idx]
+    W_prime[context_idx] -= lr * (pos_score - 1) * v_c
+    for i, neg_idx in enumerate(negative_indices):
+        W_prime[neg_idx] -= lr * neg_scores[i] * v_c
+    W[center_idx] -= lr * grad_center
+</code></pre>
+<p>魔术公式:正对的物流损失 (想要sigmoid接近1) 加上负对的物流损失 (想要sigmoid接近0). 渐变体向两个表流动.完整的衍生是在原始纸上;如果你想它粘着,用笔和纸一次穿过它.</p>
+<h3>步骤4:在玩具体上训练</h3>
+<pre><code class="language-python">def train(docs, dim=16, window=2, k_neg=5, epochs=100, lr=0.05, seed=0):
+    vocab = build_vocab(docs)
+    vocab_size = len(vocab)
+    rng = np.random.default_rng(seed)
+    W, W_prime = init_embeddings(vocab_size, dim, seed=seed)
+    pairs = skipgram_pairs(docs, window=window)
+
+    for epoch in range(epochs):
+        rng.shuffle(pairs)
+        for center, context in pairs:
+            c_idx = vocab[center]
+            ctx_idx = vocab[context]
+            negs = rng.integers(0, vocab_size, size=k_neg)
+            negs = [n for n in negs if n != ctx_idx and n != c_idx]
+            train_pair(W, W_prime, c_idx, ctx_idx, negs, lr)
+    return vocab, W
+</code></pre>
+<p>在一个大型的体积上,经过足够的时代,分享背景的词语具有类似的中心嵌入.在一个玩具体积上,你看到了效果微弱.在数十亿的代币上,你看到了戏剧性.</p>
+<h3>步骤5:比喻技巧</h3>
+<pre><code class="language-python">def nearest(vocab, W, target_vec, topk=5, exclude=None):
+    exclude = exclude or set()
+    inv_vocab = {i: w for w, i in vocab.items()}
+    norms = np.linalg.norm(W, axis=1, keepdims=True) + 1e-9
+    W_norm = W / norms
+    target = target_vec / (np.linalg.norm(target_vec) + 1e-9)
+    sims = W_norm @ target
+    order = np.argsort(-sims)
+    out = []
+    for i in order:
+        if i in exclude:
+            continue
+        out.append((inv_vocab[i], float(sims[i])))
+        if len(out) == topk:
+            break
+    return out
+
+
+def analogy(vocab, W, a, b, c, topk=5):
+    v = W[vocab[b]] - W[vocab[a]] + W[vocab[c]]
+    return nearest(vocab, W, v, topk=topk, exclude={vocab[a], vocab[b], vocab[c]})
+</code></pre>
+<p>在预训练的300d谷歌新闻载体上:</p>
+<pre><code class="language-python">&gt;&gt;&gt; analogy(vocab, W, &quot;man&quot;, &quot;king&quot;, &quot;woman&quot;)
+[('queen', 0.71), ('monarch', 0.62), ('princess', 0.59), ...]
+</code></pre>
+<p><code>king - man + woman = queen</code>不是因为模型知道皇室是什么,而是因为向量<code>(king - man)</code>像&quot;皇家&quot;这样的东西,<code>woman</code>靠近皇室妇女地区的土地.</p>
+<h2>用它</h2>
+<p>编写Word2Vec从零开始就是教学.<code>gensim</code>现在,我们要去.</p>
+<pre><code class="language-python">from gensim.models import Word2Vec
+
+sentences = [
+    [&quot;the&quot;, &quot;cat&quot;, &quot;sat&quot;, &quot;on&quot;, &quot;the&quot;, &quot;mat&quot;],
+    [&quot;the&quot;, &quot;dog&quot;, &quot;ran&quot;, &quot;across&quot;, &quot;the&quot;, &quot;room&quot;],
+]
+
+model = Word2Vec(
+    sentences,
+    vector_size=100,
+    window=5,
+    min_count=1,
+    sg=1,
+    negative=5,
+    workers=4,
+    epochs=30,
+)
+
+print(model.wv[&quot;cat&quot;])
+print(model.wv.most_similar(&quot;cat&quot;, topn=3))
+</code></pre>
+<p>对于真正的工作,你几乎从来没有训练Word2Vec.</p>
+<ul>
+<li><strong>GloVe</strong>斯坦福的共发生矩阵因数化方法. 50d, 100d, 200d, 300d检查站.</li>
+<li><strong>fastText</strong>Facebook的 Word2Vec扩展,嵌入了字符n图.通过编写子词来处理词汇库之外的单词. 第04课.</li>
+<li><strong>Pretrained Word2Vec on Google News</strong> 300d,3M字词库,发表于 2013. 仍然每天下载.</li>
+</ul>
+<h3>在2026年Word2Vec仍然赢得胜利时</h3>
+<ul>
+<li>通过笔记本电脑,在一个小时内训练医学摘要,获得专业的向量,没有一般模型捕获.</li>
+<li>类似的特征工程.<code>gender_vector = mean(man - woman pairs)</code>现在还在公平研究中使用.</li>
+<li>它们可以通过PCA或t-SNE绘制图,并实际上看到集群的形成.</li>
+<li>任何地方的推断都必须在设备上运行,没有GPU.</li>
+</ul>
+<h3>Word2Vec 失败的地方</h3>
+<p>聚墙.<code>bank</code>只有一个向量.<code>river bank</code>其他<code>financial bank</code>让我们分享.<code>table</code>后游分类器不能区分感官和向量.</p>
+<p>基于周围的环境,语境嵌入式 (ELMo,BERT,自此以来的每个变压器) 通过根据周围的环境生成一个不同的向量来解决这一问题.这就是从Word2Vec到BERT的跳跃:从静态到语境.第7阶段涵盖变压器的一半.</p>
+<p>其他失败是词汇缺失问题.<code>Zoomer-approved</code>如果没有在训练数据中.没有倒退. fastText通过子词组合来解决这一问题 (课04).</p>
+<h2>运送它</h2>
+<p>保存如<code>outputs/skill-embedding-probe.md</code>其他:</p>
+<pre><code class="language-markdown">---
+name: embedding-probe
+description: Inspect a word2vec model. Run analogies, find neighbors, diagnose quality.
+version: 1.0.0
+phase: 5
+lesson: 03
+tags: [nlp, embeddings, debugging]
+---
+
+You probe trained word embeddings to verify they are working. Given a `gensim.models.KeyedVectors` object and a vocabulary, you run:
+
+1. Three canonical analogy tests. `king : man :: queen : woman`. `paris : france :: tokyo : japan`. `walking : walked :: swimming : ?`. Report the top-1 result and its cosine.
+2. Five nearest-neighbor tests on domain-specific words the user supplies. Print top-5 neighbors with cosines.
+3. One symmetry check. `similarity(a, b) == similarity(b, a)` to within float precision.
+4. One degenerate check. If any embedding has a norm below 0.01 or above 100, the model has a training bug. Flag it.
+
+Refuse to declare a model good on analogy accuracy alone. Analogy benchmarks are gameable and do not transfer to downstream tasks. Recommend intrinsic + downstream evaluation together.
+</code></pre>
+<h2>运动</h2>
+<ol>
+<li>**Easy.**经过200个时代,检查 子的子.<code>nearest(vocab, W, W[vocab[&quot;cat&quot;]])</code>收益<code>dog</code>如果没有,则增加时代或词汇库.</li>
+<li>**Medium.**增加频率字的子样本.<code>10^-5</code>测量对稀有词的相似性的影响.</li>
+<li>**Hard.**根据20个新闻群体的模型进行训练.<code>he - she</code>其他<code>doctor - nurse</code>报告哪些职业有最大的偏差差. 这种类型的探测器公平性研究人员使用.</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Word embedding</td>
+<td>Word as a vector</td>
+<td>A dense, low-dim (typically 100-300) representation learned from context.</td>
+</tr>
+<tr>
+<td>Skip-gram</td>
+<td>Word2Vec trick</td>
+<td>Predict context words from center word. Slower than CBOW, better for rare words.</td>
+</tr>
+<tr>
+<td>Negative sampling</td>
+<td>Training shortcut</td>
+<td>Replace softmax over full vocab with binary classification against <code>k</code> random words.</td>
+</tr>
+<tr>
+<td>Static embedding</td>
+<td>One vector per word</td>
+<td>Same vector regardless of context. Fails on polysemy.</td>
+</tr>
+<tr>
+<td>Contextual embedding</td>
+<td>Context-sensitive vector</td>
+<td>Different vector for each occurrence based on surrounding words. What transformers produce.</td>
+</tr>
+<tr>
+<td>OOV</td>
+<td>Out of vocabulary</td>
+<td>Word not seen in training. Word2Vec cannot produce a vector for these.</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/1310.4546" rel="noreferrer" data-network="true">Mikolov et al. (2013). Distributed Representations of Words and Phrases and their Compositionality <small>↗ 需要联网</small></a>负样本纸. 简短可读.</li>
+<li><a href="https://arxiv.org/abs/1411.2738" rel="noreferrer" data-network="true">Rong, X. (2014). word2vec Parameter Learning Explained <small>↗ 需要联网</small></a>最清楚的梯度衍生,如果原始论文的数学感觉密集.</li>
+<li><a href="https://radimrehurek.com/gensim/models/word2vec.html" rel="noreferrer" data-network="true">gensim Word2Vec tutorial <small>↗ 需要联网</small></a>实际上有效的生产培训设置.</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Word Embeddings — Word2Vec from Scratch</h1>
+<blockquote>
+<p>A word is the company it keeps. Train a shallow net on that idea and geometry falls out.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 5 · 02 (BoW + TF-IDF), Phase 3 · 03 (Backpropagation from Scratch)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>The Problem</h2>
+<p>TF-IDF knows <code>dog</code> and <code>puppy</code> are different words. It does not know they mean nearly the same thing. A classifier trained on <code>dog</code> cannot generalize to a review about <code>puppy</code>. You can paper over this by listing synonyms, but that fails on rare terms, domain jargon, and every language you did not anticipate.</p>
+<p>You want a representation where <code>dog</code> and <code>puppy</code> land close together in space. Where <code>king - man + woman</code> lands near <code>queen</code>. Where a model trained on <code>dog</code> transfers some signal to <code>puppy</code> for free.</p>
+<p>Word2Vec gave us that space. Two layer neural network, trillion-token training runs, published in 2013. The architecture is almost embarrassingly simple. The results reshaped NLP for a decade.</p>
+<h2>The Concept</h2>
+<p><strong>Distributional hypothesis</strong> (Firth, 1957): &quot;You shall know a word by the company it keeps.&quot; If two words appear in similar contexts, they probably mean similar things.</p>
+<p>Word2Vec comes in two flavors, both exploiting that idea.</p>
+<ul>
+<li><strong>Skip-gram.</strong> Given a center word, predict the surrounding words. <code>cat -&gt; (the, sat, on)</code> with window size 2.</li>
+<li><strong>CBOW (continuous bag of words).</strong> Given surrounding words, predict the center. <code>(the, sat, on) -&gt; cat</code>.</li>
+</ul>
+<p>Skip-gram is slower to train but handles rare words better. It became the default.</p>
+<p>The network has one hidden layer with no nonlinearity. Input is a one-hot vector over the vocabulary. Output is a softmax over the vocabulary. After training, you throw away the output layer. The hidden layer weights are the embeddings.</p>
+<pre><code>one-hot(center) ── W ──▶ hidden (d-dim) ── W' ──▶ softmax(vocab)
+                          ^
+                          this is the embedding
+</code></pre>
+<p>The trick: softmax over 100k words is prohibitively expensive. Word2Vec uses <strong>negative sampling</strong> to turn it into a binary classification task. Predict &quot;did this context word appear near this center word, yes or no&quot;. Sample a handful of negative (non-co-occurring) words per training pair instead of computing softmax over the whole vocabulary.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-756231348662bfae2267.png" alt="word-vector-arithmetic 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<h3>Step 1: training pairs from a corpus</h3>
+<pre><code class="language-python">def skipgram_pairs(docs, window=2):
+    pairs = []
+    for doc in docs:
+        for i, center in enumerate(doc):
+            for j in range(max(0, i - window), min(len(doc), i + window + 1)):
+                if i == j:
+                    continue
+                pairs.append((center, doc[j]))
+    return pairs
+</code></pre>
+<pre><code class="language-python">&gt;&gt;&gt; skipgram_pairs([[&quot;the&quot;, &quot;cat&quot;, &quot;sat&quot;, &quot;on&quot;, &quot;mat&quot;]], window=2)
+[('the', 'cat'), ('the', 'sat'),
+ ('cat', 'the'), ('cat', 'sat'), ('cat', 'on'),
+ ('sat', 'the'), ('sat', 'cat'), ('sat', 'on'), ('sat', 'mat'),
+ ...]
+</code></pre>
+<p>Every (center, context) pair in a window is a positive training example.</p>
+<h3>Step 2: embedding tables</h3>
+<p>Two matrices. <code>W</code> is the center-word embedding table (the one you keep). <code>W'</code> is the context-word table (often discarded, sometimes averaged with <code>W</code>).</p>
+<pre><code class="language-python">import numpy as np
+
+
+def init_embeddings(vocab_size, dim, seed=0):
+    rng = np.random.default_rng(seed)
+    W = rng.normal(0, 0.1, size=(vocab_size, dim))
+    W_prime = rng.normal(0, 0.1, size=(vocab_size, dim))
+    return W, W_prime
+</code></pre>
+<p>Small random init. Vocab size 10k and dim 100 is realistic; for teaching, 50 vocab x 16 dim is enough to see the geometry.</p>
+<h3>Step 3: negative sampling objective</h3>
+<p>For each positive pair <code>(center, context)</code>, sample <code>k</code> random words from the vocabulary as negatives. Train the model so the dot product <code>W[center] · W'[context]</code> is high for positives and low for negatives.</p>
+<pre><code class="language-python">def sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-np.clip(x, -20, 20)))
+
+
+def train_pair(W, W_prime, center_idx, context_idx, negative_indices, lr):
+    v_c = W[center_idx]
+    u_pos = W_prime[context_idx]
+    u_negs = W_prime[negative_indices]
+
+    pos_score = sigmoid(v_c @ u_pos)
+    neg_scores = sigmoid(u_negs @ v_c)
+
+    grad_center = (pos_score - 1) * u_pos
+    for i, u in enumerate(u_negs):
+        grad_center += neg_scores[i] * u
+
+    W[context_idx] = W[context_idx]
+    W_prime[context_idx] -= lr * (pos_score - 1) * v_c
+    for i, neg_idx in enumerate(negative_indices):
+        W_prime[neg_idx] -= lr * neg_scores[i] * v_c
+    W[center_idx] -= lr * grad_center
+</code></pre>
+<p>The magic formula: logistic loss on positive pair (want sigmoid near 1) plus logistic loss on negative pairs (want sigmoid near 0). Gradients flow to both tables. Full derivation is in the original paper; walk through it once with pencil and paper if you want it to stick.</p>
+<h3>Step 4: train on a toy corpus</h3>
+<pre><code class="language-python">def train(docs, dim=16, window=2, k_neg=5, epochs=100, lr=0.05, seed=0):
+    vocab = build_vocab(docs)
+    vocab_size = len(vocab)
+    rng = np.random.default_rng(seed)
+    W, W_prime = init_embeddings(vocab_size, dim, seed=seed)
+    pairs = skipgram_pairs(docs, window=window)
+
+    for epoch in range(epochs):
+        rng.shuffle(pairs)
+        for center, context in pairs:
+            c_idx = vocab[center]
+            ctx_idx = vocab[context]
+            negs = rng.integers(0, vocab_size, size=k_neg)
+            negs = [n for n in negs if n != ctx_idx and n != c_idx]
+            train_pair(W, W_prime, c_idx, ctx_idx, negs, lr)
+    return vocab, W
+</code></pre>
+<p>After enough epochs on a large corpus, words that share contexts have similar center embeddings. On a toy corpus, you see the effect faintly. On billions of tokens, you see it dramatically.</p>
+<h3>Step 5: the analogy trick</h3>
+<pre><code class="language-python">def nearest(vocab, W, target_vec, topk=5, exclude=None):
+    exclude = exclude or set()
+    inv_vocab = {i: w for w, i in vocab.items()}
+    norms = np.linalg.norm(W, axis=1, keepdims=True) + 1e-9
+    W_norm = W / norms
+    target = target_vec / (np.linalg.norm(target_vec) + 1e-9)
+    sims = W_norm @ target
+    order = np.argsort(-sims)
+    out = []
+    for i in order:
+        if i in exclude:
+            continue
+        out.append((inv_vocab[i], float(sims[i])))
+        if len(out) == topk:
+            break
+    return out
+
+
+def analogy(vocab, W, a, b, c, topk=5):
+    v = W[vocab[b]] - W[vocab[a]] + W[vocab[c]]
+    return nearest(vocab, W, v, topk=topk, exclude={vocab[a], vocab[b], vocab[c]})
+</code></pre>
+<p>On pre-trained 300d Google News vectors:</p>
+<pre><code class="language-python">&gt;&gt;&gt; analogy(vocab, W, &quot;man&quot;, &quot;king&quot;, &quot;woman&quot;)
+[('queen', 0.71), ('monarch', 0.62), ('princess', 0.59), ...]
+</code></pre>
+<p><code>king - man + woman = queen</code>. Not because the model knows what royalty is. Because the vector <code>(king - man)</code> captures something like &quot;royal&quot;, and adding it to <code>woman</code> lands near the royal-female region.</p>
+<h2>Use It</h2>
+<p>Writing Word2Vec from scratch is teaching. Production NLP uses <code>gensim</code>.</p>
+<pre><code class="language-python">from gensim.models import Word2Vec
+
+sentences = [
+    [&quot;the&quot;, &quot;cat&quot;, &quot;sat&quot;, &quot;on&quot;, &quot;the&quot;, &quot;mat&quot;],
+    [&quot;the&quot;, &quot;dog&quot;, &quot;ran&quot;, &quot;across&quot;, &quot;the&quot;, &quot;room&quot;],
+]
+
+model = Word2Vec(
+    sentences,
+    vector_size=100,
+    window=5,
+    min_count=1,
+    sg=1,
+    negative=5,
+    workers=4,
+    epochs=30,
+)
+
+print(model.wv[&quot;cat&quot;])
+print(model.wv.most_similar(&quot;cat&quot;, topn=3))
+</code></pre>
+<p>For real work, you almost never train Word2Vec yourself. You download pre-trained vectors.</p>
+<ul>
+<li><strong>GloVe</strong> — Stanford's co-occurrence-matrix factorization approach. 50d, 100d, 200d, 300d checkpoints. Good general coverage. Lesson 04 covers GloVe specifically.</li>
+<li><strong>fastText</strong> — Facebook's Word2Vec extension that embeds character n-grams. Handles out-of-vocabulary words by composing subwords. Lesson 04.</li>
+<li><strong>Pretrained Word2Vec on Google News</strong> — 300d, 3M word vocabulary, published 2013. Still downloaded daily.</li>
+</ul>
+<h3>When Word2Vec still wins in 2026</h3>
+<ul>
+<li>Lightweight domain-specific retrieval. Train on medical abstracts in an hour on a laptop, get specialized vectors no general model captures.</li>
+<li>Analogy-style feature engineering. <code>gender_vector = mean(man - woman pairs)</code>. Subtract it from other words to get a gender-neutral axis. Still used in fairness research.</li>
+<li>Interpretability. 100d is small enough to plot via PCA or t-SNE and actually see clusters form.</li>
+<li>Anywhere inference has to run on-device with no GPU. Word2Vec lookup is a single row fetch.</li>
+</ul>
+<h3>Where Word2Vec fails</h3>
+<p>The polysemy wall. <code>bank</code> has one vector. <code>river bank</code> and <code>financial bank</code> share it. <code>table</code> (spreadsheet vs. furniture) shares it. A classifier downstream cannot distinguish the senses from the vector.</p>
+<p>Contextual embeddings (ELMo, BERT, every transformer since) solved this by producing a different vector for each occurrence of the word based on surrounding context. That is the jump from Word2Vec to BERT: from static to contextual. Phase 7 covers the transformer half.</p>
+<p>The out-of-vocabulary problem is the other failure. Word2Vec has never seen <code>Zoomer-approved</code> if it was not in training data. No fallback. fastText fixes this with subword composition (lesson 04).</p>
+<h2>Ship It</h2>
+<p>Save as <code>outputs/skill-embedding-probe.md</code>:</p>
+<pre><code class="language-markdown">---
+name: embedding-probe
+description: Inspect a word2vec model. Run analogies, find neighbors, diagnose quality.
+version: 1.0.0
+phase: 5
+lesson: 03
+tags: [nlp, embeddings, debugging]
+---
+
+You probe trained word embeddings to verify they are working. Given a `gensim.models.KeyedVectors` object and a vocabulary, you run:
+
+1. Three canonical analogy tests. `king : man :: queen : woman`. `paris : france :: tokyo : japan`. `walking : walked :: swimming : ?`. Report the top-1 result and its cosine.
+2. Five nearest-neighbor tests on domain-specific words the user supplies. Print top-5 neighbors with cosines.
+3. One symmetry check. `similarity(a, b) == similarity(b, a)` to within float precision.
+4. One degenerate check. If any embedding has a norm below 0.01 or above 100, the model has a training bug. Flag it.
+
+Refuse to declare a model good on analogy accuracy alone. Analogy benchmarks are gameable and do not transfer to downstream tasks. Recommend intrinsic + downstream evaluation together.
+</code></pre>
+<h2>Exercises</h2>
+<ol>
+<li><strong>Easy.</strong> Run the training loop on a tiny corpus (20 sentences about cats and dogs). After 200 epochs, verify <code>nearest(vocab, W, W[vocab[&quot;cat&quot;]])</code> returns <code>dog</code> in its top 3. If not, increase epochs or vocabulary.</li>
+<li><strong>Medium.</strong> Add subsampling of frequent words. Words with frequency above <code>10^-5</code> are dropped from training pairs with probability proportional to their frequency. Measure the effect on rare-word similarity.</li>
+<li><strong>Hard.</strong> Train a model on the 20 Newsgroups corpus. Compute two bias axes: <code>he - she</code> and <code>doctor - nurse</code>. Project occupation words onto both axes. Report which occupations have the largest bias gap. This is the kind of probe fairness researchers use.</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Word embedding</td>
+<td>Word as a vector</td>
+<td>A dense, low-dim (typically 100-300) representation learned from context.</td>
+</tr>
+<tr>
+<td>Skip-gram</td>
+<td>Word2Vec trick</td>
+<td>Predict context words from center word. Slower than CBOW, better for rare words.</td>
+</tr>
+<tr>
+<td>Negative sampling</td>
+<td>Training shortcut</td>
+<td>Replace softmax over full vocab with binary classification against <code>k</code> random words.</td>
+</tr>
+<tr>
+<td>Static embedding</td>
+<td>One vector per word</td>
+<td>Same vector regardless of context. Fails on polysemy.</td>
+</tr>
+<tr>
+<td>Contextual embedding</td>
+<td>Context-sensitive vector</td>
+<td>Different vector for each occurrence based on surrounding words. What transformers produce.</td>
+</tr>
+<tr>
+<td>OOV</td>
+<td>Out of vocabulary</td>
+<td>Word not seen in training. Word2Vec cannot produce a vector for these.</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/1310.4546" rel="noreferrer" data-network="true">Mikolov et al. (2013). Distributed Representations of Words and Phrases and their Compositionality <small>↗ 需要联网</small></a> — the negative-sampling paper. Short and readable.</li>
+<li><a href="https://arxiv.org/abs/1411.2738" rel="noreferrer" data-network="true">Rong, X. (2014). word2vec Parameter Learning Explained <small>↗ 需要联网</small></a> — the clearest derivation of the gradients, if the original paper's math feels dense.</li>
+<li><a href="https://radimrehurek.com/gensim/models/word2vec.html" rel="noreferrer" data-network="true">gensim Word2Vec tutorial <small>↗ 需要联网</small></a> — production training settings that actually work.</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-05-nlp-foundations-to-advanced--03-word-embeddings-word2vec.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-05-nlp-foundations-to-advanced--03-word-embeddings-word2vec.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/05-nlp-foundations-to-advanced/03-word-embeddings-word2vec/code/main.py">phases/05-nlp-foundations-to-advanced/03-word-embeddings-word2vec/code/main.py</a><details><summary>查看原始文本</summary><pre><code>import re
+
+import numpy as np
+
+
+TOKEN_RE = re.compile(r&quot;[A-Za-z]+(?:&#39;[A-Za-z]+)?&quot;)
+
+
+def tokenize(text):
+    return [t.lower() for t in TOKEN_RE.findall(text)]
+
+
+def build_vocab(docs):
+    vocab = {}
+    for doc in docs:
+        for token in doc:
+            if token not in vocab:
+                vocab[token] = len(vocab)
+    return vocab
+
+
+def skipgram_pairs(docs, window=2):
+    pairs = []
+    for doc in docs:
+        for i, center in enumerate(doc):
+            for j in range(max(0, i - window), min(len(doc), i + window + 1)):
+                if i != j:
+                    pairs.append((center, doc[j]))
+    return pairs
+
+
+def sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-np.clip(x, -20, 20)))
+
+
+def init_embeddings(vocab_size, dim, seed):
+    rng = np.random.default_rng(seed)
+    W = rng.normal(0, 0.1, size=(vocab_size, dim))
+    W_prime = rng.normal(0, 0.1, size=(vocab_size, dim))
+    return W, W_prime
+
+
+def train_pair(W, W_prime, c_idx, ctx_idx, neg_indices, lr):
+    v_c = W[c_idx]
+    u_pos = W_prime[ctx_idx]
+    u_negs = W_prime[neg_indices]
+
+    pos_err = sigmoid(v_c @ u_pos) - 1.0
+    neg_errs = sigmoid(u_negs @ v_c)
+
+    grad_center = pos_err * u_pos + neg_errs @ u_negs
+    W_prime[ctx_idx] -= lr * pos_err * v_c
+    for i, neg_idx in enumerate(neg_indices):
+        W_prime[neg_idx] -= lr * neg_errs[i] * v_c
+    W[c_idx] -= lr * grad_center
+
+
+def train(docs, dim=16, window=2, k_neg=5, epochs=200, lr=0.05, seed=0):
+    vocab = build_vocab(docs)
+    vocab_size = len(vocab)
+    W, W_prime = init_embeddings(vocab_size, dim, seed)
+    pairs = skipgram_pairs(docs, window=window)
+    rng = np.random.default_rng(seed)
+
+    for epoch in range(epochs):
+        rng.shuffle(pairs)
+        for center, context in pairs:
+            c_idx = vocab[center]
+            ctx_idx = vocab[context]
+            neg_candidates = rng.integers(0, vocab_size, size=k_neg * 2)
+            negs = [int(n) for n in neg_candidates if n != ctx_idx and n != c_idx][:k_neg]
+            train_pair(W, W_prime, c_idx, ctx_idx, negs, lr)
+    return vocab, W
+
+
+def nearest(vocab, W, target_vec, topk=5, exclude=None):
+    exclude = exclude or set()
+    inv_vocab = {i: w for w, i in vocab.items()}
+    norms = np.linalg.norm(W, axis=1, keepdims=True) + 1e-9
+    W_norm = W / norms
+    target = target_vec / (np.linalg.norm(target_vec) + 1e-9)
+    sims = W_norm @ target
+    order = np.argsort(-sims)
+    out = []
+    for i in order:
+        if int(i) in exclude:
+            continue
+        out.append((inv_vocab[int(i)], float(sims[i])))
+        if len(out) == topk:
+            break
+    return out
+
+
+def main():
+    corpus = [
+        &quot;the cat sat on the mat&quot;,
+        &quot;the dog sat on the rug&quot;,
+        &quot;a cat chased a mouse&quot;,
+        &quot;a dog chased a cat&quot;,
+        &quot;the kitten slept on the mat&quot;,
+        &quot;the puppy slept on the rug&quot;,
+        &quot;cats and dogs are pets&quot;,
+        &quot;kittens and puppies are young&quot;,
+        &quot;cats chase mice&quot;,
+        &quot;dogs chase squirrels&quot;,
+    ] * 20
+
+    docs = [tokenize(s) for s in corpus]
+    vocab, W = train(docs, dim=16, window=2, k_neg=5, epochs=120, lr=0.05, seed=42)
+
+    for word in [&quot;cat&quot;, &quot;dog&quot;, &quot;sat&quot;, &quot;chased&quot;]:
+        idx = vocab[word]
+        top = nearest(vocab, W, W[idx], topk=4, exclude={idx})
+        print(f&quot;nearest to {word}:&quot;)
+        for w, s in top:
+            print(f&quot;  {w:12s} {s:.3f}&quot;)
+        print()
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/05-nlp-foundations-to-advanced/03-word-embeddings-word2vec/outputs/.gitkeep">phases/05-nlp-foundations-to-advanced/03-word-embeddings-word2vec/outputs/.gitkeep</a><details><summary>查看原始文本</summary><pre><code></code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/05-nlp-foundations-to-advanced/03-word-embeddings-word2vec/outputs/skill-embedding-probe.md">phases/05-nlp-foundations-to-advanced/03-word-embeddings-word2vec/outputs/skill-embedding-probe.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: embedding-probe
+description: Inspect a word2vec model. Run analogies, find neighbors, diagnose quality.
+version: 1.0.0
+phase: 5
+lesson: 03
+tags: [nlp, embeddings, debugging]
+---
+
+You probe trained word embeddings to verify they are working. Given a `gensim.models.KeyedVectors` object and a vocabulary, you run:
+
+1. Three canonical analogy tests. `king : man :: queen : woman`. `paris : france :: tokyo : japan`. `walking : walked :: swimming : ?`. Report the top-1 result and its cosine.
+2. Five nearest-neighbor tests on domain-specific words the user supplies. Print top-5 neighbors with cosines.
+3. One symmetry check. `similarity(a, b) == similarity(b, a)` to within float precision.
+4. One degenerate check. If any embedding has a norm below 0.01 or above 100, the model has a training bug. Flag it.
+
+Refuse to declare a model good on analogy accuracy alone. Analogy benchmarks are gameable and do not transfer to downstream tasks. Recommend intrinsic plus downstream evaluation together.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. What is the distributional hypothesis?</legend><label class="option"><input type="radio" name="q0" value="0"> All words can be embedded in 300 dimensions</label><label class="option"><input type="radio" name="q0" value="1"> Frequent words carry the most meaning</label><label class="option"><input type="radio" name="q0" value="2"> You shall know a word by the company it keeps</label><label class="option"><input type="radio" name="q0" value="3"> Words are uniformly distributed across documents</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. Why is plain softmax over the vocabulary impractical in Word2Vec?</legend><label class="option"><input type="radio" name="q1" value="0"> Softmax cannot model probabilities</label><label class="option"><input type="radio" name="q1" value="1"> Softmax has no gradient</label><label class="option"><input type="radio" name="q1" value="2"> Computing softmax over 100k+ vocabulary terms is prohibitively expensive per training step</label><label class="option"><input type="radio" name="q1" value="3"> It causes vanishing gradients</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. What is the difference between skip-gram and CBOW?</legend><label class="option"><input type="radio" name="q2" value="0"> Skip-gram predicts context words from the center; CBOW predicts the center from context</label><label class="option"><input type="radio" name="q2" value="1"> Skip-gram predicts the center word from context; CBOW does the reverse</label><label class="option"><input type="radio" name="q2" value="2"> Skip-gram trains a deep network; CBOW is shallow</label><label class="option"><input type="radio" name="q2" value="3"> Skip-gram uses bigrams; CBOW uses unigrams</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. In negative sampling, what is the objective for the positive pair (center, context)?</legend><label class="option"><input type="radio" name="q3" value="0"> Minimize their dot product</label><label class="option"><input type="radio" name="q3" value="1"> Force them to be orthogonal</label><label class="option"><input type="radio" name="q3" value="2"> Maximize sigmoid(W[center] dot W&#39;[context]) so it is close to 1</label><label class="option"><input type="radio" name="q3" value="3"> Decorrelate the vectors</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. After training Word2Vec, which weight matrix becomes the word embeddings?</legend><label class="option"><input type="radio" name="q4" value="0"> A separate post-training projection</label><label class="option"><input type="radio" name="q4" value="1"> Both, multiplied together</label><label class="option"><input type="radio" name="q4" value="2"> The hidden-to-output W&#39; matrix</label><label class="option"><input type="radio" name="q4" value="3"> The input-to-hidden W matrix (center-word table)</label><p data-feedback="4"></p></fieldset><fieldset><legend>6. Why does Word2Vec fail on polysemy (e.g. &#39;bank&#39;)?</legend><label class="option"><input type="radio" name="q5" value="0"> Negative sampling drops rare meanings</label><label class="option"><input type="radio" name="q5" value="1"> It ignores rare words</label><label class="option"><input type="radio" name="q5" value="2"> The window size is too small</label><label class="option"><input type="radio" name="q5" value="3"> It assigns one static vector per word, so &#39;river bank&#39; and &#39;financial bank&#39; share the same vector</label><p data-feedback="5"></p></fieldset><fieldset><legend>7. When would you still reach for Word2Vec over a transformer in 2026?</legend><label class="option"><input type="radio" name="q6" value="0"> When dialog quality matters</label><label class="option"><input type="radio" name="q6" value="1"> When you need contextual disambiguation</label><label class="option"><input type="radio" name="q6" value="2"> Lightweight, on-device, domain-specific retrieval where a single row lookup is the latency budget</label><label class="option"><input type="radio" name="q6" value="3"> When inputs are very long</label><p data-feedback="6"></p></fieldset><fieldset><legend>8. What enables the famous analogy &#39;king - man + woman ~ queen&#39;?</legend><label class="option"><input type="radio" name="q7" value="0"> Skip-gram trains on royal vocabularies</label><label class="option"><input type="radio" name="q7" value="1"> Vector arithmetic captures linear directions like &#39;royal&#39; that transfer across genders</label><label class="option"><input type="radio" name="q7" value="2"> The model encodes royalty as a flag bit</label><label class="option"><input type="radio" name="q7" value="3"> Cosine similarity is invariant to gender</label><p data-feedback="7"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/05-nlp-foundations-to-advanced/02-bag-of-words-tfidf/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/05-nlp-foundations-to-advanced/04-glove-fasttext-subword/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/05-nlp-foundations-to-advanced/03-word-embeddings-word2vec/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

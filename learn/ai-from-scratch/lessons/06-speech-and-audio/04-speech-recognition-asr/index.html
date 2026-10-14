@@ -1,0 +1,638 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>语音识别 (ASR) CTC,RNN-T,注意力 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-06-speech-and-audio" data-lesson="06-speech-and-audio/04-speech-recognition-asr" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/06-speech-and-audio/">语音与音频</a> / LESSON 04</p><h1 class="lesson-title">语音识别 (ASR) CTC,RNN-T,注意力</h1><p>Speech Recognition (ASR) — CTC, RNN-T, Attention</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>语音识别 (ASR) CTC,RNN-T,注意力</h1>
+<blockquote>
+<p>语音识别是每个时间步骤上的音频分类,由一个知道英语和沉默的序列模型粘在一起.CTC,RNN-T和注意力是这三个方法.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 6 · 02 (Spectrograms &amp; Mel), Phase 5 · 08 (CNNs &amp; RNNs for Text), Phase 5 · 10 (Attention)
+<strong>Time:</strong> ~45 minutes</p>
+<h2>问题</h2>
+<p>你有一个10秒16kHz的剪辑.你想要一个字符串:&quot;点燃厨房灯&quot;.挑战是结构性的:音频框架不会与字符一致. &quot;好吧&quot;字可能需要200ms或1200ms.沉默点击发言.有些音符比其他更长.输出代码的数量未知事先.</p>
+<p>现在,我们有三种方法来解决这个问题:</p>
+<ol>
+<li>**CTC (Connectionist Temporal Classification).**发射每个框架的代币概率,包括一个特殊的 <em>空白</em>. 解码时的崩重复和空白. 非自动降低,快速. 用于 wav2vec 2.0, MMS.</li>
+<li>**RNN-T (Recurrent Neural Network Transducer).**联合网络预测下一个代码器框架和之前的代码. 流式. 谷歌的设备ASR,NVIDIA Parakeet使用.</li>
+<li>**Attention encoder-decoder.**编码器将音频压缩到隐藏状态,解码器交叉处理以自动降低生成代币.</li>
+</ol>
+<p>2026年,在 LibriSpeech 测试清洁度上,SOTA WER 是1.4% (Parakeet-TDT-1.1B,NVIDIA) 和1.58%.</p>
+<h2>概念</h2>
+<p><img src="/learn/ai-from-scratch/files/phases/06-speech-and-audio/04-speech-recognition-asr/assets/asr-formulations.svg" alt="Three ASR formulations: CTC, RNN-T, attention-encoder-decoder" loading="lazy"></p>
+<p>**CTC intuition.**让编码器输出<code>T</code>框架水平分布<code>V+1</code>标记 (V字符号 + 空格).<code>y</code>长度<code>U &lt; T</code>任何的架配线都会崩到<code>y</code>输出:每的 argmax,崩重复,删除空白.</p>
+<p>优点:非自行降低,可流动,视角零.缺点: <em>条件独立假设</em> 每个框架预测是独立的,因此没有内部语言模型.通过光束搜索或浅融合通过外部LM来解决.</p>
+<p>**RNN-T intuition.*<em>添加一个 <em>预测器</em> 网络,嵌入符号历史和一个 * 结合器</em> 结合预测器状态和编码器框架,成为一个共同分布<code>V+1</code>其他<code>+1</code>显然模型了CTC忽略的条件依赖性. 流动性,因为每个步骤只在过去的框架和过去的代币上.</p>
+<p>优点:可流动+内部LM. 缺点:训练更复杂,更需要记忆 (3D损失网格);RNN-T损失内核本身是一个整体库类别.</p>
+<p>**Attention encoder-decoder.**编码器 (6-32 个变压器层) 在日志邮件框架上. 编码器 (6-32 个变压器层) 交叉监督编码输出以自行降低代币. 没有对齐限制 注意力可以在音频中任何地方看. 除非你限制注意力外,无法流媒体 (碎片的声流, 2024).</p>
+<p>优点:在线ASR上提供最高质量,使用标准seq2seq工具进行训练很容易.缺点:自动降低延迟与输出长度相比例;不能在没有工程的情况下流.</p>
+<h3>单个号码</h3>
+<p><strong>Word Error Rate</strong><code>(S + D + I) / N</code>根据Levenstein的数据,在Levenstein的数据中,S=替代,D=删除,I=插入,N=引用词数.</p>
+<table>
+<thead>
+<tr>
+<th>Model</th>
+<th>LibriSpeech test-clean</th>
+<th>LibriSpeech test-other</th>
+<th>Size</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Parakeet-TDT-1.1B</td>
+<td>1.40%</td>
+<td>2.78%</td>
+<td>1.1B params</td>
+</tr>
+<tr>
+<td>Whisper-Large-v3-turbo</td>
+<td>1.58%</td>
+<td>3.03%</td>
+<td>809M</td>
+</tr>
+<tr>
+<td>Canary-1B Flash</td>
+<td>1.48%</td>
+<td>2.87%</td>
+<td>1B</td>
+</tr>
+<tr>
+<td>Seamless M4T v2</td>
+<td>1.7%</td>
+<td>3.5%</td>
+<td>2.3B</td>
+</tr>
+</tbody>
+</table>
+<p>所有这些都是基于编码器-解码器或RNN-T的.纯CTC系统 (wav2vec 2.0) 在测试清洁时约为1.82.1%.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-1ffeb2f5762a1cd10a30.png" alt="ctc-collapse 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<h3>步骤1:贪的CTC解码</h3>
+<pre><code class="language-python">def ctc_greedy(frame_logits, blank=0, vocab=None):
+    # frame_logits: list of per-frame probability vectors
+    preds = [max(range(len(p)), key=lambda i: p[i]) for p in frame_logits]
+    out = []
+    prev = -1
+    for p in preds:
+        if p != prev and p != blank:
+            out.append(p)
+        prev = p
+    return &quot;&quot;.join(vocab[i] for i in out) if vocab else out
+</code></pre>
+<p>两条规则: 连续重复,放空.<code>a a _ _ a b b _ c</code>其他<code>a a b c</code>现在,我们要去.</p>
+<h3>步骤2:光束检查CTC</h3>
+<pre><code class="language-python">def ctc_beam(frame_logits, beam=8, blank=0):
+    import math
+    beams = [([], 0.0)]  # (tokens, log_prob)
+    for p in frame_logits:
+        log_p = [math.log(max(pi, 1e-10)) for pi in p]
+        candidates = []
+        for seq, lp in beams:
+            for t, lpt in enumerate(log_p):
+                new = seq[:] if t == blank else (seq + [t] if not seq or seq[-1] != t else seq)
+                candidates.append((new, lp + lpt))
+        candidates.sort(key=lambda x: -x[1])
+        beams = candidates[:beam]
+    return beams[0][0]
+</code></pre>
+<p>制作使用LM融合的先树束搜索;这是概念骨架.</p>
+<h3>步骤3: WER</h3>
+<pre><code class="language-python">def wer(ref, hyp):
+    r, h = ref.split(), hyp.split()
+    dp = [[0] * (len(h) + 1) for _ in range(len(r) + 1)]
+    for i in range(len(r) + 1):
+        dp[i][0] = i
+    for j in range(len(h) + 1):
+        dp[0][j] = j
+    for i in range(1, len(r) + 1):
+        for j in range(1, len(h) + 1):
+            cost = 0 if r[i - 1] == h[j - 1] else 1
+            dp[i][j] = min(
+                dp[i - 1][j] + 1,
+                dp[i][j - 1] + 1,
+                dp[i - 1][j - 1] + cost,
+            )
+    return dp[len(r)][len(h)] / max(1, len(r))
+</code></pre>
+<h3>步骤4:推断与语</h3>
+<pre><code class="language-python">import whisper
+model = whisper.load_model(&quot;large-v3-turbo&quot;)
+result = model.transcribe(&quot;clip.wav&quot;)
+print(result[&quot;text&quot;])
+</code></pre>
+<p>单线器为2026年最强的一般ASR. 运行在24GB的GPU上以20x实时.</p>
+<h3>步骤5:使用Parakeet或 wav2vec 2.0 流媒体</h3>
+<pre><code class="language-python">from transformers import pipeline
+asr = pipeline(&quot;automatic-speech-recognition&quot;, model=&quot;nvidia/parakeet-tdt-1.1b&quot;)
+for chunk in streaming_audio():
+    print(asr(chunk, return_timestamps=True))
+</code></pre>
+<p>流媒体ASR需要分片编码器注意和运输状态;使用支持它的库 (NeMo为Parakeet,<code>transformers</code>配合的管道<code>chunk_length_s</code>)</p>
+<h2>用它</h2>
+<p>现在,我们要做什么?</p>
+<table>
+<thead>
+<tr>
+<th>Situation</th>
+<th>Pick</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>English, offline, max quality</td>
+<td>Whisper-large-v3-turbo</td>
+</tr>
+<tr>
+<td>Multilingual, robust</td>
+<td>SeamlessM4T v2</td>
+</tr>
+<tr>
+<td>Streaming, low latency</td>
+<td>Parakeet-TDT-1.1B or Riva</td>
+</tr>
+<tr>
+<td>Edge, mobile, &lt;500 ms latency</td>
+<td>Whisper-Tiny quantized or Moonshine (2024)</td>
+</tr>
+<tr>
+<td>Long-form</td>
+<td>Whisper with VAD-based chunking (WhisperX)</td>
+</tr>
+<tr>
+<td>Domain-specific (medical, legal)</td>
+<td>Fine-tune wav2vec 2.0 + domain LM fusion</td>
+</tr>
+</tbody>
+</table>
+<h2>陷在2026年仍存在</h2>
+<ul>
+<li>**No VAD.**语在沉默中产生幻觉 (&quot;谢谢你观看!&quot;).</li>
+<li>**Character vs word vs subword WER.**报告词级 WER <em>后</em>正常化 (小字母,切符符删除).</li>
+<li>**Language ID drift.**声的自动LID误导噪音的视频到日本语或威尔士语;<code>language=&quot;en&quot;</code>当你知道的时候.</li>
+<li>**Long clips without chunking.**语有30秒的时间.<code>chunk_length_s=30, stride=5</code>任何更长时间.</li>
+</ul>
+<h2>运送它</h2>
+<p>保存如<code>outputs/skill-asr-picker.md</code>选择模型,解码策略,分化和LM融合,</p>
+<h2>运动</h2>
+<ol>
+<li>**Easy.**跑步<code>code/main.py</code>它贪地解读了手工制作的CTC输出,并将WER计算在参考中.</li>
+<li>**Medium.**按照第2步的前树束搜索进行正确执行 (考虑空格合并规则).在10个合成数据集中,比较贪.</li>
+<li>**Hard.**使用<code>whisper-large-v3-turbo</code>现在<a href="https://www.openslr.org/12" rel="noreferrer" data-network="true">LibriSpeech test-clean <small>↗ 需要联网</small></a>计算第100次发言的WER.</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>CTC</td>
+<td>The blank-token loss</td>
+<td>Marginal over all frame-to-token alignments; non-AR.</td>
+</tr>
+<tr>
+<td>RNN-T</td>
+<td>The streaming loss</td>
+<td>CTC + next-token predictor; handles word-order.</td>
+</tr>
+<tr>
+<td>Attention enc-dec</td>
+<td>Whisper-style</td>
+<td>Encoder + cross-attending decoder; best offline quality.</td>
+</tr>
+<tr>
+<td>WER</td>
+<td>The number you report</td>
+<td><code>(S+D+I)/N</code> at word level.</td>
+</tr>
+<tr>
+<td>Blank</td>
+<td>The emptiness</td>
+<td>Special token in CTC signalling &quot;no emission this frame&quot;.</td>
+</tr>
+<tr>
+<td>LM fusion</td>
+<td>External language model</td>
+<td>Add weighted LM log-probs during beam search.</td>
+</tr>
+<tr>
+<td>VAD</td>
+<td>The silence gate</td>
+<td>Voice activity detector; trims non-speech.</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://www.cs.toronto.edu/~graves/icml_2006.pdf" rel="noreferrer" data-network="true">Graves et al. (2006). Connectionist Temporal Classification <small>↗ 需要联网</small></a>CTC文件.</li>
+<li><a href="https://arxiv.org/abs/1211.3711" rel="noreferrer" data-network="true">Graves (2012). Sequence Transduction with RNNs <small>↗ 需要联网</small></a>RNN-T的报纸.</li>
+<li><a href="https://arxiv.org/abs/2212.04356" rel="noreferrer" data-network="true">Radford et al. / OpenAI (2022). Whisper: Robust Speech Recognition via Large-Scale Weak Supervision <small>↗ 需要联网</small></a>2022年法典文件;2024年将扩展到v3轮机.</li>
+<li><a href="https://huggingface.co/nvidia/parakeet-tdt-1.1b" rel="noreferrer" data-network="true">NVIDIA NeMo — Parakeet-TDT card <small>↗ 需要联网</small></a> 2026年开放ASR排名榜领导人.</li>
+<li><a href="https://huggingface.co/spaces/hf-audio/open_asr_leaderboard" rel="noreferrer" data-network="true">Hugging Face — Open ASR Leaderboard <small>↗ 需要联网</small></a>25多个模型的现场基准.</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Speech Recognition (ASR) — CTC, RNN-T, Attention</h1>
+<blockquote>
+<p>Speech recognition is audio classification at every timestep, glued together by a sequence model that knows English and silence. CTC, RNN-T, and attention are the three ways to do it. Pick one and understand why.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 6 · 02 (Spectrograms &amp; Mel), Phase 5 · 08 (CNNs &amp; RNNs for Text), Phase 5 · 10 (Attention)
+<strong>Time:</strong> ~45 minutes</p>
+<h2>The Problem</h2>
+<p>You have a 10-second 16 kHz clip. You want a string: &quot;turn on the kitchen lights&quot;. The challenge is structural: audio frames do not align one-to-one with characters. The word &quot;okay&quot; might take 200 ms or 1200 ms. Silence punctuates the utterance. Some phonemes are longer than others. The number of output tokens is not known in advance.</p>
+<p>Three formulations solve this:</p>
+<ol>
+<li><strong>CTC (Connectionist Temporal Classification).</strong> Emit per-frame token probabilities including a special <em>blank</em>. Collapse repeats and blanks at decode time. Non-autoregressive, fast. Used by wav2vec 2.0, MMS.</li>
+<li><strong>RNN-T (Recurrent Neural Network Transducer).</strong> Joint network predicts next token given encoder frame and previous tokens. Streamable. Used by Google's on-device ASR, NVIDIA Parakeet.</li>
+<li><strong>Attention encoder-decoder.</strong> Encoder compresses audio to hidden states, decoder cross-attends to generate tokens autoregressively. Used by Whisper, SeamlessM4T.</li>
+</ol>
+<p>In 2026, SOTA WER on LibriSpeech test-clean is 1.4% (Parakeet-TDT-1.1B, NVIDIA) and 1.58% (Whisper-Large-v3-turbo). The differences are tiny; the deployment differences are huge.</p>
+<h2>The Concept</h2>
+<p><img src="/learn/ai-from-scratch/files/phases/06-speech-and-audio/04-speech-recognition-asr/assets/asr-formulations.svg" alt="Three ASR formulations: CTC, RNN-T, attention-encoder-decoder" loading="lazy"></p>
+<p><strong>CTC intuition.</strong> Let the encoder output <code>T</code> frame-level distributions over <code>V+1</code> tokens (V chars + blank). For a target string <code>y</code> of length <code>U &lt; T</code>, any frame alignment that collapses to <code>y</code> counts. CTC loss sums over all such alignments. Inference: per-frame argmax, collapse repeats, remove blanks.</p>
+<p>Advantages: non-autoregressive, streamable, zero lookahead. Drawback: <em>conditional independence assumption</em> — each frame prediction is independent of the others, so there is no internal language model. Fix with an external LM via beam search or shallow fusion.</p>
+<p><strong>RNN-T intuition.</strong> Adds a <em>predictor</em> network that embeds the token history and a <em>joiner</em> that combines predictor state with encoder frame into a joint distribution over <code>V+1</code> (the <code>+1</code> is a null / no-emit). Explicitly models the conditional dependence CTC ignored. Streamable because each step conditions only on past frames and past tokens.</p>
+<p>Advantages: streamable + internal LM. Drawback: training is more complex and memory-hungry (3D loss lattice); RNN-T loss kernels are a whole library category on their own.</p>
+<p><strong>Attention encoder-decoder.</strong> Encoder (6-32 transformer layers) over log-mel frames. Decoder (6-32 transformer layers) cross-attends to encoder outputs to generate tokens autoregressively. No alignment constraint — attention can look anywhere in the audio. Non-streamable unless you restrict attention (chunked Whisper-Streaming, 2024).</p>
+<p>Advantages: highest quality on offline ASR, easy to train with standard seq2seq tooling. Drawback: autoregressive latency is proportional to output length; cannot stream without engineering.</p>
+<h3>WER: the one number</h3>
+<p><strong>Word Error Rate</strong> = <code>(S + D + I) / N</code>, where S=substitutions, D=deletions, I=insertions, N=reference word count. Matches Levenshtein edit distance at the word level. Lower is better. A WER above 20% is generally unusable; below 5% is human-parity for read speech. 2026 numbers on standard benchmarks:</p>
+<table>
+<thead>
+<tr>
+<th>Model</th>
+<th>LibriSpeech test-clean</th>
+<th>LibriSpeech test-other</th>
+<th>Size</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Parakeet-TDT-1.1B</td>
+<td>1.40%</td>
+<td>2.78%</td>
+<td>1.1B params</td>
+</tr>
+<tr>
+<td>Whisper-Large-v3-turbo</td>
+<td>1.58%</td>
+<td>3.03%</td>
+<td>809M</td>
+</tr>
+<tr>
+<td>Canary-1B Flash</td>
+<td>1.48%</td>
+<td>2.87%</td>
+<td>1B</td>
+</tr>
+<tr>
+<td>Seamless M4T v2</td>
+<td>1.7%</td>
+<td>3.5%</td>
+<td>2.3B</td>
+</tr>
+</tbody>
+</table>
+<p>All these are encoder-decoder or RNN-T based. Pure CTC systems (wav2vec 2.0) sit around 1.8–2.1% on test-clean.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-1ffeb2f5762a1cd10a30.png" alt="ctc-collapse 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<h3>Step 1: greedy CTC decode</h3>
+<pre><code class="language-python">def ctc_greedy(frame_logits, blank=0, vocab=None):
+    # frame_logits: list of per-frame probability vectors
+    preds = [max(range(len(p)), key=lambda i: p[i]) for p in frame_logits]
+    out = []
+    prev = -1
+    for p in preds:
+        if p != prev and p != blank:
+            out.append(p)
+        prev = p
+    return &quot;&quot;.join(vocab[i] for i in out) if vocab else out
+</code></pre>
+<p>Two rules: collapse consecutive repeats, drop blanks. Example: <code>a a _ _ a b b _ c</code> → <code>a a b c</code>.</p>
+<h3>Step 2: beam-search CTC</h3>
+<pre><code class="language-python">def ctc_beam(frame_logits, beam=8, blank=0):
+    import math
+    beams = [([], 0.0)]  # (tokens, log_prob)
+    for p in frame_logits:
+        log_p = [math.log(max(pi, 1e-10)) for pi in p]
+        candidates = []
+        for seq, lp in beams:
+            for t, lpt in enumerate(log_p):
+                new = seq[:] if t == blank else (seq + [t] if not seq or seq[-1] != t else seq)
+                candidates.append((new, lp + lpt))
+        candidates.sort(key=lambda x: -x[1])
+        beams = candidates[:beam]
+    return beams[0][0]
+</code></pre>
+<p>Production uses prefix tree beam search with LM fusion; this is the conceptual skeleton.</p>
+<h3>Step 3: WER</h3>
+<pre><code class="language-python">def wer(ref, hyp):
+    r, h = ref.split(), hyp.split()
+    dp = [[0] * (len(h) + 1) for _ in range(len(r) + 1)]
+    for i in range(len(r) + 1):
+        dp[i][0] = i
+    for j in range(len(h) + 1):
+        dp[0][j] = j
+    for i in range(1, len(r) + 1):
+        for j in range(1, len(h) + 1):
+            cost = 0 if r[i - 1] == h[j - 1] else 1
+            dp[i][j] = min(
+                dp[i - 1][j] + 1,
+                dp[i][j - 1] + 1,
+                dp[i - 1][j - 1] + cost,
+            )
+    return dp[len(r)][len(h)] / max(1, len(r))
+</code></pre>
+<h3>Step 4: inference against Whisper</h3>
+<pre><code class="language-python">import whisper
+model = whisper.load_model(&quot;large-v3-turbo&quot;)
+result = model.transcribe(&quot;clip.wav&quot;)
+print(result[&quot;text&quot;])
+</code></pre>
+<p>One-liner for the strongest general ASR in 2026. Runs on a 24 GB GPU at ~20× realtime.</p>
+<h3>Step 5: streaming with Parakeet or wav2vec 2.0</h3>
+<pre><code class="language-python">from transformers import pipeline
+asr = pipeline(&quot;automatic-speech-recognition&quot;, model=&quot;nvidia/parakeet-tdt-1.1b&quot;)
+for chunk in streaming_audio():
+    print(asr(chunk, return_timestamps=True))
+</code></pre>
+<p>Streaming ASR needs chunked encoder attention and carryover state; use a library that supports it (NeMo for Parakeet, <code>transformers</code> pipeline with <code>chunk_length_s</code>).</p>
+<h2>Use It</h2>
+<p>The 2026 stack:</p>
+<table>
+<thead>
+<tr>
+<th>Situation</th>
+<th>Pick</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>English, offline, max quality</td>
+<td>Whisper-large-v3-turbo</td>
+</tr>
+<tr>
+<td>Multilingual, robust</td>
+<td>SeamlessM4T v2</td>
+</tr>
+<tr>
+<td>Streaming, low latency</td>
+<td>Parakeet-TDT-1.1B or Riva</td>
+</tr>
+<tr>
+<td>Edge, mobile, &lt;500 ms latency</td>
+<td>Whisper-Tiny quantized or Moonshine (2024)</td>
+</tr>
+<tr>
+<td>Long-form</td>
+<td>Whisper with VAD-based chunking (WhisperX)</td>
+</tr>
+<tr>
+<td>Domain-specific (medical, legal)</td>
+<td>Fine-tune wav2vec 2.0 + domain LM fusion</td>
+</tr>
+</tbody>
+</table>
+<h2>Pitfalls that still ship in 2026</h2>
+<ul>
+<li><strong>No VAD.</strong> Running Whisper on silence produces hallucinations (&quot;Thanks for watching!&quot;). Always gate with VAD.</li>
+<li><strong>Character vs word vs subword WER.</strong> Report word-level WER <em>after</em> normalization (lowercase, punctuation stripped).</li>
+<li><strong>Language ID drift.</strong> Whisper's auto LID mis-routes noisy clips to Japanese or Welsh; force <code>language=&quot;en&quot;</code> when you know.</li>
+<li><strong>Long clips without chunking.</strong> Whisper has a 30-second window. Use <code>chunk_length_s=30, stride=5</code> for anything longer.</li>
+</ul>
+<h2>Ship It</h2>
+<p>Save as <code>outputs/skill-asr-picker.md</code>. Pick model, decoding strategy, chunking, and LM fusion for a given deployment target.</p>
+<h2>Exercises</h2>
+<ol>
+<li><strong>Easy.</strong> Run <code>code/main.py</code>. It greedily decodes a hand-crafted CTC output and computes WER against a reference.</li>
+<li><strong>Medium.</strong> Implement the prefix-tree beam search in Step 2 properly (account for the blank merge rule). Compare with greedy on a 10-example synthetic dataset.</li>
+<li><strong>Hard.</strong> Use <code>whisper-large-v3-turbo</code> on <a href="https://www.openslr.org/12" rel="noreferrer" data-network="true">LibriSpeech test-clean <small>↗ 需要联网</small></a>. Compute WER on the first 100 utterances. Compare with published numbers.</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>CTC</td>
+<td>The blank-token loss</td>
+<td>Marginal over all frame-to-token alignments; non-AR.</td>
+</tr>
+<tr>
+<td>RNN-T</td>
+<td>The streaming loss</td>
+<td>CTC + next-token predictor; handles word-order.</td>
+</tr>
+<tr>
+<td>Attention enc-dec</td>
+<td>Whisper-style</td>
+<td>Encoder + cross-attending decoder; best offline quality.</td>
+</tr>
+<tr>
+<td>WER</td>
+<td>The number you report</td>
+<td><code>(S+D+I)/N</code> at word level.</td>
+</tr>
+<tr>
+<td>Blank</td>
+<td>The emptiness</td>
+<td>Special token in CTC signalling &quot;no emission this frame&quot;.</td>
+</tr>
+<tr>
+<td>LM fusion</td>
+<td>External language model</td>
+<td>Add weighted LM log-probs during beam search.</td>
+</tr>
+<tr>
+<td>VAD</td>
+<td>The silence gate</td>
+<td>Voice activity detector; trims non-speech.</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://www.cs.toronto.edu/~graves/icml_2006.pdf" rel="noreferrer" data-network="true">Graves et al. (2006). Connectionist Temporal Classification <small>↗ 需要联网</small></a> — the CTC paper.</li>
+<li><a href="https://arxiv.org/abs/1211.3711" rel="noreferrer" data-network="true">Graves (2012). Sequence Transduction with RNNs <small>↗ 需要联网</small></a> — the RNN-T paper.</li>
+<li><a href="https://arxiv.org/abs/2212.04356" rel="noreferrer" data-network="true">Radford et al. / OpenAI (2022). Whisper: Robust Speech Recognition via Large-Scale Weak Supervision <small>↗ 需要联网</small></a> — the 2022 canonical paper; v3-turbo extension in 2024.</li>
+<li><a href="https://huggingface.co/nvidia/parakeet-tdt-1.1b" rel="noreferrer" data-network="true">NVIDIA NeMo — Parakeet-TDT card <small>↗ 需要联网</small></a> — 2026 Open ASR Leaderboard leader.</li>
+<li><a href="https://huggingface.co/spaces/hf-audio/open_asr_leaderboard" rel="noreferrer" data-network="true">Hugging Face — Open ASR Leaderboard <small>↗ 需要联网</small></a> — live benchmark across 25+ models.</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-06-speech-and-audio--04-speech-recognition-asr.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-06-speech-and-audio--04-speech-recognition-asr.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/06-speech-and-audio/04-speech-recognition-asr/code/main.py">phases/06-speech-and-audio/04-speech-recognition-asr/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;ASR basics: greedy CTC decode, beam CTC decode, Word Error Rate.
+
+Stdlib only. Builds a tiny hand-rolled CTC example and computes WER.
+Run: python3 code/main.py
+&quot;&quot;&quot;
+
+import math
+import random
+from collections import Counter
+
+
+BLANK = 0
+VOCAB = &quot;_abcdefghijklmnopqrstuvwxyz &quot;  # index 0 is blank
+
+
+def ctc_greedy(frame_probs):
+    preds = [max(range(len(p)), key=lambda i: p[i]) for p in frame_probs]
+    out = []
+    prev = -1
+    for p in preds:
+        if p != prev and p != BLANK:
+            out.append(p)
+        prev = p
+    return &quot;&quot;.join(VOCAB[i] for i in out)
+
+
+def ctc_beam(frame_probs, beam_width=8):
+    beams = [((), 0.0)]
+    for p in frame_probs:
+        log_p = [math.log(max(pi, 1e-10)) for pi in p]
+        new_beams = {}
+        for seq, lp in beams:
+            for t, lpt in enumerate(log_p):
+                if t == BLANK:
+                    new_seq = seq
+                else:
+                    if seq and seq[-1] == t:
+                        new_seq = seq
+                    else:
+                        new_seq = seq + (t,)
+                if new_seq in new_beams:
+                    new_beams[new_seq] = math.log(math.exp(new_beams[new_seq]) + math.exp(lp + lpt))
+                else:
+                    new_beams[new_seq] = lp + lpt
+        beams = sorted(new_beams.items(), key=lambda x: -x[1])[:beam_width]
+    best = beams[0][0]
+    return &quot;&quot;.join(VOCAB[i] for i in best)
+
+
+def wer(ref, hyp):
+    r = ref.split()
+    h = hyp.split()
+    nr = len(r)
+    if nr == 0:
+        return 0.0 if not h else 1.0
+    dp = [[0] * (len(h) + 1) for _ in range(nr + 1)]
+    for i in range(nr + 1):
+        dp[i][0] = i
+    for j in range(len(h) + 1):
+        dp[0][j] = j
+    for i in range(1, nr + 1):
+        for j in range(1, len(h) + 1):
+            cost = 0 if r[i - 1] == h[j - 1] else 1
+            dp[i][j] = min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost)
+    return dp[nr][len(h)] / nr
+
+
+def one_hot_like(char, noise=0.02, vocab_size=len(VOCAB)):
+    base = [noise] * vocab_size
+    idx = VOCAB.index(char)
+    base[idx] = 1.0 - noise * (vocab_size - 1)
+    return base
+
+
+def build_frame_probs(target, duration_per_char=3, blank_runs=1):
+    random.seed(0)
+    frames = []
+    for c in target:
+        for _ in range(duration_per_char):
+            frames.append(one_hot_like(c))
+        for _ in range(blank_runs):
+            frames.append(one_hot_like(&quot;_&quot;))
+    return frames
+
+
+def corrupt(probs, n_swaps=3, swap_strength=0.4):
+    random.seed(1)
+    out = [list(p) for p in probs]
+    for _ in range(n_swaps):
+        i = random.randrange(len(out))
+        j1 = random.randrange(len(out[i]))
+        j2 = random.randrange(len(out[i]))
+        swap = swap_strength
+        out[i][j1] -= swap
+        out[i][j2] += swap
+    return out
+
+
+def main():
+    target = &quot;hello world&quot;
+    print(&quot;=== Step 1: build per-frame CTC outputs for target ===&quot;)
+    print(f&quot;  target: {target!r}&quot;)
+    probs = build_frame_probs(target, duration_per_char=3, blank_runs=1)
+    print(f&quot;  frames: {len(probs)}  vocab: {len(VOCAB)}  (index 0 = blank)&quot;)
+
+    print()
+    print(&quot;=== Step 2: greedy decode (collapse repeats, drop blank) ===&quot;)
+    greedy = ctc_greedy(probs)
+    print(f&quot;  greedy decode: {greedy!r}&quot;)
+
+    print()
+    print(&quot;=== Step 3: beam search decode (width 8, simplified) ===&quot;)
+    beam = ctc_beam(probs, beam_width=8)
+    print(f&quot;  beam decode:   {beam!r}&quot;)
+    print(f&quot;  note: this beam merges consecutive repeats without a blank-intervene state;&quot;)
+    print(f&quot;  a proper prefix-tree beam (e.g. ctcdecode) tracks P_blank / P_nonblank and&quot;)
+    print(f&quot;  preserves double letters like the two l&#39;s in &#39;hello&#39;.&quot;)
+
+    print()
+    print(&quot;=== Step 4: corrupt logits; beam should beat greedy ===&quot;)
+    corrupted = corrupt(probs, n_swaps=6, swap_strength=0.6)
+    g2 = ctc_greedy(corrupted)
+    b2 = ctc_beam(corrupted, beam_width=16)
+    print(f&quot;  greedy: {g2!r}&quot;)
+    print(f&quot;  beam:   {b2!r}&quot;)
+
+    print()
+    print(&quot;=== Step 5: WER ===&quot;)
+    ref = &quot;hello world this is a test&quot;
+    hyps = {
+        &quot;perfect&quot;:      &quot;hello world this is a test&quot;,
+        &quot;one substit&quot;:  &quot;hello world this is the test&quot;,
+        &quot;one deletion&quot;: &quot;hello world this a test&quot;,
+        &quot;one insert&quot;:   &quot;hello world this is a big test&quot;,
+        &quot;garbage&quot;:      &quot;bye everyone nothing here&quot;,
+    }
+    for label, hyp in hyps.items():
+        print(f&quot;  {label:&lt;14} WER = {wer(ref, hyp):.3f}  hyp={hyp!r}&quot;)
+
+    print()
+    print(&quot;=== Step 6: best model on LibriSpeech test-clean (2026) ===&quot;)
+    table = [
+        (&quot;Parakeet-TDT-1.1B&quot;, 1.40, &quot;1.1B&quot;),
+        (&quot;Canary-1B Flash&quot;,   1.48, &quot;1B&quot;),
+        (&quot;Whisper-L-v3-turbo&quot;, 1.58, &quot;809M&quot;),
+        (&quot;Seamless M4T v2&quot;,    1.70, &quot;2.3B&quot;),
+        (&quot;wav2vec 2.0 Large&quot;,  1.92, &quot;317M&quot;),
+    ]
+    print(&quot;  | Model                 | WER  | Params |&quot;)
+    for name, w, p in table:
+        print(f&quot;  | {name:&lt;21} | {w:.2f} | {p:&lt;6} |&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/06-speech-and-audio/04-speech-recognition-asr/outputs/skill-asr-picker.md">phases/06-speech-and-audio/04-speech-recognition-asr/outputs/skill-asr-picker.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: asr-picker
+description: Pick ASR model, decoding strategy, chunking, and LM fusion for a given deployment target.
+version: 1.0.0
+phase: 6
+lesson: 04
+tags: [audio, asr, speech-recognition]
+---
+
+Given a deployment target (language list, domain, latency budget, hardware, offline / streaming, clip duration), output:
+
+1. Model. Whisper-large-v3-turbo / Parakeet-TDT / Canary-Flash / wav2vec 2.0 / Moonshine. Reason in one sentence.
+2. Decoding. Greedy / beam width / temperature fallback / LM fusion weight. Reason tied to the quality budget.
+3. Chunking and VAD. Chunk length, stride, whether to gate with Silero-VAD or Whisper&#39;s own.
+4. Language policy. Force language vs auto-LID; how to handle cross-lingual frames.
+5. Eval plan. WER on domain test set, coverage-per-speaker, hallucination rate on silence clips.
+
+Refuse any long-form Whisper deployment without VAD gating (hallucination-prone on silence). Refuse to report WER without text normalization (lower, punct strip). Flag any beam-width &gt; 16 without an LM; raw beams over blanks do not help.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原课程未提供测验。</p></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/06-speech-and-audio/03-audio-classification/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/06-speech-and-audio/05-whisper-architecture-finetuning/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/06-speech-and-audio/04-speech-recognition-asr/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

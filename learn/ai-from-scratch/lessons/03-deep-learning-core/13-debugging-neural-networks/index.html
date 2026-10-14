@@ -1,0 +1,2093 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>调解神经网络 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-03-deep-learning-core" data-lesson="03-deep-learning-core/13-debugging-neural-networks" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/03-deep-learning-core/">深度学习核心</a> / LESSON 13</p><h1 class="lesson-title">调解神经网络</h1><p>Debugging Neural Networks</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>调解神经网络</h1>
+<blockquote>
+<p>你的网络编译了.它运行了.它产生了一个号码. 这个号码是错误的,没有什么崩. 欢迎来到最困难的调试,</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python, PyTorch
+<strong>Prerequisites:</strong> Phase 03 Lessons 01-10 (especially backpropagation, loss functions, optimizers)
+<strong>Time:</strong> ~90 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>使用系统性调试策略诊断常见的神经网络故障 (NaN损失,平损曲线,过度适应,振荡)</li>
+<li>应用&quot;超适合一批&quot;技术来验证模型架构和训练循环是否正确</li>
+<li>检查梯度大小,激活分布和重量规范,以确定消失/爆炸梯度问题</li>
+<li>建立一个调试检查清单,涵盖数据管道,模型架构,损失函数,优化器和学习速度问题</li>
+</ul>
+<h2>问题</h2>
+<p>传统软件在破产时会崩. 零指标会产生例外. 编译时类型不匹配失败. 一次一次错误会产生明显错误输出.</p>
+<p>网络不会给你提供这种奢.</p>
+<p>破产的神经网络运行到完成, 打印损失值, 损失可能会减少. 预测可能看起来是可行的. 但模型是默默地错误的 - - 学习快捷方式,记住噪音,或者接近无用的本地最低点. 谷歌研究人员估计,在ML调试时间中的60-70%,用于&quot;沉默&quot;的错误,</p>
+<p>工作模型与破产模型的区别通常是一个错误的线条:一个缺失的线条.<code>zero_grad()</code>们的学习速度是10倍. 们的神经网络训练的食谱 (2019) 开始了这样:&quot;最常见的神经网络错误是不会崩的错误.</p>
+<p>这课教你如何找到这些虫子.</p>
+<h2>概念</h2>
+<h3>错误的思维方式</h3>
+<p>忘记打印和试验调试. 网络调试需要系统方法,因为反循环很慢 (每次训练跑的分钟到小时),症状很模糊 (坏损失可能意味着20种不同的东西).</p>
+<p>黄金规则:<strong>start simple, add complexity one piece at a time, and verify each piece independently.</strong></p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-6980cf43d533732b3d81.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>症状1: 损失不减少</h3>
+<p>训练循环是流行的,时代过去了,损失保持平稳或动.</p>
+<p>**Wrong learning rate.**对于亚当来说,从1e-3开始.对于SGD来说,从1e-1或1e-2开始. 在得出其他错误之前,总是尝试3个学习率,每个学习率跨越10倍 (例如,1e-2,1e-3,1e-4)</p>
+<p>**Dead ReLUs.**如果一个ReLU神经元接收了大量的负输入,它输出0并且其梯度是0.它永远不会再次激活.如果足够的神经元死亡,网络无法学习.检查:印出每一个ReLU层后的精确0的激活率.如果50%以上死亡,则切换到LeakyReLU或降低学习速度.</p>
+<p>**Vanishing gradients.**在具有sigmoid或tanh激活的深层网络中,渐变随着向后传播而呈指数缩小.到达第一层时,它们是0.第一层停止学习.</p>
+<p>**Exploding gradients.**降梯率增长指数.在RNN和非常深度网络中常见.损失跳到NaN.<code>torch.nn.utils.clip_grad_norm_</code>),降低学习率,或增加正常化.</p>
+<h3>症状2:损失减少,但模式不好</h3>
+<p>损失下降了,训练精度达到99%,但测试精度是55%.</p>
+<p>**Overfitting.**模型记忆训练数据而不是学习模式.训练和验证损失之间的差距随着时间的推移增加.</p>
+<p>**Data leakage.**测试数据泄露到训练中.精度可疑高.常见原因:在分开之前混动,预处理数据集的统计数据,在分开之间复制样本. 修复:分开第一,预处理第二,检查复制.</p>
+<p>**Label errors.**大多数真实数据集中的5-10%的标签是错误的 (Northcutt等同,2021年&quot;测试集中的普遍标签错误&quot;).模型学习噪音.修复:使用自信学习来找到和修复错误标签的例子,或使用损失缩小忽略高损失样本.</p>
+<h3>症状3: NaN或Inf在损失中</h3>
+<p>损失值将成为<code>nan</code>或<code>inf</code>训练已经结束了.</p>
+<p>**Learning rate too high.**更新速度超越了重量爆炸.</p>
+<p>**log(0) or log(negative).**跨缩损失计算器<code>log(p)</code>如果你的模型输出精确的0或负概率,记录会爆炸.<code>[eps, 1-eps]</code>在哪里<code>eps=1e-7</code>现在,我们要去.</p>
+<p>**Division by zero.**批量正常化按标准偏差分开. 一批具有恒定值的批量具有 std=0. 修正:将epsilon添加到分母中 (PyTorch默认执行,但可能不会实现).</p>
+<p>**Numerical overflow.**输入了大量激活<code>exp()</code>解决问题:在指数化之前减去最大值 (日积-exp技巧).</p>
+<h3>技术1:渐进检查</h3>
+<p>根据分析的差异,你必须将分析的差异 (从后方向) 进行比较.</p>
+<p>参数的数值梯度<code>w</code>其他:</p>
+<pre><code>grad_numerical = (loss(w + eps) - loss(w - eps)) / (2 * eps)
+</code></pre>
+<p>协议指标 (相对差异):</p>
+<pre><code>rel_diff = |grad_analytical - grad_numerical| / max(|grad_analytical|, |grad_numerical|, 1e-8)
+</code></pre>
+<p>如果<code>rel_diff &lt; 1e-5</code>答案是正确的.<code>rel_diff &gt; 1e-3</code>几乎肯定是个虫子.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-a5f0686b5ed1f9674f9f.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>技术2:激活统计</h3>
+<p>训练期间,监测每层激活后的平均和标准偏差.健康网络保持在 0 附近的平均和 1 附近的 STD (正常化后) 或至少有界限的激活.</p>
+<table>
+<thead>
+<tr>
+<th>Health indicator</th>
+<th>Mean</th>
+<th>Std</th>
+<th>Diagnosis</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Healthy</td>
+<td>~0</td>
+<td>~1</td>
+<td>Network is learning normally</td>
+</tr>
+<tr>
+<td>Saturated</td>
+<td>&gt;&gt;0 or &lt;&lt;0</td>
+<td>~0</td>
+<td>Activations stuck at extreme values</td>
+</tr>
+<tr>
+<td>Dead</td>
+<td>0</td>
+<td>0</td>
+<td>Neurons are dead (all zeros)</td>
+</tr>
+<tr>
+<td>Exploding</td>
+<td>&gt;&gt;10</td>
+<td>&gt;&gt;10</td>
+<td>Activations growing without bound</td>
+</tr>
+</tbody>
+</table>
+<h3>技术3:渐进流量可视化</h3>
+<p>图表每层的平均梯度大小.在健康的网络中,梯度大小应该在各层之间大致相同.如果早期层的梯度比后层小1000倍,则有消失的梯度.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-25792db00fc1f0e91d8a.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><figure><img src="/learn/ai-from-scratch/figures/mermaid-3fd4f5e1f48b0c8e14d9.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>技术4:超级适应一批试验</h3>
+<p>对于深度学习来说,这是最重要的调试技术.</p>
+<p>运行一个小批量 (8-32个样本). 训练100次以上. 损失应该达到接近零,训练精度应该达到100%. 如果没有,你的模型或训练循环有基本的错误 - - 不要继续进行完整的训练.</p>
+<p>这项测试发现:</p>
+<ul>
+<li>破损函数</li>
+<li>破碎的后行</li>
+<li>建筑物太小,无法代表数据</li>
+<li>没有连接到模型参数的优化器</li>
+<li>错误地调整数据和标签</li>
+</ul>
+<p>这需要30秒的时间才能运行,</p>
+<h3>技术5:学习率查询器</h3>
+<p>莱斯利·史密斯 (2017) 提出在一个时代内将学习率从非常小 (1e-7) 扫到非常大 (10) 扫描,同时记录损失. 剧情损失与学习率.最佳学习率大约是10倍小于损失开始减速速度的速度.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-7196b7606116e4688e0a.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>在本例中最好的LR: ~1e-3 (最点前一个大小顺序).</p>
+<h3>常见的皮托尔奇虫</h3>
+<p>这些是PyTorch社区最多时间浪费的虫子:</p>
+<table>
+<thead>
+<tr>
+<th>Bug</th>
+<th>Symptom</th>
+<th>Fix</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Forgetting <code>optimizer.zero_grad()</code></td>
+<td>Gradients accumulate across batches, loss oscillates</td>
+<td>Add <code>optimizer.zero_grad()</code> before <code>loss.backward()</code></td>
+</tr>
+<tr>
+<td>Forgetting <code>model.eval()</code> at test time</td>
+<td>Dropout and batch norm behave differently, test accuracy varies between runs</td>
+<td>Add <code>model.eval()</code> and <code>torch.no_grad()</code></td>
+</tr>
+<tr>
+<td>Wrong tensor shapes</td>
+<td>Silent broadcasting produces wrong results, no error</td>
+<td>Print shapes after every operation during debugging</td>
+</tr>
+<tr>
+<td>CPU/GPU mismatch</td>
+<td><code>RuntimeError: expected CUDA tensor</code></td>
+<td>Use <code>.to(device)</code> on model AND data</td>
+</tr>
+<tr>
+<td>Not detaching tensors</td>
+<td>Computation graph grows forever, OOM</td>
+<td>Use <code>.detach()</code> or <code>with torch.no_grad()</code></td>
+</tr>
+<tr>
+<td>In-place operations breaking autograd</td>
+<td><code>RuntimeError: modified by in-place operation</code></td>
+<td>Replace <code>x += 1</code> with <code>x = x + 1</code></td>
+</tr>
+<tr>
+<td>Data not normalized</td>
+<td>Loss stuck at random-chance level</td>
+<td>Normalize inputs to mean=0, std=1</td>
+</tr>
+<tr>
+<td>Labels as wrong dtype</td>
+<td>Cross-entropy expects <code>Long</code>, got <code>Float</code></td>
+<td>Cast labels: <code>labels.long()</code></td>
+</tr>
+</tbody>
+</table>
+<h3>导师调试表</h3>
+<table>
+<thead>
+<tr>
+<th>Symptom</th>
+<th>Likely cause</th>
+<th>First thing to try</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Loss stuck at -log(1/num_classes)</td>
+<td>Model predicting uniform distribution</td>
+<td>Check data pipeline, verify labels match inputs</td>
+</tr>
+<tr>
+<td>Loss NaN after a few steps</td>
+<td>Learning rate too high</td>
+<td>Reduce LR by 10x</td>
+</tr>
+<tr>
+<td>Loss NaN immediately</td>
+<td>log(0) or division by zero</td>
+<td>Add epsilon to log/division operations</td>
+</tr>
+<tr>
+<td>Loss oscillating wildly</td>
+<td>LR too high or batch size too small</td>
+<td>Reduce LR, increase batch size</td>
+</tr>
+<tr>
+<td>Loss decreasing then plateaus</td>
+<td>LR too high for fine-tuning phase</td>
+<td>Add LR schedule (cosine or step decay)</td>
+</tr>
+<tr>
+<td>Training acc high, test acc low</td>
+<td>Overfitting</td>
+<td>Add dropout, weight decay, more data</td>
+</tr>
+<tr>
+<td>Training acc = test acc = chance</td>
+<td>Model not learning anything</td>
+<td>Run overfit-one-batch test</td>
+</tr>
+<tr>
+<td>Training acc = test acc but both low</td>
+<td>Underfitting</td>
+<td>Bigger model, more layers, more features</td>
+</tr>
+<tr>
+<td>Gradients all zero</td>
+<td>Dead ReLUs or detached computation graph</td>
+<td>Switch to LeakyReLU, check <code>.requires_grad</code></td>
+</tr>
+<tr>
+<td>Out of memory during training</td>
+<td>Batch too large or graph not freed</td>
+<td>Reduce batch size, use <code>torch.no_grad()</code> for eval</td>
+</tr>
+</tbody>
+</table>
+<figure><img src="/learn/ai-from-scratch/figures/figure-00d265968146e741e14b.png" alt="learning-curves 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<p>检测工具包监测激活,梯度和损失曲线.</p>
+<h3>步骤1:网络调试器类</h3>
+<p>入 PyTorch 模型,以记录每层的激活和梯度统计.</p>
+<pre><code class="language-python">import torch
+import torch.nn as nn
+import math
+
+
+class NetworkDebugger:
+    def __init__(self, model):
+        self.model = model
+        self.activation_stats = {}
+        self.gradient_stats = {}
+        self.loss_history = []
+        self.lr_losses = []
+        self.hooks = []
+        self._register_hooks()
+
+    def _register_hooks(self):
+        for name, module in self.model.named_modules():
+            if isinstance(module, (nn.Linear, nn.Conv2d, nn.ReLU, nn.LeakyReLU)):
+                hook = module.register_forward_hook(self._make_activation_hook(name))
+                self.hooks.append(hook)
+                hook = module.register_full_backward_hook(self._make_gradient_hook(name))
+                self.hooks.append(hook)
+
+    def _make_activation_hook(self, name):
+        def hook(module, input, output):
+            with torch.no_grad():
+                out = output.detach().float()
+                self.activation_stats[name] = {
+                    &quot;mean&quot;: out.mean().item(),
+                    &quot;std&quot;: out.std().item(),
+                    &quot;fraction_zero&quot;: (out == 0).float().mean().item(),
+                    &quot;min&quot;: out.min().item(),
+                    &quot;max&quot;: out.max().item(),
+                }
+        return hook
+
+    def _make_gradient_hook(self, name):
+        def hook(module, grad_input, grad_output):
+            if grad_output[0] is not None:
+                with torch.no_grad():
+                    grad = grad_output[0].detach().float()
+                    self.gradient_stats[name] = {
+                        &quot;mean&quot;: grad.mean().item(),
+                        &quot;std&quot;: grad.std().item(),
+                        &quot;abs_mean&quot;: grad.abs().mean().item(),
+                        &quot;max&quot;: grad.abs().max().item(),
+                    }
+        return hook
+
+    def record_loss(self, loss_value):
+        self.loss_history.append(loss_value)
+
+    def check_loss_health(self):
+        if len(self.loss_history) &lt; 2:
+            return &quot;NOT_ENOUGH_DATA&quot;
+        recent = self.loss_history[-10:]
+        if any(math.isnan(v) or math.isinf(v) for v in recent):
+            return &quot;NAN_OR_INF&quot;
+        if len(self.loss_history) &gt;= 20:
+            first_half = sum(self.loss_history[:10]) / 10
+            second_half = sum(self.loss_history[-10:]) / 10
+            if second_half &gt;= first_half * 0.99:
+                return &quot;NOT_DECREASING&quot;
+        if len(recent) &gt;= 5:
+            diffs = [recent[i+1] - recent[i] for i in range(len(recent)-1)]
+            if max(diffs) - min(diffs) &gt; 2 * abs(sum(diffs) / len(diffs)):
+                return &quot;OSCILLATING&quot;
+        return &quot;HEALTHY&quot;
+
+    def check_activations(self):
+        issues = []
+        for name, stats in self.activation_stats.items():
+            if stats[&quot;fraction_zero&quot;] &gt; 0.5:
+                issues.append(f&quot;DEAD_NEURONS: {name} has {stats['fraction_zero']:.0%} zero activations&quot;)
+            if abs(stats[&quot;mean&quot;]) &gt; 10:
+                issues.append(f&quot;EXPLODING_ACTIVATIONS: {name} mean={stats['mean']:.2f}&quot;)
+            if stats[&quot;std&quot;] &lt; 1e-6:
+                issues.append(f&quot;COLLAPSED_ACTIVATIONS: {name} std={stats['std']:.2e}&quot;)
+        return issues if issues else [&quot;HEALTHY&quot;]
+
+    def check_gradients(self):
+        issues = []
+        grad_magnitudes = []
+        for name, stats in self.gradient_stats.items():
+            grad_magnitudes.append((name, stats[&quot;abs_mean&quot;]))
+            if stats[&quot;abs_mean&quot;] &lt; 1e-7:
+                issues.append(f&quot;VANISHING_GRADIENT: {name} abs_mean={stats['abs_mean']:.2e}&quot;)
+            if stats[&quot;abs_mean&quot;] &gt; 100:
+                issues.append(f&quot;EXPLODING_GRADIENT: {name} abs_mean={stats['abs_mean']:.2e}&quot;)
+        if len(grad_magnitudes) &gt;= 2:
+            first_mag = grad_magnitudes[0][1]
+            last_mag = grad_magnitudes[-1][1]
+            if last_mag &gt; 0 and first_mag / last_mag &gt; 100:
+                issues.append(f&quot;GRADIENT_RATIO: first/last = {first_mag/last_mag:.0f}x (vanishing)&quot;)
+        return issues if issues else [&quot;HEALTHY&quot;]
+
+    def print_report(self):
+        print(&quot;\n=== NETWORK DEBUGGER REPORT ===&quot;)
+        print(f&quot;\nLoss health: {self.check_loss_health()}&quot;)
+        if self.loss_history:
+            print(f&quot;  Last 5 losses: {[f'{v:.4f}' for v in self.loss_history[-5:]]}&quot;)
+        print(&quot;\nActivation diagnostics:&quot;)
+        for item in self.check_activations():
+            print(f&quot;  {item}&quot;)
+        print(&quot;\nGradient diagnostics:&quot;)
+        for item in self.check_gradients():
+            print(f&quot;  {item}&quot;)
+        print(&quot;\nPer-layer activation stats:&quot;)
+        for name, stats in self.activation_stats.items():
+            print(f&quot;  {name}: mean={stats['mean']:.4f} std={stats['std']:.4f} zero={stats['fraction_zero']:.1%}&quot;)
+        print(&quot;\nPer-layer gradient stats:&quot;)
+        for name, stats in self.gradient_stats.items():
+            print(f&quot;  {name}: abs_mean={stats['abs_mean']:.2e} max={stats['max']:.2e}&quot;)
+
+    def remove_hooks(self):
+        for hook in self.hooks:
+            hook.remove()
+        self.hooks.clear()
+</code></pre>
+<h3>第二步:一批过度适应的测试</h3>
+<pre><code class="language-python">def overfit_one_batch(model, x_batch, y_batch, criterion, lr=0.01, steps=200):
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    model.train()
+    print(&quot;\n=== OVERFIT ONE BATCH TEST ===&quot;)
+    print(f&quot;Batch size: {x_batch.shape[0]}, Steps: {steps}&quot;)
+
+    for step in range(steps):
+        optimizer.zero_grad()
+        output = model(x_batch)
+        loss = criterion(output, y_batch)
+        loss.backward()
+        optimizer.step()
+
+        if step % 50 == 0 or step == steps - 1:
+            with torch.no_grad():
+                preds = (output &gt; 0).float() if output.shape[-1] == 1 else output.argmax(dim=1)
+                targets = y_batch if y_batch.dim() == 1 else y_batch.squeeze()
+                acc = (preds.squeeze() == targets).float().mean().item()
+            print(f&quot;  Step {step:3d} | Loss: {loss.item():.6f} | Accuracy: {acc:.1%}&quot;)
+
+    final_loss = loss.item()
+    if final_loss &gt; 0.1:
+        print(f&quot;\n  FAIL: Loss did not converge ({final_loss:.4f}). Model or training loop is broken.&quot;)
+        return False
+    print(f&quot;\n  PASS: Loss converged to {final_loss:.6f}&quot;)
+    return True
+</code></pre>
+<h3>步骤3:学习率查询器</h3>
+<pre><code class="language-python">def find_learning_rate(model, x_data, y_data, criterion, start_lr=1e-7, end_lr=10, steps=100):
+    import copy
+    original_state = copy.deepcopy(model.state_dict())
+    optimizer = torch.optim.SGD(model.parameters(), lr=start_lr)
+    lr_mult = (end_lr / start_lr) ** (1 / steps)
+
+    model.train()
+    results = []
+    best_loss = float(&quot;inf&quot;)
+    current_lr = start_lr
+
+    print(&quot;\n=== LEARNING RATE FINDER ===&quot;)
+
+    for step in range(steps):
+        optimizer.zero_grad()
+        output = model(x_data)
+        loss = criterion(output, y_data)
+
+        if math.isnan(loss.item()) or loss.item() &gt; best_loss * 10:
+            break
+
+        best_loss = min(best_loss, loss.item())
+        results.append((current_lr, loss.item()))
+
+        loss.backward()
+        optimizer.step()
+
+        current_lr *= lr_mult
+        for param_group in optimizer.param_groups:
+            param_group[&quot;lr&quot;] = current_lr
+
+    model.load_state_dict(original_state)
+
+    if len(results) &lt; 10:
+        print(&quot;  Could not complete LR sweep -- loss diverged too quickly&quot;)
+        return results
+
+    min_loss_idx = min(range(len(results)), key=lambda i: results[i][1])
+    suggested_lr = results[max(0, min_loss_idx - 10)][0]
+
+    print(f&quot;  Swept {len(results)} steps from {start_lr:.0e} to {results[-1][0]:.0e}&quot;)
+    print(f&quot;  Minimum loss {results[min_loss_idx][1]:.4f} at lr={results[min_loss_idx][0]:.2e}&quot;)
+    print(f&quot;  Suggested learning rate: {suggested_lr:.2e}&quot;)
+
+    return results
+</code></pre>
+<h3>步骤4: 测量度</h3>
+<pre><code class="language-python">def _flat_to_multi_index(flat_idx, shape):
+    multi_idx = []
+    remaining = flat_idx
+    for dim in reversed(shape):
+        multi_idx.insert(0, remaining % dim)
+        remaining //= dim
+    return tuple(multi_idx)
+
+
+def gradient_check(model, x, y, criterion, eps=1e-4):
+    model.train()
+    x_double = x.double()
+    y_double = y.double()
+    model_double = model.double()
+
+    print(&quot;\n=== GRADIENT CHECK ===&quot;)
+    overall_max_diff = 0
+    checked = 0
+
+    for name, param in model_double.named_parameters():
+        if not param.requires_grad:
+            continue
+
+        layer_max_diff = 0
+
+        model_double.zero_grad()
+        output = model_double(x_double)
+        loss = criterion(output, y_double)
+        loss.backward()
+        analytical_grad = param.grad.clone()
+
+        num_checks = min(5, param.numel())
+        for i in range(num_checks):
+            idx = _flat_to_multi_index(i, param.shape)
+            original = param.data[idx].item()
+
+            param.data[idx] = original + eps
+            with torch.no_grad():
+                loss_plus = criterion(model_double(x_double), y_double).item()
+
+            param.data[idx] = original - eps
+            with torch.no_grad():
+                loss_minus = criterion(model_double(x_double), y_double).item()
+
+            param.data[idx] = original
+
+            numerical = (loss_plus - loss_minus) / (2 * eps)
+            analytical = analytical_grad[idx].item()
+
+            denom = max(abs(numerical), abs(analytical), 1e-8)
+            rel_diff = abs(numerical - analytical) / denom
+
+            layer_max_diff = max(layer_max_diff, rel_diff)
+            checked += 1
+
+        overall_max_diff = max(overall_max_diff, layer_max_diff)
+        status = &quot;OK&quot; if layer_max_diff &lt; 1e-5 else &quot;MISMATCH&quot;
+        print(f&quot;  {name}: max_rel_diff={layer_max_diff:.2e} [{status}]&quot;)
+
+    model.float()
+
+    print(f&quot;\n  Checked {checked} parameters&quot;)
+    if overall_max_diff &lt; 1e-5:
+        print(&quot;  PASS: Gradients match (rel_diff &lt; 1e-5)&quot;)
+    elif overall_max_diff &lt; 1e-3:
+        print(&quot;  WARN: Small differences (1e-5 &lt; rel_diff &lt; 1e-3)&quot;)
+    else:
+        print(&quot;  FAIL: Gradient mismatch detected (rel_diff &gt; 1e-3)&quot;)
+    return overall_max_diff
+</code></pre>
+<h3>步骤5:故意破解网络</h3>
+<p>现在将工具包应用到破产的网络,</p>
+<pre><code class="language-python">def demo_broken_networks():
+    torch.manual_seed(42)
+    x = torch.randn(64, 10)
+    y = (x[:, 0] &gt; 0).long()
+
+    print(&quot;\n&quot; + &quot;=&quot; * 60)
+    print(&quot;BUG 1: Learning rate too high (lr=10)&quot;)
+    print(&quot;=&quot; * 60)
+    model1 = nn.Sequential(nn.Linear(10, 32), nn.ReLU(), nn.Linear(32, 2))
+    debugger1 = NetworkDebugger(model1)
+    optimizer1 = torch.optim.SGD(model1.parameters(), lr=10.0)
+    criterion = nn.CrossEntropyLoss()
+    for step in range(20):
+        optimizer1.zero_grad()
+        out = model1(x)
+        loss = criterion(out, y)
+        debugger1.record_loss(loss.item())
+        loss.backward()
+        optimizer1.step()
+    debugger1.print_report()
+    debugger1.remove_hooks()
+
+    print(&quot;\n&quot; + &quot;=&quot; * 60)
+    print(&quot;BUG 2: Dead ReLUs from bad initialization&quot;)
+    print(&quot;=&quot; * 60)
+    model2 = nn.Sequential(nn.Linear(10, 32), nn.ReLU(), nn.Linear(32, 32), nn.ReLU(), nn.Linear(32, 2))
+    with torch.no_grad():
+        for m in model2.modules():
+            if isinstance(m, nn.Linear):
+                m.weight.fill_(-1.0)
+                m.bias.fill_(-5.0)
+    debugger2 = NetworkDebugger(model2)
+    optimizer2 = torch.optim.Adam(model2.parameters(), lr=1e-3)
+    for step in range(50):
+        optimizer2.zero_grad()
+        out = model2(x)
+        loss = criterion(out, y)
+        debugger2.record_loss(loss.item())
+        loss.backward()
+        optimizer2.step()
+    debugger2.print_report()
+    debugger2.remove_hooks()
+
+    print(&quot;\n&quot; + &quot;=&quot; * 60)
+    print(&quot;BUG 3: Missing zero_grad (gradients accumulate)&quot;)
+    print(&quot;=&quot; * 60)
+    model3 = nn.Sequential(nn.Linear(10, 32), nn.ReLU(), nn.Linear(32, 2))
+    debugger3 = NetworkDebugger(model3)
+    optimizer3 = torch.optim.SGD(model3.parameters(), lr=0.01)
+    for step in range(50):
+        out = model3(x)
+        loss = criterion(out, y)
+        debugger3.record_loss(loss.item())
+        loss.backward()
+        optimizer3.step()
+    debugger3.print_report()
+    debugger3.remove_hooks()
+
+    print(&quot;\n&quot; + &quot;=&quot; * 60)
+    print(&quot;HEALTHY NETWORK: Correct setup for comparison&quot;)
+    print(&quot;=&quot; * 60)
+    model_good = nn.Sequential(nn.Linear(10, 32), nn.ReLU(), nn.Linear(32, 2))
+    debugger_good = NetworkDebugger(model_good)
+    optimizer_good = torch.optim.Adam(model_good.parameters(), lr=1e-3)
+    for step in range(50):
+        optimizer_good.zero_grad()
+        out = model_good(x)
+        loss = criterion(out, y)
+        debugger_good.record_loss(loss.item())
+        loss.backward()
+        optimizer_good.step()
+    debugger_good.print_report()
+    debugger_good.remove_hooks()
+
+    print(&quot;\n&quot; + &quot;=&quot; * 60)
+    print(&quot;OVERFIT-ONE-BATCH TEST (healthy model)&quot;)
+    print(&quot;=&quot; * 60)
+    model_test = nn.Sequential(nn.Linear(10, 32), nn.ReLU(), nn.Linear(32, 2))
+    overfit_one_batch(model_test, x[:8], y[:8], criterion)
+
+    print(&quot;\n&quot; + &quot;=&quot; * 60)
+    print(&quot;LEARNING RATE FINDER&quot;)
+    print(&quot;=&quot; * 60)
+    model_lr = nn.Sequential(nn.Linear(10, 32), nn.ReLU(), nn.Linear(32, 2))
+    find_learning_rate(model_lr, x, y, criterion)
+
+    print(&quot;\n&quot; + &quot;=&quot; * 60)
+    print(&quot;GRADIENT CHECK&quot;)
+    print(&quot;=&quot; * 60)
+    model_grad = nn.Sequential(nn.Linear(10, 8), nn.ReLU(), nn.Linear(8, 2))
+    gradient_check(model_grad, x[:4], y[:4], criterion)
+</code></pre>
+<h2>用它</h2>
+<h3>嵌入式 PyTorch 工具</h3>
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+model = nn.Sequential(
+    nn.Linear(768, 256),
+    nn.ReLU(),
+    nn.Linear(256, 10),
+)
+
+with torch.autograd.detect_anomaly():
+    output = model(input_tensor)
+    loss = criterion(output, target)
+    loss.backward()
+
+for name, param in model.named_parameters():
+    if param.grad is not None:
+        print(f&quot;{name}: grad_mean={param.grad.abs().mean():.2e}&quot;)
+</code></pre>
+<h3>重量与偏差的整合</h3>
+<pre><code class="language-python">import wandb
+
+wandb.init(project=&quot;debug-training&quot;)
+
+for epoch in range(100):
+    loss = train_one_epoch()
+    wandb.log({
+        &quot;loss&quot;: loss,
+        &quot;lr&quot;: optimizer.param_groups[0][&quot;lr&quot;],
+        &quot;grad_norm&quot;: torch.nn.utils.clip_grad_norm_(model.parameters(), float(&quot;inf&quot;)),
+    })
+
+    for name, param in model.named_parameters():
+        if param.grad is not None:
+            wandb.log({f&quot;grad/{name}&quot;: wandb.Histogram(param.grad.cpu().numpy())})
+</code></pre>
+<h3>电压板</h3>
+<pre><code class="language-python">from torch.utils.tensorboard import SummaryWriter
+
+writer = SummaryWriter(&quot;runs/debug_experiment&quot;)
+
+for epoch in range(100):
+    loss = train_one_epoch()
+    writer.add_scalar(&quot;Loss/train&quot;, loss, epoch)
+
+    for name, param in model.named_parameters():
+        writer.add_histogram(f&quot;weights/{name}&quot;, param, epoch)
+        if param.grad is not None:
+            writer.add_histogram(f&quot;gradients/{name}&quot;, param.grad, epoch)
+</code></pre>
+<h3>检查清单 (在充分训练之前)</h3>
+<ol>
+<li>试试一次,如果失败,就停止.</li>
+<li>打印模型总结-- 验证参数数量是合理的.</li>
+<li>运行一个随机数据的前进传输--检查输出形状.</li>
+<li>列车5个时代,检查损失减少.</li>
+<li>检查激活数据,没有死层,没有爆炸.</li>
+<li>检查梯度流量,没有消失,没有爆炸.</li>
+<li>检查数据管道-- 打印5个随机样本,</li>
+</ol>
+<h2>运送它</h2>
+<p>这一课产生了:</p>
+<ul>
+<li><code>outputs/prompt-nn-debugger.md</code>-- 诊断神经网络训练失败的提示</li>
+<li><code>outputs/skill-debug-checklist.md</code>-- 调试训练问题决策树检查清单</li>
+</ul>
+<p>调试的主要部署模式:</p>
+<ul>
+<li>添加监控子到生产训练脚本中</li>
+<li>每次N步骤的W&amp;B或TensorBoard日志激活和梯度统计</li>
+<li>实现自动警告,即纳损失,死神经元 (&gt;80%零) 或梯度爆炸</li>
+<li>总是在修改架构或数据管道时,始终执行过度配件一批测试</li>
+</ul>
+<h2>运动</h2>
+<ol>
+<li>
+<p>**Add an exploding gradient detector.**修改<code>NetworkDebugger</code>检测梯度超过门时,并自动提示梯度切割值. 在20层网络上测试,没有正常化.</p>
+</li>
+<li>
+<p>**Build a dead neuron resurrector.**写一个识别死 ReLU 神经元的函数 (总是输出0),并通过凯明初始化重新启动其进来的重量. 显示这恢复了神经元的70%以上死亡的网络.</p>
+</li>
+<li>
+<p>**Implement the learning rate finder with plotting.**延长时间<code>find_learning_rate</code>通过 matplotlib 保存结果作为 CSV,并写一个单独的脚本,该脚本读取CSV,并显示LR与损失曲线.在CIFAR-10上确定ResNet-18的最佳LR.</p>
+</li>
+<li>
+<p>**Create a data pipeline validator.**写一个检查数据中的函数:在列车/测试分区间中复制样本,标签分布不平衡 (&gt;10:1比率),输入正常化 (平均接近0, std接近1),以及数据中的NaN/Inf值. 运行在故意破坏的数据集上.</p>
+</li>
+<li>
+<p>**Debug a real failure.**根据10课的迷你框架,引入一个微妙的错误 (例如,将权重矩阵转换向后),并使用梯度检查,以确定哪个参数有不正确的梯度. 记录调试过程.</p>
+</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Silent bug</td>
+<td>&quot;It runs but gives bad results&quot;</td>
+<td>A bug that produces no error but degrades model quality -- the dominant failure mode in ML</td>
+</tr>
+<tr>
+<td>Dead ReLU</td>
+<td>&quot;The neurons died&quot;</td>
+<td>A ReLU neuron whose input is always negative, so it outputs 0 and receives 0 gradient permanently</td>
+</tr>
+<tr>
+<td>Vanishing gradients</td>
+<td>&quot;Early layers stop learning&quot;</td>
+<td>Gradients shrink exponentially through layers, making weights in early layers effectively frozen</td>
+</tr>
+<tr>
+<td>Exploding gradients</td>
+<td>&quot;Loss went to NaN&quot;</td>
+<td>Gradients grow exponentially through layers, causing weight updates so large they overflow</td>
+</tr>
+<tr>
+<td>Gradient checking</td>
+<td>&quot;Verify backprop is correct&quot;</td>
+<td>Comparing analytical gradients from backprop to numerical gradients from finite differences</td>
+</tr>
+<tr>
+<td>Overfit-one-batch</td>
+<td>&quot;The most important debug test&quot;</td>
+<td>Training on a single small batch to verify the model CAN learn -- if it cannot, something is fundamentally broken</td>
+</tr>
+<tr>
+<td>LR finder</td>
+<td>&quot;Sweep to find the right learning rate&quot;</td>
+<td>Exponentially increasing the learning rate over one epoch and picking the rate just before loss diverges</td>
+</tr>
+<tr>
+<td>Data leakage</td>
+<td>&quot;Test data leaked into training&quot;</td>
+<td>When information from the test set contaminates training, producing artificially high accuracy</td>
+</tr>
+<tr>
+<td>Activation statistics</td>
+<td>&quot;Monitor layer health&quot;</td>
+<td>Tracking mean, std, and zero-fraction of each layer's output to detect dead, saturated, or exploding neurons</td>
+</tr>
+<tr>
+<td>Gradient clipping</td>
+<td>&quot;Cap the gradient magnitude&quot;</td>
+<td>Scaling gradients down when their norm exceeds a threshold, preventing exploding gradient updates</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li>史密斯, &quot;神经网络培训周期性学习率&quot; (2017) - - 引入学习率范围测试的论文 (LR寻找器)</li>
+<li>诺斯卡特等&quot;,测试组中的普遍标签错误破坏机器学习基准&quot; (2021) -- 证明ImageNet,CIFAR-10和其他主要基准中的3-6%的标签是错误的</li>
+<li>张等人&quot;,理解深度学习需要重新思考通用化&quot; (2017) -- 论文显示神经网络可以记住随机标签,</li>
+<li>关于 PyTorch 的文件<code>torch.autograd.detect_anomaly</code>其他<code>torch.autograd.set_detect_anomaly</code>用于内置的NAN/Inf检测</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Debugging Neural Networks</h1>
+<blockquote>
+<p>Your network compiled. It ran. It produced a number. The number is wrong and nothing crashed. Welcome to the hardest kind of debugging -- the kind where there is no error message.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python, PyTorch
+<strong>Prerequisites:</strong> Phase 03 Lessons 01-10 (especially backpropagation, loss functions, optimizers)
+<strong>Time:</strong> ~90 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Diagnose common neural network failures (NaN loss, flat loss curve, overfitting, oscillation) using systematic debugging strategies</li>
+<li>Apply the &quot;overfit one batch&quot; technique to verify that your model architecture and training loop are correct</li>
+<li>Inspect gradient magnitudes, activation distributions, and weight norms to identify vanishing/exploding gradient problems</li>
+<li>Build a debugging checklist that covers data pipeline, model architecture, loss function, optimizer, and learning rate issues</li>
+</ul>
+<h2>The Problem</h2>
+<p>Traditional software crashes when it is broken. A null pointer throws an exception. A type mismatch fails at compile time. An off-by-one error produces a clearly wrong output.</p>
+<p>Neural networks do not give you that luxury.</p>
+<p>A broken neural network runs to completion, prints a loss value, and outputs predictions. The loss might decrease. The predictions might look plausible. But the model is silently wrong -- learning shortcuts, memorizing noise, or converging to a useless local minimum. Google researchers estimated that 60-70% of ML debugging time is spent on &quot;silent&quot; bugs that produce no errors but degrade model quality.</p>
+<p>The difference between a working model and a broken one is often a single misplaced line: a missing <code>zero_grad()</code>, a transposed dimension, a learning rate off by 10x. the canonical &quot;Recipe for Training Neural Networks&quot; (2019) opens with this: &quot;The most common neural net mistakes are bugs that don't crash.&quot;</p>
+<p>This lesson teaches you to find those bugs.</p>
+<h2>The Concept</h2>
+<h3>The Debugging Mindset</h3>
+<p>Forget print-and-pray debugging. Neural network debugging requires a systematic approach because the feedback loop is slow (minutes to hours per training run) and the symptoms are ambiguous (bad loss could mean 20 different things).</p>
+<p>The golden rule: <strong>start simple, add complexity one piece at a time, and verify each piece independently.</strong></p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-6980cf43d533732b3d81.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>Symptom 1: Loss Not Decreasing</h3>
+<p>This is the most common complaint. The training loop runs, epochs tick by, and the loss stays flat or oscillates wildly.</p>
+<p><strong>Wrong learning rate.</strong> Too high: loss oscillates or jumps to NaN. Too low: loss decreases so slowly it looks flat. For Adam, start at 1e-3. For SGD, start at 1e-1 or 1e-2. Always try 3 learning rates spanning 10x each (e.g., 1e-2, 1e-3, 1e-4) before concluding something else is wrong.</p>
+<p><strong>Dead ReLUs.</strong> If a ReLU neuron receives a large negative input, it outputs 0 and its gradient is 0. It never activates again. If enough neurons die, the network cannot learn. Check: print the fraction of activations that are exactly 0 after each ReLU layer. If &gt;50% are dead, switch to LeakyReLU or reduce the learning rate.</p>
+<p><strong>Vanishing gradients.</strong> In deep networks with sigmoid or tanh activations, gradients shrink exponentially as they propagate backward. By the time they reach the first layer, they are ~0. The first layers stop learning. Fix: use ReLU/GELU, add residual connections, or use batch normalization.</p>
+<p><strong>Exploding gradients.</strong> The opposite problem -- gradients grow exponentially. Common in RNNs and very deep networks. Loss jumps to NaN. Fix: gradient clipping (<code>torch.nn.utils.clip_grad_norm_</code>), lower learning rate, or add normalization.</p>
+<h3>Symptom 2: Loss Decreasing But Model is Bad</h3>
+<p>The loss goes down. Training accuracy hits 99%. But test accuracy is 55%. Or the model produces nonsensical outputs on real data.</p>
+<p><strong>Overfitting.</strong> The model memorizes training data instead of learning patterns. Gap between training and validation loss grows over time. Fix: more data, dropout, weight decay, early stopping, data augmentation.</p>
+<p><strong>Data leakage.</strong> Test data leaked into training. Accuracy is suspiciously high. Common causes: shuffling before splitting, preprocessing with statistics from the full dataset, duplicate samples across splits. Fix: split first, preprocess second, check for duplicates.</p>
+<p><strong>Label errors.</strong> 5-10% of labels in most real datasets are wrong (Northcutt et al., 2021 -- &quot;Pervasive Label Errors in Test Sets&quot;). The model learns the noise. Fix: use confident learning to find and fix mislabeled examples, or use loss truncation to ignore high-loss samples.</p>
+<h3>Symptom 3: NaN or Inf in Loss</h3>
+<p>The loss value becomes <code>nan</code> or <code>inf</code>. Training is dead.</p>
+<p><strong>Learning rate too high.</strong> Gradient updates overshoot so far that weights explode. Fix: reduce by 10x.</p>
+<p><strong>log(0) or log(negative).</strong> Cross-entropy loss computes <code>log(p)</code>. If your model outputs exactly 0 or a negative probability, the log explodes. Fix: clamp predictions to <code>[eps, 1-eps]</code> where <code>eps=1e-7</code>.</p>
+<p><strong>Division by zero.</strong> Batch normalization divides by standard deviation. A batch with constant values has std=0. Fix: add epsilon to the denominator (PyTorch does this by default, but custom implementations might not).</p>
+<p><strong>Numerical overflow.</strong> Large activations fed into <code>exp()</code> produce Inf. Softmax is especially prone. Fix: subtract the max before exponentiating (the log-sum-exp trick).</p>
+<h3>Technique 1: Gradient Checking</h3>
+<p>Compare your analytical gradients (from backprop) to numerical gradients (from finite differences). If they disagree, your backward pass has a bug.</p>
+<p>Numerical gradient for parameter <code>w</code>:</p>
+<pre><code>grad_numerical = (loss(w + eps) - loss(w - eps)) / (2 * eps)
+</code></pre>
+<p>Agreement metric (relative difference):</p>
+<pre><code>rel_diff = |grad_analytical - grad_numerical| / max(|grad_analytical|, |grad_numerical|, 1e-8)
+</code></pre>
+<p>If <code>rel_diff &lt; 1e-5</code>: correct. If <code>rel_diff &gt; 1e-3</code>: almost certainly a bug.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-a5f0686b5ed1f9674f9f.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>Technique 2: Activation Statistics</h3>
+<p>Monitor the mean and standard deviation of activations after each layer during training. Healthy networks maintain activations with mean near 0 and std near 1 (after normalization) or at least bounded.</p>
+<table>
+<thead>
+<tr>
+<th>Health indicator</th>
+<th>Mean</th>
+<th>Std</th>
+<th>Diagnosis</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Healthy</td>
+<td>~0</td>
+<td>~1</td>
+<td>Network is learning normally</td>
+</tr>
+<tr>
+<td>Saturated</td>
+<td>&gt;&gt;0 or &lt;&lt;0</td>
+<td>~0</td>
+<td>Activations stuck at extreme values</td>
+</tr>
+<tr>
+<td>Dead</td>
+<td>0</td>
+<td>0</td>
+<td>Neurons are dead (all zeros)</td>
+</tr>
+<tr>
+<td>Exploding</td>
+<td>&gt;&gt;10</td>
+<td>&gt;&gt;10</td>
+<td>Activations growing without bound</td>
+</tr>
+</tbody>
+</table>
+<h3>Technique 3: Gradient Flow Visualization</h3>
+<p>Plot the average gradient magnitude for each layer. In a healthy network, gradient magnitudes should be roughly similar across layers. If early layers have gradients 1000x smaller than later layers, you have vanishing gradients.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-25792db00fc1f0e91d8a.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><figure><img src="/learn/ai-from-scratch/figures/mermaid-3fd4f5e1f48b0c8e14d9.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>Technique 4: The Overfit-One-Batch Test</h3>
+<p>The single most important debugging technique in deep learning.</p>
+<p>Take one small batch (8-32 samples). Train on it for 100+ iterations. The loss should go to nearly zero and training accuracy should hit 100%. If it does not, your model or training loop has a fundamental bug -- do not proceed to full training.</p>
+<p>This test catches:</p>
+<ul>
+<li>Broken loss functions</li>
+<li>Broken backward passes</li>
+<li>Architecture too small to represent the data</li>
+<li>Optimizer not connected to model parameters</li>
+<li>Data and labels misaligned</li>
+</ul>
+<p>This takes 30 seconds to run and saves hours of debugging full training runs.</p>
+<h3>Technique 5: Learning Rate Finder</h3>
+<p>Leslie Smith (2017) proposed sweeping the learning rate from very small (1e-7) to very large (10) over one epoch while recording the loss. Plot loss vs learning rate. The optimal learning rate is roughly 10x smaller than the rate where loss starts decreasing fastest.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-7196b7606116e4688e0a.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>Best LR in this example: ~1e-3 (one order of magnitude before the steepest point).</p>
+<h3>Common PyTorch Bugs</h3>
+<p>These are the bugs that waste the most collective hours in the PyTorch community:</p>
+<table>
+<thead>
+<tr>
+<th>Bug</th>
+<th>Symptom</th>
+<th>Fix</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Forgetting <code>optimizer.zero_grad()</code></td>
+<td>Gradients accumulate across batches, loss oscillates</td>
+<td>Add <code>optimizer.zero_grad()</code> before <code>loss.backward()</code></td>
+</tr>
+<tr>
+<td>Forgetting <code>model.eval()</code> at test time</td>
+<td>Dropout and batch norm behave differently, test accuracy varies between runs</td>
+<td>Add <code>model.eval()</code> and <code>torch.no_grad()</code></td>
+</tr>
+<tr>
+<td>Wrong tensor shapes</td>
+<td>Silent broadcasting produces wrong results, no error</td>
+<td>Print shapes after every operation during debugging</td>
+</tr>
+<tr>
+<td>CPU/GPU mismatch</td>
+<td><code>RuntimeError: expected CUDA tensor</code></td>
+<td>Use <code>.to(device)</code> on model AND data</td>
+</tr>
+<tr>
+<td>Not detaching tensors</td>
+<td>Computation graph grows forever, OOM</td>
+<td>Use <code>.detach()</code> or <code>with torch.no_grad()</code></td>
+</tr>
+<tr>
+<td>In-place operations breaking autograd</td>
+<td><code>RuntimeError: modified by in-place operation</code></td>
+<td>Replace <code>x += 1</code> with <code>x = x + 1</code></td>
+</tr>
+<tr>
+<td>Data not normalized</td>
+<td>Loss stuck at random-chance level</td>
+<td>Normalize inputs to mean=0, std=1</td>
+</tr>
+<tr>
+<td>Labels as wrong dtype</td>
+<td>Cross-entropy expects <code>Long</code>, got <code>Float</code></td>
+<td>Cast labels: <code>labels.long()</code></td>
+</tr>
+</tbody>
+</table>
+<h3>The Master Debugging Table</h3>
+<table>
+<thead>
+<tr>
+<th>Symptom</th>
+<th>Likely cause</th>
+<th>First thing to try</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Loss stuck at -log(1/num_classes)</td>
+<td>Model predicting uniform distribution</td>
+<td>Check data pipeline, verify labels match inputs</td>
+</tr>
+<tr>
+<td>Loss NaN after a few steps</td>
+<td>Learning rate too high</td>
+<td>Reduce LR by 10x</td>
+</tr>
+<tr>
+<td>Loss NaN immediately</td>
+<td>log(0) or division by zero</td>
+<td>Add epsilon to log/division operations</td>
+</tr>
+<tr>
+<td>Loss oscillating wildly</td>
+<td>LR too high or batch size too small</td>
+<td>Reduce LR, increase batch size</td>
+</tr>
+<tr>
+<td>Loss decreasing then plateaus</td>
+<td>LR too high for fine-tuning phase</td>
+<td>Add LR schedule (cosine or step decay)</td>
+</tr>
+<tr>
+<td>Training acc high, test acc low</td>
+<td>Overfitting</td>
+<td>Add dropout, weight decay, more data</td>
+</tr>
+<tr>
+<td>Training acc = test acc = chance</td>
+<td>Model not learning anything</td>
+<td>Run overfit-one-batch test</td>
+</tr>
+<tr>
+<td>Training acc = test acc but both low</td>
+<td>Underfitting</td>
+<td>Bigger model, more layers, more features</td>
+</tr>
+<tr>
+<td>Gradients all zero</td>
+<td>Dead ReLUs or detached computation graph</td>
+<td>Switch to LeakyReLU, check <code>.requires_grad</code></td>
+</tr>
+<tr>
+<td>Out of memory during training</td>
+<td>Batch too large or graph not freed</td>
+<td>Reduce batch size, use <code>torch.no_grad()</code> for eval</td>
+</tr>
+</tbody>
+</table>
+<figure><img src="/learn/ai-from-scratch/figures/figure-00d265968146e741e14b.png" alt="learning-curves 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<p>A diagnostic toolkit that monitors activations, gradients, and loss curves. You will deliberately break a network and use the toolkit to diagnose each problem.</p>
+<h3>Step 1: The NetworkDebugger Class</h3>
+<p>Hooks into a PyTorch model to record activation and gradient statistics per layer.</p>
+<pre><code class="language-python">import torch
+import torch.nn as nn
+import math
+
+
+class NetworkDebugger:
+    def __init__(self, model):
+        self.model = model
+        self.activation_stats = {}
+        self.gradient_stats = {}
+        self.loss_history = []
+        self.lr_losses = []
+        self.hooks = []
+        self._register_hooks()
+
+    def _register_hooks(self):
+        for name, module in self.model.named_modules():
+            if isinstance(module, (nn.Linear, nn.Conv2d, nn.ReLU, nn.LeakyReLU)):
+                hook = module.register_forward_hook(self._make_activation_hook(name))
+                self.hooks.append(hook)
+                hook = module.register_full_backward_hook(self._make_gradient_hook(name))
+                self.hooks.append(hook)
+
+    def _make_activation_hook(self, name):
+        def hook(module, input, output):
+            with torch.no_grad():
+                out = output.detach().float()
+                self.activation_stats[name] = {
+                    &quot;mean&quot;: out.mean().item(),
+                    &quot;std&quot;: out.std().item(),
+                    &quot;fraction_zero&quot;: (out == 0).float().mean().item(),
+                    &quot;min&quot;: out.min().item(),
+                    &quot;max&quot;: out.max().item(),
+                }
+        return hook
+
+    def _make_gradient_hook(self, name):
+        def hook(module, grad_input, grad_output):
+            if grad_output[0] is not None:
+                with torch.no_grad():
+                    grad = grad_output[0].detach().float()
+                    self.gradient_stats[name] = {
+                        &quot;mean&quot;: grad.mean().item(),
+                        &quot;std&quot;: grad.std().item(),
+                        &quot;abs_mean&quot;: grad.abs().mean().item(),
+                        &quot;max&quot;: grad.abs().max().item(),
+                    }
+        return hook
+
+    def record_loss(self, loss_value):
+        self.loss_history.append(loss_value)
+
+    def check_loss_health(self):
+        if len(self.loss_history) &lt; 2:
+            return &quot;NOT_ENOUGH_DATA&quot;
+        recent = self.loss_history[-10:]
+        if any(math.isnan(v) or math.isinf(v) for v in recent):
+            return &quot;NAN_OR_INF&quot;
+        if len(self.loss_history) &gt;= 20:
+            first_half = sum(self.loss_history[:10]) / 10
+            second_half = sum(self.loss_history[-10:]) / 10
+            if second_half &gt;= first_half * 0.99:
+                return &quot;NOT_DECREASING&quot;
+        if len(recent) &gt;= 5:
+            diffs = [recent[i+1] - recent[i] for i in range(len(recent)-1)]
+            if max(diffs) - min(diffs) &gt; 2 * abs(sum(diffs) / len(diffs)):
+                return &quot;OSCILLATING&quot;
+        return &quot;HEALTHY&quot;
+
+    def check_activations(self):
+        issues = []
+        for name, stats in self.activation_stats.items():
+            if stats[&quot;fraction_zero&quot;] &gt; 0.5:
+                issues.append(f&quot;DEAD_NEURONS: {name} has {stats['fraction_zero']:.0%} zero activations&quot;)
+            if abs(stats[&quot;mean&quot;]) &gt; 10:
+                issues.append(f&quot;EXPLODING_ACTIVATIONS: {name} mean={stats['mean']:.2f}&quot;)
+            if stats[&quot;std&quot;] &lt; 1e-6:
+                issues.append(f&quot;COLLAPSED_ACTIVATIONS: {name} std={stats['std']:.2e}&quot;)
+        return issues if issues else [&quot;HEALTHY&quot;]
+
+    def check_gradients(self):
+        issues = []
+        grad_magnitudes = []
+        for name, stats in self.gradient_stats.items():
+            grad_magnitudes.append((name, stats[&quot;abs_mean&quot;]))
+            if stats[&quot;abs_mean&quot;] &lt; 1e-7:
+                issues.append(f&quot;VANISHING_GRADIENT: {name} abs_mean={stats['abs_mean']:.2e}&quot;)
+            if stats[&quot;abs_mean&quot;] &gt; 100:
+                issues.append(f&quot;EXPLODING_GRADIENT: {name} abs_mean={stats['abs_mean']:.2e}&quot;)
+        if len(grad_magnitudes) &gt;= 2:
+            first_mag = grad_magnitudes[0][1]
+            last_mag = grad_magnitudes[-1][1]
+            if last_mag &gt; 0 and first_mag / last_mag &gt; 100:
+                issues.append(f&quot;GRADIENT_RATIO: first/last = {first_mag/last_mag:.0f}x (vanishing)&quot;)
+        return issues if issues else [&quot;HEALTHY&quot;]
+
+    def print_report(self):
+        print(&quot;\n=== NETWORK DEBUGGER REPORT ===&quot;)
+        print(f&quot;\nLoss health: {self.check_loss_health()}&quot;)
+        if self.loss_history:
+            print(f&quot;  Last 5 losses: {[f'{v:.4f}' for v in self.loss_history[-5:]]}&quot;)
+        print(&quot;\nActivation diagnostics:&quot;)
+        for item in self.check_activations():
+            print(f&quot;  {item}&quot;)
+        print(&quot;\nGradient diagnostics:&quot;)
+        for item in self.check_gradients():
+            print(f&quot;  {item}&quot;)
+        print(&quot;\nPer-layer activation stats:&quot;)
+        for name, stats in self.activation_stats.items():
+            print(f&quot;  {name}: mean={stats['mean']:.4f} std={stats['std']:.4f} zero={stats['fraction_zero']:.1%}&quot;)
+        print(&quot;\nPer-layer gradient stats:&quot;)
+        for name, stats in self.gradient_stats.items():
+            print(f&quot;  {name}: abs_mean={stats['abs_mean']:.2e} max={stats['max']:.2e}&quot;)
+
+    def remove_hooks(self):
+        for hook in self.hooks:
+            hook.remove()
+        self.hooks.clear()
+</code></pre>
+<h3>Step 2: The Overfit-One-Batch Test</h3>
+<pre><code class="language-python">def overfit_one_batch(model, x_batch, y_batch, criterion, lr=0.01, steps=200):
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    model.train()
+    print(&quot;\n=== OVERFIT ONE BATCH TEST ===&quot;)
+    print(f&quot;Batch size: {x_batch.shape[0]}, Steps: {steps}&quot;)
+
+    for step in range(steps):
+        optimizer.zero_grad()
+        output = model(x_batch)
+        loss = criterion(output, y_batch)
+        loss.backward()
+        optimizer.step()
+
+        if step % 50 == 0 or step == steps - 1:
+            with torch.no_grad():
+                preds = (output &gt; 0).float() if output.shape[-1] == 1 else output.argmax(dim=1)
+                targets = y_batch if y_batch.dim() == 1 else y_batch.squeeze()
+                acc = (preds.squeeze() == targets).float().mean().item()
+            print(f&quot;  Step {step:3d} | Loss: {loss.item():.6f} | Accuracy: {acc:.1%}&quot;)
+
+    final_loss = loss.item()
+    if final_loss &gt; 0.1:
+        print(f&quot;\n  FAIL: Loss did not converge ({final_loss:.4f}). Model or training loop is broken.&quot;)
+        return False
+    print(f&quot;\n  PASS: Loss converged to {final_loss:.6f}&quot;)
+    return True
+</code></pre>
+<h3>Step 3: Learning Rate Finder</h3>
+<pre><code class="language-python">def find_learning_rate(model, x_data, y_data, criterion, start_lr=1e-7, end_lr=10, steps=100):
+    import copy
+    original_state = copy.deepcopy(model.state_dict())
+    optimizer = torch.optim.SGD(model.parameters(), lr=start_lr)
+    lr_mult = (end_lr / start_lr) ** (1 / steps)
+
+    model.train()
+    results = []
+    best_loss = float(&quot;inf&quot;)
+    current_lr = start_lr
+
+    print(&quot;\n=== LEARNING RATE FINDER ===&quot;)
+
+    for step in range(steps):
+        optimizer.zero_grad()
+        output = model(x_data)
+        loss = criterion(output, y_data)
+
+        if math.isnan(loss.item()) or loss.item() &gt; best_loss * 10:
+            break
+
+        best_loss = min(best_loss, loss.item())
+        results.append((current_lr, loss.item()))
+
+        loss.backward()
+        optimizer.step()
+
+        current_lr *= lr_mult
+        for param_group in optimizer.param_groups:
+            param_group[&quot;lr&quot;] = current_lr
+
+    model.load_state_dict(original_state)
+
+    if len(results) &lt; 10:
+        print(&quot;  Could not complete LR sweep -- loss diverged too quickly&quot;)
+        return results
+
+    min_loss_idx = min(range(len(results)), key=lambda i: results[i][1])
+    suggested_lr = results[max(0, min_loss_idx - 10)][0]
+
+    print(f&quot;  Swept {len(results)} steps from {start_lr:.0e} to {results[-1][0]:.0e}&quot;)
+    print(f&quot;  Minimum loss {results[min_loss_idx][1]:.4f} at lr={results[min_loss_idx][0]:.2e}&quot;)
+    print(f&quot;  Suggested learning rate: {suggested_lr:.2e}&quot;)
+
+    return results
+</code></pre>
+<h3>Step 4: Gradient Checker</h3>
+<pre><code class="language-python">def _flat_to_multi_index(flat_idx, shape):
+    multi_idx = []
+    remaining = flat_idx
+    for dim in reversed(shape):
+        multi_idx.insert(0, remaining % dim)
+        remaining //= dim
+    return tuple(multi_idx)
+
+
+def gradient_check(model, x, y, criterion, eps=1e-4):
+    model.train()
+    x_double = x.double()
+    y_double = y.double()
+    model_double = model.double()
+
+    print(&quot;\n=== GRADIENT CHECK ===&quot;)
+    overall_max_diff = 0
+    checked = 0
+
+    for name, param in model_double.named_parameters():
+        if not param.requires_grad:
+            continue
+
+        layer_max_diff = 0
+
+        model_double.zero_grad()
+        output = model_double(x_double)
+        loss = criterion(output, y_double)
+        loss.backward()
+        analytical_grad = param.grad.clone()
+
+        num_checks = min(5, param.numel())
+        for i in range(num_checks):
+            idx = _flat_to_multi_index(i, param.shape)
+            original = param.data[idx].item()
+
+            param.data[idx] = original + eps
+            with torch.no_grad():
+                loss_plus = criterion(model_double(x_double), y_double).item()
+
+            param.data[idx] = original - eps
+            with torch.no_grad():
+                loss_minus = criterion(model_double(x_double), y_double).item()
+
+            param.data[idx] = original
+
+            numerical = (loss_plus - loss_minus) / (2 * eps)
+            analytical = analytical_grad[idx].item()
+
+            denom = max(abs(numerical), abs(analytical), 1e-8)
+            rel_diff = abs(numerical - analytical) / denom
+
+            layer_max_diff = max(layer_max_diff, rel_diff)
+            checked += 1
+
+        overall_max_diff = max(overall_max_diff, layer_max_diff)
+        status = &quot;OK&quot; if layer_max_diff &lt; 1e-5 else &quot;MISMATCH&quot;
+        print(f&quot;  {name}: max_rel_diff={layer_max_diff:.2e} [{status}]&quot;)
+
+    model.float()
+
+    print(f&quot;\n  Checked {checked} parameters&quot;)
+    if overall_max_diff &lt; 1e-5:
+        print(&quot;  PASS: Gradients match (rel_diff &lt; 1e-5)&quot;)
+    elif overall_max_diff &lt; 1e-3:
+        print(&quot;  WARN: Small differences (1e-5 &lt; rel_diff &lt; 1e-3)&quot;)
+    else:
+        print(&quot;  FAIL: Gradient mismatch detected (rel_diff &gt; 1e-3)&quot;)
+    return overall_max_diff
+</code></pre>
+<h3>Step 5: Deliberately Broken Networks</h3>
+<p>Now apply the toolkit to broken networks and diagnose each one.</p>
+<pre><code class="language-python">def demo_broken_networks():
+    torch.manual_seed(42)
+    x = torch.randn(64, 10)
+    y = (x[:, 0] &gt; 0).long()
+
+    print(&quot;\n&quot; + &quot;=&quot; * 60)
+    print(&quot;BUG 1: Learning rate too high (lr=10)&quot;)
+    print(&quot;=&quot; * 60)
+    model1 = nn.Sequential(nn.Linear(10, 32), nn.ReLU(), nn.Linear(32, 2))
+    debugger1 = NetworkDebugger(model1)
+    optimizer1 = torch.optim.SGD(model1.parameters(), lr=10.0)
+    criterion = nn.CrossEntropyLoss()
+    for step in range(20):
+        optimizer1.zero_grad()
+        out = model1(x)
+        loss = criterion(out, y)
+        debugger1.record_loss(loss.item())
+        loss.backward()
+        optimizer1.step()
+    debugger1.print_report()
+    debugger1.remove_hooks()
+
+    print(&quot;\n&quot; + &quot;=&quot; * 60)
+    print(&quot;BUG 2: Dead ReLUs from bad initialization&quot;)
+    print(&quot;=&quot; * 60)
+    model2 = nn.Sequential(nn.Linear(10, 32), nn.ReLU(), nn.Linear(32, 32), nn.ReLU(), nn.Linear(32, 2))
+    with torch.no_grad():
+        for m in model2.modules():
+            if isinstance(m, nn.Linear):
+                m.weight.fill_(-1.0)
+                m.bias.fill_(-5.0)
+    debugger2 = NetworkDebugger(model2)
+    optimizer2 = torch.optim.Adam(model2.parameters(), lr=1e-3)
+    for step in range(50):
+        optimizer2.zero_grad()
+        out = model2(x)
+        loss = criterion(out, y)
+        debugger2.record_loss(loss.item())
+        loss.backward()
+        optimizer2.step()
+    debugger2.print_report()
+    debugger2.remove_hooks()
+
+    print(&quot;\n&quot; + &quot;=&quot; * 60)
+    print(&quot;BUG 3: Missing zero_grad (gradients accumulate)&quot;)
+    print(&quot;=&quot; * 60)
+    model3 = nn.Sequential(nn.Linear(10, 32), nn.ReLU(), nn.Linear(32, 2))
+    debugger3 = NetworkDebugger(model3)
+    optimizer3 = torch.optim.SGD(model3.parameters(), lr=0.01)
+    for step in range(50):
+        out = model3(x)
+        loss = criterion(out, y)
+        debugger3.record_loss(loss.item())
+        loss.backward()
+        optimizer3.step()
+    debugger3.print_report()
+    debugger3.remove_hooks()
+
+    print(&quot;\n&quot; + &quot;=&quot; * 60)
+    print(&quot;HEALTHY NETWORK: Correct setup for comparison&quot;)
+    print(&quot;=&quot; * 60)
+    model_good = nn.Sequential(nn.Linear(10, 32), nn.ReLU(), nn.Linear(32, 2))
+    debugger_good = NetworkDebugger(model_good)
+    optimizer_good = torch.optim.Adam(model_good.parameters(), lr=1e-3)
+    for step in range(50):
+        optimizer_good.zero_grad()
+        out = model_good(x)
+        loss = criterion(out, y)
+        debugger_good.record_loss(loss.item())
+        loss.backward()
+        optimizer_good.step()
+    debugger_good.print_report()
+    debugger_good.remove_hooks()
+
+    print(&quot;\n&quot; + &quot;=&quot; * 60)
+    print(&quot;OVERFIT-ONE-BATCH TEST (healthy model)&quot;)
+    print(&quot;=&quot; * 60)
+    model_test = nn.Sequential(nn.Linear(10, 32), nn.ReLU(), nn.Linear(32, 2))
+    overfit_one_batch(model_test, x[:8], y[:8], criterion)
+
+    print(&quot;\n&quot; + &quot;=&quot; * 60)
+    print(&quot;LEARNING RATE FINDER&quot;)
+    print(&quot;=&quot; * 60)
+    model_lr = nn.Sequential(nn.Linear(10, 32), nn.ReLU(), nn.Linear(32, 2))
+    find_learning_rate(model_lr, x, y, criterion)
+
+    print(&quot;\n&quot; + &quot;=&quot; * 60)
+    print(&quot;GRADIENT CHECK&quot;)
+    print(&quot;=&quot; * 60)
+    model_grad = nn.Sequential(nn.Linear(10, 8), nn.ReLU(), nn.Linear(8, 2))
+    gradient_check(model_grad, x[:4], y[:4], criterion)
+</code></pre>
+<h2>Use It</h2>
+<h3>PyTorch Built-in Tools</h3>
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+model = nn.Sequential(
+    nn.Linear(768, 256),
+    nn.ReLU(),
+    nn.Linear(256, 10),
+)
+
+with torch.autograd.detect_anomaly():
+    output = model(input_tensor)
+    loss = criterion(output, target)
+    loss.backward()
+
+for name, param in model.named_parameters():
+    if param.grad is not None:
+        print(f&quot;{name}: grad_mean={param.grad.abs().mean():.2e}&quot;)
+</code></pre>
+<h3>Weights &amp; Biases Integration</h3>
+<pre><code class="language-python">import wandb
+
+wandb.init(project=&quot;debug-training&quot;)
+
+for epoch in range(100):
+    loss = train_one_epoch()
+    wandb.log({
+        &quot;loss&quot;: loss,
+        &quot;lr&quot;: optimizer.param_groups[0][&quot;lr&quot;],
+        &quot;grad_norm&quot;: torch.nn.utils.clip_grad_norm_(model.parameters(), float(&quot;inf&quot;)),
+    })
+
+    for name, param in model.named_parameters():
+        if param.grad is not None:
+            wandb.log({f&quot;grad/{name}&quot;: wandb.Histogram(param.grad.cpu().numpy())})
+</code></pre>
+<h3>TensorBoard</h3>
+<pre><code class="language-python">from torch.utils.tensorboard import SummaryWriter
+
+writer = SummaryWriter(&quot;runs/debug_experiment&quot;)
+
+for epoch in range(100):
+    loss = train_one_epoch()
+    writer.add_scalar(&quot;Loss/train&quot;, loss, epoch)
+
+    for name, param in model.named_parameters():
+        writer.add_histogram(f&quot;weights/{name}&quot;, param, epoch)
+        if param.grad is not None:
+            writer.add_histogram(f&quot;gradients/{name}&quot;, param.grad, epoch)
+</code></pre>
+<h3>The Debug Checklist (Before Full Training)</h3>
+<ol>
+<li>Run overfit-one-batch test. If it fails, stop.</li>
+<li>Print model summary -- verify parameter count is reasonable.</li>
+<li>Run a single forward pass with random data -- check output shape.</li>
+<li>Train for 5 epochs -- verify loss decreases.</li>
+<li>Check activation statistics -- no dead layers, no explosions.</li>
+<li>Check gradient flow -- no vanishing, no exploding.</li>
+<li>Verify data pipeline -- print 5 random samples with labels.</li>
+</ol>
+<h2>Ship It</h2>
+<p>This lesson produces:</p>
+<ul>
+<li><code>outputs/prompt-nn-debugger.md</code> -- a prompt for diagnosing neural network training failures</li>
+<li><code>outputs/skill-debug-checklist.md</code> -- a decision-tree checklist for debugging training issues</li>
+</ul>
+<p>Key deployment patterns for debugging:</p>
+<ul>
+<li>Add monitoring hooks to production training scripts</li>
+<li>Log activation and gradient statistics to W&amp;B or TensorBoard every N steps</li>
+<li>Implement automatic alerts for NaN loss, dead neurons (&gt;80% zero), or gradient explosion</li>
+<li>Always run the overfit-one-batch test when changing architectures or data pipelines</li>
+</ul>
+<h2>Exercises</h2>
+<ol>
+<li>
+<p><strong>Add an exploding gradient detector.</strong> Modify the <code>NetworkDebugger</code> to detect when gradients exceed a threshold and automatically suggest a gradient clipping value. Test it on a 20-layer network with no normalization.</p>
+</li>
+<li>
+<p><strong>Build a dead neuron resurrector.</strong> Write a function that identifies dead ReLU neurons (always outputting 0) and reinitializes their incoming weights with Kaiming initialization. Show that this recovers a network where &gt;70% of neurons are dead.</p>
+</li>
+<li>
+<p><strong>Implement the learning rate finder with plotting.</strong> Extend <code>find_learning_rate</code> to save results as a CSV and write a separate script that reads the CSV and displays the LR vs loss curve using matplotlib. Identify the optimal LR for ResNet-18 on CIFAR-10.</p>
+</li>
+<li>
+<p><strong>Create a data pipeline validator.</strong> Write a function that checks for: duplicate samples across train/test splits, label distribution imbalance (&gt;10:1 ratio), input normalization (mean near 0, std near 1), and NaN/Inf values in the data. Run it on a deliberately corrupted dataset.</p>
+</li>
+<li>
+<p><strong>Debug a real failure.</strong> Take the mini-framework from Lesson 10, introduce a subtle bug (e.g., transpose the weight matrix in backward), and use gradient checking to locate exactly which parameter has incorrect gradients. Document the debugging process.</p>
+</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Silent bug</td>
+<td>&quot;It runs but gives bad results&quot;</td>
+<td>A bug that produces no error but degrades model quality -- the dominant failure mode in ML</td>
+</tr>
+<tr>
+<td>Dead ReLU</td>
+<td>&quot;The neurons died&quot;</td>
+<td>A ReLU neuron whose input is always negative, so it outputs 0 and receives 0 gradient permanently</td>
+</tr>
+<tr>
+<td>Vanishing gradients</td>
+<td>&quot;Early layers stop learning&quot;</td>
+<td>Gradients shrink exponentially through layers, making weights in early layers effectively frozen</td>
+</tr>
+<tr>
+<td>Exploding gradients</td>
+<td>&quot;Loss went to NaN&quot;</td>
+<td>Gradients grow exponentially through layers, causing weight updates so large they overflow</td>
+</tr>
+<tr>
+<td>Gradient checking</td>
+<td>&quot;Verify backprop is correct&quot;</td>
+<td>Comparing analytical gradients from backprop to numerical gradients from finite differences</td>
+</tr>
+<tr>
+<td>Overfit-one-batch</td>
+<td>&quot;The most important debug test&quot;</td>
+<td>Training on a single small batch to verify the model CAN learn -- if it cannot, something is fundamentally broken</td>
+</tr>
+<tr>
+<td>LR finder</td>
+<td>&quot;Sweep to find the right learning rate&quot;</td>
+<td>Exponentially increasing the learning rate over one epoch and picking the rate just before loss diverges</td>
+</tr>
+<tr>
+<td>Data leakage</td>
+<td>&quot;Test data leaked into training&quot;</td>
+<td>When information from the test set contaminates training, producing artificially high accuracy</td>
+</tr>
+<tr>
+<td>Activation statistics</td>
+<td>&quot;Monitor layer health&quot;</td>
+<td>Tracking mean, std, and zero-fraction of each layer's output to detect dead, saturated, or exploding neurons</td>
+</tr>
+<tr>
+<td>Gradient clipping</td>
+<td>&quot;Cap the gradient magnitude&quot;</td>
+<td>Scaling gradients down when their norm exceeds a threshold, preventing exploding gradient updates</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li>Smith, &quot;Cyclical Learning Rates for Training Neural Networks&quot; (2017) -- the paper introducing the learning rate range test (LR finder)</li>
+<li>Northcutt et al., &quot;Pervasive Label Errors in Test Sets Destabilize Machine Learning Benchmarks&quot; (2021) -- demonstrates that 3-6% of labels in ImageNet, CIFAR-10, and other major benchmarks are wrong</li>
+<li>Zhang et al., &quot;Understanding Deep Learning Requires Rethinking Generalization&quot; (2017) -- the paper showing neural networks can memorize random labels, which is why the overfit-one-batch test works</li>
+<li>PyTorch documentation on <code>torch.autograd.detect_anomaly</code> and <code>torch.autograd.set_detect_anomaly</code> for built-in NaN/Inf detection</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-03-deep-learning-core--13-debugging-neural-networks.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-03-deep-learning-core--13-debugging-neural-networks.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/03-deep-learning-core/13-debugging-neural-networks/code/debug_neural_nets.py">phases/03-deep-learning-core/13-debugging-neural-networks/code/debug_neural_nets.py</a><details><summary>查看原始文本</summary><pre><code>import torch
+import torch.nn as nn
+import math
+import copy
+
+
+class NetworkDebugger:
+    def __init__(self, model):
+        self.model = model
+        self.activation_stats = {}
+        self.gradient_stats = {}
+        self.loss_history = []
+        self.hooks = []
+        self._register_hooks()
+
+    def _register_hooks(self):
+        for name, module in self.model.named_modules():
+            if isinstance(module, (nn.Linear, nn.Conv2d, nn.ReLU, nn.LeakyReLU)):
+                hook = module.register_forward_hook(self._make_activation_hook(name))
+                self.hooks.append(hook)
+                hook = module.register_full_backward_hook(self._make_gradient_hook(name))
+                self.hooks.append(hook)
+
+    def _make_activation_hook(self, name):
+        def hook(module, input, output):
+            with torch.no_grad():
+                out = output.detach().float()
+                self.activation_stats[name] = {
+                    &quot;mean&quot;: out.mean().item(),
+                    &quot;std&quot;: out.std().item(),
+                    &quot;fraction_zero&quot;: (out == 0).float().mean().item(),
+                    &quot;min&quot;: out.min().item(),
+                    &quot;max&quot;: out.max().item(),
+                }
+        return hook
+
+    def _make_gradient_hook(self, name):
+        def hook(module, grad_input, grad_output):
+            if grad_output[0] is not None:
+                with torch.no_grad():
+                    grad = grad_output[0].detach().float()
+                    self.gradient_stats[name] = {
+                        &quot;mean&quot;: grad.mean().item(),
+                        &quot;std&quot;: grad.std().item(),
+                        &quot;abs_mean&quot;: grad.abs().mean().item(),
+                        &quot;max&quot;: grad.abs().max().item(),
+                    }
+        return hook
+
+    def record_loss(self, loss_value):
+        self.loss_history.append(loss_value)
+
+    def check_loss_health(self):
+        if len(self.loss_history) &lt; 2:
+            return &quot;NOT_ENOUGH_DATA&quot;
+        recent = self.loss_history[-10:]
+        if any(math.isnan(v) or math.isinf(v) for v in recent):
+            return &quot;NAN_OR_INF&quot;
+        if len(self.loss_history) &gt;= 20:
+            first_half = sum(self.loss_history[:10]) / 10
+            second_half = sum(self.loss_history[-10:]) / 10
+            if second_half &gt;= first_half * 0.99:
+                return &quot;NOT_DECREASING&quot;
+        if len(recent) &gt;= 5:
+            diffs = [recent[i + 1] - recent[i] for i in range(len(recent) - 1)]
+            if max(diffs) - min(diffs) &gt; 2 * abs(sum(diffs) / len(diffs) + 1e-10):
+                return &quot;OSCILLATING&quot;
+        return &quot;HEALTHY&quot;
+
+    def check_activations(self):
+        issues = []
+        for name, stats in self.activation_stats.items():
+            if stats[&quot;fraction_zero&quot;] &gt; 0.5:
+                issues.append(
+                    f&quot;DEAD_NEURONS: {name} has {stats[&#39;fraction_zero&#39;]:.0%} zero activations&quot;
+                )
+            if abs(stats[&quot;mean&quot;]) &gt; 10:
+                issues.append(
+                    f&quot;EXPLODING_ACTIVATIONS: {name} mean={stats[&#39;mean&#39;]:.2f}&quot;
+                )
+            if stats[&quot;std&quot;] &lt; 1e-6:
+                issues.append(
+                    f&quot;COLLAPSED_ACTIVATIONS: {name} std={stats[&#39;std&#39;]:.2e}&quot;
+                )
+        return issues if issues else [&quot;HEALTHY&quot;]
+
+    def check_gradients(self):
+        issues = []
+        grad_magnitudes = []
+        for name, stats in self.gradient_stats.items():
+            grad_magnitudes.append((name, stats[&quot;abs_mean&quot;]))
+            if stats[&quot;abs_mean&quot;] &lt; 1e-7:
+                issues.append(
+                    f&quot;VANISHING_GRADIENT: {name} abs_mean={stats[&#39;abs_mean&#39;]:.2e}&quot;
+                )
+            if stats[&quot;abs_mean&quot;] &gt; 100:
+                issues.append(
+                    f&quot;EXPLODING_GRADIENT: {name} abs_mean={stats[&#39;abs_mean&#39;]:.2e}&quot;
+                )
+        if len(grad_magnitudes) &gt;= 2:
+            first_mag = grad_magnitudes[0][1]
+            last_mag = grad_magnitudes[-1][1]
+            if last_mag &gt; 0 and first_mag / (last_mag + 1e-15) &gt; 100:
+                issues.append(
+                    f&quot;GRADIENT_RATIO: first/last = {first_mag / (last_mag + 1e-15):.0f}x (vanishing)&quot;
+                )
+        return issues if issues else [&quot;HEALTHY&quot;]
+
+    def print_report(self):
+        print(&quot;\n=== NETWORK DEBUGGER REPORT ===&quot;)
+        print(f&quot;\nLoss health: {self.check_loss_health()}&quot;)
+        if self.loss_history:
+            print(
+                f&quot;  Last 5 losses: {[f&#39;{v:.4f}&#39; for v in self.loss_history[-5:]]}&quot;
+            )
+        print(&quot;\nActivation diagnostics:&quot;)
+        for item in self.check_activations():
+            print(f&quot;  {item}&quot;)
+        print(&quot;\nGradient diagnostics:&quot;)
+        for item in self.check_gradients():
+            print(f&quot;  {item}&quot;)
+        print(&quot;\nPer-layer activation stats:&quot;)
+        for name, stats in self.activation_stats.items():
+            print(
+                f&quot;  {name}: mean={stats[&#39;mean&#39;]:.4f} std={stats[&#39;std&#39;]:.4f} &quot;
+                f&quot;zero={stats[&#39;fraction_zero&#39;]:.1%}&quot;
+            )
+        print(&quot;\nPer-layer gradient stats:&quot;)
+        for name, stats in self.gradient_stats.items():
+            print(
+                f&quot;  {name}: abs_mean={stats[&#39;abs_mean&#39;]:.2e} max={stats[&#39;max&#39;]:.2e}&quot;
+            )
+
+    def remove_hooks(self):
+        for hook in self.hooks:
+            hook.remove()
+        self.hooks.clear()
+
+
+def overfit_one_batch(model, x_batch, y_batch, criterion, lr=0.01, steps=200):
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    model.train()
+    print(&quot;\n=== OVERFIT ONE BATCH TEST ===&quot;)
+    print(f&quot;Batch size: {x_batch.shape[0]}, Steps: {steps}&quot;)
+
+    for step in range(steps):
+        optimizer.zero_grad()
+        output = model(x_batch)
+        loss = criterion(output, y_batch)
+        loss.backward()
+        optimizer.step()
+
+        if step % 50 == 0 or step == steps - 1:
+            with torch.no_grad():
+                if output.shape[-1] == 1:
+                    preds = (output &gt; 0).float().squeeze()
+                else:
+                    preds = output.argmax(dim=1)
+                targets = y_batch if y_batch.dim() == 1 else y_batch.squeeze()
+                acc = (preds == targets).float().mean().item()
+            print(f&quot;  Step {step:3d} | Loss: {loss.item():.6f} | Accuracy: {acc:.1%}&quot;)
+
+    final_loss = loss.item()
+    if final_loss &gt; 0.1:
+        print(
+            f&quot;\n  FAIL: Loss did not converge ({final_loss:.4f}). &quot;
+            f&quot;Model or training loop is broken.&quot;
+        )
+        return False
+    print(f&quot;\n  PASS: Loss converged to {final_loss:.6f}&quot;)
+    return True
+
+
+def find_learning_rate(
+    model, x_data, y_data, criterion, start_lr=1e-7, end_lr=10, steps=100
+):
+    original_state = copy.deepcopy(model.state_dict())
+    optimizer = torch.optim.SGD(model.parameters(), lr=start_lr)
+    lr_mult = (end_lr / start_lr) ** (1 / steps)
+
+    model.train()
+    results = []
+    best_loss = float(&quot;inf&quot;)
+    current_lr = start_lr
+
+    print(&quot;\n=== LEARNING RATE FINDER ===&quot;)
+
+    for step in range(steps):
+        optimizer.zero_grad()
+        output = model(x_data)
+        loss = criterion(output, y_data)
+
+        if math.isnan(loss.item()) or loss.item() &gt; best_loss * 10:
+            break
+
+        best_loss = min(best_loss, loss.item())
+        results.append((current_lr, loss.item()))
+
+        loss.backward()
+        optimizer.step()
+
+        current_lr *= lr_mult
+        for param_group in optimizer.param_groups:
+            param_group[&quot;lr&quot;] = current_lr
+
+    model.load_state_dict(original_state)
+
+    if len(results) &lt; 10:
+        print(&quot;  Could not complete LR sweep -- loss diverged too quickly&quot;)
+        return results
+
+    min_loss_idx = min(range(len(results)), key=lambda i: results[i][1])
+    suggested_lr = results[max(0, min_loss_idx - 10)][0]
+
+    print(
+        f&quot;  Swept {len(results)} steps from {start_lr:.0e} to {results[-1][0]:.0e}&quot;
+    )
+    print(
+        f&quot;  Minimum loss {results[min_loss_idx][1]:.4f} at lr={results[min_loss_idx][0]:.2e}&quot;
+    )
+    print(f&quot;  Suggested learning rate: {suggested_lr:.2e}&quot;)
+
+    return results
+
+
+def _flat_to_multi_index(flat_idx, shape):
+    multi_idx = []
+    remaining = flat_idx
+    for dim in reversed(shape):
+        multi_idx.insert(0, remaining % dim)
+        remaining //= dim
+    return tuple(multi_idx)
+
+
+def gradient_check(model, x, y, criterion, eps=1e-4):
+    model.train()
+    x_double = x.double()
+    y_double = y.double()
+    model_double = model.double()
+
+    print(&quot;\n=== GRADIENT CHECK ===&quot;)
+    overall_max_diff = 0
+    checked = 0
+
+    for name, param in model_double.named_parameters():
+        if not param.requires_grad:
+            continue
+
+        layer_max_diff = 0
+
+        model_double.zero_grad()
+        output = model_double(x_double)
+        loss = criterion(output, y_double)
+        loss.backward()
+        analytical_grad = param.grad.clone()
+
+        num_checks = min(5, param.numel())
+        for i in range(num_checks):
+            idx = _flat_to_multi_index(i, param.shape)
+            original = param.data[idx].item()
+
+            param.data[idx] = original + eps
+            with torch.no_grad():
+                loss_plus = criterion(model_double(x_double), y_double).item()
+
+            param.data[idx] = original - eps
+            with torch.no_grad():
+                loss_minus = criterion(model_double(x_double), y_double).item()
+
+            param.data[idx] = original
+
+            numerical = (loss_plus - loss_minus) / (2 * eps)
+            analytical = analytical_grad[idx].item()
+
+            denom = max(abs(numerical), abs(analytical), 1e-8)
+            rel_diff = abs(numerical - analytical) / denom
+
+            layer_max_diff = max(layer_max_diff, rel_diff)
+            checked += 1
+
+        overall_max_diff = max(overall_max_diff, layer_max_diff)
+        status = &quot;OK&quot; if layer_max_diff &lt; 1e-5 else &quot;MISMATCH&quot;
+        print(f&quot;  {name}: max_rel_diff={layer_max_diff:.2e} [{status}]&quot;)
+
+    model.float()
+
+    print(f&quot;\n  Checked {checked} parameters&quot;)
+    if overall_max_diff &lt; 1e-5:
+        print(&quot;  PASS: Gradients match (rel_diff &lt; 1e-5)&quot;)
+    elif overall_max_diff &lt; 1e-3:
+        print(&quot;  WARN: Small differences (1e-5 &lt; rel_diff &lt; 1e-3)&quot;)
+    else:
+        print(&quot;  FAIL: Gradient mismatch detected (rel_diff &gt; 1e-3)&quot;)
+    return overall_max_diff
+
+
+def demo_broken_networks():
+    torch.manual_seed(42)
+    x = torch.randn(64, 10)
+    y = (x[:, 0] &gt; 0).long()
+    criterion = nn.CrossEntropyLoss()
+
+    print(&quot;=&quot; * 60)
+    print(&quot;BUG 1: Learning rate too high (lr=10)&quot;)
+    print(&quot;=&quot; * 60)
+    model1 = nn.Sequential(nn.Linear(10, 32), nn.ReLU(), nn.Linear(32, 2))
+    debugger1 = NetworkDebugger(model1)
+    optimizer1 = torch.optim.SGD(model1.parameters(), lr=10.0)
+    for step in range(20):
+        optimizer1.zero_grad()
+        out = model1(x)
+        loss = criterion(out, y)
+        debugger1.record_loss(loss.item())
+        loss.backward()
+        optimizer1.step()
+    debugger1.print_report()
+    debugger1.remove_hooks()
+
+    print(&quot;\n&quot; + &quot;=&quot; * 60)
+    print(&quot;BUG 2: Dead ReLUs from bad initialization&quot;)
+    print(&quot;=&quot; * 60)
+    model2 = nn.Sequential(
+        nn.Linear(10, 32),
+        nn.ReLU(),
+        nn.Linear(32, 32),
+        nn.ReLU(),
+        nn.Linear(32, 2),
+    )
+    with torch.no_grad():
+        for m in model2.modules():
+            if isinstance(m, nn.Linear):
+                m.weight.fill_(-1.0)
+                m.bias.fill_(-5.0)
+    debugger2 = NetworkDebugger(model2)
+    optimizer2 = torch.optim.Adam(model2.parameters(), lr=1e-3)
+    for step in range(50):
+        optimizer2.zero_grad()
+        out = model2(x)
+        loss = criterion(out, y)
+        debugger2.record_loss(loss.item())
+        loss.backward()
+        optimizer2.step()
+    debugger2.print_report()
+    debugger2.remove_hooks()
+
+    print(&quot;\n&quot; + &quot;=&quot; * 60)
+    print(&quot;BUG 3: Missing zero_grad (gradients accumulate)&quot;)
+    print(&quot;=&quot; * 60)
+    model3 = nn.Sequential(nn.Linear(10, 32), nn.ReLU(), nn.Linear(32, 2))
+    debugger3 = NetworkDebugger(model3)
+    optimizer3 = torch.optim.SGD(model3.parameters(), lr=0.01)
+    for step in range(50):
+        out = model3(x)
+        loss = criterion(out, y)
+        debugger3.record_loss(loss.item())
+        loss.backward()
+        optimizer3.step()
+    debugger3.print_report()
+    debugger3.remove_hooks()
+
+    print(&quot;\n&quot; + &quot;=&quot; * 60)
+    print(&quot;HEALTHY NETWORK: Correct setup for comparison&quot;)
+    print(&quot;=&quot; * 60)
+    model_good = nn.Sequential(nn.Linear(10, 32), nn.ReLU(), nn.Linear(32, 2))
+    debugger_good = NetworkDebugger(model_good)
+    optimizer_good = torch.optim.Adam(model_good.parameters(), lr=1e-3)
+    for step in range(50):
+        optimizer_good.zero_grad()
+        out = model_good(x)
+        loss = criterion(out, y)
+        debugger_good.record_loss(loss.item())
+        loss.backward()
+        optimizer_good.step()
+    debugger_good.print_report()
+    debugger_good.remove_hooks()
+
+    print(&quot;\n&quot; + &quot;=&quot; * 60)
+    print(&quot;OVERFIT-ONE-BATCH TEST&quot;)
+    print(&quot;=&quot; * 60)
+    model_test = nn.Sequential(nn.Linear(10, 32), nn.ReLU(), nn.Linear(32, 2))
+    overfit_one_batch(model_test, x[:8], y[:8], criterion)
+
+    print(&quot;\n&quot; + &quot;=&quot; * 60)
+    print(&quot;LEARNING RATE FINDER&quot;)
+    print(&quot;=&quot; * 60)
+    model_lr = nn.Sequential(nn.Linear(10, 32), nn.ReLU(), nn.Linear(32, 2))
+    find_learning_rate(model_lr, x, y, criterion)
+
+    print(&quot;\n&quot; + &quot;=&quot; * 60)
+    print(&quot;GRADIENT CHECK (smooth model + MSE loss for clean finite differences)&quot;)
+    print(&quot;=&quot; * 60)
+    torch.manual_seed(123)
+    x_check = torch.randn(4, 3)
+    y_check = torch.randn(4, 1)
+    model_grad = nn.Sequential(nn.Linear(3, 4), nn.Tanh(), nn.Linear(4, 1))
+    gradient_check(model_grad, x_check, y_check, nn.MSELoss())
+
+
+if __name__ == &quot;__main__&quot;:
+    print(&quot;=&quot; * 60)
+    print(&quot;DEBUGGING NEURAL NETWORKS -- Phase 3, Lesson 13&quot;)
+    print(&quot;=&quot; * 60)
+    demo_broken_networks()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/03-deep-learning-core/13-debugging-neural-networks/outputs/prompt-nn-debugger.md">phases/03-deep-learning-core/13-debugging-neural-networks/outputs/prompt-nn-debugger.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: prompt-nn-debugger
+description: Diagnose neural network training failures from symptoms -- loss curves, gradient stats, and activation patterns
+phase: 03
+lesson: 13
+---
+
+You are a neural network debugging expert. Given a description of training behavior, diagnose the root cause and prescribe a fix.
+
+## Input
+
+I will describe:
+- The loss curve behavior (flat, oscillating, NaN, decreasing then plateau)
+- Model architecture (layers, activations, normalization)
+- Training configuration (optimizer, learning rate, batch size, epochs)
+- Any activation or gradient statistics available
+- The dataset (size, type, preprocessing)
+
+## Diagnostic Protocol
+
+### Step 1: Classify the Symptom
+
+| Symptom | Category |
+|---------|----------|
+| Loss not decreasing at all | OPTIMIZATION FAILURE |
+| Loss NaN or Inf | NUMERICAL INSTABILITY |
+| Loss decreasing but model bad | GENERALIZATION FAILURE |
+| Loss oscillating wildly | HYPERPARAMETER PROBLEM |
+| Training works, inference wrong | EVAL MODE BUG |
+
+### Step 2: Run the Decision Tree
+
+**OPTIMIZATION FAILURE:**
+1. Is the learning rate reasonable? (Adam: 1e-4 to 1e-2, SGD: 1e-3 to 1e-1)
+2. Are gradients flowing? Check gradient magnitude per layer.
+3. Are neurons alive? Check fraction of zero activations after ReLU.
+4. Does the model pass the overfit-one-batch test?
+5. Are parameters actually being updated? Compare weights before/after a step.
+
+**NUMERICAL INSTABILITY:**
+1. Is learning rate too high? Reduce by 10x.
+2. Is there a log(0) or division by zero? Add epsilon.
+3. Are activations overflowing in exp()? Use log-sum-exp trick.
+4. Is batch norm getting a constant batch? Add epsilon to denominator.
+
+**GENERALIZATION FAILURE:**
+1. Is there a train/test gap? If &gt;10% accuracy gap, overfitting.
+2. Is there data leakage? Check for duplicates across splits.
+3. Are labels correct? Manually inspect 20 random samples.
+4. Is the test distribution different from training? Check feature distributions.
+
+**HYPERPARAMETER PROBLEM:**
+1. Run the learning rate finder to get the right order of magnitude.
+2. Try batch sizes: 32, 64, 128, 256.
+3. Try gradient clipping at 1.0.
+
+**EVAL MODE BUG:**
+1. Is `model.eval()` called before inference?
+2. Is `torch.no_grad()` used for inference?
+3. Are dropout and batch norm behaving correctly?
+
+### Step 3: Prescribe the Fix
+
+For each diagnosis, provide:
+1. The specific code change needed
+2. Expected behavior after the fix
+3. How to verify the fix worked
+
+## Output Format
+
+```
+SYMPTOM: [description]
+DIAGNOSIS: [root cause]
+EVIDENCE: [what confirms this diagnosis]
+FIX: [specific code change]
+VERIFICATION: [how to confirm the fix worked]
+ALTERNATIVE: [if the fix does not work, try this next]
+```
+
+## Common Patterns
+
+| Architecture | Common bug | Fix |
+|-------------|-----------|-----|
+| Deep MLP (&gt;5 layers) | Vanishing gradients | Add residual connections or batch norm |
+| CNN | Shape mismatch after pooling | Print shapes after every layer |
+| RNN/LSTM | Exploding gradients | Clip gradients to norm 1.0 |
+| Transformer | Attention scores overflow | Scale by 1/sqrt(d_k) |
+| Fine-tuning pretrained | Catastrophic forgetting | Use 10-100x smaller LR than pretraining |
+| GAN | Mode collapse | Check discriminator accuracy, adjust training ratio |
+
+Always start with the simplest possible diagnosis. The bug is almost always simpler than you think.
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/03-deep-learning-core/13-debugging-neural-networks/outputs/skill-debug-checklist.md">phases/03-deep-learning-core/13-debugging-neural-networks/outputs/skill-debug-checklist.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: skill-debug-checklist
+description: Decision-tree checklist for debugging neural network training failures
+version: 1.0.0
+phase: 3
+lesson: 13
+tags: [debugging, neural-networks, training, diagnostics, deep-learning]
+---
+
+# Neural Network Debug Checklist
+
+Systematic debugging protocol for when training goes wrong. Work through these in order -- most bugs are caught in the first 3 steps.
+
+## Before training (prevent bugs)
+
+1. Print model architecture and parameter count. Does the size make sense for your data?
+2. Run a single forward pass with random input. Does the output shape match your target shape?
+3. Check that labels are the correct dtype (CrossEntropyLoss needs Long, BCELoss needs Float)
+4. Verify data normalization: inputs should have mean near 0 and std near 1
+5. Print 5 random (input, label) pairs. Do the labels match what you expect?
+6. Confirm train/test split has no duplicate samples
+
+## Overfit-one-batch test (60 seconds, catches 80% of bugs)
+
+1. Take 8-32 samples from your training set
+2. Train for 200 steps with a reasonable learning rate
+3. Loss should approach 0. Training accuracy should hit 100%
+4. If it fails: the bug is in your model, loss function, or training loop -- not your data or hyperparameters
+5. If it passes: proceed to full training
+
+## Loss not decreasing
+
+1. Check learning rate. Try 3 values: current/10, current, current*10
+2. Print gradient norms per layer. All zeros means dead network or detached graph
+3. Check `requires_grad=True` on parameters. Check that `loss.backward()` is called
+4. Check that `optimizer.zero_grad()` is called before `loss.backward()`
+5. Check that `optimizer.step()` is called after `loss.backward()`
+6. Verify model parameters are passed to the optimizer: `optimizer = Adam(model.parameters())`
+
+## Loss is NaN or Inf
+
+1. Reduce learning rate by 10x
+2. Add epsilon to all log() calls: `torch.log(x + 1e-7)`
+3. Add epsilon to all division: `x / (y + 1e-8)`
+4. Clamp predictions: `torch.clamp(pred, 1e-7, 1 - 1e-7)` before BCE loss
+5. Use `torch.autograd.detect_anomaly()` to find the exact operation
+6. Check for NaN in input data: `assert not torch.isnan(x).any()`
+
+## Loss oscillating
+
+1. Reduce learning rate by 3-10x
+2. Increase batch size (reduces gradient noise)
+3. Add gradient clipping: `torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)`
+4. Switch from SGD to Adam (adaptive LR per parameter)
+5. Add learning rate warmup for the first 5-10% of training
+
+## Overfitting (train acc high, test acc low)
+
+1. Add dropout (start with p=0.1, increase to 0.5)
+2. Add weight decay to optimizer: `Adam(params, weight_decay=1e-4)`
+3. Reduce model size (fewer layers or narrower layers)
+4. Add data augmentation
+5. Use early stopping: stop when validation loss increases for 5+ epochs
+6. Check for data leakage between train and test sets
+
+## Underfitting (both train and test acc low)
+
+1. Increase model capacity (more layers, wider layers)
+2. Train for more epochs
+3. Increase learning rate (carefully)
+4. Remove regularization temporarily to verify the model can learn
+5. Check that your model is expressive enough for the task
+
+## Dead ReLU neurons
+
+1. Check fraction of zero activations per layer. &gt;50% is a problem
+2. Switch to LeakyReLU(0.01) or GELU
+3. Use Kaiming initialization for weights
+4. Reduce learning rate (large updates can push neurons into the dead zone)
+5. Add batch normalization before activation functions
+
+## Quick reference: learning rate starting points
+
+| Optimizer | Task | Starting LR |
+|-----------|------|------------|
+| Adam | Training from scratch | 1e-3 |
+| Adam | Fine-tuning pretrained | 1e-5 |
+| SGD + momentum | Training from scratch | 1e-1 |
+| SGD + momentum | Fine-tuning pretrained | 1e-3 |
+| AdamW | Transformer training | 3e-4 |
+
+## Quick reference: batch size effects
+
+| Batch size | Gradient noise | Memory | Generalization |
+|-----------|---------------|--------|---------------|
+| 8-16 | High (noisy) | Low | Often better |
+| 32-64 | Moderate | Moderate | Good default |
+| 128-256 | Low (smooth) | High | May need warmup |
+| 512+ | Very low | Very high | Needs LR scaling |
+
+## When nothing works
+
+1. Simplify the model to 1 hidden layer. Does it learn?
+2. Simplify the data to 100 samples. Does it overfit?
+3. Replace your loss with MSE. Does it converge?
+4. Replace your optimizer with SGD(lr=0.01). Does it make progress?
+5. Replace your data with synthetic data (e.g., y = x[0] &gt; 0). Does it learn?
+6. If none of these work: the bug is in code you are not looking at (data loading, preprocessing, tensor shapes)
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. Why is neural network debugging harder than traditional software debugging?</legend><label class="option"><input type="radio" name="q0" value="0"> There are no debugging tools for neural networks</label><label class="option"><input type="radio" name="q0" value="1"> Networks can produce wrong outputs without any error messages or crashes -- the code runs but the results are silently incorrect</label><label class="option"><input type="radio" name="q0" value="2"> Neural networks use different programming languages</label><label class="option"><input type="radio" name="q0" value="3"> Neural networks can&#39;t be tested</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. What is the &#39;overfit one batch&#39; debugging technique?</legend><label class="option"><input type="radio" name="q1" value="0"> Training on the full dataset until it overfits</label><label class="option"><input type="radio" name="q1" value="1"> Overfitting the validation set</label><label class="option"><input type="radio" name="q1" value="2"> Using a very large batch size</label><label class="option"><input type="radio" name="q1" value="3"> Training on a single small batch until the loss reaches near-zero, verifying the model can memorize at least a few examples</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. Your loss is NaN after a few training steps. What is the most likely cause?</legend><label class="option"><input type="radio" name="q2" value="0"> The model has too few parameters</label><label class="option"><input type="radio" name="q2" value="1"> The activation function is wrong</label><label class="option"><input type="radio" name="q2" value="2"> Exploding gradients or numerical overflow, often from a learning rate that&#39;s too high or missing gradient clipping</label><label class="option"><input type="radio" name="q2" value="3"> The dataset is too small</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. Your training loss decreases but validation loss stays flat from the start. What does this indicate?</legend><label class="option"><input type="radio" name="q3" value="0"> The model is learning training data patterns but they don&#39;t generalize -- likely a data pipeline issue (train/val data mismatch) or severe overfitting</label><label class="option"><input type="radio" name="q3" value="1"> The learning rate is too low</label><label class="option"><input type="radio" name="q3" value="2"> The model needs more layers</label><label class="option"><input type="radio" name="q3" value="3"> The model is overfitting</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. What should you check first when your loss curve is completely flat (loss doesn&#39;t decrease at all)?</legend><label class="option"><input type="radio" name="q4" value="0"> Try a different architecture</label><label class="option"><input type="radio" name="q4" value="1"> Switch to a different optimizer</label><label class="option"><input type="radio" name="q4" value="2"> Verify gradients are nonzero, the learning rate is high enough, and the loss function actually depends on the model&#39;s predictions</label><label class="option"><input type="radio" name="q4" value="3"> Add more training data</label><p data-feedback="4"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/03-deep-learning-core/12-intro-to-jax/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/04-computer-vision/01-image-fundamentals/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/03-deep-learning-core/13-debugging-neural-networks/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

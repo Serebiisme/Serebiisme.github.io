@@ -1,0 +1,697 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>关键点检测和姿势估计 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-04-computer-vision" data-lesson="04-computer-vision/21-keypoint-pose" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/04-computer-vision/">计算机视觉</a> / LESSON 21</p><h1 class="lesson-title">关键点检测和姿势估计</h1><p>Keypoint Detection &amp; Pose Estimation</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>关键点检测和姿势估计</h1>
+<blockquote>
+<p>姿势是一个排序的关键点.一个关键点探测器是热图回归器. 其他的都是会计.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 4 Lesson 06 (Detection), Phase 4 Lesson 07 (U-Net)
+<strong>Time:</strong> ~45 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>区分上下和下上姿势估计,并说明每一个姿势是什么时候使用的</li>
+<li>对于K键点的回归热图,以每键点的高斯目标,并在推断时提取键点坐标</li>
+<li>解释部分亲密性字段 (PAF) 以及下向上管道如何将关键点将分为实例</li>
+<li>使用MediaPipe Pose或MMPose来估算生产关键点,并了解其输出格式</li>
+</ul>
+<h2>问题</h2>
+<p>关键任务隐藏在许多名字下:人姿 (17 个身体关节),面部标志 (68 或 478 个点),手 (21 个点),动物姿势,机器人物体姿势,医学解剖学标志.它们每个都具有相同的结构:检测对象上的K分离点并输出它们的 (x, y) 坐标.</p>
+<p>姿势估计是运动捕捉,健身应用,体育分析,手势控制,动画,AR试验和机器人抓取的基础. 2D 案例已经成熟; 3D 姿势 (从单个摄像头来估计世界坐标中的联合位置) 是当前的研究界限.</p>
+<p>工程问题是规模.一个单个图像,一个人姿势是一个20ms的问题.在人群中30fps的多人姿势是一个不同的问题,不同架构.</p>
+<h2>概念</h2>
+<h3>向上和下</h3>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-b654f00fbd51c0bf5310.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><ul>
+<li><strong>Top-down</strong>首先检测到人,然后在每种作物上运行一个人均关键点模型.</li>
+<li><strong>Bottom-up</strong>一个前进传输预测所有关键点加上一个关键字段;组组它们.不论群众规模如何,持续时间.</li>
+</ul>
+<p>顶部 (HRNet,ViTPose) 是精度领导者;下部 (OpenPose,HigherHRNet) 是拥挤场景的吞吐量领导者.</p>
+<h3>热图回归</h3>
+<p>没有退缩<code>(x, y)</code>直接预测一个<code>H x W</code>热地图每一个键点,一个位于真实位置的高斯斑点.</p>
+<pre><code>target[k, y, x] = exp(-((x - cx_k)^2 + (y - cy_k)^2) / (2 sigma^2))
+</code></pre>
+<p>在推断时,每个热图的 argmax 是预测的关键点位置.</p>
+<p>为什么热图比直接回归更有效:网络的空间结构 (conv功能地图) 与空间输出自然一致.高斯目标也规范一个小的定位错误会产生小损失,而不是零.</p>
+<h3>亚像素定位</h3>
+<p>为了获得子像素精度,通过将抛物线与 argmax 和其邻居相连,或使用已知的偏移来精炼.<code>(dx, dy) = 0.25 * (heatmap[y, x+1] - heatmap[y, x-1], ...)</code>方向.</p>
+<h3>部分亲密性领域 (PAF)</h3>
+<p>开放Pose的俩用于下方上方关联.对于每个连接关键点的对 (例如左肩到左肘),预测一个2通道的领域,编码从一个向另一个指向的单元向量.将肩膀与肘部关联,将PAF整合在连接候选对的线路上;具有最高整体的对匹配.</p>
+<pre><code>For each connection (limb):
+  PAF channels: 2 (unit vector x, y)
+  Line integral: sum over sample points of (PAF . line_direction)
+  Higher integral = stronger match
+</code></pre>
+<p>优雅,可达到任意的群众规模,</p>
+<h3>COCO关键点</h3>
+<p>标准的体位数据集:每个人17个关键点,PCK (正确关键点的百分比) 和OKS (对象关键点相似性) 作为指标.OKS是IoU的关键点模拟器,这是COCO mAP@OKS报告的.</p>
+<h3>两维对三维</h3>
+<ul>
+<li><strong>2D pose</strong>图像坐标;在生产质量下解决 (MediaPipe,HRNet,ViTPose).</li>
+<li><strong>3D pose</strong>世界/摄像机坐标;仍在进行研究.
+<ul>
+<li>通过一个小的MLP (VideoPose3D) 将2D预测转换为3D.</li>
+<li>直接3D回归从图像 (PyMAF, MHFormer).</li>
+<li>为了地上的真相,设置多视图 (CMU Panoptic).</li>
+</ul>
+</li>
+</ul>
+<figure><img src="/learn/ai-from-scratch/figures/figure-09a4a2dfd1b763ef0b20.png" alt="cv3-pose-heatmap 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<h3>步骤1:高斯热图目标</h3>
+<pre><code class="language-python">import numpy as np
+import torch
+
+def gaussian_heatmap(size, cx, cy, sigma=2.0):
+    yy, xx = np.meshgrid(np.arange(size), np.arange(size), indexing=&quot;ij&quot;)
+    return np.exp(-((xx - cx) ** 2 + (yy - cy) ** 2) / (2 * sigma ** 2)).astype(np.float32)
+
+hm = gaussian_heatmap(64, 32, 32, sigma=2.0)
+print(f&quot;peak: {hm.max():.3f} at ({hm.argmax() % 64}, {hm.argmax() // 64})&quot;)
+</code></pre>
+<p>按键点的热图沿着一个道轴堆叠,提供了全部目标子.</p>
+<h3>步骤2: 小键点头</h3>
+<p>通过U-Net的模型,输出K热图频道.</p>
+<pre><code class="language-python">import torch.nn as nn
+import torch.nn.functional as F
+
+class TinyKeypointNet(nn.Module):
+    def __init__(self, num_keypoints=4, base=16):
+        super().__init__()
+        self.down1 = nn.Sequential(nn.Conv2d(3, base, 3, 2, 1), nn.ReLU(inplace=True))
+        self.down2 = nn.Sequential(nn.Conv2d(base, base * 2, 3, 2, 1), nn.ReLU(inplace=True))
+        self.mid = nn.Sequential(nn.Conv2d(base * 2, base * 2, 3, 1, 1), nn.ReLU(inplace=True))
+        self.up1 = nn.ConvTranspose2d(base * 2, base, 2, 2)
+        self.up2 = nn.ConvTranspose2d(base, num_keypoints, 2, 2)
+
+    def forward(self, x):
+        h1 = self.down1(x)
+        h2 = self.down2(h1)
+        h3 = self.mid(h2)
+        u1 = self.up1(h3)
+        return self.up2(u1)
+</code></pre>
+<p>输入<code>(N, 3, H, W)</code>产量<code>(N, K, H, W)</code>损失是每像素的MSE对高斯目标.</p>
+<h3>步骤3: 推理 提取键点坐标</h3>
+<pre><code class="language-python">def heatmap_to_coords(heatmaps):
+    &quot;&quot;&quot;
+    heatmaps: (N, K, H, W)
+    returns:  (N, K, 2) float coordinates in image pixels
+    &quot;&quot;&quot;
+    N, K, H, W = heatmaps.shape
+    hm = heatmaps.reshape(N, K, -1)
+    idx = hm.argmax(dim=-1)
+    ys = (idx // W).float()
+    xs = (idx % W).float()
+    return torch.stack([xs, ys], dim=-1)
+
+coords = heatmap_to_coords(torch.randn(2, 4, 32, 32))
+print(f&quot;coords: {coords.shape}&quot;)  # (2, 4, 2)
+</code></pre>
+<p>为了提高子精度,在 argmax 周围插入.</p>
+<h3>步骤4:合成键点数据集</h3>
+<p>简单:画出四个点在白色的画布上,</p>
+<pre><code class="language-python">def make_synthetic_sample(size=64):
+    img = np.ones((3, size, size), dtype=np.float32)
+    rng = np.random.default_rng()
+    kps = rng.integers(8, size - 8, size=(4, 2))
+    for cx, cy in kps:
+        img[:, cy - 2:cy + 2, cx - 2:cx + 2] = 0.0
+    hms = np.stack([gaussian_heatmap(size, cx, cy) for cx, cy in kps])
+    return img, hms, kps
+</code></pre>
+<p>很容易让一个小模型在一分钟内学会.</p>
+<h3>五步:培训</h3>
+<pre><code class="language-python">model = TinyKeypointNet(num_keypoints=4)
+opt = torch.optim.Adam(model.parameters(), lr=3e-3)
+
+for step in range(200):
+    batch = [make_synthetic_sample() for _ in range(16)]
+    imgs = torch.from_numpy(np.stack([b[0] for b in batch]))
+    hms = torch.from_numpy(np.stack([b[1] for b in batch]))
+    pred = model(imgs)
+    # Upsample pred to full resolution
+    pred = F.interpolate(pred, size=hms.shape[-2:], mode=&quot;bilinear&quot;, align_corners=False)
+    loss = F.mse_loss(pred, hms)
+    opt.zero_grad(); loss.backward(); opt.step()
+</code></pre>
+<h2>用它</h2>
+<ul>
+<li><strong>MediaPipe Pose</strong>谷歌的生产姿势估计器; 运输 WebGL + 手机运行时间低于10ms延迟.</li>
+<li><strong>MMPose</strong>综合研究代码库;每一个SOTA架构都具有预训练的权重.</li>
+<li><strong>YOLOv8-pose</strong>最快的实时多人姿势,只有一个前进的传球.</li>
+<li><strong>transformers HumanDPT / PoseAnything</strong>对开放词汇姿势 (任何对象,任何关键点集合) 的新视觉语言方法.</li>
+</ul>
+<h2>运送它</h2>
+<p>这一课产生了:</p>
+<ul>
+<li><code>outputs/prompt-pose-stack-picker.md</code>一个提示,以视频/YOLOv8-pose/HRNet/ViTPose为期,群众规模和2D对3D需求.</li>
+<li><code>outputs/skill-heatmap-to-coords.md</code>写出每个生产姿势模型使用的子像素热地图到协调程序的技能.</li>
+</ul>
+<h2>运动</h2>
+<ol>
+<li>**(Easy)**报告平均值在预测和真实的关键点之间错误L2200步后.</li>
+<li>**(Medium)**添加子像素精炼:鉴于 argmax 位置,将一个 1D 抛物线沿 x 和 y 连接到邻近的像素. 报告准确度增长与整数 argmax.</li>
+<li>**(Hard)**构建一个2人合成数据集,每个图像显示4键点模式的两个实例.使用PAF预测哪个键点属于哪个实例的下游管道,并评估OKS.</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Keypoint</td>
+<td>&quot;A landmark&quot;</td>
+<td>A specific ordered point on an object (joint, corner, feature)</td>
+</tr>
+<tr>
+<td>Pose</td>
+<td>&quot;The skeleton&quot;</td>
+<td>An ordered set of keypoints belonging to one instance</td>
+</tr>
+<tr>
+<td>Top-down</td>
+<td>&quot;Detect then pose&quot;</td>
+<td>Two-stage pipeline: person detector + per-crop keypoint model; highest accuracy</td>
+</tr>
+<tr>
+<td>Bottom-up</td>
+<td>&quot;Pose first, group later&quot;</td>
+<td>Single-pass all-keypoint prediction + grouping; constant time in crowd size</td>
+</tr>
+<tr>
+<td>Heatmap</td>
+<td>&quot;Gaussian target&quot;</td>
+<td>H x W tensor per keypoint with peak at the true location; the preferred regression target</td>
+</tr>
+<tr>
+<td>PAF</td>
+<td>&quot;Part Affinity Field&quot;</td>
+<td>2-channel unit vector field encoding limb directions; used to group keypoints into instances</td>
+</tr>
+<tr>
+<td>OKS</td>
+<td>&quot;Keypoint IoU&quot;</td>
+<td>Object Keypoint Similarity; the COCO metric for pose</td>
+</tr>
+<tr>
+<td>HRNet</td>
+<td>&quot;High-Resolution Net&quot;</td>
+<td>The dominant top-down keypoint architecture; preserves high-res features throughout</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/1812.08008" rel="noreferrer" data-network="true">OpenPose (Cao et al., 2017) <small>↗ 需要联网</small></a> 低至上的PAF;仍然是方法的最佳写作</li>
+<li><a href="https://arxiv.org/abs/1902.09212" rel="noreferrer" data-network="true">HRNet (Sun et al., 2019) <small>↗ 需要联网</small></a>上下引用架构</li>
+<li><a href="https://arxiv.org/abs/2204.12484" rel="noreferrer" data-network="true">ViTPose (Xu et al., 2022) <small>↗ 需要联网</small></a>简单的ViT作为一个姿势的脊柱;在许多基准上,目前的SOTA</li>
+<li><a href="https://developers.google.com/mediapipe/solutions/vision/pose_landmarker" rel="noreferrer" data-network="true">MediaPipe Pose <small>↗ 需要联网</small></a>实时生产姿势;2026年部署最快的堆</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Keypoint Detection &amp; Pose Estimation</h1>
+<blockquote>
+<p>A pose is a set of ordered keypoints. A keypoint detector is a heatmap regressor. Everything else is bookkeeping.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 4 Lesson 06 (Detection), Phase 4 Lesson 07 (U-Net)
+<strong>Time:</strong> ~45 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Distinguish top-down and bottom-up pose estimation and state when each is used</li>
+<li>Regress heatmaps for K keypoints with a Gaussian-per-keypoint target and extract keypoint coordinates at inference</li>
+<li>Explain Part Affinity Fields (PAFs) and how bottom-up pipelines associate keypoints into instances</li>
+<li>Use MediaPipe Pose or MMPose for production keypoint estimation and understand their output format</li>
+</ul>
+<h2>The Problem</h2>
+<p>Keypoint tasks hide under many names: human pose (17 body joints), face landmarks (68 or 478 points), hand (21 points), animal pose, robotic object pose, medical anatomy landmarks. Every one of them shares the same structure: detect K discrete points on an object and output their (x, y) coordinates.</p>
+<p>Pose estimation is the foundation of motion capture, fitness apps, sports analytics, gesture control, animation, AR try-on, and robotic grasping. The 2D case is mature; 3D pose (estimating joint positions in world coordinates from a single camera) is the current research frontier.</p>
+<p>The engineering question is scale. A single-image, single-person pose is a 20ms problem. Multi-person pose in a crowd at 30 fps is a different problem with different architectures.</p>
+<h2>The Concept</h2>
+<h3>Top-down vs bottom-up</h3>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-b654f00fbd51c0bf5310.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><ul>
+<li><strong>Top-down</strong> — detect people first, then run a per-person keypoint model on each crop. Highest accuracy; scales linearly with number of people.</li>
+<li><strong>Bottom-up</strong> — one forward pass predicts all keypoints plus an association field; group them. Constant time regardless of crowd size.</li>
+</ul>
+<p>Top-down (HRNet, ViTPose) is the accuracy leader; bottom-up (OpenPose, HigherHRNet) is the throughput leader for crowded scenes.</p>
+<h3>Heatmap regression</h3>
+<p>Instead of regressing <code>(x, y)</code> directly, predict an <code>H x W</code> heatmap per keypoint with a Gaussian blob centred at the true location.</p>
+<pre><code>target[k, y, x] = exp(-((x - cx_k)^2 + (y - cy_k)^2) / (2 sigma^2))
+</code></pre>
+<p>At inference, the argmax of each heatmap is the predicted keypoint location.</p>
+<p>Why heatmaps work better than direct regression: the network's spatial structure (conv feature map) aligns naturally with spatial output. Gaussian targets also regularise — a small localisation error produces a small loss, not zero.</p>
+<h3>Sub-pixel localisation</h3>
+<p>Argmax gives integer coordinates. For sub-pixel precision, refine by fitting a parabola to the argmax and its neighbours, or use the well-known offset <code>(dx, dy) = 0.25 * (heatmap[y, x+1] - heatmap[y, x-1], ...)</code> direction.</p>
+<h3>Part Affinity Fields (PAFs)</h3>
+<p>OpenPose's trick for bottom-up association. For each pair of connected keypoints (e.g. left shoulder to left elbow), predict a 2-channel field that encodes the unit vector pointing from one to the other. To associate a shoulder with its elbow, integrate the PAF along the line connecting candidate pairs; the pair with the highest integral is matched.</p>
+<pre><code>For each connection (limb):
+  PAF channels: 2 (unit vector x, y)
+  Line integral: sum over sample points of (PAF . line_direction)
+  Higher integral = stronger match
+</code></pre>
+<p>Elegant and scales to arbitrary crowd sizes without per-person crops.</p>
+<h3>COCO keypoints</h3>
+<p>The standard body-pose dataset: 17 keypoints per person, PCK (Percentage of Correct Keypoints) and OKS (Object Keypoint Similarity) as metrics. OKS is the keypoint analogue of IoU and is what COCO mAP@OKS reports.</p>
+<h3>2D vs 3D</h3>
+<ul>
+<li><strong>2D pose</strong> — image coordinates; solved at production quality (MediaPipe, HRNet, ViTPose).</li>
+<li><strong>3D pose</strong> — world / camera coordinates; still active research. Common approaches:
+<ul>
+<li>Lift 2D predictions to 3D with a small MLP (VideoPose3D).</li>
+<li>Direct 3D regression from image (PyMAF, MHFormer).</li>
+<li>Multi-view setups (CMU Panoptic) for ground truth.</li>
+</ul>
+</li>
+</ul>
+<figure><img src="/learn/ai-from-scratch/figures/figure-09a4a2dfd1b763ef0b20.png" alt="cv3-pose-heatmap 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<h3>Step 1: Gaussian heatmap target</h3>
+<pre><code class="language-python">import numpy as np
+import torch
+
+def gaussian_heatmap(size, cx, cy, sigma=2.0):
+    yy, xx = np.meshgrid(np.arange(size), np.arange(size), indexing=&quot;ij&quot;)
+    return np.exp(-((xx - cx) ** 2 + (yy - cy) ** 2) / (2 * sigma ** 2)).astype(np.float32)
+
+hm = gaussian_heatmap(64, 32, 32, sigma=2.0)
+print(f&quot;peak: {hm.max():.3f} at ({hm.argmax() % 64}, {hm.argmax() // 64})&quot;)
+</code></pre>
+<p>Per-keypoint heatmaps stacked along a channel axis give the full target tensor.</p>
+<h3>Step 2: Tiny keypoint head</h3>
+<p>A U-Net-style model that outputs K heatmap channels.</p>
+<pre><code class="language-python">import torch.nn as nn
+import torch.nn.functional as F
+
+class TinyKeypointNet(nn.Module):
+    def __init__(self, num_keypoints=4, base=16):
+        super().__init__()
+        self.down1 = nn.Sequential(nn.Conv2d(3, base, 3, 2, 1), nn.ReLU(inplace=True))
+        self.down2 = nn.Sequential(nn.Conv2d(base, base * 2, 3, 2, 1), nn.ReLU(inplace=True))
+        self.mid = nn.Sequential(nn.Conv2d(base * 2, base * 2, 3, 1, 1), nn.ReLU(inplace=True))
+        self.up1 = nn.ConvTranspose2d(base * 2, base, 2, 2)
+        self.up2 = nn.ConvTranspose2d(base, num_keypoints, 2, 2)
+
+    def forward(self, x):
+        h1 = self.down1(x)
+        h2 = self.down2(h1)
+        h3 = self.mid(h2)
+        u1 = self.up1(h3)
+        return self.up2(u1)
+</code></pre>
+<p>Input <code>(N, 3, H, W)</code>, output <code>(N, K, H, W)</code>. Loss is per-pixel MSE against Gaussian targets.</p>
+<h3>Step 3: Inference — extract keypoint coordinates</h3>
+<pre><code class="language-python">def heatmap_to_coords(heatmaps):
+    &quot;&quot;&quot;
+    heatmaps: (N, K, H, W)
+    returns:  (N, K, 2) float coordinates in image pixels
+    &quot;&quot;&quot;
+    N, K, H, W = heatmaps.shape
+    hm = heatmaps.reshape(N, K, -1)
+    idx = hm.argmax(dim=-1)
+    ys = (idx // W).float()
+    xs = (idx % W).float()
+    return torch.stack([xs, ys], dim=-1)
+
+coords = heatmap_to_coords(torch.randn(2, 4, 32, 32))
+print(f&quot;coords: {coords.shape}&quot;)  # (2, 4, 2)
+</code></pre>
+<p>One line at inference. For sub-pixel refinement, interpolate around the argmax.</p>
+<h3>Step 4: Synthetic keypoint dataset</h3>
+<p>Simple: draw four points on a white canvas and learn to predict them.</p>
+<pre><code class="language-python">def make_synthetic_sample(size=64):
+    img = np.ones((3, size, size), dtype=np.float32)
+    rng = np.random.default_rng()
+    kps = rng.integers(8, size - 8, size=(4, 2))
+    for cx, cy in kps:
+        img[:, cy - 2:cy + 2, cx - 2:cx + 2] = 0.0
+    hms = np.stack([gaussian_heatmap(size, cx, cy) for cx, cy in kps])
+    return img, hms, kps
+</code></pre>
+<p>Easy enough for a tiny model to learn in a minute.</p>
+<h3>Step 5: Training</h3>
+<pre><code class="language-python">model = TinyKeypointNet(num_keypoints=4)
+opt = torch.optim.Adam(model.parameters(), lr=3e-3)
+
+for step in range(200):
+    batch = [make_synthetic_sample() for _ in range(16)]
+    imgs = torch.from_numpy(np.stack([b[0] for b in batch]))
+    hms = torch.from_numpy(np.stack([b[1] for b in batch]))
+    pred = model(imgs)
+    # Upsample pred to full resolution
+    pred = F.interpolate(pred, size=hms.shape[-2:], mode=&quot;bilinear&quot;, align_corners=False)
+    loss = F.mse_loss(pred, hms)
+    opt.zero_grad(); loss.backward(); opt.step()
+</code></pre>
+<h2>Use It</h2>
+<ul>
+<li><strong>MediaPipe Pose</strong> — Google's production pose estimator; ships WebGL + mobile runtimes with sub-10ms latency.</li>
+<li><strong>MMPose</strong> (OpenMMLab) — comprehensive research codebase; every SOTA architecture with pretrained weights.</li>
+<li><strong>YOLOv8-pose</strong> — fastest real-time multi-person pose with a single forward pass.</li>
+<li><strong>transformers HumanDPT / PoseAnything</strong> — newer vision-language approaches for open-vocabulary pose (any object, any keypoint set).</li>
+</ul>
+<h2>Ship It</h2>
+<p>This lesson produces:</p>
+<ul>
+<li><code>outputs/prompt-pose-stack-picker.md</code> — a prompt that picks MediaPipe / YOLOv8-pose / HRNet / ViTPose given latency, crowd size, and 2D vs 3D need.</li>
+<li><code>outputs/skill-heatmap-to-coords.md</code> — a skill that writes the sub-pixel heatmap-to-coordinate routine used by every production pose model.</li>
+</ul>
+<h2>Exercises</h2>
+<ol>
+<li><strong>(Easy)</strong> Train the tiny keypoint model on the synthetic 4-point dataset. Report mean L2 error between predicted and true keypoints after 200 steps.</li>
+<li><strong>(Medium)</strong> Add sub-pixel refinement: given the argmax position, fit a 1D parabola along x and y from the neighbouring pixels. Report the accuracy gain vs integer argmax.</li>
+<li><strong>(Hard)</strong> Build a 2-person synthetic dataset where each image shows two instances of the 4-keypoint pattern. Train a bottom-up pipeline with PAFs that predict which keypoint belongs to which instance, and evaluate OKS.</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Keypoint</td>
+<td>&quot;A landmark&quot;</td>
+<td>A specific ordered point on an object (joint, corner, feature)</td>
+</tr>
+<tr>
+<td>Pose</td>
+<td>&quot;The skeleton&quot;</td>
+<td>An ordered set of keypoints belonging to one instance</td>
+</tr>
+<tr>
+<td>Top-down</td>
+<td>&quot;Detect then pose&quot;</td>
+<td>Two-stage pipeline: person detector + per-crop keypoint model; highest accuracy</td>
+</tr>
+<tr>
+<td>Bottom-up</td>
+<td>&quot;Pose first, group later&quot;</td>
+<td>Single-pass all-keypoint prediction + grouping; constant time in crowd size</td>
+</tr>
+<tr>
+<td>Heatmap</td>
+<td>&quot;Gaussian target&quot;</td>
+<td>H x W tensor per keypoint with peak at the true location; the preferred regression target</td>
+</tr>
+<tr>
+<td>PAF</td>
+<td>&quot;Part Affinity Field&quot;</td>
+<td>2-channel unit vector field encoding limb directions; used to group keypoints into instances</td>
+</tr>
+<tr>
+<td>OKS</td>
+<td>&quot;Keypoint IoU&quot;</td>
+<td>Object Keypoint Similarity; the COCO metric for pose</td>
+</tr>
+<tr>
+<td>HRNet</td>
+<td>&quot;High-Resolution Net&quot;</td>
+<td>The dominant top-down keypoint architecture; preserves high-res features throughout</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/1812.08008" rel="noreferrer" data-network="true">OpenPose (Cao et al., 2017) <small>↗ 需要联网</small></a> — bottom-up with PAFs; still the best writeup of the approach</li>
+<li><a href="https://arxiv.org/abs/1902.09212" rel="noreferrer" data-network="true">HRNet (Sun et al., 2019) <small>↗ 需要联网</small></a> — the top-down reference architecture</li>
+<li><a href="https://arxiv.org/abs/2204.12484" rel="noreferrer" data-network="true">ViTPose (Xu et al., 2022) <small>↗ 需要联网</small></a> — plain ViT as a pose backbone; current SOTA on many benchmarks</li>
+<li><a href="https://developers.google.com/mediapipe/solutions/vision/pose_landmarker" rel="noreferrer" data-network="true">MediaPipe Pose <small>↗ 需要联网</small></a> — production real-time pose; the fastest deployed stack in 2026</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-04-computer-vision--21-keypoint-pose.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-04-computer-vision--21-keypoint-pose.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/04-computer-vision/21-keypoint-pose/code/main.py">phases/04-computer-vision/21-keypoint-pose/code/main.py</a><details><summary>查看原始文本</summary><pre><code>import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+def gaussian_heatmap(size, cx, cy, sigma=2.0):
+    yy, xx = np.meshgrid(np.arange(size), np.arange(size), indexing=&quot;ij&quot;)
+    return np.exp(-((xx - cx) ** 2 + (yy - cy) ** 2) / (2 * sigma ** 2)).astype(np.float32)
+
+
+class TinyKeypointNet(nn.Module):
+    def __init__(self, num_keypoints=4, base=16):
+        super().__init__()
+        self.down1 = nn.Sequential(nn.Conv2d(3, base, 3, 2, 1), nn.ReLU(inplace=True))
+        self.down2 = nn.Sequential(nn.Conv2d(base, base * 2, 3, 2, 1), nn.ReLU(inplace=True))
+        self.mid = nn.Sequential(nn.Conv2d(base * 2, base * 2, 3, 1, 1), nn.ReLU(inplace=True))
+        self.up1 = nn.ConvTranspose2d(base * 2, base, 2, 2)
+        self.up2 = nn.ConvTranspose2d(base, num_keypoints, 2, 2)
+
+    def forward(self, x):
+        h1 = self.down1(x)
+        h2 = self.down2(h1)
+        h3 = self.mid(h2)
+        u1 = self.up1(h3)
+        return self.up2(u1)
+
+
+def heatmap_to_coords(heatmaps):
+    N, K, H, W = heatmaps.shape
+    hm = heatmaps.reshape(N, K, -1)
+    idx = hm.argmax(dim=-1)
+    ys = (idx // W).float()
+    xs = (idx % W).float()
+    return torch.stack([xs, ys], dim=-1)
+
+
+def subpixel_refine(heatmaps):
+    N, K, H, W = heatmaps.shape
+    coords = heatmap_to_coords(heatmaps)
+    refined = coords.clone()
+    for n in range(N):
+        for k in range(K):
+            x, y = int(coords[n, k, 0]), int(coords[n, k, 1])
+            if 0 &lt; x &lt; W - 1 and 0 &lt; y &lt; H - 1:
+                hm = heatmaps[n, k]
+                dx = 0.25 * (hm[y, x + 1] - hm[y, x - 1])
+                dy = 0.25 * (hm[y + 1, x] - hm[y - 1, x])
+                refined[n, k, 0] = x + dx
+                refined[n, k, 1] = y + dy
+    return refined
+
+
+def make_synthetic_sample(size=64, rng=None):
+    rng = rng or np.random.default_rng()
+    img = np.ones((3, size, size), dtype=np.float32)
+    kps = rng.integers(10, size - 10, size=(4, 2))
+    for cx, cy in kps:
+        img[:, cy - 2:cy + 2, cx - 2:cx + 2] = 0.0
+    hms = np.stack([gaussian_heatmap(size, cx, cy) for cx, cy in kps])
+    return img, hms, kps.astype(np.float32)
+
+
+def main():
+    torch.manual_seed(0)
+    rng = np.random.default_rng(0)
+
+    model = TinyKeypointNet(num_keypoints=4)
+    opt = torch.optim.Adam(model.parameters(), lr=3e-3)
+
+    for step in range(200):
+        batch = [make_synthetic_sample(rng=rng) for _ in range(16)]
+        imgs = torch.from_numpy(np.stack([b[0] for b in batch]))
+        hms = torch.from_numpy(np.stack([b[1] for b in batch]))
+        pred = model(imgs)
+        pred = F.interpolate(pred, size=hms.shape[-2:], mode=&quot;bilinear&quot;, align_corners=False)
+        loss = F.mse_loss(pred, hms)
+        opt.zero_grad(); loss.backward(); opt.step()
+        if step % 40 == 0:
+            print(f&quot;step {step:3d}  mse {loss.item():.4f}&quot;)
+
+    model.eval()
+    with torch.no_grad():
+        eval_batch = [make_synthetic_sample(rng=rng) for _ in range(8)]
+        imgs = torch.from_numpy(np.stack([b[0] for b in eval_batch]))
+        gt = torch.from_numpy(np.stack([b[2] for b in eval_batch]))
+        pred = model(imgs)
+        pred = F.interpolate(pred, size=(64, 64), mode=&quot;bilinear&quot;, align_corners=False)
+        coords = heatmap_to_coords(pred)
+        refined = subpixel_refine(pred)
+        l2_int = (coords - gt).norm(dim=-1).mean().item()
+        l2_sub = (refined - gt).norm(dim=-1).mean().item()
+        print(f&quot;\nmean L2 error (argmax):    {l2_int:.3f} px&quot;)
+        print(f&quot;mean L2 error (subpixel):  {l2_sub:.3f} px&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/04-computer-vision/21-keypoint-pose/outputs/prompt-pose-stack-picker.md">phases/04-computer-vision/21-keypoint-pose/outputs/prompt-pose-stack-picker.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: prompt-pose-stack-picker
+description: Pick MediaPipe / YOLOv8-pose / HRNet / ViTPose given latency, crowd size, and 2D vs 3D need
+phase: 4
+lesson: 21
+---
+
+You are a pose-estimation stack selector.
+
+## Inputs
+
+- `target`: human_body | face | hand | object_pose_custom
+- `dimension`: 2D | 3D
+- `max_people`: 1 | small_group (2-10) | crowd (10+)
+- `latency_target_ms`: p95 per frame
+- `stack`: mobile | browser | server_gpu | embedded
+
+## Decision
+
+### Human body 2D
+
+- `latency_target_ms &lt; 20` and `stack == mobile | browser` -&gt; **MediaPipe Pose** (Lite / Full / Heavy). Production default.
+- `max_people == 1` and `latency_target_ms &gt; 30` -&gt; **ViTPose-B** (accuracy).
+- `max_people == small_group` -&gt; **YOLOv8-pose** (top-down with person detector + HRNet head if accuracy matters).
+- `max_people == crowd` -&gt; **YOLOv8-pose** (real-time bottom-up) or **HigherHRNet** (accurate bottom-up).
+
+### Human body 3D
+
+- `max_people == 1` and single camera -&gt; lift from 2D using **MotionBERT** or **MHFormer** over a short temporal window.
+- multi-camera calibrated -&gt; triangulate 2D predictions per view, then optimise with **SMPL** or **SMPL-X** body model.
+- never rely on single-image 3D lifting when absolute depth is required; it predicts only relative pose.
+
+### Face landmarks
+
+- mobile / browser -&gt; **MediaPipe Face Mesh** (478 keypoints, real-time).
+- high accuracy, offline -&gt; **3DDFA_V2** or **DECA** (3D face).
+
+### Hand
+
+- real-time -&gt; **MediaPipe Hands** (21 keypoints).
+- research-quality -&gt; **MANO-based 3D hand reconstructors**.
+
+### Custom object pose
+
+- `dimension == 2D` -&gt; train an HRNet-style heatmap head on your dataset; 500+ annotated images minimum.
+- `dimension == 3D` -&gt; EPnP on detected 2D keypoints + known object model, or learning-based PoseCNN / DeepIM.
+
+## Output
+
+```
+[pose stack]
+  model:         &lt;name&gt;
+  runtime:       &lt;MediaPipe | ONNX | TensorRT | PyTorch&gt;
+  input_size:    &lt;H x W&gt;
+  output:        &lt;list of keypoint names&gt;
+
+[expected latency]
+  &lt;ms p95 on target stack&gt;
+
+[notes]
+  - accuracy gate
+  - crowd behaviour
+  - 3D extension path
+```
+
+## Rules
+
+- Never recommend a top-down pipeline for `max_people == crowd` unless GPU parallelism is available; the linear scaling becomes prohibitive.
+- For `stack == embedded` / `RPi-like`, require a TFLite-quantised model; most pytorch implementations will not meet frame-rate there.
+- When `dimension == 3D`, be explicit about whether single-camera lifting is acceptable or if calibrated multi-view is available; the answers differ wildly.
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/04-computer-vision/21-keypoint-pose/outputs/skill-heatmap-to-coords.md">phases/04-computer-vision/21-keypoint-pose/outputs/skill-heatmap-to-coords.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: skill-heatmap-to-coords
+description: Write the sub-pixel heatmap-to-coordinate routine used by every production pose model
+version: 1.0.0
+phase: 4
+lesson: 21
+tags: [keypoint, pose, subpixel, inference]
+---
+
+# Heatmap to Coords
+
+Turn raw keypoint heatmaps into sub-pixel precise coordinates. The cheapest accuracy upgrade in every pose pipeline.
+
+## When to use
+
+- Deploying a heatmap-based keypoint model.
+- Benchmarking pose metrics — OKS is extremely sensitive to sub-pixel accuracy.
+- Porting pose code from one framework to another.
+
+## Inputs
+
+- `heatmaps`: `(N, K, H, W)` tensor, per-keypoint heatmaps from the model.
+- `confidence_threshold`: discard keypoints whose peak is below this value.
+
+## Steps
+
+1. **Argmax** each heatmap to find the integer peak location.
+2. **First-difference offset** — estimate sub-pixel offset from neighbouring pixels. The `0.25` coefficient is a heuristic calibrated for Gaussian heatmaps with `sigma &gt;= 1`; for principled sub-pixel recovery, use a full quadratic fit (DARK) or a Gaussian fit.
+
+```
+dx = 0.25 * sign(heatmap[y, x+1] - heatmap[y, x-1])
+dy = 0.25 * sign(heatmap[y+1, x] - heatmap[y-1, x])
+```
+
+For the DARK / quadratic variant, approximate using a local quadratic:
+
+```
+dx = -0.5 * (heatmap[y, x+1] - heatmap[y, x-1])
+        / (heatmap[y, x+1] - 2 * heatmap[y, x] + heatmap[y, x-1] + eps)
+```
+
+The quadratic fit is more accurate on peaked heatmaps; the sign-based offset is the safer default when heatmaps are noisy.
+
+3. **Add offset** to the integer peak.
+4. **Confidence** — return the peak value per keypoint; clients use it to mask low-confidence predictions.
+5. **Boundary case** — when the peak lands on the first or last pixel along an axis, one of the neighbours is clamped; the offset collapses to zero, which is the safest fallback.
+
+## Output template
+
+```python
+import torch
+
+def heatmap_to_coords_subpixel(heatmaps, threshold=0.2):
+    N, K, H, W = heatmaps.shape
+    flat = heatmaps.reshape(N, K, -1)
+    conf, idx = flat.max(dim=-1)
+    ys = (idx // W).float()
+    xs = (idx % W).float()
+
+    ys_int = ys.long()
+    xs_int = xs.long()
+
+    x_minus = (xs_int - 1).clamp(min=0)
+    x_plus = (xs_int + 1).clamp(max=W - 1)
+    y_minus = (ys_int - 1).clamp(min=0)
+    y_plus = (ys_int + 1).clamp(max=H - 1)
+
+    batch_idx = torch.arange(N).view(-1, 1).expand(-1, K)
+    kp_idx = torch.arange(K).view(1, -1).expand(N, -1)
+
+    dx_raw = (heatmaps[batch_idx, kp_idx, ys_int, x_plus]
+              - heatmaps[batch_idx, kp_idx, ys_int, x_minus])
+    dy_raw = (heatmaps[batch_idx, kp_idx, y_plus, xs_int]
+              - heatmaps[batch_idx, kp_idx, y_minus, xs_int])
+    dx = 0.25 * torch.sign(dx_raw)
+    dy = 0.25 * torch.sign(dy_raw)
+
+    at_left = xs_int == 0
+    at_right = xs_int == (W - 1)
+    at_top = ys_int == 0
+    at_bottom = ys_int == (H - 1)
+    dx = torch.where(at_left | at_right, torch.zeros_like(dx), dx)
+    dy = torch.where(at_top | at_bottom, torch.zeros_like(dy), dy)
+
+    refined_x = xs + dx
+    refined_y = ys + dy
+    coords = torch.stack([refined_x, refined_y], dim=-1)
+    mask = conf &gt;= threshold
+    return coords, conf, mask
+```
+
+## Report
+
+```
+[subpixel decode]
+  keypoints:   K
+  threshold:   &lt;float&gt;
+  valid_rate:  fraction of keypoints above threshold
+```
+
+## Rules
+
+- Always clamp neighbour indices to valid range; off-edge keypoints have zero-difference offset but no crash.
+- Return confidence alongside coordinates so clients can mask low-confidence points.
+- Sub-pixel refinement only helps when the heatmap is smooth around the peak — check that training used a Gaussian target with sigma &gt;= 1.
+- For very small heatmap resolutions (&lt; 48x48), consider upsampling the heatmap to full image size before extracting coordinates; the sub-pixel offset scales with the stride.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. Why do pose models regress heatmaps instead of (x, y) coordinates directly?</legend><label class="option"><input type="radio" name="q0" value="0"> Heatmaps are cheaper to compute</label><label class="option"><input type="radio" name="q0" value="1"> Coordinate regression produces NaN</label><label class="option"><input type="radio" name="q0" value="2"> Heatmaps are required by the COCO metric</label><label class="option"><input type="radio" name="q0" value="3"> The spatial structure of a conv feature map aligns with spatial output; a Gaussian heatmap target provides a smooth loss landscape that tolerates small localisation errors, whereas direct coordinate regression is brittle and loses spatial context</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. Top-down pose estimation vs bottom-up: which scales better with crowd size, and why?</legend><label class="option"><input type="radio" name="q1" value="0"> They scale equally</label><label class="option"><input type="radio" name="q1" value="1"> Top-down never scales</label><label class="option"><input type="radio" name="q1" value="2"> Bottom-up, because it does one forward pass over the whole image then groups keypoints, so runtime is constant in the number of people</label><label class="option"><input type="radio" name="q1" value="3"> Top-down, because each person uses a separate fast model</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. What are Part Affinity Fields?</legend><label class="option"><input type="radio" name="q2" value="0"> A data augmentation technique</label><label class="option"><input type="radio" name="q2" value="1"> A type of loss function</label><label class="option"><input type="radio" name="q2" value="2"> A scheduling algorithm</label><label class="option"><input type="radio" name="q2" value="3"> 2-channel unit-vector fields that encode the direction from one keypoint to another; integrating the PAF along a candidate line tells you whether two keypoints belong to the same instance, enabling bottom-up association without per-person detection</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. Why does sub-pixel refinement around the argmax meaningfully lift keypoint accuracy?</legend><label class="option"><input type="radio" name="q3" value="0"> It prevents overfitting</label><label class="option"><input type="radio" name="q3" value="1"> It normalises the output</label><label class="option"><input type="radio" name="q3" value="2"> Integer argmax rounds to the nearest grid cell; fitting a local parabola or using the offset dx = 0.25*(heatmap[y,x+1] - heatmap[y,x-1]) recovers the continuous peak position, often halving the L2 error for cleanly predicted keypoints</label><label class="option"><input type="radio" name="q3" value="3"> It smooths the heatmap</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. OKS (Object Keypoint Similarity) is the pose-estimation analogue of what object-detection metric?</legend><label class="option"><input type="radio" name="q4" value="0"> Cross-entropy loss</label><label class="option"><input type="radio" name="q4" value="1"> Inference latency</label><label class="option"><input type="radio" name="q4" value="2"> IoU — both measure geometric match between prediction and ground truth, with OKS using keypoint distances weighted by each keypoint&#39;s annotation variance; COCO reports mAP@OKS 0.5:0.95 for pose</label><label class="option"><input type="radio" name="q4" value="3"> Classification accuracy</label><p data-feedback="4"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/04-computer-vision/20-image-retrieval-metric/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/04-computer-vision/22-3d-gaussian-splatting/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/04-computer-vision/21-keypoint-pose/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

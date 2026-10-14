@@ -1,0 +1,619 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>代码执行量表 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-19-capstone-projects" data-lesson="19-capstone-projects/72-code-exec-metric" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/19-capstone-projects/">综合项目</a> / LESSON 72</p><h1 class="lesson-title">代码执行量表</h1><p>Code Exec Metric</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>代码执行量表</h1>
+<blockquote>
+<p>通过测试,生成的代码是正确的. 评估带必须提取代码,运行它而不撞击主机,并诚实地计算通过率. 这一课构建了表面.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 19 Track B foundations, lessons 70 and 71
+<strong>Time:</strong> ~90 min</p>
+<h2>学习目标</h2>
+<ul>
+<li>通过与课70后过程规则相匹配的方式从自由形式生成中提取代码块.</li>
+<li>执行候选代码在一个孤立的子进程中,具有墙钟时间限,输出盖和进口列表.</li>
+<li>作为提供的断言字符串的分数,将任务分为对候选人的分数.</li>
+<li>计算一个模型中多个代人的任务的pass-at-k.</li>
+<li>处理沙箱崩,语法错误和时间切断作为第一级失败模式,运行者可以登录的出口代码.</li>
+</ul>
+<figure><img src="/learn/ai-from-scratch/figures/figure-eb3aabb80d08232dbbbe.png" alt="sandbox-runner 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>为什么一个孤立的子工艺</h2>
+<p>排列中的<code>exec</code>造成安全和稳定危险.<code>while True: pass</code>永远阻止了评估.<code>import shutil; shutil.rmtree('/')</code>解决方案是产生一个新的Python解释器,通过代码到Stdin,写出声明结果到Stdout,然后杀死该过程,如果它超越.主机评估过程继续运行.</p>
+<p>实际的评估,如HumanEval,MBPP,BigCodeBench和LiveCodeBench都使用一个子进程沙箱.上面有一层Docker.我们停下来处理这个子进程的原因是:它便携式,它是stdlib,它捕获了对教育评估重要的故障模式.生产部署增加了Seccomp,网络隔离和只读取文件系统.下一个关于硬化生活的课程是除了这条轨道之外.</p>
+<h2>执行代码任务的形状</h2>
+<p><code>code_exec</code>任务包含了声明字符串<code>targets</code>运行者从该代码中提取一个围的代码块,围绕它建立一个测试圈,然后运行结果.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-454f4039a8fcebc03c1c.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>结果是中小部分<code>[0, 1]</code>运行者无论失败如何都会返回相同的形状:子进程崩都会被映射到一个正常化的错误代码,而不是一个到带的Python追踪.</p>
+<h2>丹尼尔斯</h2>
+<p>在运行候选码之前,运行脚本将危险模块的进口重写到一个子上<code>ImportError(&quot;denied&quot;)</code>清单是故意保守的:<code>os.system</code>现在<code>subprocess</code>现在<code>socket</code>现在<code>requests</code>现在<code>urllib</code>现在<code>urllib.request</code>现在<code>urllib.error</code>现在<code>urllib.parse</code>现在<code>ctypes</code>现在<code>shutil</code>现在<code>http.client</code>现在<code>asyncio.subprocess</code>现在,我们要去.</p>
+<p>我们不假装这是弹药性. 确定对抗代码可以逃脱任何在过程中的沙盒在Python. 丹尼尔列表是一个后备. 墙钟时间和输出盖是承载控制.</p>
+<pre><code class="language-python">DENIED = {
+    &quot;os.system&quot;: True,
+    &quot;subprocess&quot;: True,
+    &quot;socket&quot;: True,
+    &quot;shutil&quot;: True,
+    &quot;requests&quot;: True,
+    &quot;urllib&quot;: True,
+    &quot;ctypes&quot;: True,
+}
+</code></pre>
+<p>我们将候选人包装成预期.<code>import sys</code>一个子的守护者.<code>os.system</code>现在我们可以提升.<code>main.py</code>现在,我们要去.</p>
+<h2>时间限制</h2>
+<p>每个子进程都会得到3秒的默认预算.<code>subprocess.run(..., timeout=t)</code>如果时间停止,跑者会抓住<code>TimeoutExpired</code>杀死过程,记录一个<code>timeout</code>运行者继续前进,运行者继续前进.</p>
+<p>时间间隔可根据任务配置到<code>task.metadata.timeout_s</code>长期的单元测试可能要求更多;课70的验证器将值限制在30秒,以保持套件的限制.</p>
+<h2>输出盖</h2>
+<p>运行过程可以淹没工作室,使主机内存疲.运行员将工作室输入缓冲器,一旦运行总数超过256 KB,就会杀死孩子.结果记录为<code>exit_code = error</code>随着细节链<code>&quot;output overflow&quot;</code>实际上,一代人会意外地写出一个印发的无限循环.</p>
+<h2>通过-在-k</h2>
+<p>通过-at-k是HumanEval和朋友使用的无偏见估计器.<code>n</code>独立的任务样本<code>c</code>通过它们的概率,<code>k</code>其他<code>n</code>含有至少一个可通过的溶液:</p>
+<pre><code>pass_at_k(n, c, k) = 1 - C(n - c, k) / C(n, k)
+</code></pre>
+<p>什么时候<code>n - c &lt; k</code>值是 值是 值是<code>1</code>执行直接处理边缘案例.<code>pass_at_k(n, c, k)</code>对于第74课中的排名板层来说.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-bd2b3b5d9ddbd5c72f17.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h2>退出码</h2>
+<p>跑者每项任务中返回五个结果之一:</p>
+<ul>
+<li><code>pass</code>当一切说法都过去了的时候.</li>
+<li><code>assertion_fail</code>没有任何证据.</li>
+<li><code>syntax_error</code>当代码没有进口或出现语法错误时.</li>
+<li><code>timeout</code>当墙上的钟表过期.</li>
+<li><code>error</code>其他任何撞击,包括列击和输出过度 (详细的过度过度表面)<code>&quot;output overflow&quot;</code>)</li>
+</ul>
+<p>结果仍然是小部分. 出口代码是元数据. 下游课程可以决定是否计算时间作为零或缺失数据.</p>
+<h2>这一课不做什么</h2>
+<p>它不会给你一个真正的沙盒.它不会从开放的网上运行不可信赖的代码.它不会处理文件I/O或网络调用等状态任务.这些需要容器或微VM.本课程的重点是合同:一个孤立的子进程,一个代码列表,一个时间限,一个输出盖,一个清洁的出口代码词汇和通过k数学.</p>
+<h2>如何读取代码</h2>
+<p><code>main.py</code>定义<code>extract_code</code>现在<code>run_candidate</code>现在<code>score_code_exec</code>其他<code>pass_at_k</code>字符串的脚本是构建成字符串,然后通过为<code>-c</code>通过一个新的Python解释器.<code>code/tests/test_exec.py</code>根据HumanEval风格的工作示例,使用四个出口代码加上pass-at-k.</p>
+<p>阅读<code>main.py</code>运行模板是承载的部分. 着断循环,直到你可以预测它将写回母进程的JSON包裹.</p>
+<h2>走得更远</h2>
+<p>接下来,我们需要解决问题. 不同 Python 版本在 Windows 上处理 SIGKILL 不同. 最好的解决方案是把跑步者放入Docker图像中. 接下来是用真实单位测试文件取代断言字符串,以便评估与生产CI的匹配. 现在就不要叫断言弦测试了,因为它们是玩具测试,</p>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Code Exec Metric</h1>
+<blockquote>
+<p>Generated code is right when it passes the tests. The eval harness has to extract code, run it without crashing the host, and tally pass-rates honestly. This lesson builds that surface.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 19 Track B foundations, lessons 70 and 71
+<strong>Time:</strong> ~90 min</p>
+<h2>Learning objectives</h2>
+<ul>
+<li>Extract a code block from a free-form generation in a way that matches the post-process rule from lesson 70.</li>
+<li>Execute candidate code in an isolated subprocess with a wall-clock timeout, output cap, and an import denylist.</li>
+<li>Score a task as the fraction of supplied assertion strings that pass against the candidate.</li>
+<li>Compute pass-at-k for tasks that sample multiple generations from one model.</li>
+<li>Treat sandbox crashes, syntax errors, and timeouts as first-class fail modes with distinct exit codes the runner can log.</li>
+</ul>
+<figure><img src="/learn/ai-from-scratch/figures/figure-eb3aabb80d08232dbbbe.png" alt="sandbox-runner 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Why an isolated subprocess</h2>
+<p>Inline <code>exec</code> is a security and stability hazard. A generated <code>while True: pass</code> blocks the eval forever. A generated <code>import shutil; shutil.rmtree('/')</code> is exactly as catastrophic as it sounds. The fix is to spawn a fresh Python interpreter per candidate, pass the code on stdin, write the assertion results to stdout, and kill the process if it overruns. The host eval process keeps running.</p>
+<p>Real evals like HumanEval, MBPP, BigCodeBench, and LiveCodeBench all use a subprocess sandbox. Some layer Docker on top. We stop at the subprocess for a reason: it is portable, it is stdlib, and it catches the failure modes that matter for educational eval. Production deployments add seccomp, network isolation, and a read-only filesystem. The next lesson on hardening lives outside this track.</p>
+<h2>The shape of a code-exec task</h2>
+<p>A <code>code_exec</code> task carries assertion strings in <code>targets</code>. The runner extracts a fenced code block from the generation, builds a test harness around it, and runs the result.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-454f4039a8fcebc03c1c.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>The score is a fraction in <code>[0, 1]</code>. A task with three assertions where two pass scores 0.667. The runner returns the same shape no matter what fails: the subprocess crashes are mapped to a normalised error code, not a Python traceback bubbling up to the harness.</p>
+<h2>The denylist</h2>
+<p>The denylist is import-based. Before running candidate code, the runner script rewrites imports of dangerous modules to a stub that raises <code>ImportError(&quot;denied&quot;)</code>. The list is deliberately conservative: <code>os.system</code>, <code>subprocess</code>, <code>socket</code>, <code>requests</code>, <code>urllib</code>, <code>urllib.request</code>, <code>urllib.error</code>, <code>urllib.parse</code>, <code>ctypes</code>, <code>shutil</code>, <code>http.client</code>, <code>asyncio.subprocess</code>.</p>
+<p>We do not pretend this is bulletproof. Determined adversarial code can escape any in-process sandbox in Python. The denylist is a backstop. The wall-clock timeout and the output cap are the load-bearing controls.</p>
+<pre><code class="language-python">DENIED = {
+    &quot;os.system&quot;: True,
+    &quot;subprocess&quot;: True,
+    &quot;socket&quot;: True,
+    &quot;shutil&quot;: True,
+    &quot;requests&quot;: True,
+    &quot;urllib&quot;: True,
+    &quot;ctypes&quot;: True,
+}
+</code></pre>
+<p>We wrap the candidate by prepending <code>import sys</code> and a guard that monkey-patches <code>os.system</code> to raise. The full template is in <code>main.py</code>.</p>
+<h2>Wall-clock timeout</h2>
+<p>Every subprocess gets a default budget of three wall-clock seconds. The runner uses <code>subprocess.run(..., timeout=t)</code>. If the timeout fires, the runner catches <code>TimeoutExpired</code>, kills the process, and records a <code>timeout</code> exit reason for the task. The score for that task is zero. The runner moves on.</p>
+<p>The timeout is configurable per task through <code>task.metadata.timeout_s</code>. Long-running unit tests can ask for more; the validator from lesson 70 caps the value at thirty seconds to keep the suite bounded.</p>
+<h2>Output cap</h2>
+<p>The subprocess can flood stdout, exhausting host memory. The runner streams stdout into a buffer and kills the child as soon as the running total crosses 256 KB. The result is recorded as <code>exit_code = error</code> with the detail string <code>&quot;output overflow&quot;</code>. This shows up in practice when a generation accidentally writes an infinite loop that prints.</p>
+<h2>Pass-at-k</h2>
+<p>Pass-at-k is the unbiased estimator used by HumanEval and friends. Given <code>n</code> independent samples per task and <code>c</code> of them passing, the probability that a sample of size <code>k</code> from the <code>n</code> contains at least one passing solution is:</p>
+<pre><code>pass_at_k(n, c, k) = 1 - C(n - c, k) / C(n, k)
+</code></pre>
+<p>When <code>n - c &lt; k</code> the numerator is undefined and the value is <code>1</code>. The implementation handles the edge case directly. We expose <code>pass_at_k(n, c, k)</code> for use by the leaderboard layer in lesson 74.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-bd2b3b5d9ddbd5c72f17.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h2>Exit codes</h2>
+<p>The runner returns one of five outcomes per task:</p>
+<ul>
+<li><code>pass</code> when every assertion passed.</li>
+<li><code>assertion_fail</code> when the code ran but at least one assertion failed.</li>
+<li><code>syntax_error</code> when the code did not import or had a SyntaxError.</li>
+<li><code>timeout</code> when the wall clock expired.</li>
+<li><code>error</code> for any other crash, including denylist hits and output overflow (overflow surfaces with detail <code>&quot;output overflow&quot;</code>).</li>
+</ul>
+<p>The score is still a fraction. The exit code is metadata. Downstream lessons can decide whether to count a timeout as zero or as missing data.</p>
+<h2>What this lesson does not do</h2>
+<p>It does not give you a real sandbox. It does not run untrusted code from the open web. It does not handle stateful tasks like file I/O or network calls. Those need a container or a microVM. The point of this lesson is the contract: an isolated subprocess, a denylist, a timeout, an output cap, a clean exit-code vocabulary, and pass-at-k math.</p>
+<h2>How to read the code</h2>
+<p><code>main.py</code> defines <code>extract_code</code>, <code>run_candidate</code>, <code>score_code_exec</code>, and <code>pass_at_k</code>. The subprocess runner script is built as a string and passed as <code>-c</code> to a fresh Python interpreter. The tests in <code>code/tests/test_exec.py</code> exercise the four exit codes plus pass-at-k against worked examples drawn from the HumanEval style.</p>
+<p>Read <code>main.py</code> top to bottom. The runner template is the load-bearing piece. Stare at the assertion loop until you can predict the JSON envelope it writes back to the parent process.</p>
+<h2>Going further</h2>
+<p>Once the subprocess shape works, the next concern is portability. Different Python versions handle SIGKILL differently on Windows. The cleanest fix is to put the runner in a Docker image. The next thing after that is replacing assertion strings with real unit test files so the eval matches what production CI does. Stop calling assertion strings tests at that point; they are toy tests and they have toy failure modes.</p>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-19-capstone-projects--72-code-exec-metric.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-19-capstone-projects--72-code-exec-metric.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/72-code-exec-metric/code/main.py">phases/19-capstone-projects/72-code-exec-metric/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Code execution metric: extract, sandbox subprocess, pass-at-k.
+
+Conceptual references:
+- ./docs/en.md (this lesson)
+- lesson 70 (task spec format) for code_exec task shape
+- lesson 71 (classical metrics) for the dispatcher pattern
+
+Stdlib + numpy. Run: python3 code/main.py
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import json
+import math
+import os
+import re
+import select
+import subprocess
+import sys
+import tempfile
+import time
+from dataclasses import dataclass, field
+from typing import Iterable
+
+import numpy as np
+
+
+CODE_BLOCK_RE = re.compile(r&quot;```(?:[a-zA-Z0-9_]*)\n(.*?)```&quot;, re.DOTALL)
+
+DEFAULT_TIMEOUT_S = 3.0
+MAX_TIMEOUT_S = 30.0
+OUTPUT_CAP_BYTES = 256 * 1024
+
+
+EXIT_PASS = &quot;pass&quot;
+EXIT_ASSERTION_FAIL = &quot;assertion_fail&quot;
+EXIT_SYNTAX_ERROR = &quot;syntax_error&quot;
+EXIT_TIMEOUT = &quot;timeout&quot;
+EXIT_ERROR = &quot;error&quot;
+
+EXIT_CODES = (EXIT_PASS, EXIT_ASSERTION_FAIL, EXIT_SYNTAX_ERROR, EXIT_TIMEOUT, EXIT_ERROR)
+
+
+@dataclass
+class ExecResult:
+    score: float
+    exit_code: str
+    passed: int
+    total: int
+    detail: str = &quot;&quot;
+    per_assertion: list[bool] = field(default_factory=list)
+
+    def to_dict(self) -&gt; dict:
+        return {
+            &quot;score&quot;: self.score,
+            &quot;exit_code&quot;: self.exit_code,
+            &quot;passed&quot;: self.passed,
+            &quot;total&quot;: self.total,
+            &quot;detail&quot;: self.detail,
+            &quot;per_assertion&quot;: list(self.per_assertion),
+        }
+
+
+RUNNER_TEMPLATE = r&quot;&quot;&quot;
+import json, sys, traceback
+import builtins as _builtins
+
+_DENIED_MODULES = {
+    &#39;subprocess&#39;, &#39;socket&#39;, &#39;shutil&#39;, &#39;requests&#39;, &#39;urllib&#39;,
+    &#39;urllib.request&#39;, &#39;urllib.error&#39;, &#39;urllib.parse&#39;, &#39;ctypes&#39;,
+    &#39;http.client&#39;, &#39;asyncio.subprocess&#39;,
+}
+
+_real_import = _builtins.__import__
+def _guarded_import(name, *args, **kwargs):
+    base = name.split(&#39;.&#39;)[0]
+    if name in _DENIED_MODULES or base in _DENIED_MODULES:
+        raise ImportError(&quot;denied module: %s&quot; % name)
+    return _real_import(name, *args, **kwargs)
+_builtins.__import__ = _guarded_import
+
+import os as _os
+def _denied_system(_cmd):
+    raise OSError(&quot;os.system denied&quot;)
+_os.system = _denied_system
+
+CODE = __PLACEHOLDER_CODE__
+ASSERTIONS = __PLACEHOLDER_ASSERTIONS__
+
+ns = {}
+status = {&quot;exit_code&quot;: &quot;pass&quot;, &quot;results&quot;: [], &quot;detail&quot;: &quot;&quot;}
+try:
+    compiled = compile(CODE, &quot;&lt;candidate&gt;&quot;, &quot;exec&quot;)
+except SyntaxError as exc:
+    status[&quot;exit_code&quot;] = &quot;syntax_error&quot;
+    status[&quot;detail&quot;] = &quot;SyntaxError: %s&quot; % exc
+    sys.stdout.write(json.dumps(status))
+    sys.exit(0)
+except Exception as exc:
+    status[&quot;exit_code&quot;] = &quot;error&quot;
+    status[&quot;detail&quot;] = &quot;compile error: %r&quot; % exc
+    sys.stdout.write(json.dumps(status))
+    sys.exit(0)
+
+try:
+    exec(compiled, ns)
+except Exception as exc:
+    status[&quot;exit_code&quot;] = &quot;error&quot;
+    status[&quot;detail&quot;] = &quot;exec error: %s&quot; % exc
+    sys.stdout.write(json.dumps(status))
+    sys.exit(0)
+
+passed = 0
+for assertion in ASSERTIONS:
+    try:
+        ok = bool(eval(assertion, ns))
+    except Exception as exc:
+        ok = False
+        status[&quot;detail&quot;] = &quot;assertion error: %s&quot; % exc
+    status[&quot;results&quot;].append(ok)
+    if ok:
+        passed += 1
+
+if passed &lt; len(ASSERTIONS):
+    status[&quot;exit_code&quot;] = &quot;assertion_fail&quot; if passed &gt; 0 or len(ASSERTIONS) &gt; 0 else status[&quot;exit_code&quot;]
+    if passed == len(ASSERTIONS):
+        status[&quot;exit_code&quot;] = &quot;pass&quot;
+elif len(ASSERTIONS) &gt; 0:
+    status[&quot;exit_code&quot;] = &quot;pass&quot;
+
+sys.stdout.write(json.dumps(status))
+&quot;&quot;&quot;.strip()
+
+
+def extract_code(text: str) -&gt; str | None:
+    m = CODE_BLOCK_RE.search(text)
+    if m:
+        return m.group(1)
+    if &quot;```&quot; in text:
+        return None
+    return text
+
+
+def _build_runner(code: str, assertions: list[str]) -&gt; str:
+    script = RUNNER_TEMPLATE
+    script = script.replace(&quot;__PLACEHOLDER_CODE__&quot;, repr(code))
+    script = script.replace(&quot;__PLACEHOLDER_ASSERTIONS__&quot;, repr(list(assertions)))
+    return script
+
+
+def run_candidate(code: str, assertions: list[str], timeout_s: float = DEFAULT_TIMEOUT_S) -&gt; ExecResult:
+    if not assertions:
+        return ExecResult(0.0, EXIT_ERROR, 0, 0, detail=&quot;no assertions provided&quot;)
+    timeout_s = min(max(0.1, float(timeout_s)), MAX_TIMEOUT_S)
+    script = _build_runner(code, assertions)
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, &quot;-I&quot;, &quot;-c&quot;, script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except Exception as exc:
+        return ExecResult(0.0, EXIT_ERROR, 0, len(assertions), detail=f&quot;spawn error: {exc!r}&quot;)
+
+    with proc:
+        deadline = time.monotonic() + timeout_s
+        stdout_chunks: list[bytes] = []
+        stdout_bytes = 0
+        overflow = False
+        timed_out = False
+        fd = proc.stdout
+        assert fd is not None
+        os.set_blocking(fd.fileno(), False)
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining &lt;= 0:
+                    timed_out = True
+                    break
+                try:
+                    r, _, _ = select.select([fd], [], [], min(remaining, 0.1))
+                except (OSError, ValueError):
+                    break
+                if r:
+                    chunk = fd.read(8192)
+                    if chunk is None:
+                        continue
+                    if chunk == b&quot;&quot;:
+                        break
+                    stdout_bytes += len(chunk)
+                    if stdout_bytes &gt; OUTPUT_CAP_BYTES:
+                        overflow = True
+                        break
+                    stdout_chunks.append(chunk)
+                elif proc.poll() is not None:
+                    tail = fd.read()
+                    if tail:
+                        stdout_bytes += len(tail)
+                        if stdout_bytes &gt; OUTPUT_CAP_BYTES:
+                            overflow = True
+                        else:
+                            stdout_chunks.append(tail)
+                    break
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                try:
+                    proc.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    pass
+            try:
+                stderr_bytes = proc.stderr.read() if proc.stderr else b&quot;&quot;
+            except Exception:
+                stderr_bytes = b&quot;&quot;
+
+    if timed_out:
+        return ExecResult(0.0, EXIT_TIMEOUT, 0, len(assertions),
+                          detail=f&quot;timeout after {timeout_s:.2f}s&quot;)
+    if overflow:
+        return ExecResult(0.0, EXIT_ERROR, 0, len(assertions), detail=&quot;output overflow&quot;)
+    stdout = b&quot;&quot;.join(stdout_chunks).decode(&quot;utf-8&quot;, errors=&quot;replace&quot;)
+    if proc.returncode != 0:
+        stderr_text = stderr_bytes.decode(&quot;utf-8&quot;, errors=&quot;replace&quot;) if stderr_bytes else &quot;&quot;
+        return ExecResult(0.0, EXIT_ERROR, 0, len(assertions),
+                          detail=f&quot;subprocess exit {proc.returncode}: {stderr_text[:200]}&quot;)
+    try:
+        status = json.loads(stdout) if stdout else {}
+    except json.JSONDecodeError:
+        return ExecResult(0.0, EXIT_ERROR, 0, len(assertions), detail=&quot;non-json output&quot;)
+
+    exit_code = status.get(&quot;exit_code&quot;, EXIT_ERROR)
+    results = list(status.get(&quot;results&quot;, []))
+    detail = status.get(&quot;detail&quot;, &quot;&quot;)
+    passed = sum(1 for r in results if r)
+    total = len(assertions)
+    score = passed / total if total else 0.0
+    if exit_code not in EXIT_CODES:
+        exit_code = EXIT_ERROR
+    if exit_code == EXIT_PASS and passed &lt; total:
+        exit_code = EXIT_ASSERTION_FAIL
+    if exit_code == EXIT_ASSERTION_FAIL and passed == total and total &gt; 0:
+        exit_code = EXIT_PASS
+    return ExecResult(score, exit_code, passed, total, detail=detail, per_assertion=results)
+
+
+def score_code_exec(prediction: str, assertions: list[str], timeout_s: float = DEFAULT_TIMEOUT_S) -&gt; float:
+    code = extract_code(prediction)
+    if code is None:
+        return 0.0
+    return run_candidate(code, assertions, timeout_s=timeout_s).score
+
+
+def pass_at_k(n: int, c: int, k: int) -&gt; float:
+    if n &lt; 0 or c &lt; 0 or k &lt;= 0:
+        raise ValueError(&quot;n, c &gt;= 0 and k &gt; 0&quot;)
+    if c &gt; n:
+        raise ValueError(&quot;c cannot exceed n&quot;)
+    if k &gt; n:
+        return float(c &gt; 0)
+    if n - c &lt; k:
+        return 1.0
+    log_prob = 0.0
+    for i in range(k):
+        log_prob += math.log(n - c - i) - math.log(n - i)
+    return float(1.0 - math.exp(log_prob))
+
+
+def pass_at_k_estimator(samples: list[list[bool]], ks: list[int]) -&gt; dict[int, float]:
+    out: dict[int, float] = {}
+    for k in ks:
+        per_task = []
+        for sample in samples:
+            n = len(sample)
+            c = sum(1 for s in sample if s)
+            per_task.append(pass_at_k(n, c, k))
+        out[k] = float(np.mean(per_task)) if per_task else 0.0
+    return out
+
+
+def _demo_examples() -&gt; list[dict]:
+    return [
+        {
+            &quot;name&quot;: &quot;passes_all&quot;,
+            &quot;prediction&quot;: &quot;```python\ndef add(a, b):\n    return a + b\n```&quot;,
+            &quot;assertions&quot;: [&quot;add(1, 2) == 3&quot;, &quot;add(-5, 5) == 0&quot;, &quot;add(100, 1) == 101&quot;],
+            &quot;expected_exit&quot;: EXIT_PASS,
+            &quot;expected_score&quot;: 1.0,
+        },
+        {
+            &quot;name&quot;: &quot;one_assertion_fails&quot;,
+            &quot;prediction&quot;: &quot;```python\ndef add(a, b):\n    return a + b + 1\n```&quot;,
+            &quot;assertions&quot;: [&quot;add(1, 2) == 3&quot;, &quot;add(-5, 5) == 0&quot;],
+            &quot;expected_exit&quot;: EXIT_ASSERTION_FAIL,
+            &quot;expected_score&quot;: 0.0,
+        },
+        {
+            &quot;name&quot;: &quot;syntax_error&quot;,
+            &quot;prediction&quot;: &quot;```python\ndef add(a, b)\n    return a + b\n```&quot;,
+            &quot;assertions&quot;: [&quot;add(1, 2) == 3&quot;],
+            &quot;expected_exit&quot;: EXIT_SYNTAX_ERROR,
+            &quot;expected_score&quot;: 0.0,
+        },
+        {
+            &quot;name&quot;: &quot;timeout&quot;,
+            &quot;prediction&quot;: &quot;```python\nimport time\ndef add(a, b):\n    time.sleep(10)\n    return a + b\n```&quot;,
+            &quot;assertions&quot;: [&quot;add(1, 2) == 3&quot;],
+            &quot;expected_exit&quot;: EXIT_TIMEOUT,
+            &quot;expected_score&quot;: 0.0,
+            &quot;timeout_s&quot;: 0.6,
+        },
+        {
+            &quot;name&quot;: &quot;denylist_subprocess&quot;,
+            &quot;prediction&quot;: &quot;```python\nimport subprocess\ndef bad():\n    subprocess.run([&#39;ls&#39;])\nbad()\n```&quot;,
+            &quot;assertions&quot;: [&quot;bad() is None&quot;],
+            &quot;expected_exit&quot;: EXIT_ERROR,
+            &quot;expected_score&quot;: 0.0,
+        },
+    ]
+
+
+def demo() -&gt; int:
+    failures = 0
+    for ex in _demo_examples():
+        result = run_candidate(
+            extract_code(ex[&quot;prediction&quot;]) or &quot;&quot;,
+            ex[&quot;assertions&quot;],
+            timeout_s=ex.get(&quot;timeout_s&quot;, DEFAULT_TIMEOUT_S),
+        )
+        status = &quot;OK&quot; if result.exit_code == ex[&quot;expected_exit&quot;] and abs(result.score - ex[&quot;expected_score&quot;]) &lt; 1e-6 else &quot;WRONG&quot;
+        if status == &quot;WRONG&quot;:
+            failures += 1
+        print(f&quot;  [{status}] {ex[&#39;name&#39;]:24s} exit={result.exit_code:14s} score={result.score:.2f} detail={result.detail[:60]}&quot;)
+
+    samples_per_task = [
+        [True, True, False, False, False, False, False, False, False, False],
+        [True, False, False, False, False, False, False, False, False, False],
+        [False, False, False, False, False, False, False, False, False, False],
+    ]
+    p_at_k = pass_at_k_estimator(samples_per_task, [1, 5, 10])
+    print(f&quot;  pass@1={p_at_k[1]:.3f}  pass@5={p_at_k[5]:.3f}  pass@10={p_at_k[10]:.3f}&quot;)
+    return 0 if failures == 0 else 1
+
+
+if __name__ == &quot;__main__&quot;:
+    sys.exit(demo())
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/72-code-exec-metric/code/tests/test_exec.py">phases/19-capstone-projects/72-code-exec-metric/code/tests/test_exec.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Tests for code extraction, sandbox subprocess execution, and pass-at-k.&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import math
+import os
+import sys
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(HERE))
+
+from main import (  # noqa: E402
+    EXIT_ASSERTION_FAIL,
+    EXIT_ERROR,
+    EXIT_PASS,
+    EXIT_SYNTAX_ERROR,
+    EXIT_TIMEOUT,
+    extract_code,
+    pass_at_k,
+    pass_at_k_estimator,
+    run_candidate,
+    score_code_exec,
+)
+
+
+GOOD_ADD = &quot;```python\ndef add(a, b):\n    return a + b\n```&quot;
+BAD_ADD = &quot;```python\ndef add(a, b):\n    return a + b + 1\n```&quot;
+
+
+class TestExtractCode(unittest.TestCase):
+    def test_extracts_python_block(self) -&gt; None:
+        code = extract_code(GOOD_ADD)
+        self.assertIn(&quot;def add&quot;, code)
+        self.assertNotIn(&quot;```&quot;, code)
+
+    def test_extracts_untagged_block(self) -&gt; None:
+        text = &quot;Here:\n```\ndef f():\n    return 1\n```&quot;
+        code = extract_code(text)
+        self.assertIn(&quot;def f&quot;, code)
+
+    def test_no_block_no_backticks_returns_raw(self) -&gt; None:
+        self.assertEqual(extract_code(&quot;def f(): pass&quot;), &quot;def f(): pass&quot;)
+
+    def test_backticks_but_unclosed_returns_none(self) -&gt; None:
+        self.assertIsNone(extract_code(&quot;```python\ndef f&quot;))
+
+
+class TestRunCandidate(unittest.TestCase):
+    def test_all_assertions_pass(self) -&gt; None:
+        r = run_candidate(&quot;def add(a,b):\n    return a+b\n&quot;, [&quot;add(1,2) == 3&quot;, &quot;add(0,0) == 0&quot;])
+        self.assertEqual(r.exit_code, EXIT_PASS)
+        self.assertEqual(r.score, 1.0)
+        self.assertEqual(r.passed, 2)
+        self.assertEqual(r.total, 2)
+
+    def test_partial_assertions_fail(self) -&gt; None:
+        r = run_candidate(&quot;def add(a,b):\n    return a+b+1\n&quot;, [&quot;add(1,2) == 3&quot;, &quot;add(0,0) == 1&quot;])
+        self.assertEqual(r.exit_code, EXIT_ASSERTION_FAIL)
+        self.assertEqual(r.passed, 1)
+        self.assertEqual(r.total, 2)
+        self.assertAlmostEqual(r.score, 0.5)
+
+    def test_syntax_error(self) -&gt; None:
+        r = run_candidate(&quot;def add(a,b)\n    return a+b\n&quot;, [&quot;add(1,2) == 3&quot;])
+        self.assertEqual(r.exit_code, EXIT_SYNTAX_ERROR)
+        self.assertEqual(r.score, 0.0)
+
+    def test_timeout(self) -&gt; None:
+        r = run_candidate(&quot;import time\ntime.sleep(5)\ndef add(a,b):\n    return a+b\n&quot;,
+                          [&quot;add(1,2) == 3&quot;], timeout_s=0.5)
+        self.assertEqual(r.exit_code, EXIT_TIMEOUT)
+        self.assertEqual(r.score, 0.0)
+
+    def test_runtime_error_during_assertion(self) -&gt; None:
+        r = run_candidate(&quot;def add(a,b):\n    raise RuntimeError(&#39;boom&#39;)\n&quot;, [&quot;add(1,2) == 3&quot;])
+        self.assertEqual(r.exit_code, EXIT_ASSERTION_FAIL)
+        self.assertEqual(r.score, 0.0)
+
+    def test_denied_import_subprocess(self) -&gt; None:
+        r = run_candidate(&quot;import subprocess\nsubprocess.run([&#39;ls&#39;])\n&quot;, [&quot;True&quot;])
+        self.assertEqual(r.exit_code, EXIT_ERROR)
+        self.assertIn(&quot;denied&quot;, r.detail)
+
+    def test_no_assertions_yields_error(self) -&gt; None:
+        r = run_candidate(&quot;def f(): return 1\n&quot;, [])
+        self.assertEqual(r.exit_code, EXIT_ERROR)
+
+
+class TestScoreCodeExec(unittest.TestCase):
+    def test_score_from_fenced_block(self) -&gt; None:
+        self.assertEqual(
+            score_code_exec(GOOD_ADD, [&quot;add(1,2) == 3&quot;]),
+            1.0,
+        )
+
+    def test_score_zero_on_bad_block(self) -&gt; None:
+        self.assertEqual(
+            score_code_exec(BAD_ADD, [&quot;add(1,2) == 3&quot;]),
+            0.0,
+        )
+
+    def test_unclosed_block_scores_zero(self) -&gt; None:
+        self.assertEqual(
+            score_code_exec(&quot;```python\nbroken&quot;, [&quot;True&quot;]),
+            0.0,
+        )
+
+
+class TestPassAtK(unittest.TestCase):
+    def test_pass_at_1_equals_c_over_n(self) -&gt; None:
+        self.assertAlmostEqual(pass_at_k(10, 3, 1), 0.3)
+
+    def test_pass_at_k_perfect(self) -&gt; None:
+        self.assertAlmostEqual(pass_at_k(10, 10, 5), 1.0)
+
+    def test_pass_at_k_none_pass(self) -&gt; None:
+        self.assertAlmostEqual(pass_at_k(10, 0, 5), 0.0)
+
+    def test_pass_at_k_known_value(self) -&gt; None:
+        v = pass_at_k(10, 1, 5)
+        expected = 1.0 - math.comb(9, 5) / math.comb(10, 5)
+        self.assertAlmostEqual(v, expected, places=8)
+
+    def test_pass_at_k_when_k_greater_than_n_minus_c(self) -&gt; None:
+        self.assertAlmostEqual(pass_at_k(5, 3, 4), 1.0)
+
+    def test_pass_at_k_estimator_over_tasks(self) -&gt; None:
+        samples = [
+            [True, False, False],
+            [True, True, False],
+        ]
+        result = pass_at_k_estimator(samples, [1, 3])
+        self.assertAlmostEqual(result[1], 0.5, places=6)
+        self.assertAlmostEqual(result[3], 1.0, places=6)
+
+    def test_invalid_inputs_raise(self) -&gt; None:
+        with self.assertRaises(ValueError):
+            pass_at_k(-1, 0, 1)
+        with self.assertRaises(ValueError):
+            pass_at_k(5, 6, 1)
+        with self.assertRaises(ValueError):
+            pass_at_k(5, 1, 0)
+
+
+if __name__ == &quot;__main__&quot;:
+    unittest.main()
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. Why does the runner spawn a fresh Python subprocess per candidate rather than calling exec inline?</legend><label class="option"><input type="radio" name="q0" value="0"> It avoids polluting builtins</label><label class="option"><input type="radio" name="q0" value="1"> exec is deprecated in modern Python</label><label class="option"><input type="radio" name="q0" value="2"> It is faster than exec</label><label class="option"><input type="radio" name="q0" value="3"> It isolates timeouts, output overruns, and dangerous imports from the host eval process</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. What is the score for a task with three assertions when two pass and one fails?</legend><label class="option"><input type="radio" name="q1" value="0"> 0.667</label><label class="option"><input type="radio" name="q1" value="1"> 1.0</label><label class="option"><input type="radio" name="q1" value="2"> 0.0</label><label class="option"><input type="radio" name="q1" value="3"> 0.5</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. Which exit code does the runner return when the candidate code does not parse?</legend><label class="option"><input type="radio" name="q2" value="0"> syntax_error</label><label class="option"><input type="radio" name="q2" value="1"> error</label><label class="option"><input type="radio" name="q2" value="2"> timeout</label><label class="option"><input type="radio" name="q2" value="3"> assertion_fail</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. Why is wall-clock timeout the load-bearing control rather than the import denylist?</legend><label class="option"><input type="radio" name="q3" value="0"> Imports cannot be denied in Python</label><label class="option"><input type="radio" name="q3" value="1"> subprocess.run does not support denylists</label><label class="option"><input type="radio" name="q3" value="2"> Most failures are infinite loops, and a determined adversary can bypass any in-process denylist</label><label class="option"><input type="radio" name="q3" value="3"> Wall-clock is checked at compile time</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. What does pass_at_k(n, c, k) return when n - c &lt; k?</legend><label class="option"><input type="radio" name="q4" value="0"> One, because the sample must contain at least one passing solution</label><label class="option"><input type="radio" name="q4" value="1"> c / n, the empirical pass rate</label><label class="option"><input type="radio" name="q4" value="2"> Zero, because the sample is undefined</label><label class="option"><input type="radio" name="q4" value="3"> Raises ValueError</label><p data-feedback="4"></p></fieldset><fieldset><legend>6. How does the runner surface an output overflow, and why is the cap 256 KB?</legend><label class="option"><input type="radio" name="q5" value="0"> Stderr only; size matches the OS pipe default</label><label class="option"><input type="radio" name="q5" value="1"> The score value, expressed as a percentage with two decimals</label><label class="option"><input type="radio" name="q5" value="2"> Stdout from the subprocess is streamed; once the 256 KB running total is crossed the child is killed and the task is recorded as exit_code=error with detail &quot;output overflow&quot;</label><label class="option"><input type="radio" name="q5" value="3"> The candidate source size, capped so generated code stays small</label><p data-feedback="5"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/19-capstone-projects/71-classical-metrics/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/19-capstone-projects/73-perplexity-calibration/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/19-capstone-projects/72-code-exec-metric/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

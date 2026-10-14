@@ -1,0 +1,766 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>图像检索和测量学习 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-04-computer-vision" data-lesson="04-computer-vision/20-image-retrieval-metric" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/04-computer-vision/">计算机视觉</a> / LESSON 20</p><h1 class="lesson-title">图像检索和测量学习</h1><p>Image Retrieval &amp; Metric Learning</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>图像检索和测量学习</h1>
+<blockquote>
+<p>测量学习是塑造空间的学科,使距离意味着你想要的.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 4 Lesson 14 (ViT), Phase 4 Lesson 18 (CLIP)
+<strong>Time:</strong> ~45 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>解释三小部分,对比和代理的指标学习损失,并选择给定的数据集的正确数据</li>
+<li>执行L2规范化和共数相似性正确,并审核&quot;同类&quot;和&quot;同类&quot;检索之间的差异</li>
+<li>建立一个 FAISS 指数,通过文字和图像查询,并报告回忆@K 对于一个已保留的查询集</li>
+<li>使用DINOv2,Clip和SigLIP作为现货嵌入骨,并知道每一个赢得什么时候</li>
+</ul>
+<h2>问题</h2>
+<p>检索在生产视觉中无处不在:重复检测,反向图像搜索,视觉搜索 (&quot;找到类似的产品&quot;),面部重新识别,监控的人身份,电子商务的实例级匹配.</p>
+<p>两个设计决定塑造整个系统.嵌入式 产生向量模型.索引 如何在尺度上找到最近的邻居.这两种都是2026年的商品 (嵌入式 DINOv2 ,索引式 FAISS),这提高了条:最难的部分是定义 <em>什么是类似的</em> 对于您的应用,然后塑造嵌入式空间,使距离匹配.</p>
+<p>塑造是一种微小但高杆性的学科.</p>
+<h2>概念</h2>
+<h3>一眼发现</h3>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-1ec05935d84f7f5992d9.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>失去的四个家庭</h3>
+<table>
+<thead>
+<tr>
+<th>Loss</th>
+<th>Requires</th>
+<th>Pros</th>
+<th>Cons</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Contrastive</strong></td>
+<td>(anchor, positive) + negatives</td>
+<td>Simple, works with any pair label</td>
+<td>Slow to converge without many negatives</td>
+</tr>
+<tr>
+<td><strong>Triplet</strong></td>
+<td>(anchor, positive, negative)</td>
+<td>Intuitive; direct margin control</td>
+<td>Hard-triplet mining is expensive</td>
+</tr>
+<tr>
+<td><strong>NT-Xent / InfoNCE</strong></td>
+<td>Pairs + batch-mined negatives</td>
+<td>Scales to large batches</td>
+<td>Needs big batch or momentum queue</td>
+</tr>
+<tr>
+<td><strong>Proxy-based (ProxyNCA)</strong></td>
+<td>Class labels only</td>
+<td>Fast, stable, no mining</td>
+<td>Can overfit to proxies on small datasets</td>
+</tr>
+</tbody>
+</table>
+<p>在大多数生产使用案例中,从预训练的脊椎开始,只需在测试组上使用的嵌入式性能低,才能添加测量学习细节调整.</p>
+<h3>官方的三分之一损失</h3>
+<pre><code>L = max(0, ||f(a) - f(p)||^2 - ||f(a) - f(n)||^2 + margin)
+</code></pre>
+<p>拉<code>a</code>接近正面<code>p</code>让它远离负面<code>n</code>通过<code>margin</code>对于任何类似性来说,这将使得图像结构普遍化.</p>
+<p>矿业问题:轻松三重 (<code>n</code>现在还不太久了<code>a</code>只有硬三分之一教网络.<code>n</code>超过<code>p</code>虽然这项技术是最重要的,但在边缘范围内) 是2016年FaceNet的配方,</p>
+<h3>子相似性与L2</h3>
+<p>两个指标,两个公约:</p>
+<ul>
+<li><strong>Cosine</strong>需要L2标准化嵌入式.</li>
+<li><strong>L2</strong>工作在原始或正常嵌入式上,但通常与L2正常化 +2L2相对.</li>
+</ul>
+<p>对于大多数现代网络来说,这两种网络是相当的:<code>||a - b||^2 = 2 - 2 cos(a, b)</code>什么时候<code>||a|| = ||b|| = 1</code>选择与你的嵌入训练相匹配的会议; 默默地混合它们改变了&quot;最接近&quot;的意思.</p>
+<h3>提醒@K</h3>
+<p>标准检索指标:</p>
+<pre><code>recall@K = fraction of queries where at least one correct match is in the top K results
+</code></pre>
+<p>报告 recall@1, @5, @10 旁边. recall@10 在 0.95 之上, recall@1 在 0.5 之下,意味着嵌入空间有正确的结构,但排名很尝试更长的细节调节或重新排名步骤.</p>
+<p>对于重复检测,精度@K更重要,因为每一个假正是用户可见的错误.</p>
+<h3>单一段落中的 FAISS</h3>
+<p>根据&quot;Facebook AI相似性搜索&quot;的实际图书馆,</p>
+<ul>
+<li><code>IndexFlatIP</code>现在,<code>IndexFlatL2</code>粗力,精确,没有训练. 运用到1M向量.</li>
+<li><code>IndexIVFFlat</code>分成K细胞,只搜索最近的几个细胞. 接近,快速,需要训练数据.</li>
+<li><code>IndexHNSW</code>基于图表,最快于许多查询,大指数尺寸.</li>
+</ul>
+<p>对于100万个向量,你可能想要<code>IndexFlatIP</code>对于10万,你想要的<code>IndexIVFFlat</code>对于100万+与产品量化相结合 (<code>IndexIVFPQ</code>)</p>
+<h3>实例级别与类别级别检索</h3>
+<p>两个完全不同的问题,</p>
+<ul>
+<li><strong>Category-level</strong>&quot;在我的目录中找到猫&quot;.类条件相似性;现货CLIP/DINOv2嵌入式工作良好.</li>
+<li><strong>Instance-level</strong>&quot;在我的目录中找到<em>这个精确的产品</em>&quot;.需要细微的区分相同类别的视觉相似物体;现货嵌入式性能低;对测量学习问题进行细微调整.</li>
+</ul>
+<p>在选择模型之前,你总是问你要解决哪个问题.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-7fe214beae34c1c4a859.png" alt="metric-embedding 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<h3>步骤1:三分钟损失</h3>
+<pre><code class="language-python">import torch
+import torch.nn.functional as F
+
+def triplet_loss(anchor, positive, negative, margin=0.2):
+    d_ap = F.pairwise_distance(anchor, positive, p=2)
+    d_an = F.pairwise_distance(anchor, negative, p=2)
+    return F.relu(d_ap - d_an + margin).mean()
+</code></pre>
+<p>能在L2标准化或原始嵌入式上使用.</p>
+<h3>步骤2:半硬的采矿</h3>
+<p>根据嵌入式和标签的批量, 找出每个的最难的半硬负值.</p>
+<pre><code class="language-python">def semi_hard_negatives(emb, labels, margin=0.2):
+    dist = torch.cdist(emb, emb)
+    same_class = labels[:, None] == labels[None, :]
+    diff_class = ~same_class
+    N = emb.size(0)
+
+    positives = dist.clone()
+    positives[~same_class] = float(&quot;-inf&quot;)
+    positives.fill_diagonal_(float(&quot;-inf&quot;))
+    pos_idx = positives.argmax(dim=1)
+
+    semi_hard = dist.clone()
+    semi_hard[same_class] = float(&quot;inf&quot;)
+    d_ap = dist[torch.arange(N), pos_idx].unsqueeze(1)
+    semi_hard[dist &lt;= d_ap] = float(&quot;inf&quot;)
+    neg_idx = semi_hard.argmin(dim=1)
+
+    fallback_mask = semi_hard[torch.arange(N), neg_idx] == float(&quot;inf&quot;)
+    if fallback_mask.any():
+        hardest = dist.clone()
+        hardest[same_class] = float(&quot;inf&quot;)
+        neg_idx = torch.where(fallback_mask, hardest.argmin(dim=1), neg_idx)
+    return pos_idx, neg_idx
+</code></pre>
+<p>每个都有最硬的正值,半硬的负值,远于正值,但在边缘范围内.</p>
+<h3>步骤3:回忆@K</h3>
+<pre><code class="language-python">def recall_at_k(query_emb, gallery_emb, query_labels, gallery_labels, k=1):
+    sim = query_emb @ gallery_emb.T
+    _, top_k = sim.topk(k, dim=-1)
+    matches = (gallery_labels[top_k] == query_labels[:, None]).any(dim=-1)
+    return matches.float().mean().item()
+</code></pre>
+<p>在L2标准化嵌入式上,内产量上-k等于kosine上-k.报告至少一个正确邻居的平均查询比例.</p>
+<h3>步骤4: 组合</h3>
+<pre><code class="language-python">import torch
+import torch.nn as nn
+from torch.optim import Adam
+
+class Encoder(nn.Module):
+    def __init__(self, in_dim=128, emb_dim=64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, 128), nn.ReLU(),
+            nn.Linear(128, emb_dim),
+        )
+
+    def forward(self, x):
+        return F.normalize(self.net(x), dim=-1)
+
+torch.manual_seed(0)
+num_classes = 6
+protos = F.normalize(torch.randn(num_classes, 128), dim=-1)
+
+def sample_batch(bs=32):
+    labels = torch.randint(0, num_classes, (bs,))
+    x = protos[labels] + 0.15 * torch.randn(bs, 128)
+    return x, labels
+
+enc = Encoder()
+opt = Adam(enc.parameters(), lr=3e-3)
+
+for step in range(200):
+    x, y = sample_batch(32)
+    emb = enc(x)
+    pos_idx, neg_idx = semi_hard_negatives(emb, y)
+    loss = triplet_loss(emb, emb[pos_idx], emb[neg_idx])
+    opt.zero_grad(); loss.backward(); opt.step()
+</code></pre>
+<p>后几百步,嵌入集群形成一个集群每个类.</p>
+<h2>用它</h2>
+<p>2026年生产堆:</p>
+<ul>
+<li><strong>DINOv2 + FAISS</strong>一般用途的视觉检索.</li>
+<li><strong>CLIP + FAISS</strong>当查询是短信时.</li>
+<li><strong>Fine-tuned DINOv2 + FAISS</strong>实例级检索,面部重新识别,时尚,电子商务.</li>
+<li><strong>Milvus / Weaviate / Qdrant</strong>管理在 FAISS 或 HNSW 周围的向量 DB 包装.</li>
+</ul>
+<p>对于SOTA实例检索,配方是:DINOv2脊柱,添加嵌入头,通过三小组调整或InfoNCE损失在实例标记的对,索引在FAISS中.</p>
+<h2>运送它</h2>
+<p>这一课产生了:</p>
+<ul>
+<li><code>outputs/prompt-retrieval-loss-picker.md</code>一个提示,选择给定的检索问题的三小部分 / InfoNCE / ProxyNCA.</li>
+<li><code>outputs/skill-recall-at-k-runner.md</code>写一个清洁的评估带,以火车//图库分区和适当的数据合同.</li>
+</ul>
+<h2>运动</h2>
+<ol>
+<li>**(Easy)**在训练前和后,用PCA绘制嵌入式图,看看六个集群形成.</li>
+<li>**(Medium)**添加ProxyNCA损失实现:每个类学习一个&quot;代理&quot;,在可西因相似度上标准交叉.在玩具数据上比较缩速度与三分钟损失.</li>
+<li>**(Hard)**通过 HuggingFace 嵌入DINOv2的1000个ImageNet验证图像,构建一个 FAISS平面索引,并报告回忆@{1, 5, 10}与查询相同的图像 (应该是1.0) 和与ImageNet标签的持久分离作为基础真相.</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Metric learning</td>
+<td>&quot;Shape the space&quot;</td>
+<td>Training an encoder so distances in its output space reflect a target similarity</td>
+</tr>
+<tr>
+<td>Triplet loss</td>
+<td>&quot;Pull and push&quot;</td>
+<td>L = max(0, d(a, p) - d(a, n) + margin); the canonical metric-learning loss</td>
+</tr>
+<tr>
+<td>Semi-hard mining</td>
+<td>&quot;Useful negatives&quot;</td>
+<td>Negatives further from the anchor than the positive but within margin; empirically the most informative</td>
+</tr>
+<tr>
+<td>Proxy-based loss</td>
+<td>&quot;Class prototypes&quot;</td>
+<td>One learned proxy per class; cross-entropy over similarity-to-proxies; no pair mining</td>
+</tr>
+<tr>
+<td>Recall@K</td>
+<td>&quot;Top-K hit rate&quot;</td>
+<td>Fraction of queries with at least one correct result in the top K</td>
+</tr>
+<tr>
+<td>Instance retrieval</td>
+<td>&quot;Find this exact thing&quot;</td>
+<td>Fine-grained matching; off-the-shelf features usually underperform</td>
+</tr>
+<tr>
+<td>FAISS</td>
+<td>&quot;The NN library&quot;</td>
+<td>Facebook's nearest-neighbour library; supports exact and approximate indexes</td>
+</tr>
+<tr>
+<td>HNSW</td>
+<td>&quot;Graph index&quot;</td>
+<td>Hierarchical navigable small world; fast approximate NN with small memory overhead</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/1503.03832" rel="noreferrer" data-network="true">FaceNet: A Unified Embedding for Face Recognition (Schroff et al., 2015) <small>↗ 需要联网</small></a>三片损失/半硬的矿山纸</li>
+<li><a href="https://arxiv.org/abs/1703.07737" rel="noreferrer" data-network="true">In Defense of the Triplet Loss for Person Re-Identification (Hermans et al., 2017) <small>↗ 需要联网</small></a>三重小组细调的实用指南</li>
+<li><a href="https://github.com/facebookresearch/faiss/wiki" rel="noreferrer" data-network="true">FAISS documentation <small>↗ 需要联网</small></a>每一个指数,每一个交易</li>
+<li><a href="https://arxiv.org/abs/2010.06927" rel="noreferrer" data-network="true">SMoT: Metric Learning Taxonomy (Kim et al., 2021) <small>↗ 需要联网</small></a>现代损失及其联系的调查</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Image Retrieval &amp; Metric Learning</h1>
+<blockquote>
+<p>A retrieval system ranks candidates by a distance in embedding space. Metric learning is the discipline of shaping that space so the distances mean what you want.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 4 Lesson 14 (ViT), Phase 4 Lesson 18 (CLIP)
+<strong>Time:</strong> ~45 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Explain triplet, contrastive, and proxy-based metric learning losses and pick the right one for a given dataset</li>
+<li>Implement L2-normalisation and cosine similarity correctly and audit the difference between &quot;same item&quot; and &quot;same class&quot; retrieval</li>
+<li>Build a FAISS index, query it by text and by image, and report recall@K for a held-out query set</li>
+<li>Use DINOv2, CLIP, and SigLIP as off-the-shelf embedding backbones and know when each wins</li>
+</ul>
+<h2>The Problem</h2>
+<p>Retrieval is everywhere in production vision: duplicate detection, reverse image search, visual search (&quot;find similar products&quot;), face re-identification, person re-ID for surveillance, instance-level matching for e-commerce. The product question is always the same: &quot;given this query image, rank my catalogue.&quot;</p>
+<p>Two design decisions shape the whole system. The embedding — what model produces the vectors. The index — how to find nearest neighbours at scale. Both are commodity in 2026 (DINOv2 for the embedding, FAISS for the index), which raises the bar: the hard part is defining <em>what counts as similar</em> for your application, then shaping the embedding space so the distances match.</p>
+<p>That shaping is metric learning. It is a small but high-leverage discipline.</p>
+<h2>The Concept</h2>
+<h3>Retrieval at a glance</h3>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-1ec05935d84f7f5992d9.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>The four loss families</h3>
+<table>
+<thead>
+<tr>
+<th>Loss</th>
+<th>Requires</th>
+<th>Pros</th>
+<th>Cons</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Contrastive</strong></td>
+<td>(anchor, positive) + negatives</td>
+<td>Simple, works with any pair label</td>
+<td>Slow to converge without many negatives</td>
+</tr>
+<tr>
+<td><strong>Triplet</strong></td>
+<td>(anchor, positive, negative)</td>
+<td>Intuitive; direct margin control</td>
+<td>Hard-triplet mining is expensive</td>
+</tr>
+<tr>
+<td><strong>NT-Xent / InfoNCE</strong></td>
+<td>Pairs + batch-mined negatives</td>
+<td>Scales to large batches</td>
+<td>Needs big batch or momentum queue</td>
+</tr>
+<tr>
+<td><strong>Proxy-based (ProxyNCA)</strong></td>
+<td>Class labels only</td>
+<td>Fast, stable, no mining</td>
+<td>Can overfit to proxies on small datasets</td>
+</tr>
+</tbody>
+</table>
+<p>For most production use cases, start with a pretrained backbone and only add a metric-learning fine-tune if the off-the-shelf embeddings underperform on your test set.</p>
+<h3>Triplet loss formally</h3>
+<pre><code>L = max(0, ||f(a) - f(p)||^2 - ||f(a) - f(n)||^2 + margin)
+</code></pre>
+<p>Pull anchor <code>a</code> close to positive <code>p</code>, push it away from negative <code>n</code>, with a <code>margin</code> that ensures a gap. The three-image structure generalises to any similarity ordering.</p>
+<p>Mining matters: easy triplets (<code>n</code> already far from <code>a</code>) contribute zero loss; only hard triplets teach the network. Semi-hard mining (<code>n</code> further than <code>p</code> but within margin) is the 2016 FaceNet recipe and still dominates.</p>
+<h3>Cosine similarity vs L2</h3>
+<p>Two metrics, two conventions:</p>
+<ul>
+<li><strong>Cosine</strong>: angle between vectors. Requires L2-normalised embeddings.</li>
+<li><strong>L2</strong>: Euclidean distance. Works on raw or normalised embeddings, but is usually paired with L2-normalised + squared L2.</li>
+</ul>
+<p>For most modern nets the two are equivalent: <code>||a - b||^2 = 2 - 2 cos(a, b)</code> when <code>||a|| = ||b|| = 1</code>. Pick the convention that matches your embedding training; mixing them silently changes what &quot;nearest&quot; means.</p>
+<h3>Recall@K</h3>
+<p>The standard retrieval metric:</p>
+<pre><code>recall@K = fraction of queries where at least one correct match is in the top K results
+</code></pre>
+<p>Report recall@1, @5, @10 side by side. A recall@10 above 0.95 with recall@1 below 0.5 means the embedding space has the right structure but the ranking is noisy — try longer fine-tunes or a re-ranking step.</p>
+<p>For duplicate detection, precision@K matters more because every false positive is a user-visible mistake. For visual search, recall@K is the product signal.</p>
+<h3>FAISS in one paragraph</h3>
+<p>Facebook AI Similarity Search. The de-facto library for nearest-neighbour search. Three index choices:</p>
+<ul>
+<li><code>IndexFlatIP</code> / <code>IndexFlatL2</code> — brute force, exact, no training. Use up to ~1M vectors.</li>
+<li><code>IndexIVFFlat</code> — partition into K cells, search only the closest few cells. Approximate, fast, needs training data.</li>
+<li><code>IndexHNSW</code> — graph-based, fastest for many queries, large index size.</li>
+</ul>
+<p>For 100k vectors you probably want <code>IndexFlatIP</code> on cosine similarity. For 10M you want <code>IndexIVFFlat</code>. For 100M+ combined with product quantisation (<code>IndexIVFPQ</code>).</p>
+<h3>Instance-level vs category-level retrieval</h3>
+<p>Two very different problems with the same name:</p>
+<ul>
+<li><strong>Category-level</strong> — &quot;find cats in my catalogue.&quot; Class-conditional similarity; off-the-shelf CLIP / DINOv2 embeddings work well.</li>
+<li><strong>Instance-level</strong> — &quot;find <em>this exact product</em> in my catalogue.&quot; Needs fine-grained discrimination between visually similar objects of the same class; off-the-shelf embeddings under-perform; fine-tuning with metric learning matters.</li>
+</ul>
+<p>Always ask which one you are solving before picking a model.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-7fe214beae34c1c4a859.png" alt="metric-embedding 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<h3>Step 1: Triplet loss</h3>
+<pre><code class="language-python">import torch
+import torch.nn.functional as F
+
+def triplet_loss(anchor, positive, negative, margin=0.2):
+    d_ap = F.pairwise_distance(anchor, positive, p=2)
+    d_an = F.pairwise_distance(anchor, negative, p=2)
+    return F.relu(d_ap - d_an + margin).mean()
+</code></pre>
+<p>One line. Works on L2-normalised or raw embeddings.</p>
+<h3>Step 2: Semi-hard mining</h3>
+<p>Given a batch of embeddings and labels, find the hardest semi-hard negative for each anchor.</p>
+<pre><code class="language-python">def semi_hard_negatives(emb, labels, margin=0.2):
+    dist = torch.cdist(emb, emb)
+    same_class = labels[:, None] == labels[None, :]
+    diff_class = ~same_class
+    N = emb.size(0)
+
+    positives = dist.clone()
+    positives[~same_class] = float(&quot;-inf&quot;)
+    positives.fill_diagonal_(float(&quot;-inf&quot;))
+    pos_idx = positives.argmax(dim=1)
+
+    semi_hard = dist.clone()
+    semi_hard[same_class] = float(&quot;inf&quot;)
+    d_ap = dist[torch.arange(N), pos_idx].unsqueeze(1)
+    semi_hard[dist &lt;= d_ap] = float(&quot;inf&quot;)
+    neg_idx = semi_hard.argmin(dim=1)
+
+    fallback_mask = semi_hard[torch.arange(N), neg_idx] == float(&quot;inf&quot;)
+    if fallback_mask.any():
+        hardest = dist.clone()
+        hardest[same_class] = float(&quot;inf&quot;)
+        neg_idx = torch.where(fallback_mask, hardest.argmin(dim=1), neg_idx)
+    return pos_idx, neg_idx
+</code></pre>
+<p>Each anchor gets the hardest positive in-class and a semi-hard negative that is further than the positive but within margin.</p>
+<h3>Step 3: Recall@K</h3>
+<pre><code class="language-python">def recall_at_k(query_emb, gallery_emb, query_labels, gallery_labels, k=1):
+    sim = query_emb @ gallery_emb.T
+    _, top_k = sim.topk(k, dim=-1)
+    matches = (gallery_labels[top_k] == query_labels[:, None]).any(dim=-1)
+    return matches.float().mean().item()
+</code></pre>
+<p>Top-k by inner product on L2-normalised embeddings equals top-k by cosine. Report the mean proportion of queries with at least one correct neighbour.</p>
+<h3>Step 4: Putting it together</h3>
+<pre><code class="language-python">import torch
+import torch.nn as nn
+from torch.optim import Adam
+
+class Encoder(nn.Module):
+    def __init__(self, in_dim=128, emb_dim=64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, 128), nn.ReLU(),
+            nn.Linear(128, emb_dim),
+        )
+
+    def forward(self, x):
+        return F.normalize(self.net(x), dim=-1)
+
+torch.manual_seed(0)
+num_classes = 6
+protos = F.normalize(torch.randn(num_classes, 128), dim=-1)
+
+def sample_batch(bs=32):
+    labels = torch.randint(0, num_classes, (bs,))
+    x = protos[labels] + 0.15 * torch.randn(bs, 128)
+    return x, labels
+
+enc = Encoder()
+opt = Adam(enc.parameters(), lr=3e-3)
+
+for step in range(200):
+    x, y = sample_batch(32)
+    emb = enc(x)
+    pos_idx, neg_idx = semi_hard_negatives(emb, y)
+    loss = triplet_loss(emb, emb[pos_idx], emb[neg_idx])
+    opt.zero_grad(); loss.backward(); opt.step()
+</code></pre>
+<p>After a few hundred steps the embedding clusters form one cluster per class.</p>
+<h2>Use It</h2>
+<p>Production stacks in 2026:</p>
+<ul>
+<li><strong>DINOv2 + FAISS</strong> — general-purpose visual retrieval. Works off-the-shelf.</li>
+<li><strong>CLIP + FAISS</strong> — when queries are text.</li>
+<li><strong>Fine-tuned DINOv2 + FAISS</strong> — instance-level retrieval, face re-ID, fashion, e-commerce.</li>
+<li><strong>Milvus / Weaviate / Qdrant</strong> — managed vector DB wrappers around FAISS or HNSW.</li>
+</ul>
+<p>For SOTA instance retrieval, the recipe is: DINOv2 backbone, add an embedding head, fine-tune with a triplet or InfoNCE loss on instance-labelled pairs, index in FAISS.</p>
+<h2>Ship It</h2>
+<p>This lesson produces:</p>
+<ul>
+<li><code>outputs/prompt-retrieval-loss-picker.md</code> — a prompt that picks triplet / InfoNCE / ProxyNCA for a given retrieval problem.</li>
+<li><code>outputs/skill-recall-at-k-runner.md</code> — a skill that writes a clean evaluation harness for recall@K with train/val/gallery splits and proper data contract.</li>
+</ul>
+<h2>Exercises</h2>
+<ol>
+<li><strong>(Easy)</strong> Run the toy example above. Plot the embeddings with PCA before and after training to see the six clusters form.</li>
+<li><strong>(Medium)</strong> Add a ProxyNCA loss implementation: one learned &quot;proxy&quot; per class, standard cross-entropy on cosine similarity. Compare convergence speed vs triplet loss on the toy data.</li>
+<li><strong>(Hard)</strong> Take 1,000 ImageNet validation images, embed with DINOv2 via HuggingFace, build a FAISS flat index, and report recall@{1, 5, 10} against the same images as queries (should be 1.0) and against a held-out split with ImageNet labels as ground truth.</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Metric learning</td>
+<td>&quot;Shape the space&quot;</td>
+<td>Training an encoder so distances in its output space reflect a target similarity</td>
+</tr>
+<tr>
+<td>Triplet loss</td>
+<td>&quot;Pull and push&quot;</td>
+<td>L = max(0, d(a, p) - d(a, n) + margin); the canonical metric-learning loss</td>
+</tr>
+<tr>
+<td>Semi-hard mining</td>
+<td>&quot;Useful negatives&quot;</td>
+<td>Negatives further from the anchor than the positive but within margin; empirically the most informative</td>
+</tr>
+<tr>
+<td>Proxy-based loss</td>
+<td>&quot;Class prototypes&quot;</td>
+<td>One learned proxy per class; cross-entropy over similarity-to-proxies; no pair mining</td>
+</tr>
+<tr>
+<td>Recall@K</td>
+<td>&quot;Top-K hit rate&quot;</td>
+<td>Fraction of queries with at least one correct result in the top K</td>
+</tr>
+<tr>
+<td>Instance retrieval</td>
+<td>&quot;Find this exact thing&quot;</td>
+<td>Fine-grained matching; off-the-shelf features usually underperform</td>
+</tr>
+<tr>
+<td>FAISS</td>
+<td>&quot;The NN library&quot;</td>
+<td>Facebook's nearest-neighbour library; supports exact and approximate indexes</td>
+</tr>
+<tr>
+<td>HNSW</td>
+<td>&quot;Graph index&quot;</td>
+<td>Hierarchical navigable small world; fast approximate NN with small memory overhead</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/1503.03832" rel="noreferrer" data-network="true">FaceNet: A Unified Embedding for Face Recognition (Schroff et al., 2015) <small>↗ 需要联网</small></a> — the triplet loss / semi-hard mining paper</li>
+<li><a href="https://arxiv.org/abs/1703.07737" rel="noreferrer" data-network="true">In Defense of the Triplet Loss for Person Re-Identification (Hermans et al., 2017) <small>↗ 需要联网</small></a> — practical guide to triplet fine-tuning</li>
+<li><a href="https://github.com/facebookresearch/faiss/wiki" rel="noreferrer" data-network="true">FAISS documentation <small>↗ 需要联网</small></a> — every index, every trade-off</li>
+<li><a href="https://arxiv.org/abs/2010.06927" rel="noreferrer" data-network="true">SMoT: Metric Learning Taxonomy (Kim et al., 2021) <small>↗ 需要联网</small></a> — survey of modern losses and their connections</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-04-computer-vision--20-image-retrieval-metric.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-04-computer-vision--20-image-retrieval-metric.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/04-computer-vision/20-image-retrieval-metric/code/main.py">phases/04-computer-vision/20-image-retrieval-metric/code/main.py</a><details><summary>查看原始文本</summary><pre><code>import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+def triplet_loss(anchor, positive, negative, margin=0.2):
+    d_ap = F.pairwise_distance(anchor, positive, p=2)
+    d_an = F.pairwise_distance(anchor, negative, p=2)
+    return F.relu(d_ap - d_an + margin).mean()
+
+
+def semi_hard_negatives(emb, labels, margin=0.2):
+    dist = torch.cdist(emb, emb)
+    same_class = labels[:, None] == labels[None, :]
+    N = emb.size(0)
+
+    positives = dist.clone()
+    positives[~same_class] = float(&quot;-inf&quot;)
+    positives.fill_diagonal_(float(&quot;-inf&quot;))
+    pos_idx = positives.argmax(dim=1)
+
+    # Semi-hard: d_ap &lt; d_an &lt; d_ap + margin. Exclude same-class, diagonals,
+    # negatives closer than the positive, and those past the margin boundary.
+    semi_hard = dist.clone()
+    semi_hard[same_class] = float(&quot;inf&quot;)
+    d_ap = dist[torch.arange(N), pos_idx].unsqueeze(1)
+    semi_hard[dist &lt;= d_ap] = float(&quot;inf&quot;)
+    semi_hard[dist &gt;= d_ap + margin] = float(&quot;inf&quot;)
+    neg_idx = semi_hard.argmin(dim=1)
+
+    fallback = semi_hard[torch.arange(N), neg_idx] == float(&quot;inf&quot;)
+    if fallback.any():
+        hardest = dist.clone()
+        hardest[same_class] = float(&quot;inf&quot;)
+        neg_idx = torch.where(fallback, hardest.argmin(dim=1), neg_idx)
+    return pos_idx, neg_idx
+
+
+def recall_at_k(query_emb, gallery_emb, query_labels, gallery_labels, k=1):
+    sim = query_emb @ gallery_emb.T
+    _, top_k = sim.topk(k, dim=-1)
+    matches = (gallery_labels[top_k] == query_labels[:, None]).any(dim=-1)
+    return matches.float().mean().item()
+
+
+class Encoder(nn.Module):
+    def __init__(self, in_dim=128, emb_dim=64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, 128), nn.ReLU(),
+            nn.Linear(128, emb_dim),
+        )
+
+    def forward(self, x):
+        return F.normalize(self.net(x), dim=-1)
+
+
+def main():
+    torch.manual_seed(0)
+    num_classes = 6
+    dim = 128
+    protos = F.normalize(torch.randn(num_classes, dim), dim=-1)
+
+    def sample(bs=48):
+        labels = torch.randint(0, num_classes, (bs,))
+        x = protos[labels] + 0.15 * torch.randn(bs, dim)
+        return x, labels
+
+    enc = Encoder(in_dim=dim, emb_dim=64)
+    opt = torch.optim.Adam(enc.parameters(), lr=3e-3)
+
+    for step in range(200):
+        x, y = sample(48)
+        emb = enc(x)
+        pos_idx, neg_idx = semi_hard_negatives(emb, y)
+        loss = triplet_loss(emb, emb[pos_idx], emb[neg_idx])
+        opt.zero_grad(); loss.backward(); opt.step()
+        if step % 40 == 0:
+            print(f&quot;step {step:3d}  triplet {loss.item():.4f}&quot;)
+
+    enc.eval()
+    with torch.no_grad():
+        gx, gy = sample(200)
+        g_emb = enc(gx)
+        qx, qy = sample(50)
+        q_emb = enc(qx)
+        for k in [1, 5, 10]:
+            r = recall_at_k(q_emb, g_emb, qy, gy, k=k)
+            print(f&quot;  recall@{k}: {r:.3f}&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/04-computer-vision/20-image-retrieval-metric/outputs/prompt-retrieval-loss-picker.md">phases/04-computer-vision/20-image-retrieval-metric/outputs/prompt-retrieval-loss-picker.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: prompt-retrieval-loss-picker
+description: Pick triplet / InfoNCE / ProxyNCA for a given retrieval problem
+phase: 4
+lesson: 20
+---
+
+You are a metric-learning loss selector.
+
+## Inputs
+
+- `task_level`: instance | category
+- `labelled_pairs`: pair (anchor, positive) | triplet (a, p, n) | class_labels_only
+- `dataset_size`: small (&lt;10k) | medium (10k-100k) | large (&gt;100k)
+- `batch_size`: small (&lt;128) | medium (128-512) | large (&gt;512)
+
+## Decision
+
+1. `labelled_pairs == class_labels_only` -&gt; **ProxyNCA / ProxyAnchor**. One proxy per class; no mining.
+2. `labelled_pairs == pair` and `batch_size in [medium, large]` -&gt; **InfoNCE / NT-Xent**. In-batch negatives scale with batch.
+3. `labelled_pairs == pair` and `batch_size == small` -&gt; **MoCo-style contrastive** with momentum queue.
+4. `labelled_pairs == triplet` or `task_level == instance` -&gt; **triplet loss with semi-hard mining**.
+
+## Output
+
+```
+[loss]
+  name:       triplet | InfoNCE | ProxyNCA | ProxyAnchor
+  margin:     &lt;float, if triplet&gt;
+  temperature: &lt;float, if InfoNCE&gt;
+  embedding_dim: typical 128-768
+
+[training]
+  batch:      &lt;int&gt;
+  optimiser:  Adam / SGD with weight decay
+  lr:         &lt;float&gt;
+  epochs:     &lt;int&gt;
+
+[gotchas]
+  - always L2-normalise embeddings
+  - watch for dead proxies in ProxyNCA on small datasets
+  - semi-hard mining requires labels within the batch
+```
+
+## Rules
+
+- Never combine two metric-learning losses unless you have strong evidence they are complementary; usually one wins.
+- For `task_level == category`, strongly prefer off-the-shelf DINOv2 / CLIP before training a custom loss.
+- For `dataset_size &lt; 5k`, recommend starting from a pretrained backbone and training only the embedding head to avoid overfitting.
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/04-computer-vision/20-image-retrieval-metric/outputs/skill-recall-at-k-runner.md">phases/04-computer-vision/20-image-retrieval-metric/outputs/skill-recall-at-k-runner.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: skill-recall-at-k-runner
+description: Write a clean evaluation harness for recall@K with train/val/gallery splits and proper data contract
+version: 1.0.0
+phase: 4
+lesson: 20
+tags: [retrieval, evaluation, recall, faiss]
+---
+
+# Recall@K Runner
+
+Turn a folder of query and gallery images plus labels into a reproducible recall@K number.
+
+## When to use
+
+- First retrieval benchmark for a new backbone.
+- Tracking embedding quality across fine-tune epochs.
+- Comparing two retrieval systems on the same dataset.
+
+## Inputs
+
+- `query_images`: list of paths.
+- `gallery_images`: list of paths (query may or may not overlap).
+- `query_labels`, `gallery_labels`: class or instance IDs.
+- `encoder_fn`: callable `image -&gt; embedding` (precomputed or live).
+- `ks`: list like `[1, 5, 10]`.
+
+## Steps
+
+1. Encode every gallery image once. Save as numpy array.
+2. Encode every query image.
+3. L2-normalise both sets of embeddings.
+4. For each query, compute similarity against all gallery items.
+5. Sort descending, take top max(ks).
+6. For each K, check whether any of the top-K gallery items shares the query&#39;s label.
+7. Report `recall@K = fraction of queries that had at least one correct neighbour in top K`.
+
+## Output template
+
+```python
+import numpy as np
+from sklearn.preprocessing import normalize
+
+def encode_all(images, encoder_fn, batch=32):
+    out = []
+    for i in range(0, len(images), batch):
+        embs = encoder_fn(images[i:i + batch])
+        out.append(embs)
+    return np.concatenate(out)
+
+
+def recall_at_k(query_emb, gallery_emb, q_labels, g_labels,
+                ks=(1, 5, 10), query_ids=None, gallery_ids=None):
+    if len(query_emb) == 0 or len(gallery_emb) == 0:
+        return {f&quot;recall@{k}&quot;: 0.0 for k in ks}
+
+    g_label_set = set(g_labels.tolist())
+    keep = np.array([lbl in g_label_set for lbl in q_labels])
+    if not keep.any():
+        return {f&quot;recall@{k}&quot;: 0.0 for k in ks}
+
+    q_emb_f = query_emb[keep]
+    q_lab_f = q_labels[keep]
+    q_id_f = query_ids[keep] if query_ids is not None else None
+
+    q = normalize(q_emb_f)
+    g = normalize(gallery_emb)
+    sims = q @ g.T
+
+    if q_id_f is not None and gallery_ids is not None:
+        self_mask = q_id_f[:, None] == gallery_ids[None, :]
+        sims = np.where(self_mask, -np.inf, sims)
+
+    top_k_max = min(max(ks), g.shape[0])
+    if top_k_max &lt;= 0:
+        return {f&quot;recall@{k}&quot;: 0.0 for k in ks}
+
+    top = np.argpartition(-sims, top_k_max - 1, axis=1)[:, :top_k_max]
+    sorted_top = np.take_along_axis(
+        top, np.argsort(-sims[np.arange(len(q))[:, None], top], axis=1), axis=1
+    )
+    out = {}
+    for k in ks:
+        k_eff = min(k, top_k_max)
+        hits = np.any(g_labels[sorted_top[:, :k_eff]] == q_lab_f[:, None], axis=1)
+        out[f&quot;recall@{k}&quot;] = float(hits.mean())
+    return out
+
+
+def evaluate(query_images, query_labels, gallery_images, gallery_labels, encoder_fn, ks=(1, 5, 10)):
+    q_emb = encode_all(query_images, encoder_fn)
+    g_emb = encode_all(gallery_images, encoder_fn)
+    return recall_at_k(q_emb, g_emb, np.array(query_labels), np.array(gallery_labels), ks)
+```
+
+## Report
+
+```
+[evaluation]
+  num queries:   &lt;int&gt;
+  num gallery:   &lt;int&gt;
+  embedding_dim: &lt;int&gt;
+
+[recall]
+  recall@1:  &lt;float&gt;
+  recall@5:  &lt;float&gt;
+  recall@10: &lt;float&gt;
+```
+
+## Rules
+
+- Normalise embeddings before computing similarity; FAISS IndexFlatIP on normalised vectors equals cosine.
+- When a query&#39;s ground-truth label is absent from the gallery, exclude it; otherwise recall is trivially capped below 1.
+- If query and gallery overlap, exclude the query itself from its own top-K or you measure self-similarity, not retrieval.
+- For `num_queries &gt; 10,000`, batch the similarity matmul to avoid OOM.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. For a visual search product where queries are text and gallery items are images, which backbone do you pick first?</legend><label class="option"><input type="radio" name="q0" value="0"> A CLIP or SigLIP model — they learn a shared text-image embedding space so cosine similarity between text query and image gallery is meaningful out of the box</label><label class="option"><input type="radio" name="q0" value="1"> A supervised ResNet-50</label><label class="option"><input type="radio" name="q0" value="2"> A handcrafted ORB descriptor</label><label class="option"><input type="radio" name="q0" value="3"> A self-supervised DINOv2 model</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. What does &#39;semi-hard mining&#39; mean in triplet-loss training?</legend><label class="option"><input type="radio" name="q1" value="0"> For each anchor, select a negative that is further than the positive but still within the margin; easy negatives contribute no gradient and hardest negatives can destabilise training, so semi-hard is the sweet spot</label><label class="option"><input type="radio" name="q1" value="1"> Mining cryptocurrency for training examples</label><label class="option"><input type="radio" name="q1" value="2"> Using only the hardest possible negatives</label><label class="option"><input type="radio" name="q1" value="3"> Picking random triplets</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. Your retrieval system reports recall@10 = 0.95 but recall@1 = 0.42. What should you conclude?</legend><label class="option"><input type="radio" name="q2" value="0"> The model is overfitting</label><label class="option"><input type="radio" name="q2" value="1"> Data is leaking from gallery to queries</label><label class="option"><input type="radio" name="q2" value="2"> The evaluation is broken</label><label class="option"><input type="radio" name="q2" value="3"> The embedding space has the correct structure — relevant items are usually in the top 10 — but ranking within the top 10 is noisy; a re-ranking model (cross-encoder, second-stage scorer) or longer metric-learning fine-tune will fix recall@1 without damaging recall@10</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. Cosine similarity on unnormalised embeddings is not cosine similarity — what goes wrong?</legend><label class="option"><input type="radio" name="q3" value="0"> The matmul overflows</label><label class="option"><input type="radio" name="q3" value="1"> It mixes direction with magnitude; cos(a, b) is only correct when both vectors are L2-normalised. On unnormalised embeddings, large-norm items dominate regardless of direction, skewing ranks toward vectors with big magnitudes</label><label class="option"><input type="radio" name="q3" value="2"> PyTorch raises an error</label><label class="option"><input type="radio" name="q3" value="3"> Nothing, it is fine</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. Between instance-level retrieval (find this exact car) and category-level retrieval (find cars), which requires metric-learning fine-tuning?</legend><label class="option"><input type="radio" name="q4" value="0"> Instance-level. Off-the-shelf DINOv2 and CLIP embeddings discriminate between categories well but not between visually similar instances of the same category. A triplet or contrastive fine-tune on (same instance, different instance) pairs tightens the embedding around each instance</label><label class="option"><input type="radio" name="q4" value="1"> Both require the same amount of fine-tuning</label><label class="option"><input type="radio" name="q4" value="2"> Category-level</label><label class="option"><input type="radio" name="q4" value="3"> Neither</label><p data-feedback="4"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/04-computer-vision/19-ocr-document-understanding/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/04-computer-vision/21-keypoint-pose/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/04-computer-vision/20-image-retrieval-metric/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

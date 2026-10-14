@@ -1,0 +1,677 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>调整模式的投影层 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-19-capstone-projects" data-lesson="19-capstone-projects/60-projection-layer-modality-align" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/19-capstone-projects/">综合项目</a> / LESSON 60</p><h1 class="lesson-title">调整模式的投影层</h1><p>Projection Layer for Modality Alignment</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>调整模式的投影层</h1>
+<blockquote>
+<p>视觉编码器生成图像代币.文本解码器消耗文本代币.这两个生活在不同的矢量空间中.一个小的两层MLP将图像代币投射到文本嵌入空间中,而对对对的副本的可西因对齐损失将两个空间拉入协议.该投影是视觉语言模型中最小的部分,并且是转移最重要的.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 19 lessons 30-37 (Track B foundations)
+<strong>Time:</strong> ~90 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>构建一个两个层的MLP投影,将图像特性映射到文本嵌入空间中.</li>
+<li>构建一个模拟文本嵌入表 (没有预先训练的代币,没有真正的体积).</li>
+<li>计算预测图像代币和对标题嵌入之间的可西因对齐损失.</li>
+<li>通过冷的视觉编码器和冷的文本表来训练单独的投影.</li>
+</ul>
+<h2>问题</h2>
+<p>你有一个视觉编码器 (58-59课) 产生维度标记<code>vision_hidden = 768</code>你有一个文本解码器,你想把它插入到上面.<code>text_hidden = 512</code>解码器预期文字形象的代币.图像代币不是文字形象:它们生活在一个编码器在视觉预训练中学到的基础上,没有与解码器的词向量关系.</p>
+<p>两层MLP投影 (线性,GELU,线性) 弥合了差距.<code>768 * 1024 + 1024 * 512 = 1.3M</code>视觉编码器保持冷.文本嵌入表保持冷.只有投影运动.这是2023年发送的LLaVA配方,BLIP-2被重新框架为Q-Former,并且自那以后,每一个开放式VLM都以某种形式采用.</p>
+<h2>概念</h2>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-f189f9be523fea2c26c4.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>在投射前汇集</h3>
+<p>视觉编码器发射197个代币.文本侧有一个标题级嵌入.为了对齐它们,你需要每样本一个图像级向量.CLS聚合是最简单的:从编码器中取出第一个代币并投射它.所有197个代币的平均聚合是另一个选择,这是SigLIP使用的.</p>
+<h3>为什么两个层而不是一个层</h3>
+<p>一个线性投影可以旋转和重新扩展,但如果两个空间有曲率不匹配,则不能固定基础. 两层线性之间的GELU给投影一个非线性曲线,这对Clip风格的特性进行对应到语言模型嵌入式的经验性足够. 深度投影 (LLaVA-NeXT使用GLU;Qwen-VL使用了一堆注意力层) 是扩展;双层MLP是可信的基线,是BLIP-2的Q-Former投影头舰在罩杯下面的.</p>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Shape</th>
+<th>Parameters</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>fc1</td>
+<td><code>(vision_hidden, projection_hidden)</code></td>
+<td><code>768 * 1024 + 1024</code></td>
+</tr>
+<tr>
+<td>activation</td>
+<td>GELU</td>
+<td>0</td>
+</tr>
+<tr>
+<td>fc2</td>
+<td><code>(projection_hidden, text_hidden)</code></td>
+<td><code>1024 * 512 + 512</code></td>
+</tr>
+</tbody>
+</table>
+<p>约为1.3M的参数<code>768 -&gt; 1024 -&gt; 512</code>头部.</p>
+<h3>位的可西因排行性损失</h3>
+<p>调整并不意味着<code>image_emb == text_emb</code>调整意味着<code>image_emb</code>方向的点<code>text_emb</code>体损失是<code>1 - cos_sim(image, text)</code>训练将这项工作推向每对零. 第62课将其概括为对比分批量 (InfoNCE),每个图像必须比批量的任何其他标题更接近自己的标题;本课使用每对版本,以便动态可见.</p>
+<h3>结编码器是这个技巧</h3>
+<p>视觉编码器具有86M参数. 文本表还有一些百万. 训练他们从假体是一个不初步. 结两者都意味着投影的1.3M参数是唯一的变化, 适配器的VLM的运行形状是这样的:重部件保持冷,轻桥列车.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-653d3385d1275ad51ace.png" alt="ch-projection-bridge 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<p><code>code/main.py</code>执行:</p>
+<ul>
+<li><code>MLPProjector(in_dim, hidden_dim, out_dim)</code>两层线性MLP,具有GELU激活.</li>
+<li><code>MockTextEmbedding(vocab_size, dim)</code>结结结嵌入表,由种子的定性源头.</li>
+<li><code>make_pair(seed, vocab_size)</code>标题是短的 id 序列;标题嵌入是指合并于代币嵌入.</li>
+<li><code>cosine_alignment_loss(image_emb, text_emb)</code>两人均<code>1 - cos_sim</code>目标.</li>
+<li>训练循环,在32个合成对 (循环) 上运行了200步的投影,视觉编码器和文本表被结,每25步就会打印损失.</li>
+</ul>
+<p>运行它:</p>
+<pre><code class="language-bash">python3 code/main.py
+</code></pre>
+<p>输出:训练报告在200步内从初始损失下降到0.80左右,证明仅投影可以将图像代币拉到文本空间.每对的最终共数相似性也会打印.</p>
+<h2>用它</h2>
+<p>任何开放式VLM都会出现相同的模式:</p>
+<ul>
+<li>**LLaVA 1.5.**双层GELU MLP投影从CLIP-ViT-L隐藏到LLaMA嵌入薄.冷视觉编码器,冷LLM,训练只有投影 (然后在第二阶段解LLM).</li>
+<li>**BLIP-2.**通过通过交叉注意力与图像代币进行学习的32个查询代币,然后将其投影到LLM嵌入式.Q-Former的最尾的投影头是本课的MLP的模拟.</li>
+<li>**MiniGPT-4.**从BLIP-2 Q-Former输出到Vicuna嵌入式.</li>
+<li>**Qwen-VL.**交叉注意力适配器有几个层,但最后的部分再次是投影到LM嵌入式.</li>
+</ul>
+<p>形状不同,但作用是一样的:池图标,投影到文本嵌入模糊,单独列车.</p>
+<h2>测试</h2>
+<p><code>code/test_main.py</code>覆盖:</p>
+<ul>
+<li>投影机输出形状与配置相匹配<code>out_dim</code></li>
+<li>结结结文本嵌入表为零<code>requires_grad</code>参数</li>
+<li>在相同的向量上,可素损失为零,而在反平行向量上则为2</li>
+<li>投影仪梯度流动在一次向后过后</li>
+<li>训练循环减少步骤0至步骤200之间的损失</li>
+</ul>
+<p>运行它们:</p>
+<pre><code class="language-bash">python3 -m unittest code/test_main.py
+</code></pre>
+<h2>运动</h2>
+<ol>
+<li>
+<p>替换CLS聚合式为196个补丁代币的平均聚合式,并比较200步后的最终损失.平均聚合式通常在合成数据上运行得更快;CLS在自然图像上更有效的样本.</p>
+</li>
+<li>
+<p>增加已知的度温度 (<code>cos / tau</code>) 并观察当<code>tau</code>低于 (渐变噪音) 或高于 (高于损失平原).</p>
+</li>
+<li>
+<p>换取两层MLP为单一线性层,量化损失差距.非线性更重要于自然图像特征,而不重要于合成特征.</p>
+</li>
+<li>
+<p>添加一个小的L2罚款在投影仪重量和观察它如何与可西因配线相互作用 (可西因是尺度不变,所以罚款大多缩小未使用的方向).</p>
+</li>
+<li>
+<p>继续投影仪的重量,然后重新加载并运行推断,而不需要视觉编码器向后通过,以验证在部署时只需要投影仪.</p>
+</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What it means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Modality alignment</td>
+<td>The act of making image and text embeddings comparable in one shared space</td>
+</tr>
+<tr>
+<td>Projection head</td>
+<td>The small module that maps one space to another, usually a 2-layer MLP</td>
+</tr>
+<tr>
+<td>Cosine similarity</td>
+<td>Dot product divided by the product of L2 norms</td>
+</tr>
+<tr>
+<td>Frozen encoder</td>
+<td>The vision (or text) model has all parameters with <code>requires_grad=False</code></td>
+</tr>
+<tr>
+<td>Mock corpus</td>
+<td>Synthetic pairs used so training has no dataset download dependency</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li>两阶段火车的LLaVA纸 (项目,然后解LM).</li>
+<li>作为可学习的投影替代品,用于Q-Former的BLIP-2纸.</li>
+<li>作为更深层次的投影头,交叉注意力适配器的Qwen-VL技术报告.</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Projection Layer for Modality Alignment</h1>
+<blockquote>
+<p>A vision encoder produces image tokens. A text decoder consumes text tokens. The two live in different vector spaces. A small two-layer MLP projects image tokens into the text embedding space, and a cosine alignment loss against a paired caption pulls the two spaces into agreement. That projection is the smallest piece of a vision-language model and the one that matters most for transfer.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 19 lessons 30-37 (Track B foundations)
+<strong>Time:</strong> ~90 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Build a two-layer MLP projection that maps image features into the text embedding space.</li>
+<li>Construct a mock text embedding table (no pretrained tokenizer, no real corpus).</li>
+<li>Compute a cosine alignment loss between projected image tokens and a paired caption embedding.</li>
+<li>Train the projection alone with a frozen vision encoder and a frozen text table.</li>
+</ul>
+<h2>The Problem</h2>
+<p>You have a vision encoder (lessons 58-59) producing tokens of dimension <code>vision_hidden = 768</code>. You have a text decoder you want to bolt on top with embedding dimension <code>text_hidden = 512</code> (any other number is just as plausible). The decoder expects text-shaped tokens. The image tokens are not text-shaped: they live in a basis the encoder learned during vision-only pretraining, with no relationship to the decoder's word vectors.</p>
+<p>Two-layer MLP projection (linear, GELU, linear) bridges the gap. It is small enough (about <code>768 * 1024 + 1024 * 512 = 1.3M</code> parameters) to train in minutes on a single GPU, and it is the only piece that has to learn during the alignment phase. The vision encoder stays frozen. The text embedding table stays frozen. Only the projection moves. This is the recipe LLaVA shipped in 2023, that BLIP-2 reframed as a Q-Former, and that every open-weight VLM since has adopted in some form.</p>
+<h2>The Concept</h2>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-f189f9be523fea2c26c4.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>Pooling before projection</h3>
+<p>The vision encoder emits 197 tokens. The text side has a single caption-level embedding. To align them you need one image-level vector per sample. CLS pooling is the simplest: take the first token from the encoder and project it. Mean pooling over all 197 tokens is another option and is what SigLIP uses. Either pools 197 vectors down to one.</p>
+<h3>Why two layers and not one</h3>
+<p>A single linear projection can rotate and rescale but cannot fix the basis if the two spaces have curvature mismatches. GELU between two linear layers gives the projection one non-linear bend, which is empirically enough to align CLIP-style features to language model embeddings. Deeper projections (LLaVA-NeXT used GLU; Qwen-VL used a stack of attention layers) are extensions; two-layer MLP is the canonical baseline and is what BLIP-2's Q-Former projection head ships with under the hood.</p>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Shape</th>
+<th>Parameters</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>fc1</td>
+<td><code>(vision_hidden, projection_hidden)</code></td>
+<td><code>768 * 1024 + 1024</code></td>
+</tr>
+<tr>
+<td>activation</td>
+<td>GELU</td>
+<td>0</td>
+</tr>
+<tr>
+<td>fc2</td>
+<td><code>(projection_hidden, text_hidden)</code></td>
+<td><code>1024 * 512 + 512</code></td>
+</tr>
+</tbody>
+</table>
+<p>About 1.3M parameters for a <code>768 -&gt; 1024 -&gt; 512</code> head.</p>
+<h3>Cosine alignment loss</h3>
+<p>Align does not mean <code>image_emb == text_emb</code>. Align means <code>image_emb</code> points in the same direction as <code>text_emb</code> in the joint space. The cosine loss is <code>1 - cos_sim(image, text)</code>, ranging from 0 (perfectly aligned) to 2 (opposite). Training drives this toward zero per pair. Lesson 62 generalizes to a contrastive batch (InfoNCE) where every image must be closer to its own caption than to any other caption in the batch; this lesson uses the per-pair version so the dynamics are visible.</p>
+<h3>Frozen encoder is the trick</h3>
+<p>The vision encoder has 86M parameters. The text table has another few million. Training all of them from a mock corpus is a non-starter. Freezing both means the projection's 1.3M parameters are the only thing changing, and a few hundred steps on synthetic pairs is enough to drive the loss down. This is exactly the operational shape of every adapter-based VLM: the heavy parts stay frozen, the light bridge trains.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-653d3385d1275ad51ace.png" alt="ch-projection-bridge 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<p><code>code/main.py</code> implements:</p>
+<ul>
+<li><code>MLPProjector(in_dim, hidden_dim, out_dim)</code>, two-layer linear MLP with GELU activation.</li>
+<li><code>MockTextEmbedding(vocab_size, dim)</code>, a frozen embedding table with deterministic init from a seed.</li>
+<li><code>make_pair(seed, vocab_size)</code>, which synthesizes one paired (image, caption) sample. Captions are short id sequences; the caption embedding is mean-pooled over token embeddings.</li>
+<li><code>cosine_alignment_loss(image_emb, text_emb)</code>, the per-pair <code>1 - cos_sim</code> objective.</li>
+<li>A training loop that runs the projection for 200 steps over 32 synthetic pairs (cycled), with the vision encoder and text table frozen, and prints the loss every 25 steps.</li>
+</ul>
+<p>Run it:</p>
+<pre><code class="language-bash">python3 code/main.py
+</code></pre>
+<p>Output: training reports drop from initial loss around 1.07 down to about 0.80 within 200 steps, demonstrating that the projection alone can pull image tokens toward the text space. The final cosine similarity per pair is also printed.</p>
+<h2>Use It</h2>
+<p>The same pattern shows up in every open-weight VLM:</p>
+<ul>
+<li><strong>LLaVA 1.5.</strong> Two-layer GELU MLP projection from CLIP-ViT-L hidden to LLaMA embedding dim. Frozen vision encoder, frozen LLM, train only the projection (then unfreeze the LLM in stage two).</li>
+<li><strong>BLIP-2.</strong> Q-Former takes 32 learned query tokens through cross-attention against image tokens, then projects to the LLM embedding dim. The projection head at the very end of Q-Former is the analog of this lesson's MLP.</li>
+<li><strong>MiniGPT-4.</strong> Single linear projection from BLIP-2 Q-Former output to Vicuna embedding dim.</li>
+<li><strong>Qwen-VL.</strong> Cross-attention adapter with several layers, but the final piece is again a projection to the LM embedding dim.</li>
+</ul>
+<p>The shape varies but the role is identical: pool image tokens, project to text embedding dim, train alone.</p>
+<h2>Tests</h2>
+<p><code>code/test_main.py</code> covers:</p>
+<ul>
+<li>projector output shape matches the configured <code>out_dim</code></li>
+<li>frozen text embedding table has zero <code>requires_grad</code> parameters</li>
+<li>cosine loss is zero on identical vectors and is 2 on anti-parallel vectors</li>
+<li>projector gradient flows after one backward pass</li>
+<li>the training loop reduces loss between step 0 and step 200</li>
+</ul>
+<p>Run them:</p>
+<pre><code class="language-bash">python3 -m unittest code/test_main.py
+</code></pre>
+<h2>Exercises</h2>
+<ol>
+<li>
+<p>Replace CLS pooling with mean pooling over the 196 patch tokens and compare final loss after 200 steps. Mean pooling usually trains faster on synthetic data; CLS is more sample-efficient on natural images.</p>
+</li>
+<li>
+<p>Add a learned scalar temperature to the cosine loss (<code>cos / tau</code>) and observe what happens when <code>tau</code> is too small (gradient noise) or too large (loss plateaus high).</p>
+</li>
+<li>
+<p>Swap the two-layer MLP for a single linear layer and quantify the loss gap. The non-linearity matters more on natural image features and less on synthetic ones.</p>
+</li>
+<li>
+<p>Add a small L2 penalty on the projector weights and watch how it interacts with cosine alignment (cosine is scale-invariant, so the penalty mostly shrinks unused directions).</p>
+</li>
+<li>
+<p>Persist projector weights, then reload and run inference without the vision encoder backward pass to verify that only the projector is needed at deploy time.</p>
+</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What it means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Modality alignment</td>
+<td>The act of making image and text embeddings comparable in one shared space</td>
+</tr>
+<tr>
+<td>Projection head</td>
+<td>The small module that maps one space to another, usually a 2-layer MLP</td>
+</tr>
+<tr>
+<td>Cosine similarity</td>
+<td>Dot product divided by the product of L2 norms</td>
+</tr>
+<tr>
+<td>Frozen encoder</td>
+<td>The vision (or text) model has all parameters with <code>requires_grad=False</code></td>
+</tr>
+<tr>
+<td>Mock corpus</td>
+<td>Synthetic pairs used so training has no dataset download dependency</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li>LLaVA paper for the two-stage train (project, then unfreeze LM).</li>
+<li>BLIP-2 paper for Q-Former as a learnable projection alternative.</li>
+<li>Qwen-VL technical report for cross-attention adapters as deeper projection heads.</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-19-capstone-projects--60-projection-layer-modality-align.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-19-capstone-projects--60-projection-layer-modality-align.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/60-projection-layer-modality-align/code/main.py">phases/19-capstone-projects/60-projection-layer-modality-align/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Two-layer MLP projection from vision-token space to text embedding space.
+
+The vision encoder (lessons 58 and 59) stays frozen. A frozen mock text
+embedding table provides target vectors for synthetic captions. Only the
+projector trains. The objective is per-pair cosine alignment.
+
+Run with: python3 main.py
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import importlib.util
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+THIS_DIR = Path(__file__).resolve().parent
+LESSON_59 = THIS_DIR.parent.parent / &quot;59-vit-transformer&quot; / &quot;code&quot;
+
+
+def _load_module(name: str, path: Path):
+    if name in sys.modules:
+        return sys.modules[name]
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f&quot;could not load {path}&quot;)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    try:
+        spec.loader.exec_module(mod)
+    except Exception:
+        sys.modules.pop(name, None)
+        raise
+    return mod
+
+
+_encoder_mod = _load_module(&quot;vit_encoder_lesson59&quot;, LESSON_59 / &quot;main.py&quot;)
+ViTConfig = _encoder_mod.ViTConfig
+VisionEncoder = _encoder_mod.VisionEncoder
+synthesize_image = _encoder_mod.synthesize_image
+
+
+@dataclass(frozen=True)
+class AlignConfig:
+    vision_hidden: int = 768
+    projection_hidden: int = 1024
+    text_hidden: int = 512
+    vocab_size: int = 4096
+    max_caption_len: int = 16
+    pairs: int = 32
+    steps: int = 200
+    lr: float = 3e-4
+    seed: int = 0
+
+
+class MLPProjector(nn.Module):
+    &quot;&quot;&quot;Two-layer MLP, the canonical adapter shape used by LLaVA-style VLMs.&quot;&quot;&quot;
+
+    def __init__(self, in_dim: int, hidden_dim: int, out_dim: int) -&gt; None:
+        super().__init__()
+        self.fc1 = nn.Linear(in_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, out_dim)
+
+    def forward(self, x: torch.Tensor) -&gt; torch.Tensor:
+        return self.fc2(F.gelu(self.fc1(x)))
+
+
+class MockTextEmbedding(nn.Module):
+    &quot;&quot;&quot;Frozen text table used as alignment targets.
+
+    Captions are sequences of token ids; the caption embedding is the mean of
+    the embedded ids. Deterministic given seed.
+    &quot;&quot;&quot;
+
+    def __init__(self, vocab_size: int, dim: int, seed: int) -&gt; None:
+        super().__init__()
+        gen = torch.Generator().manual_seed(seed)
+        weight = torch.randn(vocab_size, dim, generator=gen) * (1.0 / dim ** 0.5)
+        self.table = nn.Embedding(vocab_size, dim, _weight=weight)
+        for p in self.table.parameters():
+            p.requires_grad_(False)
+
+    def forward(self, ids: torch.Tensor) -&gt; torch.Tensor:
+        if ids.dim() != 2:
+            raise ValueError(f&quot;expected (B, L) ids, got {tuple(ids.shape)}&quot;)
+        embed = self.table(ids)
+        mask = (ids != 0).float().unsqueeze(-1)
+        denom = mask.sum(dim=1).clamp(min=1.0)
+        pooled = (embed * mask).sum(dim=1) / denom
+        return pooled
+
+
+def make_pair(seed: int, vocab_size: int, max_len: int) -&gt; tuple[torch.Tensor, torch.Tensor]:
+    &quot;&quot;&quot;One synthetic (image, caption_ids) pair.
+
+    Image is the deterministic 224x224x3 fixture from lesson 58 with a per-pair
+    seed. Caption is a length-`max_len` sequence of token ids, again
+    deterministic in seed. Token id 0 is reserved as padding.
+    &quot;&quot;&quot;
+    img = synthesize_image(seed=seed)
+    rng = np.random.default_rng(seed + 10_000)
+    length = int(rng.integers(4, max_len + 1))
+    ids = np.zeros((max_len,), dtype=np.int64)
+    ids[:length] = rng.integers(1, vocab_size, size=length)
+    return img, torch.from_numpy(ids).unsqueeze(0)
+
+
+def cosine_alignment_loss(image_emb: torch.Tensor, text_emb: torch.Tensor) -&gt; torch.Tensor:
+    if image_emb.shape != text_emb.shape:
+        raise ValueError(
+            f&quot;shape mismatch image {tuple(image_emb.shape)} vs text {tuple(text_emb.shape)}&quot;
+        )
+    img_n = F.normalize(image_emb, dim=-1)
+    txt_n = F.normalize(text_emb, dim=-1)
+    cos = (img_n * txt_n).sum(dim=-1)
+    return (1.0 - cos).mean()
+
+
+def freeze(module: nn.Module) -&gt; None:
+    for p in module.parameters():
+        p.requires_grad_(False)
+
+
+@dataclass
+class TrainStats:
+    initial_loss: float
+    final_loss: float
+    final_cos: float
+    losses: list[float]
+
+
+def train(cfg: AlignConfig) -&gt; tuple[MLPProjector, TrainStats]:
+    if cfg.pairs &lt;= 0:
+        raise ValueError(f&quot;pairs must be &gt; 0, got {cfg.pairs}&quot;)
+    if cfg.steps &lt;= 0:
+        raise ValueError(f&quot;steps must be &gt; 0, got {cfg.steps}&quot;)
+    if cfg.max_caption_len &lt; 4:
+        raise ValueError(
+            f&quot;max_caption_len must be &gt;= 4 for make_pair(), got {cfg.max_caption_len}&quot;
+        )
+
+    torch.manual_seed(cfg.seed)
+
+    encoder_cfg = ViTConfig(image_size=224, patch_size=16, hidden=cfg.vision_hidden,
+                            depth=4, heads=8, mlp_ratio=2.0)
+    encoder = VisionEncoder(encoder_cfg).eval()
+    freeze(encoder)
+
+    text = MockTextEmbedding(cfg.vocab_size, cfg.text_hidden, seed=cfg.seed + 1)
+    freeze(text)
+
+    projector = MLPProjector(cfg.vision_hidden, cfg.projection_hidden, cfg.text_hidden)
+
+    pairs = [make_pair(seed=cfg.seed + 1000 + i,
+                       vocab_size=cfg.vocab_size,
+                       max_len=cfg.max_caption_len) for i in range(cfg.pairs)]
+
+    opt = torch.optim.Adam(projector.parameters(), lr=cfg.lr)
+    losses: list[float] = []
+
+    initial_loss = 0.0
+    final_loss = 0.0
+    final_cos = 0.0
+    for step in range(cfg.steps):
+        img, ids = pairs[step % cfg.pairs]
+        with torch.no_grad():
+            _, cls = encoder(img)
+            text_emb = text(ids)
+
+        image_emb = projector(cls)
+        loss = cosine_alignment_loss(image_emb, text_emb)
+
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+
+        losses.append(loss.item())
+        if step == 0:
+            initial_loss = loss.item()
+        if step % 25 == 0 or step == cfg.steps - 1:
+            with torch.no_grad():
+                cos = F.cosine_similarity(image_emb, text_emb).mean().item()
+            print(f&quot;  step {step:4d}  loss {loss.item():.4f}  cos {cos:+.4f}&quot;)
+        if step == cfg.steps - 1:
+            final_loss = loss.item()
+            with torch.no_grad():
+                final_cos = F.cosine_similarity(image_emb, text_emb).mean().item()
+
+    return projector, TrainStats(
+        initial_loss=initial_loss,
+        final_loss=final_loss,
+        final_cos=final_cos,
+        losses=losses,
+    )
+
+
+def main() -&gt; None:
+    print(&quot;=&quot; * 60)
+    print(&quot;PROJECTION LAYER FOR MODALITY ALIGNMENT&quot;)
+    print(&quot;=&quot; * 60)
+
+    cfg = AlignConfig()
+    print(f&quot;  vision hidden     : {cfg.vision_hidden}&quot;)
+    print(f&quot;  projection hidden : {cfg.projection_hidden}&quot;)
+    print(f&quot;  text hidden       : {cfg.text_hidden}&quot;)
+    print(f&quot;  vocab size        : {cfg.vocab_size}&quot;)
+    print(f&quot;  pairs             : {cfg.pairs}&quot;)
+    print(f&quot;  steps             : {cfg.steps}&quot;)
+    print(f&quot;  learning rate     : {cfg.lr}&quot;)
+
+    print(&quot;\ntraining (vision encoder frozen, text table frozen, projector trains):&quot;)
+    projector, stats = train(cfg)
+
+    n_proj = sum(p.numel() for p in projector.parameters())
+    print(f&quot;\nprojector params  : {n_proj:,}&quot;)
+    print(f&quot;initial loss      : {stats.initial_loss:.4f}&quot;)
+    print(f&quot;final loss        : {stats.final_loss:.4f}&quot;)
+    print(f&quot;final cosine sim  : {stats.final_cos:+.4f}&quot;)
+    drop = stats.initial_loss - stats.final_loss
+    print(f&quot;loss drop         : {drop:.4f}&quot;)
+    if drop &gt; 0.0:
+        print(&quot;  ok: projector learned an alignment direction&quot;)
+    else:
+        print(&quot;  FAIL: loss did not decrease&quot;)
+
+    print(&quot;\ndone.&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/60-projection-layer-modality-align/code/test_main.py">phases/19-capstone-projects/60-projection-layer-modality-align/code/test_main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Unit tests for the modality-alignment projection layer.&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import unittest
+
+import torch
+import torch.nn.functional as F
+
+from main import (
+    AlignConfig,
+    MLPProjector,
+    MockTextEmbedding,
+    cosine_alignment_loss,
+    make_pair,
+    train,
+)
+
+
+class TestProjector(unittest.TestCase):
+    def test_output_shape(self) -&gt; None:
+        proj = MLPProjector(in_dim=64, hidden_dim=128, out_dim=32)
+        x = torch.randn(5, 64)
+        out = proj(x)
+        self.assertEqual(out.shape, (5, 32))
+
+    def test_gradient_flows(self) -&gt; None:
+        proj = MLPProjector(in_dim=32, hidden_dim=64, out_dim=16)
+        x = torch.randn(3, 32)
+        target = torch.randn(3, 16)
+        loss = cosine_alignment_loss(proj(x), target)
+        loss.backward()
+        self.assertIsNotNone(proj.fc1.weight.grad)
+        self.assertGreater(proj.fc1.weight.grad.norm().item(), 0.0)
+
+
+class TestTextTable(unittest.TestCase):
+    def test_table_is_frozen(self) -&gt; None:
+        table = MockTextEmbedding(vocab_size=64, dim=16, seed=0)
+        trainable = [p for p in table.parameters() if p.requires_grad]
+        self.assertEqual(trainable, [])
+
+    def test_pooling_ignores_padding(self) -&gt; None:
+        table = MockTextEmbedding(vocab_size=64, dim=8, seed=2)
+        ids_full = torch.tensor([[1, 2, 3, 4]])
+        ids_pad = torch.tensor([[1, 2, 3, 4, 0, 0]])
+        out_full = table(ids_full)
+        out_pad = table(ids_pad)
+        self.assertTrue(torch.allclose(out_full, out_pad, atol=1e-5))
+
+
+class TestCosineLoss(unittest.TestCase):
+    def test_zero_loss_on_identical_vectors(self) -&gt; None:
+        v = torch.randn(4, 8)
+        loss = cosine_alignment_loss(v, v)
+        self.assertAlmostEqual(loss.item(), 0.0, places=5)
+
+    def test_max_loss_on_antiparallel_vectors(self) -&gt; None:
+        v = torch.randn(4, 8)
+        loss = cosine_alignment_loss(v, -v)
+        self.assertAlmostEqual(loss.item(), 2.0, places=4)
+
+
+class TestTrainingLoop(unittest.TestCase):
+    def test_loss_drops_over_steps(self) -&gt; None:
+        cfg = AlignConfig(
+            vision_hidden=64,
+            projection_hidden=128,
+            text_hidden=32,
+            vocab_size=64,
+            max_caption_len=4,
+            pairs=4,
+            steps=40,
+            lr=1e-3,
+            seed=7,
+        )
+        torch.manual_seed(cfg.seed)
+        _, stats = _train_small(cfg)
+        self.assertLess(stats.final_loss, stats.initial_loss)
+
+
+def _train_small(cfg: AlignConfig):
+    import importlib.util
+    import sys
+    from pathlib import Path
+
+    THIS = Path(__file__).resolve().parent
+    LESSON_59 = THIS.parent.parent / &quot;59-vit-transformer&quot; / &quot;code&quot;
+    name = &quot;vit_encoder_lesson59_test&quot;
+    if name in sys.modules:
+        mod = sys.modules[name]
+    else:
+        spec = importlib.util.spec_from_file_location(name, LESSON_59 / &quot;main.py&quot;)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[name] = mod
+        spec.loader.exec_module(mod)
+
+    encoder_cfg = mod.ViTConfig(
+        image_size=32, patch_size=16, hidden=cfg.vision_hidden,
+        depth=2, heads=4, mlp_ratio=2.0,
+    )
+    encoder = mod.VisionEncoder(encoder_cfg).eval()
+    for p in encoder.parameters():
+        p.requires_grad_(False)
+
+    text = MockTextEmbedding(cfg.vocab_size, cfg.text_hidden, seed=cfg.seed + 1)
+    projector = MLPProjector(cfg.vision_hidden, cfg.projection_hidden, cfg.text_hidden)
+
+    pairs = []
+    for i in range(cfg.pairs):
+        img = torch.randn(1, 3, 32, 32)
+        ids = torch.randint(1, cfg.vocab_size, (1, cfg.max_caption_len))
+        pairs.append((img, ids))
+
+    opt = torch.optim.Adam(projector.parameters(), lr=cfg.lr)
+    losses = []
+    init = 0.0
+    final = 0.0
+    for step in range(cfg.steps):
+        img, ids = pairs[step % cfg.pairs]
+        with torch.no_grad():
+            _, cls = encoder(img)
+            text_emb = text(ids)
+        loss = cosine_alignment_loss(projector(cls), text_emb)
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+        if step == 0:
+            init = loss.item()
+        if step == cfg.steps - 1:
+            final = loss.item()
+        losses.append(loss.item())
+
+    class S:
+        pass
+
+    s = S()
+    s.initial_loss = init
+    s.final_loss = final
+    s.final_cos = 0.0
+    s.losses = losses
+    return projector, s
+
+
+class TestPairFixture(unittest.TestCase):
+    def test_make_pair_shapes(self) -&gt; None:
+        img, ids = make_pair(seed=3, vocab_size=128, max_len=8)
+        self.assertEqual(img.shape, (1, 3, 224, 224))
+        self.assertEqual(ids.shape, (1, 8))
+        self.assertTrue((ids &gt;= 0).all().item())
+        self.assertTrue((ids &lt; 128).all().item())
+
+
+if __name__ == &quot;__main__&quot;:
+    unittest.main()
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. Why does the vision encoder produce tokens that the text decoder cannot consume directly?</legend><label class="option"><input type="radio" name="q0" value="0"> Image tokens are encrypted</label><label class="option"><input type="radio" name="q0" value="1"> Image tokens are too short</label><label class="option"><input type="radio" name="q0" value="2"> They are in a different file format</label><label class="option"><input type="radio" name="q0" value="3"> Image tokens live in a basis the encoder learned during vision pretraining with no correspondence to the decoder&#39;s word vectors</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. Why is the two-layer MLP enough for modality alignment in practice?</legend><label class="option"><input type="radio" name="q1" value="0"> One-layer projections are forbidden</label><label class="option"><input type="radio" name="q1" value="1"> PyTorch requires two layers</label><label class="option"><input type="radio" name="q1" value="2"> One non-linear bend (GELU) between two linear projections is empirically enough to align CLIP-style features with text embeddings</label><label class="option"><input type="radio" name="q1" value="3"> Deeper projections are illegal</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. Why is the vision encoder frozen during this alignment stage?</legend><label class="option"><input type="radio" name="q2" value="0"> The encoder is empty</label><label class="option"><input type="radio" name="q2" value="1"> The 86M-parameter encoder cannot be retrained on a small mock corpus; the 1.3M-parameter projection alone is light enough to align in minutes</label><label class="option"><input type="radio" name="q2" value="2"> Frozen means faster wall time</label><label class="option"><input type="radio" name="q2" value="3"> PyTorch does not support training the encoder</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. What does cosine_alignment_loss(image_emb, text_emb) return when the two vectors point in opposite directions?</legend><label class="option"><input type="radio" name="q3" value="0"> Infinity</label><label class="option"><input type="radio" name="q3" value="1"> 1.0</label><label class="option"><input type="radio" name="q3" value="2"> 0.0</label><label class="option"><input type="radio" name="q3" value="3"> 2.0</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. Why does CLS pooling get used to produce a single image-level vector from 197 tokens?</legend><label class="option"><input type="radio" name="q4" value="0"> It saves disk space</label><label class="option"><input type="radio" name="q4" value="1"> PyTorch sums tokens automatically</label><label class="option"><input type="radio" name="q4" value="2"> Patch tokens are unused</label><label class="option"><input type="radio" name="q4" value="3"> Captions are one vector per sample so the image side also needs one vector; the CLS token is the encoder&#39;s built-in image summary</label><p data-feedback="4"></p></fieldset><fieldset><legend>6. Which production system maps most directly to the lesson 60 pattern?</legend><label class="option"><input type="radio" name="q5" value="0"> LLaVA 1.5: frozen vision encoder, frozen LLM, train only a two-layer MLP projection</label><label class="option"><input type="radio" name="q5" value="1"> PaLM</label><label class="option"><input type="radio" name="q5" value="2"> AlphaFold</label><label class="option"><input type="radio" name="q5" value="3"> Stable Diffusion</label><p data-feedback="5"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/19-capstone-projects/59-vit-transformer/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/19-capstone-projects/61-cross-attention-fusion/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/19-capstone-projects/60-projection-layer-modality-align/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

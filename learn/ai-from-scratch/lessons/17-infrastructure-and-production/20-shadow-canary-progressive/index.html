@@ -1,0 +1,782 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>阴影交通,加拿大陆部署和LLM的逐步部署 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-17-infrastructure-and-production" data-lesson="17-infrastructure-and-production/20-shadow-canary-progressive" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/17-infrastructure-and-production/">基础设施与生产</a> / LESSON 20</p><h1 class="lesson-title">阴影交通,加拿大陆部署和LLM的逐步部署</h1><p>Shadow Traffic, Canary Rollout, and Progressive Deployment for LLMs</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>阴影交通,加拿大陆部署和LLM的逐步部署</h1>
+<blockquote>
+<p>应用程序的部署结合了软件部署最困难的部分:无单元测试,分散故障模式,信号延迟. 序列是 (1) 影子模式 复制的提示请求候选模型,记录,与零用户影响比较;捕获明显的分布问题,但不是质量保证; (2) 化推广 渐进的流量转移 10% → 25% → 50% → 75% → 100% 每一步都有门;跟踪延迟百分比,成本/请求,错误/拒绝率,输出长度分布,用户反率; (3) 稳定后A/B测试不同的替代方案. 由于GPU FP非关联性加上批量大小差异,具有相同输入的运行中高达15%的精度变化. 成本是变量,不是常量 一个20%更好的模型可以每次调用成本高出3倍. 转型速度是决定性的:如果转型需要重新部署,你太慢了. 政策生活在配置/旗中;模型生活在注册表中,注册表有注册表;反转 = 翻转政策 + 逆转门 + 缩旧模型在几秒钟内.</p>
+</blockquote>
+<p><strong>Type:</strong> Learn
+<strong>Languages:</strong> Python (stdlib, toy canary-progression simulator)
+<strong>Prerequisites:</strong> Phase 17 · 13 (Observability), Phase 17 · 21 (A/B Testing)
+<strong>Time:</strong> ~60 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>区分影子模式 (零冲击比较),加拿大 (现场流量进步),A/B (稳定证实比较).</li>
+<li>列出五项专为LLM的加拿大标准 (延迟,成本/请求,错误/拒绝,输出长度分布,用户反).</li>
+<li>解释为什么LLM非决定性 (高达15%) 改变了&quot;稳定&quot;在推广中意味着什么.</li>
+<li>设计一个需要几秒钟 (政策转换) 而不是几小时 (重新部署) 的反转路径.</li>
+</ul>
+<h2>问题</h2>
+<p>你发出了新车型. 离线评估显示了3%的准确度,你将其转换到生产中. 在24小时内,成本上升了40%,用户指下降了8%,三个客户的门票报告了&quot;奇怪的答案&quot;. 你回头. 再部署需要3小时. 你的周末是破产的.</p>
+<p>影模式在任何用户看到之前就会发现成本上40%的. 利将在指下移动时停止在10%的水平. 政策旗倒车将需要30秒. 纪律是填补&quot;离线评估看起来很好&quot;和&quot;真实用户很开心&quot;之间的差距.</p>
+<h2>概念</h2>
+<h3>影子模式</h3>
+<p>申请人收到与生产相同的请求;输出记录,而不是返回用户.用户影响零.记录:</p>
+<ul>
+<li>产量含量 (与生产差异).</li>
+<li>代币计数 (成本分数).</li>
+<li>延迟.</li>
+<li>拒绝和错误.</li>
+</ul>
+<p>捕获:成本升高,长度回归,明显的拒绝变化,严重的错误. 没有捕获: 质量的德尔塔用户会感觉. 影子是一个烟雾测试,而不是质量测试.</p>
+<h3>卡纳里地区的部署</h3>
+<p>随着门的转移,流量逐步转移.典型的进步:1% → 10% → 25% → 50% → 75% → 100%.每步5个指标的门:</p>
+<ol>
+<li><strong>Latency percentiles</strong> P50, P95, P99. 违规性:鱼的P99&gt; 1.5x基线.</li>
+<li><strong>Cost per request</strong>混合. 违规:超过原线20%</li>
+<li><strong>Error / refusal rate</strong>5xx加上明确拒绝.</li>
+<li><strong>Output length distribution</strong>平均值+P99. 违规性:分布转移.</li>
+<li><strong>User-feedback rate</strong>指/票票申请. 违规:1.5倍的基线.</li>
+</ol>
+<h3>无决定主义是新的变化</h3>
+<p>相同的输入产生的输出不相同.</p>
+<ul>
+<li>GPU FP非关联性 (浮点降低顺序因批量而异).</li>
+<li>批量差异 (在128批量和16批量时相同的提示).</li>
+<li>采样 (温度 &gt; 0).</li>
+</ul>
+<p>测量:在相同的评估集中,可进行最大15%的精度变化.在推出中&quot;稳定&quot;意味着指标在预期变化范围内,不与基线相同.设置门在噪音地面以上.</p>
+<h3>成本是变量</h3>
+<p>通过&quot;更好的&quot;模型,每次通话都会有3倍的成本.成本/请求是五个门口之一.</p>
+<h3>滚动是武器</h3>
+<ul>
+<li>政策标志 (功能标志系统):配置中的翻转百分比;需要几秒钟.</li>
+<li>模型点 (注册表消化):点模型不会自动升级.</li>
+<li>翻转=反转旗+设置固定的消化到之前.</li>
+</ul>
+<p>如果你的堆需要重新部署,然后在滚动之前修复.</p>
+<h3>工具</h3>
+<p><strong>Argo Rollouts</strong>现在,<strong>Flagger</strong> Kubernetes 渐进式交货控制器. 集成到Istio/Linkerd权重路由.</p>
+<p><strong>Istio weighted routing</strong>服务网层面的交通分区.</p>
+<p><strong>KServe / Seldon Core</strong>模型提供内置的菜.</p>
+<p><strong>Feature flags</strong>发射,暗,旗,释放.</p>
+<h3>计量序列</h3>
+<p>卡纳里大门根据流量每5-15分钟检查.1%的流量每窗口提供50-150个数据点,但对用户反来说足够.10%的数据提供了10倍多.进步应该停留足够长时间,以在每个步骤上积累足够的样本.</p>
+<h3>选项:A/B</h3>
+<p>如果新型号明显不同 (不同行为,不同的成本曲线,不同的调度),在鱼通过后,A/B测试它50%;如果它只是一个改进的版本,当鱼门通过时,跳到100%.</p>
+<h3>你应该记住的数字</h3>
+<ul>
+<li>鱼进展:1% → 10% → 25% → 50% → 75% → 100%.</li>
+<li>无决定性性上限:在相同输入中,可达15%的连续变异.</li>
+<li>五个可取量指标:延迟,成本,错误/拒绝,输出长度,用户反.</li>
+<li>成本门:超过原线20%是违规行为.</li>
+<li>秒钟,不是几个小时.</li>
+</ul>
+<figure><img src="/learn/ai-from-scratch/figures/figure-f78ef36ea95ad960f9ea.png" alt="i4-canary-ramp 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>用它</h2>
+<p><code>code/main.py</code>报告中,哪个阶段的推出停止,哪个门启动.</p>
+<h2>运送它</h2>
+<p>这一课产生了<code>outputs/skill-rollout-runbook.md</code>鉴于候选模型,基线和风险耐受性,设计了 shadow→canary→100%计划.</p>
+<h2>运动</h2>
+<ol>
+<li>跑步<code>code/main.py</code>鱼在哪个阶段停止?</li>
+<li>您的新型号在线上获得3%的准确度,但成本/请求是+18%.</li>
+<li>设计一个不到60秒的回滚,并列出所需的基础设施.</li>
+<li>没有确定性在你的评估中显示 ±7% 设置鱼门,所以你不会错误报警.你使用什么乘法?</li>
+<li>影子模式在鱼之前,成本上升了40%.</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Shadow mode</td>
+<td>&quot;duplicate to new&quot;</td>
+<td>Zero-impact send-to-candidate for logging</td>
+</tr>
+<tr>
+<td>Canary</td>
+<td>&quot;progressive traffic&quot;</td>
+<td>Gradual user-exposed rollout with gates</td>
+</tr>
+<tr>
+<td>Gates</td>
+<td>&quot;rollout checks&quot;</td>
+<td>Metric thresholds that block progression</td>
+</tr>
+<tr>
+<td>Non-determinism</td>
+<td>&quot;LLM variance&quot;</td>
+<td>Irreducible run-to-run differences</td>
+</tr>
+<tr>
+<td>Policy flag</td>
+<td>&quot;flag flip rollback&quot;</td>
+<td>Config-level rollback, seconds not hours</td>
+</tr>
+<tr>
+<td>Model pin</td>
+<td>&quot;registry digest&quot;</td>
+<td>Immutable reference to a model version</td>
+</tr>
+<tr>
+<td>Argo Rollouts</td>
+<td>&quot;K8s progressive&quot;</td>
+<td>Kubernetes-native canary/rollback controller</td>
+</tr>
+<tr>
+<td>KServe</td>
+<td>&quot;inference K8s&quot;</td>
+<td>Model serving with canary primitives</td>
+</tr>
+<tr>
+<td>Istio weighted</td>
+<td>&quot;mesh split&quot;</td>
+<td>Service-mesh traffic splitter</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://tianpan.co/blog/2026-04-09-llm-gradual-rollout-shadow-canary-ab-testing" rel="noreferrer" data-network="true">TianPan — Releasing AI Features Without Breaking Production <small>↗ 需要联网</small></a></li>
+<li><a href="https://www.marktechpost.com/2026/03/21/safely-deploying-ml-models-to-production-four-controlled-strategies-a-b-canary-interleaved-shadow-testing/" rel="noreferrer" data-network="true">MarkTechPost — Safely Deploying ML Models <small>↗ 需要联网</small></a></li>
+<li><a href="https://apxml.com/courses/mlops-for-large-models-llmops/chapter-4-llm-deployment-serving-optimization/advanced-llm-deployment-patterns" rel="noreferrer" data-network="true">APXML — Advanced LLM Deployment Patterns <small>↗ 需要联网</small></a></li>
+<li><a href="https://argo-rollouts.readthedocs.io/" rel="noreferrer" data-network="true">Argo Rollouts docs <small>↗ 需要联网</small></a></li>
+<li><a href="https://docs.flagger.app/" rel="noreferrer" data-network="true">Flagger docs <small>↗ 需要联网</small></a></li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Shadow Traffic, Canary Rollout, and Progressive Deployment for LLMs</h1>
+<blockquote>
+<p>LLM rollouts combine the hardest parts of software deployment: no unit tests, diffuse failure modes, delayed signals. The sequence is (1) shadow mode — duplicate prod requests to candidate model, log, compare with zero user impact; catches obvious distribution issues but is not a quality guarantee; (2) canary rollout — progressive traffic shift 10% → 25% → 50% → 75% → 100% with gates at each step; track latency percentiles, cost/request, error/refusal rate, output length distribution, user-feedback rate; (3) A/B testing for distinct alternatives after stability confirmed. Non-determinism is irreducible — up to 15% accuracy variation across runs with identical inputs due to GPU FP non-associativity plus batch-size variance. Cost is a variable, not constant — a 20% better model can be 3x more expensive per call. Rollback speed is decisive: if rollback requires redeploy, you are too slow. Policy lives in config/flags; model lives in registry with pinned digests; rollback = flip policy + revert threshold + pin old model in seconds.</p>
+</blockquote>
+<p><strong>Type:</strong> Learn
+<strong>Languages:</strong> Python (stdlib, toy canary-progression simulator)
+<strong>Prerequisites:</strong> Phase 17 · 13 (Observability), Phase 17 · 21 (A/B Testing)
+<strong>Time:</strong> ~60 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Distinguish shadow mode (zero-impact compare), canary (live traffic progressive), and A/B (stability-confirmed comparison).</li>
+<li>Enumerate five LLM-specific canary metrics (latency, cost/request, error/refusal, output-length distribution, user feedback).</li>
+<li>Explain why LLM non-determinism (up to 15%) changes what &quot;stable&quot; means in a rollout.</li>
+<li>Design a rollback path that takes seconds (policy flip) not hours (redeploy).</li>
+</ul>
+<h2>The Problem</h2>
+<p>You ship a new model. Offline evals show 3% accuracy gain. You flip it on in production. Within 24 hours, cost is up 40%, user thumbs-down is up 8%, three customer tickets report &quot;weird answers.&quot; You roll back. Redeploy takes 3 hours. Your weekend is ruined.</p>
+<p>Every piece of that was avoidable. Shadow mode would have caught the 40% cost spike before any user saw it. Canary would have stopped at 10% when thumbs-down moved. Policy-flag rollback would have taken 30 seconds. The discipline is what fills in the gap between &quot;offline evals look good&quot; and &quot;real users are happy.&quot;</p>
+<h2>The Concept</h2>
+<h3>Shadow mode</h3>
+<p>Candidate receives the same requests as production; outputs are logged, not returned to users. Zero user impact. Log:</p>
+<ul>
+<li>Output content (diff against production).</li>
+<li>Token counts (cost delta).</li>
+<li>Latency.</li>
+<li>Refusal and error.</li>
+</ul>
+<p>Catches: cost blow-ups, length regressions, obvious refusal changes, hard errors. Does NOT catch: quality delta users would perceive. Shadow is a smoke test, not a quality test.</p>
+<h3>Canary rollout</h3>
+<p>Progressive traffic shift with gates. Typical progression: 1% → 10% → 25% → 50% → 75% → 100%. Gate on 5 metrics at each step:</p>
+<ol>
+<li><strong>Latency percentiles</strong> — P50, P95, P99. Breach: canary has P99 &gt; 1.5x baseline.</li>
+<li><strong>Cost per request</strong> — blended $. Breach: &gt;20% above baseline.</li>
+<li><strong>Error / refusal rate</strong> — 5xx plus explicit refusals. Breach: 2x baseline.</li>
+<li><strong>Output length distribution</strong> — mean + P99. Breach: distributional shift.</li>
+<li><strong>User-feedback rate</strong> — thumbs-down / ticket filings. Breach: 1.5x baseline.</li>
+</ol>
+<h3>Non-determinism is the new variance</h3>
+<p>Identical inputs produce non-identical outputs. Reasons:</p>
+<ul>
+<li>GPU FP non-associativity (floating-point reduction order varies by batch).</li>
+<li>Batch-size variance (same prompt in a batch of 128 vs batch of 16).</li>
+<li>Sampling (temperature &gt; 0).</li>
+</ul>
+<p>Measured: up to 15% accuracy variation run-to-run on identical eval sets. &quot;Stable&quot; in a rollout means metrics are within expected variance, not identical to baseline. Set gates above the noise floor.</p>
+<h3>Cost is a variable</h3>
+<p>A 20% better model can be 3x more expensive per call. Cost/request is one of the five gates. Shipping a &quot;better&quot; model that breaks unit economics is a rollback case.</p>
+<h3>Rollback is the weapon</h3>
+<ul>
+<li>Policy flag (feature flag system): flip percentage in config; takes seconds.</li>
+<li>Model pinning (registry digest): pinned model does not auto-upgrade.</li>
+<li>Rollback = revert flag + set pinned digest to previous. Seconds, not hours.</li>
+</ul>
+<p>If your stack requires redeploy to rollback, fix that before rolling.</p>
+<h3>Tooling</h3>
+<p><strong>Argo Rollouts</strong> / <strong>Flagger</strong> — Kubernetes progressive delivery controllers. Integrate with Istio/Linkerd weighted routing.</p>
+<p><strong>Istio weighted routing</strong> — service-mesh-level traffic split.</p>
+<p><strong>KServe / Seldon Core</strong> — model serving with built-in canary.</p>
+<p><strong>Feature flags</strong> — LaunchDarkly, Flagsmith, Unleash. Policy-level flip, no redeploy.</p>
+<h3>Metrics cadence</h3>
+<p>Canary gates check every 5-15 minutes depending on traffic volume. 1% traffic with 10 req/min gives 50-150 data points per window — enough for latency but noisy for user feedback. 10% gives ~10x more. Progressions should pause long enough to accumulate enough samples at each step.</p>
+<h3>The A/B step is optional</h3>
+<p>If the new model is distinctly different (different behavior, different cost curve, different tone), A/B test it at 50% after canary passes. If it's just an improved version, skip to 100% when canary gates pass.</p>
+<h3>Numbers you should remember</h3>
+<ul>
+<li>Canary progression: 1% → 10% → 25% → 50% → 75% → 100%.</li>
+<li>Non-determinism ceiling: up to 15% run-to-run variance on identical inputs.</li>
+<li>Five canary metrics: latency, cost, error/refusal, output length, user feedback.</li>
+<li>Cost gate: &gt;20% above baseline is a breach.</li>
+<li>Rollback: seconds, not hours.</li>
+</ul>
+<figure><img src="/learn/ai-from-scratch/figures/figure-f78ef36ea95ad960f9ea.png" alt="i4-canary-ramp 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Use It</h2>
+<p><code>code/main.py</code> simulates a canary rollout with injected regressions. Reports which stage the rollout halts at and which gate triggered.</p>
+<h2>Ship It</h2>
+<p>This lesson produces <code>outputs/skill-rollout-runbook.md</code>. Given candidate model, baseline, and risk tolerance, designs shadow→canary→100% plan.</p>
+<h2>Exercises</h2>
+<ol>
+<li>Run <code>code/main.py</code>. Inject a 25% cost regression. At which stage does the canary halt?</li>
+<li>Your new model has 3% accuracy gain offline but cost/request is +18%. Is it a ship? Depends on the policy — write both paths.</li>
+<li>Design a rollback that takes under 60 seconds end-to-end. List the required infrastructure.</li>
+<li>Non-determinism shows ±7% on your eval. Set canary gates so you don't false-alarm. What multipliers do you use?</li>
+<li>Shadow mode catches a 40% cost spike before canary. Write the alert rule that fires in shadow.</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Shadow mode</td>
+<td>&quot;duplicate to new&quot;</td>
+<td>Zero-impact send-to-candidate for logging</td>
+</tr>
+<tr>
+<td>Canary</td>
+<td>&quot;progressive traffic&quot;</td>
+<td>Gradual user-exposed rollout with gates</td>
+</tr>
+<tr>
+<td>Gates</td>
+<td>&quot;rollout checks&quot;</td>
+<td>Metric thresholds that block progression</td>
+</tr>
+<tr>
+<td>Non-determinism</td>
+<td>&quot;LLM variance&quot;</td>
+<td>Irreducible run-to-run differences</td>
+</tr>
+<tr>
+<td>Policy flag</td>
+<td>&quot;flag flip rollback&quot;</td>
+<td>Config-level rollback, seconds not hours</td>
+</tr>
+<tr>
+<td>Model pin</td>
+<td>&quot;registry digest&quot;</td>
+<td>Immutable reference to a model version</td>
+</tr>
+<tr>
+<td>Argo Rollouts</td>
+<td>&quot;K8s progressive&quot;</td>
+<td>Kubernetes-native canary/rollback controller</td>
+</tr>
+<tr>
+<td>KServe</td>
+<td>&quot;inference K8s&quot;</td>
+<td>Model serving with canary primitives</td>
+</tr>
+<tr>
+<td>Istio weighted</td>
+<td>&quot;mesh split&quot;</td>
+<td>Service-mesh traffic splitter</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://tianpan.co/blog/2026-04-09-llm-gradual-rollout-shadow-canary-ab-testing" rel="noreferrer" data-network="true">TianPan — Releasing AI Features Without Breaking Production <small>↗ 需要联网</small></a></li>
+<li><a href="https://www.marktechpost.com/2026/03/21/safely-deploying-ml-models-to-production-four-controlled-strategies-a-b-canary-interleaved-shadow-testing/" rel="noreferrer" data-network="true">MarkTechPost — Safely Deploying ML Models <small>↗ 需要联网</small></a></li>
+<li><a href="https://apxml.com/courses/mlops-for-large-models-llmops/chapter-4-llm-deployment-serving-optimization/advanced-llm-deployment-patterns" rel="noreferrer" data-network="true">APXML — Advanced LLM Deployment Patterns <small>↗ 需要联网</small></a></li>
+<li><a href="https://argo-rollouts.readthedocs.io/" rel="noreferrer" data-network="true">Argo Rollouts docs <small>↗ 需要联网</small></a></li>
+<li><a href="https://docs.flagger.app/" rel="noreferrer" data-network="true">Flagger docs <small>↗ 需要联网</small></a></li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-17-infrastructure-and-production--20-shadow-canary-progressive.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-17-infrastructure-and-production--20-shadow-canary-progressive.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/17-infrastructure-and-production/20-shadow-canary-progressive/code/main.py">phases/17-infrastructure-and-production/20-shadow-canary-progressive/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Canary rollout simulator — stdlib Python.
+
+Progressively increases candidate traffic share and checks five gates at each
+step. Halts when any gate breaches. Supports injected regressions.
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import random
+
+
+STAGES = [0.01, 0.10, 0.25, 0.50, 0.75, 1.00]
+
+BASELINE = {
+    &quot;latency_p99_ms&quot;: 900,
+    &quot;cost_per_req&quot;: 0.02,
+    &quot;error_rate&quot;: 0.02,
+    &quot;output_len_p99&quot;: 450,
+    &quot;thumbs_down_rate&quot;: 0.03,
+}
+
+GATES = {
+    &quot;latency_p99_ms&quot;: 1.5,
+    &quot;cost_per_req&quot;: 1.2,
+    &quot;error_rate&quot;: 2.0,
+    &quot;output_len_p99&quot;: 1.4,
+    &quot;thumbs_down_rate&quot;: 1.5,
+}
+
+
+@dataclass
+class Regression:
+    latency_mult: float = 1.0
+    cost_mult: float = 1.0
+    error_mult: float = 1.0
+    output_len_mult: float = 1.0
+    thumbs_down_mult: float = 1.0
+
+
+def measure_stage(stage: float, reg: Regression, seed: int) -&gt; dict:
+    rng = random.Random(seed)
+    noise = lambda v: v * rng.uniform(0.92, 1.08)
+    return {
+        &quot;latency_p99_ms&quot;: noise(BASELINE[&quot;latency_p99_ms&quot;] * reg.latency_mult),
+        &quot;cost_per_req&quot;: noise(BASELINE[&quot;cost_per_req&quot;] * reg.cost_mult),
+        &quot;error_rate&quot;: noise(BASELINE[&quot;error_rate&quot;] * reg.error_mult),
+        &quot;output_len_p99&quot;: noise(BASELINE[&quot;output_len_p99&quot;] * reg.output_len_mult),
+        &quot;thumbs_down_rate&quot;: noise(BASELINE[&quot;thumbs_down_rate&quot;] * reg.thumbs_down_mult),
+    }
+
+
+def check_gates(metrics: dict) -&gt; list[str]:
+    breaches = []
+    for k, mult in GATES.items():
+        if metrics[k] &gt; BASELINE[k] * mult:
+            breaches.append(k)
+    return breaches
+
+
+def rollout(name: str, reg: Regression) -&gt; None:
+    print(f&quot;\n{name}&quot;)
+    print(f&quot;Regression: latency={reg.latency_mult}, cost={reg.cost_mult}, error={reg.error_mult}, len={reg.output_len_mult}, thumbs={reg.thumbs_down_mult}&quot;)
+    for i, stage in enumerate(STAGES):
+        metrics = measure_stage(stage, reg, seed=stage_seed(i))
+        breaches = check_gates(metrics)
+        status = &quot;PASS&quot; if not breaches else f&quot;HALT ({&#39;,&#39;.join(breaches)})&quot;
+        pct = int(stage * 100)
+        print(f&quot;  stage {pct:3}%  &quot;
+              f&quot;lat_p99={metrics[&#39;latency_p99_ms&#39;]:5.0f}  &quot;
+              f&quot;cost=${metrics[&#39;cost_per_req&#39;]:.4f}  &quot;
+              f&quot;err={metrics[&#39;error_rate&#39;]*100:4.1f}%  &quot;
+              f&quot;thumbs_dn={metrics[&#39;thumbs_down_rate&#39;]*100:4.1f}%  &quot;
+              f&quot;{status}&quot;)
+        if breaches:
+            print(f&quot;  → ROLLBACK (policy flip, pinned model reverted)&quot;)
+            return
+    print(&quot;  → PROMOTED to 100%&quot;)
+
+
+def stage_seed(i: int) -&gt; int:
+    return 11 + i * 3
+
+
+def main() -&gt; None:
+    print(&quot;=&quot; * 95)
+    print(&quot;CANARY ROLLOUT — six stages, five gates, injected regressions&quot;)
+    print(&quot;=&quot; * 95)
+
+    rollout(&quot;Clean promotion&quot;, Regression())
+    rollout(&quot;Small cost regression (10%) — within gate&quot;, Regression(cost_mult=1.10))
+    rollout(&quot;Cost regression 25%&quot;, Regression(cost_mult=1.25))
+    rollout(&quot;Latency regression 80%&quot;, Regression(latency_mult=1.80))
+    rollout(&quot;Thumbs-down regression 60%&quot;, Regression(thumbs_down_mult=1.60))
+    rollout(&quot;Quality silent + cost creep&quot;, Regression(cost_mult=1.15, thumbs_down_mult=1.45))
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/17-infrastructure-and-production/20-shadow-canary-progressive/code/main.ts">phases/17-infrastructure-and-production/20-shadow-canary-progressive/code/main.ts</a><details><summary>查看原始文本</summary><pre><code>/**
+ * Shadow + canary + progressive rollout — TypeScript port + policy engine.
+ *
+ * Three policies:
+ *   1. Shadow mode: duplicates each request to candidate; logs the deltas;
+ *      never returns candidate output to the user. Catches cost/length
+ *      regressions before any user exposure.
+ *   2. Canary rollout: progressive traffic shift through stages with five
+ *      LLM-specific gates. Halts the moment any gate breaches.
+ *   3. Progressive policy: combines shadow → canary → 100%, with a policy
+ *      flag that supports seconds-not-hours rollback.
+ *
+ * Plus the same canary simulator main.py runs (six stages, five gates, six
+ * regression scenarios) so the numbers reproduce.
+ *
+ * Citations:
+ *   - Argo Rollouts (Kubernetes progressive delivery)
+ *     https://argo-rollouts.readthedocs.io/
+ *   - Flagger (progressive delivery operator)
+ *     https://docs.flagger.app/
+ *   - Non-determinism ~15% run-to-run cited in docs/en.md (GPU FP
+ *     non-associativity + batch-size variance + sampling).
+ *
+ * Runs on Node 20+ stdlib. No npm deps.
+ */
+
+// -- Baseline + gates ------------------------------------------------------
+
+type Metrics = {
+  latencyP99Ms: number;
+  costPerReq: number;
+  errorRate: number;
+  outputLenP99: number;
+  thumbsDownRate: number;
+};
+
+const BASELINE: Metrics = {
+  latencyP99Ms: 900,
+  costPerReq: 0.02,
+  errorRate: 0.02,
+  outputLenP99: 450,
+  thumbsDownRate: 0.03,
+};
+
+// Multipliers above baseline that constitute a breach. Set high enough to
+// stay above the LLM non-determinism noise floor (~15% per docs/en.md).
+const GATES: Record&lt;keyof Metrics, number&gt; = {
+  latencyP99Ms: 1.5,
+  costPerReq: 1.2,
+  errorRate: 2.0,
+  outputLenP99: 1.4,
+  thumbsDownRate: 1.5,
+};
+
+const STAGES = [0.01, 0.1, 0.25, 0.5, 0.75, 1.0];
+
+// -- Mulberry32 PRNG ------------------------------------------------------
+
+function makeRng(seed: number): () =&gt; number {
+  let s = seed &gt;&gt;&gt; 0;
+  return function () {
+    s = (s + 0x6d2b79f5) &gt;&gt;&gt; 0;
+    let t = s;
+    t = Math.imul(t ^ (t &gt;&gt;&gt; 15), t | 1);
+    t ^= t + Math.imul(t ^ (t &gt;&gt;&gt; 7), t | 61);
+    return ((t ^ (t &gt;&gt;&gt; 14)) &gt;&gt;&gt; 0) / 4294967296;
+  };
+}
+
+function stageSeed(i: number): number {
+  return 11 + i * 3;
+}
+
+// -- Regression injector --------------------------------------------------
+
+type Regression = {
+  latencyMult: number;
+  costMult: number;
+  errorMult: number;
+  outputLenMult: number;
+  thumbsDownMult: number;
+};
+
+const NO_REGRESSION: Regression = {
+  latencyMult: 1,
+  costMult: 1,
+  errorMult: 1,
+  outputLenMult: 1,
+  thumbsDownMult: 1,
+};
+
+function measureStage(_stage: number, reg: Regression, seed: number): Metrics {
+  const rng = makeRng(seed);
+  // Noise floor is the non-determinism docs/en.md describes: ~±8% per measurement.
+  const noise = (v: number): number =&gt; v * (0.92 + rng() * 0.16);
+  return {
+    latencyP99Ms: noise(BASELINE.latencyP99Ms * reg.latencyMult),
+    costPerReq: noise(BASELINE.costPerReq * reg.costMult),
+    errorRate: noise(BASELINE.errorRate * reg.errorMult),
+    outputLenP99: noise(BASELINE.outputLenP99 * reg.outputLenMult),
+    thumbsDownRate: noise(BASELINE.thumbsDownRate * reg.thumbsDownMult),
+  };
+}
+
+function checkGates(metrics: Metrics): (keyof Metrics)[] {
+  const breaches: (keyof Metrics)[] = [];
+  for (const k of Object.keys(GATES) as (keyof Metrics)[]) {
+    if (metrics[k] &gt; BASELINE[k] * GATES[k]) breaches.push(k);
+  }
+  return breaches;
+}
+
+// -- Policy engine --------------------------------------------------------
+
+type ShadowSample = {
+  baselineCost: number;
+  candidateCost: number;
+  baselineLatencyMs: number;
+  candidateLatencyMs: number;
+};
+
+type ShadowReport = {
+  n: number;
+  meanCostDeltaPct: number;
+  meanLatencyDeltaPct: number;
+  // True if shadow alone justifies halting before canary.
+  alert: boolean;
+  reasons: string[];
+};
+
+function shadowEvaluate(samples: ShadowSample[]): ShadowReport {
+  if (samples.length === 0) {
+    return {
+      n: 0,
+      meanCostDeltaPct: 0,
+      meanLatencyDeltaPct: 0,
+      alert: false,
+      reasons: [],
+    };
+  }
+  let costDelta = 0;
+  let latDelta = 0;
+  let costN = 0;
+  let latN = 0;
+  for (const s of samples) {
+    // Skip rows with non-positive baselines so a single zero row cannot turn
+    // the average into Infinity/NaN and corrupt the gate decision.
+    if (s.baselineCost &gt; 0) {
+      costDelta += (s.candidateCost - s.baselineCost) / s.baselineCost;
+      costN++;
+    }
+    if (s.baselineLatencyMs &gt; 0) {
+      latDelta += (s.candidateLatencyMs - s.baselineLatencyMs) / s.baselineLatencyMs;
+      latN++;
+    }
+  }
+  const meanCost = costN &gt; 0 ? (costDelta / costN) * 100 : 0;
+  const meanLat = latN &gt; 0 ? (latDelta / latN) * 100 : 0;
+  const reasons: string[] = [];
+  if (meanCost &gt; 30) reasons.push(`cost +${meanCost.toFixed(1)}% (&gt;30%)`);
+  if (meanLat &gt; 50) reasons.push(`latency +${meanLat.toFixed(1)}% (&gt;50%)`);
+  return {
+    n: samples.length,
+    meanCostDeltaPct: meanCost,
+    meanLatencyDeltaPct: meanLat,
+    alert: reasons.length &gt; 0,
+    reasons,
+  };
+}
+
+type CanaryDecision = {
+  promoted: boolean;
+  stagesAdvanced: number;
+  breaches: (keyof Metrics)[];
+};
+
+function canaryRollout(reg: Regression): CanaryDecision {
+  for (let i = 0; i &lt; STAGES.length; i++) {
+    const metrics = measureStage(STAGES[i], reg, stageSeed(i));
+    const breaches = checkGates(metrics);
+    if (breaches.length &gt; 0) {
+      return { promoted: false, stagesAdvanced: i, breaches };
+    }
+  }
+  return { promoted: true, stagesAdvanced: STAGES.length, breaches: [] };
+}
+
+// PolicyEngine wraps a feature flag — flip pinnedModel from candidate back to
+// baseline in O(1). Mirrors LaunchDarkly/Flagsmith/Unleash flag-flip rollback.
+class PolicyEngine {
+  private baselineDigest: string;
+  private pinnedDigest: string;
+  private rolloutPct = 0;
+
+  constructor(initialDigest: string) {
+    this.baselineDigest = initialDigest;
+    this.pinnedDigest = initialDigest;
+  }
+
+  promote(candidateDigest: string, pct: number): void {
+    this.pinnedDigest = candidateDigest;
+    this.rolloutPct = pct;
+  }
+
+  // Constant-time rollback — what your runbook flips. Repins to the
+  // baseline captured at construction time (or the most recent rollback
+  // override).
+  rollback(baselineDigest?: string): void {
+    if (baselineDigest !== undefined) this.baselineDigest = baselineDigest;
+    this.pinnedDigest = this.baselineDigest;
+    this.rolloutPct = 0;
+  }
+
+  pick(rng: () =&gt; number): { digest: string; chose: &quot;baseline&quot; | &quot;candidate&quot; } {
+    return rng() &lt; this.rolloutPct
+      ? { digest: this.pinnedDigest, chose: &quot;candidate&quot; }
+      : { digest: this.baselineDigest, chose: &quot;baseline&quot; };
+  }
+}
+
+// -- Reporting ------------------------------------------------------------
+
+function rolloutReport(name: string, reg: Regression): void {
+  console.log(`\n${name}`);
+  console.log(
+    `Regression: latency=${reg.latencyMult}, cost=${reg.costMult}, error=${reg.errorMult}, len=${reg.outputLenMult}, thumbs=${reg.thumbsDownMult}`,
+  );
+  for (let i = 0; i &lt; STAGES.length; i++) {
+    const stage = STAGES[i];
+    const metrics = measureStage(stage, reg, stageSeed(i));
+    const breaches = checkGates(metrics);
+    const status =
+      breaches.length === 0 ? &quot;PASS&quot; : `HALT (${breaches.join(&quot;,&quot;)})`;
+    const pct = Math.round(stage * 100);
+    console.log(
+      `  stage ${String(pct).padStart(3)}%  ` +
+        `lat_p99=${metrics.latencyP99Ms.toFixed(0).padStart(5)}  ` +
+        `cost=$${metrics.costPerReq.toFixed(4)}  ` +
+        `err=${(metrics.errorRate * 100).toFixed(1).padStart(4)}%  ` +
+        `thumbs_dn=${(metrics.thumbsDownRate * 100).toFixed(1).padStart(4)}%  ` +
+        `${status}`,
+    );
+    if (breaches.length &gt; 0) {
+      console.log(&quot;  → ROLLBACK (policy flip, pinned model reverted)&quot;);
+      return;
+    }
+  }
+  console.log(&quot;  → PROMOTED to 100%&quot;);
+}
+
+// -- Demo ------------------------------------------------------------------
+
+function shadowDemo(): void {
+  console.log(&quot;--- Shadow-mode evaluation (zero user impact) ---&quot;);
+  // Three scenarios: candidate roughly comparable, candidate cheaper, candidate
+  // 40% more expensive (the docs&#39; canonical bad scenario).
+  const rng = makeRng(99);
+  const mkSamples = (costMult: number, latMult: number): ShadowSample[] =&gt;
+    Array.from({ length: 200 }, () =&gt; ({
+      baselineCost: 0.02 * (0.95 + rng() * 0.1),
+      candidateCost: 0.02 * costMult * (0.95 + rng() * 0.1),
+      baselineLatencyMs: 800 * (0.95 + rng() * 0.1),
+      candidateLatencyMs: 800 * latMult * (0.95 + rng() * 0.1),
+    }));
+
+  const scenarios: { name: string; samples: ShadowSample[] }[] = [
+    { name: &quot;comparable candidate&quot;, samples: mkSamples(1.05, 1.02) },
+    { name: &quot;candidate 20% cheaper&quot;, samples: mkSamples(0.8, 0.95) },
+    { name: &quot;candidate 40% more expensive (rollback case)&quot;, samples: mkSamples(1.4, 1.0) },
+  ];
+
+  for (const s of scenarios) {
+    const r = shadowEvaluate(s.samples);
+    console.log(
+      `  ${s.name}: n=${r.n} cost_delta=${r.meanCostDeltaPct.toFixed(1)}%  ` +
+        `lat_delta=${r.meanLatencyDeltaPct.toFixed(1)}%  ` +
+        `alert=${r.alert}${r.reasons.length ? &quot;  reasons=&quot; + r.reasons.join(&quot;; &quot;) : &quot;&quot;}`,
+    );
+  }
+}
+
+function policyEngineDemo(): void {
+  console.log(&quot;\n--- PolicyEngine — promote then rollback in O(1) ---&quot;);
+  const engine = new PolicyEngine(&quot;baseline-digest&quot;);
+  engine.promote(&quot;candidate-digest-v2&quot;, 0.1);
+  const rng = makeRng(42);
+  let candidateCount = 0;
+  for (let i = 0; i &lt; 1000; i++) {
+    if (engine.pick(rng).chose === &quot;candidate&quot;) candidateCount++;
+  }
+  console.log(
+    `  after promote to 10%: ${candidateCount}/1000 picks chose candidate (target ~100)`,
+  );
+  engine.rollback();
+  let postCount = 0;
+  for (let i = 0; i &lt; 1000; i++) {
+    if (engine.pick(rng).chose === &quot;candidate&quot;) postCount++;
+  }
+  console.log(`  after rollback: ${postCount}/1000 (target 0)`);
+}
+
+function canaryDemo(): void {
+  console.log(&quot;\n&quot; + &quot;=&quot;.repeat(95));
+  console.log(&quot;CANARY ROLLOUT — six stages, five gates, injected regressions&quot;);
+  console.log(&quot;=&quot;.repeat(95));
+
+  rolloutReport(&quot;Clean promotion&quot;, NO_REGRESSION);
+  rolloutReport(&quot;Small cost regression (10%) — within gate&quot;, {
+    ...NO_REGRESSION,
+    costMult: 1.1,
+  });
+  rolloutReport(&quot;Cost regression 25%&quot;, { ...NO_REGRESSION, costMult: 1.25 });
+  rolloutReport(&quot;Latency regression 80%&quot;, {
+    ...NO_REGRESSION,
+    latencyMult: 1.8,
+  });
+  rolloutReport(&quot;Thumbs-down regression 60%&quot;, {
+    ...NO_REGRESSION,
+    thumbsDownMult: 1.6,
+  });
+  rolloutReport(&quot;Quality silent + cost creep&quot;, {
+    ...NO_REGRESSION,
+    costMult: 1.15,
+    thumbsDownMult: 1.45,
+  });
+
+  // Programmatic outcome of canaryRollout() for the same six scenarios.
+  console.log(&quot;\n--- canaryRollout() programmatic verdict ---&quot;);
+  const scenarios: { name: string; reg: Regression }[] = [
+    { name: &quot;clean&quot;, reg: NO_REGRESSION },
+    { name: &quot;cost 10%&quot;, reg: { ...NO_REGRESSION, costMult: 1.1 } },
+    { name: &quot;cost 25%&quot;, reg: { ...NO_REGRESSION, costMult: 1.25 } },
+    { name: &quot;latency 80%&quot;, reg: { ...NO_REGRESSION, latencyMult: 1.8 } },
+    { name: &quot;thumbs 60%&quot;, reg: { ...NO_REGRESSION, thumbsDownMult: 1.6 } },
+    {
+      name: &quot;cost 15% + thumbs 45%&quot;,
+      reg: { ...NO_REGRESSION, costMult: 1.15, thumbsDownMult: 1.45 },
+    },
+  ];
+  for (const s of scenarios) {
+    const d = canaryRollout(s.reg);
+    const verdict = d.promoted
+      ? &quot;PROMOTED&quot;
+      : `HALT @ stage ${d.stagesAdvanced} on ${d.breaches.join(&quot;,&quot;)}`;
+    console.log(`  ${s.name.padEnd(28)} → ${verdict}`);
+  }
+}
+
+function main(): void {
+  shadowDemo();
+  policyEngineDemo();
+  canaryDemo();
+}
+
+main();
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/17-infrastructure-and-production/20-shadow-canary-progressive/outputs/skill-rollout-runbook.md">phases/17-infrastructure-and-production/20-shadow-canary-progressive/outputs/skill-rollout-runbook.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: rollout-runbook
+description: Design a shadow → canary → A/B → 100% rollout plan for a new LLM model or prompt template, with five canary gates, noise-floor-aware thresholds, and a seconds-fast rollback path.
+version: 1.0.0
+phase: 17
+lesson: 20
+tags: [rollout, canary, shadow, progressive-delivery, feature-flags, argo-rollouts, flagger, kserve]
+---
+
+Given a candidate change (new model, new prompt template, new router policy), baseline production metrics, and risk tolerance, produce a rollout runbook.
+
+Produce:
+
+1. Shadow plan. Duration (24-72 hours). Metrics logged: outputs, token counts, latency, refusal, error. Alert on: &gt;20% cost shift, &gt;30% output length shift, any schema violation.
+2. Canary progression. Stages (1% → 10% → 25% → 50% → 75% → 100%). Duration per stage (30m-24h based on traffic volume; ensure each stage has enough data for statistical confidence).
+3. Five gates. Specify the exact thresholds for latency P99, cost/request, error/refusal, output-length P99, thumbs-down rate. Set above noise floor (expect 15% irreducible variance).
+4. Tooling. Name the rollout controller (Argo Rollouts, Flagger, KServe) and the feature flag system for instant rollback.
+5. Rollback path. Document the three actions: flip flag → revert pinned digest → verify. Target time: under 60 seconds end to end.
+6. Skip A/B? Justify. Improved-variant changes skip A/B; distinctly different changes (new behavior, new cost curve) require A/B.
+
+Hard rejects:
+- Skipping shadow mode. Refuse — cost spikes and length regressions slip past offline eval.
+- Gates tighter than 15% variance. Refuse — false alarms will halt legitimate rollouts.
+- Rollback that requires redeploy. Refuse — it is not a rollback, it is a damage report.
+
+Refusal rules:
+- If the change is safety-critical (e.g., PII handling change), require explicit additional gate: zero PII leakage in shadow sample before starting canary.
+- If traffic volume is &lt;100 req/hour, require extended canary stages — otherwise gate noise overwhelms signal.
+- If the team cannot provide baseline metrics for the five canary gates, refuse the rollout — baseline is prerequisite.
+
+Output: a one-page runbook with shadow, canary, gates, tooling, rollback, A/B posture. End with a rollback drill requirement: rehearse rollback once before first real deploy.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. What is the right way to order shadow, canary, and A/B testing for an LLM rollout?</legend><label class="option"><input type="radio" name="q0" value="0"> Skip shadow entirely</label><label class="option"><input type="radio" name="q0" value="1"> Shadow (zero-impact compare), then canary (live traffic progressive with gates), then A/B for distinct alternatives once stability is confirmed</label><label class="option"><input type="radio" name="q0" value="2"> Canary first, then shadow, then A/B</label><label class="option"><input type="radio" name="q0" value="3"> A/B first, then shadow, then canary</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. Which set of five metrics does the lesson gate canary progressions on?</legend><label class="option"><input type="radio" name="q1" value="0"> GPU temp, fan speed, queue depth, cost, latency</label><label class="option"><input type="radio" name="q1" value="1"> Just throughput</label><label class="option"><input type="radio" name="q1" value="2"> Latency percentiles, cost per request, error/refusal rate, output length distribution, user-feedback rate</label><label class="option"><input type="radio" name="q1" value="3"> Accuracy on offline eval only</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. Roughly how much run-to-run accuracy variance does the lesson cite for identical inputs on LLMs?</legend><label class="option"><input type="radio" name="q2" value="0"> Under 0.1%</label><label class="option"><input type="radio" name="q2" value="1"> Up to about 15%, due to GPU FP non-associativity plus batch-size variance</label><label class="option"><input type="radio" name="q2" value="2"> Always 50%</label><label class="option"><input type="radio" name="q2" value="3"> Identical outputs run-to-run</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. What is shadow mode for, in the lesson&#39;s framing?</legend><label class="option"><input type="radio" name="q3" value="0"> A complete quality test that replaces evals</label><label class="option"><input type="radio" name="q3" value="1"> A smoke test catching cost blow-ups, length regressions, refusal changes, and hard errors — not a quality guarantee</label><label class="option"><input type="radio" name="q3" value="2"> Replacement for rollback</label><label class="option"><input type="radio" name="q3" value="3"> Final production rollout step</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. What is the correct rollback design per the lesson?</legend><label class="option"><input type="radio" name="q4" value="0"> Manual SSH to each pod</label><label class="option"><input type="radio" name="q4" value="1"> Redeploy with new model digest, taking hours</label><label class="option"><input type="radio" name="q4" value="2"> Flip a policy flag and revert the pinned model digest in seconds — no redeploy</label><label class="option"><input type="radio" name="q4" value="3"> Wait for the next release window</label><p data-feedback="4"></p></fieldset><fieldset><legend>6. Why is cost listed as a gate alongside latency and quality?</legend><label class="option"><input type="radio" name="q5" value="0"> A 20% better model can be 3x more expensive per call; shipping that without a cost gate breaks unit economics</label><label class="option"><input type="radio" name="q5" value="1"> Cost is the same across providers</label><label class="option"><input type="radio" name="q5" value="2"> Cost is automatically capped by every provider</label><label class="option"><input type="radio" name="q5" value="3"> Cost is a vanity metric</label><p data-feedback="5"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/17-infrastructure-and-production/19-ai-gateways/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/17-infrastructure-and-production/21-ab-testing-llm-features/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/17-infrastructure-and-production/20-shadow-canary-progressive/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

@@ -1,0 +1,704 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>自我监督视觉  SimCLR,DINO,MAE · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-04-computer-vision" data-lesson="04-computer-vision/17-self-supervised-vision" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/04-computer-vision/">计算机视觉</a> / LESSON 17</p><h1 class="lesson-title">自我监督视觉  SimCLR,DINO,MAE</h1><p>Self-Supervised Vision — SimCLR, DINO, MAE</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>自我监督视觉  SimCLR,DINO,MAE</h1>
+<blockquote>
+<p>标签是监督视觉的瓶. 自主监督预训练消除了它们:从100万个未标记的图像中学习视觉特征,</p>
+</blockquote>
+<p><strong>Type:</strong> Learn + Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 4 Lesson 04 (Image Classification), Phase 4 Lesson 14 (ViT)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>追踪三个主要的自我监督家庭:对比性 (SimCLR),教师-学生 (DINO),面具重建 (MAE) ,并说明每个家庭都优化什么</li>
+<li>实施InfoNCE损失从零开始,并解释为什么512批成功,但32批失败</li>
+<li>解释为什么MAE的75%隐藏比不任意,以及它与BERT的15%对文本的不同</li>
+<li>使用DINOv2或MAE ImageNet检查站进行线性探测和零射击检索</li>
+</ul>
+<h2>问题</h2>
+<p>监督图像网有1300万个标记图像,这些图像的标记成本估计为1000万美元.医疗和工业数据集较小,标记成本更高.每个视觉团队都问:我们可以预训练低成本的无标记数据吗?</p>
+<p>现代的自主监督 ViT 在LAION或JFT上训练,在调整时达到或超过监督的ImageNet精度.它还更好地转移到下游任务 (检测,细分,深度) 比监督的预训练.DINOv2 (Meta, 2023) 和MAE (Meta, 2022) 是可转移视觉功能的当前生产默认.</p>
+<p>概念转变是,借口任务 模型训练要做的事情 不必是下游任务. 重要的是,它迫使模型学习有用的特性. 预测灰色图像的颜色,旋转图像,并要求模型分类旋转,掩盖补丁并重建它们都成功了. 对于此,三种方法是对比性学习,教师与学生蒸,</p>
+<h2>概念</h2>
+<h3>三个家庭</h3>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-ff63ccc5c5400a0db00c.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>对比学习 (SimCLR)</h3>
+<p>通过同一个编码器加上投影头,减少说&quot;这两个嵌入应该接近&quot;和&quot;这个嵌入应该远离每个其他图像的嵌入&quot;.</p>
+<pre><code>Loss for positive pair (z_i, z_j) among 2N views per batch:
+
+   L_ij = -log( exp(sim(z_i, z_j) / tau) / sum_k in batch \ {i} exp(sim(z_i, z_k) / tau) )
+
+sim = cosine similarity
+tau = temperature (0.1 standard)
+</code></pre>
+<p>这就是InfoNCE损失.它需要每一个正数的许多负数,所以批量大小很重要. SimCLR需要512-8192.</p>
+<h3>教师-学生 (DINO)</h3>
+<p>学生和老师:两个网络具有相同的架构.老师是学生的体重的指数动平均值 (EMA).两个都看到图像的增强视图.学生的输出训练以匹配老师的没有明确的负面.</p>
+<pre><code>loss = CE( student_output(view_1),  teacher_output(view_2) )
+     + CE( student_output(view_2),  teacher_output(view_1) )
+
+teacher_weights = m * teacher_weights + (1 - m) * student_weights   (m ≈ 0.996)
+</code></pre>
+<p>为什么&quot;预测常数&quot;不崩:教师的输出是集中 (减减每维度平均值) 和磨损 (分为小温度).中心化防止一个维度主导;磨损防止输出崩到均.</p>
+<p>根据DINOv2的扩展,DINOv2在142万个策划图像上进行了扩展.</p>
+<h3>面具重建 (MAE)</h3>
+<p>掩盖VIT输入的 75%的补丁.通过编码器传输只可见的25%.一个小的解码器在掩盖位置接收编码器的输出加上面具代币,并被训练重建掩盖补丁的像素.</p>
+<pre><code>Encoder:  visible 25% of patches -&gt; features
+Decoder:  features + mask tokens at masked positions -&gt; reconstructed pixels
+Loss:     MSE between reconstructed and original pixels on masked patches only
+</code></pre>
+<p>让MAE工作的关键设计选择:</p>
+<ul>
+<li><strong>75% mask ratio</strong>高.强迫编码器学习语义特性;重建25%将是几乎无关紧要的 (邻近的像素是相对的,以至于CNN可以钉它).</li>
+<li><strong>Asymmetric encoder/decoder</strong>大型ViT编码器只能看到可见的补丁;一个小型的解码器 (8层,512层) 处理重建.比天真BEiT快3倍的预训练.</li>
+<li><strong>Pixel-space reconstruction target</strong>比BEiT的标记目标更简单,并且在ViT上更有效.</li>
+</ul>
+<p>训练前,放弃解码器.</p>
+<h3>为什么75%而不是15%</h3>
+<p>密码是15%,MAE是75%. 信息密度是区别.</p>
+<ul>
+<li>预测15%的代币仍然很难,因为每个隐藏的位置都有许多可行的完成.</li>
+<li>图像补丁具有低值.一个未掩盖的邻居通常几乎准确地确定了掩盖补丁的像素.</li>
+</ul>
+<p>75%是足够高的,以至于简单的空间外分不能解决任务;编码器必须代表图像内容.</p>
+<h3>线性探测评估</h3>
+<p>经过自我监督的预训,标准评估是<strong>linear probe</strong>通过将编码器结,将单个线性分类器放在图像网标签上.</p>
+<ul>
+<li>升级率: 低于50%</li>
+<li>子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子</li>
+<li>果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果果</li>
+<li>酸 (酸) 含量:</li>
+</ul>
+<p>线性探测器是特征质量的纯度衡量;细调通常增加2-5个点,但也会产生头部重训效果.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-6bf6d64445b9297e8ba0.png" alt="data-augmentation 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<h3>步骤1:双视图增强管道</h3>
+<pre><code class="language-python">import torch
+import torchvision.transforms as T
+
+two_view_train = lambda: T.Compose([
+    T.RandomResizedCrop(96, scale=(0.2, 1.0)),
+    T.RandomHorizontalFlip(),
+    T.ColorJitter(0.4, 0.4, 0.4, 0.1),
+    T.RandomGrayscale(p=0.2),
+    T.ToTensor(),
+])
+
+
+class TwoViewDataset(torch.utils.data.Dataset):
+    def __init__(self, base):
+        self.base = base
+        self.aug = two_view_train()
+
+    def __len__(self):
+        return len(self.base)
+
+    def __getitem__(self, i):
+        img, _ = self.base[i]
+        v1 = self.aug(img)
+        v2 = self.aug(img)
+        return v1, v2
+</code></pre>
+<p>每个__getitem__返回相同图像的两个增长视图;没有需要标签.</p>
+<h3>步骤2:InfoNCE损失</h3>
+<pre><code class="language-python">import torch.nn.functional as F
+
+def info_nce(z1, z2, tau=0.1):
+    &quot;&quot;&quot;
+    z1, z2: (N, D) L2-normalised embeddings of paired views
+    &quot;&quot;&quot;
+    N, D = z1.shape
+    z = torch.cat([z1, z2], dim=0)  # (2N, D)
+    sim = z @ z.T / tau              # (2N, 2N)
+
+    mask = torch.eye(2 * N, dtype=torch.bool, device=z.device)
+    sim = sim.masked_fill(mask, float(&quot;-inf&quot;))
+
+    targets = torch.cat([torch.arange(N, 2 * N), torch.arange(0, N)]).to(z.device)
+    return F.cross_entropy(sim, targets)
+</code></pre>
+<p>在调用之前,将L2嵌入正常化. <code>tau=0.1</code>低的值使损失更为明显,需要更多的负值.</p>
+<h3>步骤3: 智力检查 InfoNCE</h3>
+<pre><code class="language-python">z1 = F.normalize(torch.randn(16, 32), dim=-1)
+z2 = z1.clone()
+loss_same = info_nce(z1, z2, tau=0.1).item()
+z2_random = F.normalize(torch.randn(16, 32), dim=-1)
+loss_random = info_nce(z1, z2_random, tau=0.1).item()
+print(f&quot;InfoNCE with identical pairs:  {loss_same:.3f}&quot;)
+print(f&quot;InfoNCE with random pairs:     {loss_random:.3f}&quot;)
+</code></pre>
+<p>偶数对应输出低损失 (对于大型批量和冷温度接近0).随机对应应输出 log(2N-1) = ~log(31) = ~3.4 与16对批量.</p>
+<h3>步骤4:MAE风格的罩</h3>
+<pre><code class="language-python">def random_mask_indices(num_patches, mask_ratio=0.75, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    n_keep = int(num_patches * (1 - mask_ratio))
+    perm = torch.randperm(num_patches, generator=g)
+    visible = perm[:n_keep]
+    masked = perm[n_keep:]
+    return visible.sort().values, masked.sort().values
+
+
+num_patches = 196
+visible, masked = random_mask_indices(num_patches, mask_ratio=0.75)
+print(f&quot;visible: {len(visible)} / {num_patches}&quot;)
+print(f&quot;masked:  {len(masked)} / {num_patches}&quot;)
+</code></pre>
+<p>实际的MAE实现将这些进行批量并保持每样品面具.</p>
+<h2>用它</h2>
+<p>诺维2是2026年的生产标准:</p>
+<pre><code class="language-python">import torch
+from transformers import AutoImageProcessor, AutoModel
+
+processor = AutoImageProcessor.from_pretrained(&quot;facebook/dinov2-base&quot;)
+model = AutoModel.from_pretrained(&quot;facebook/dinov2-base&quot;)
+model.eval()
+
+# Per-image embeddings for zero-shot retrieval
+with torch.no_grad():
+    inputs = processor(images=[pil_image], return_tensors=&quot;pt&quot;)
+    outputs = model(**inputs)
+    embedding = outputs.last_hidden_state[:, 0]  # CLS token
+</code></pre>
+<p>结果的768dim嵌入式是现代图像检索,密集通信和零射击传输管道的脊柱.下游任务的细节调整很少需要超过线性头部.</p>
+<p>对于图像文本嵌入,SigLIP或OpenCLIP是相当的;对于MAE风格的细调,<code>timm</code>通过每一个检查点.</p>
+<h2>运送它</h2>
+<p>这一课产生了:</p>
+<ul>
+<li><code>outputs/prompt-ssl-pretraining-picker.md</code>一个提示,根据数据集的大小,计算和下游任务,选择 SimCLR / MAE / DINOv2.</li>
+<li><code>outputs/skill-linear-probe-runner.md</code>写出任何结编码器+标记数据集的线性探测评估的技能.</li>
+</ul>
+<h2>运动</h2>
+<ol>
+<li>**(Easy)**检查如果您降低了适配嵌入式温度时的 InfoNCE 损失降低了,并且如果您降低了随机嵌入式温度时会增加.<code>tau in [0.05, 0.1, 0.2, 0.5]</code>损失和损失</li>
+<li>**(Medium)**通过DINO式的中心缓冲器, 显示学生在几个时代内会崩到一个恒定向量.</li>
+<li>**(Hard)**训练MAE在CIFAR-100上使用TinyUNet从10课作为脊柱.报告线性探测器的准确性在10,50和200个时代.显示MAE训练的线性探测器在同一1000图片子组上击败了从零开始监督的线性探测器.</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Self-supervised</td>
+<td>&quot;Label-free&quot;</td>
+<td>A pretext task that produces useful representations from unlabelled data</td>
+</tr>
+<tr>
+<td>Pretext task</td>
+<td>&quot;The fake task&quot;</td>
+<td>The objective used during SSL (reconstruct patches, match views); discarded after pretraining</td>
+</tr>
+<tr>
+<td>Linear probe</td>
+<td>&quot;Frozen encoder + linear head&quot;</td>
+<td>Standard SSL evaluation: train only a linear classifier on top of frozen features</td>
+</tr>
+<tr>
+<td>InfoNCE</td>
+<td>&quot;Contrastive loss&quot;</td>
+<td>softmax over cosine similarities; positive pair is the target class, all others are negatives</td>
+</tr>
+<tr>
+<td>EMA teacher</td>
+<td>&quot;Moving-average teacher&quot;</td>
+<td>Teacher whose weights are an exponential moving average of the student's; used by BYOL, MoCo, DINO</td>
+</tr>
+<tr>
+<td>Mask ratio</td>
+<td>&quot;% of patches hidden&quot;</td>
+<td>Fraction of patches masked during MAE; 75% for vision, 15% for text</td>
+</tr>
+<tr>
+<td>Representation collapse</td>
+<td>&quot;Constant output&quot;</td>
+<td>SSL failure where the encoder outputs a constant vector for all inputs; prevented by centring, sharpening, or negatives</td>
+</tr>
+<tr>
+<td>DINOv2</td>
+<td>&quot;Production SSL backbone&quot;</td>
+<td>Meta's 2023 self-supervised ViT; strongest general-purpose image features in 2026</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2002.05709" rel="noreferrer" data-network="true">SimCLR (Chen et al., 2020) <small>↗ 需要联网</small></a>对比性学习参考</li>
+<li><a href="https://arxiv.org/abs/2104.14294" rel="noreferrer" data-network="true">DINO (Caron et al., 2021) <small>↗ 需要联网</small></a></li>
+<li><a href="https://arxiv.org/abs/2111.06377" rel="noreferrer" data-network="true">MAE (He et al., 2022) <small>↗ 需要联网</small></a>面具自动编码器预训练VIT</li>
+<li><a href="https://arxiv.org/abs/2304.07193" rel="noreferrer" data-network="true">DINOv2 (Oquab et al., 2023) <small>↗ 需要联网</small></a>扩大自主监督的ViT到生产特征</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Self-Supervised Vision — SimCLR, DINO, MAE</h1>
+<blockquote>
+<p>Labels are the bottleneck of supervised vision. Self-supervised pretraining removes them: learn visual features from 100M unlabelled images, fine-tune on 10k labelled ones.</p>
+</blockquote>
+<p><strong>Type:</strong> Learn + Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 4 Lesson 04 (Image Classification), Phase 4 Lesson 14 (ViT)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Trace the three major self-supervised families — contrastive (SimCLR), teacher-student (DINO), masked reconstruction (MAE) — and state what each one optimises</li>
+<li>Implement an InfoNCE loss from scratch and explain why a batch of 512 works but a batch of 32 fails</li>
+<li>Explain why MAE's 75% masking ratio is not arbitrary and how it differs from BERT's 15% for text</li>
+<li>Use DINOv2 or MAE ImageNet checkpoints for linear probing and zero-shot retrieval</li>
+</ul>
+<h2>The Problem</h2>
+<p>Supervised ImageNet has 1.3M labelled images, which cost an estimated $10M to annotate. Medical and industrial datasets are smaller and even more expensive to label. Every vision team asks: can we pretrain on cheap unlabelled data — YouTube frames, web crawls, webcam footage, satellite sweeps — and then fine-tune on a small labelled set?</p>
+<p>Self-supervised learning is the answer. A modern self-supervised ViT trained on LAION or JFT reaches or beats supervised ImageNet accuracy when fine-tuned. It also transfers better to downstream tasks (detection, segmentation, depth) than supervised pretraining. DINOv2 (Meta, 2023) and MAE (Meta, 2022) are the current production defaults for transferable vision features.</p>
+<p>The conceptual shift is that the pretext task — the thing the model is trained to do — does not have to be the downstream task. What matters is that it forces the model to learn useful features. Predict the colour of grayscale images, rotate images and ask the model to classify the rotation, mask patches and reconstruct them — all have worked. The three approaches that scale are contrastive learning, teacher-student distillation, and masked reconstruction.</p>
+<h2>The Concept</h2>
+<h3>Three families</h3>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-ff63ccc5c5400a0db00c.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>Contrastive learning (SimCLR)</h3>
+<p>Take one image, apply two random augmentations, get two views. Feed both through the same encoder plus a projection head. Minimise a loss that says &quot;these two embeddings should be close&quot; and &quot;this embedding should be far from every other image's embeddings in the batch.&quot;</p>
+<pre><code>Loss for positive pair (z_i, z_j) among 2N views per batch:
+
+   L_ij = -log( exp(sim(z_i, z_j) / tau) / sum_k in batch \ {i} exp(sim(z_i, z_k) / tau) )
+
+sim = cosine similarity
+tau = temperature (0.1 standard)
+</code></pre>
+<p>This is the InfoNCE loss. It requires many negatives per positive, so batch size matters — SimCLR needs 512-8192. MoCo introduced a momentum queue of past batches to decouple negative count from batch size.</p>
+<h3>Teacher-student (DINO)</h3>
+<p>Two networks with the same architecture: student and teacher. The teacher is an exponential moving average (EMA) of the student's weights. Both see augmented views of the image. The student's output is trained to match the teacher's — no explicit negatives.</p>
+<pre><code>loss = CE( student_output(view_1),  teacher_output(view_2) )
+     + CE( student_output(view_2),  teacher_output(view_1) )
+
+teacher_weights = m * teacher_weights + (1 - m) * student_weights   (m ≈ 0.996)
+</code></pre>
+<p>Why it does not collapse to &quot;predict a constant&quot;: the teacher's output is centred (subtract per-dimension mean) and sharpened (divide by small temperature). Centering prevents one dimension from dominating; sharpening prevents output collapse to uniform.</p>
+<p>DINO is what DINOv2 scales up, on 142M curated images. The resulting features are the current SOTA for zero-shot visual retrieval and dense prediction.</p>
+<h3>Masked reconstruction (MAE)</h3>
+<p>Mask 75% of patches of a ViT input. Pass only the visible 25% through the encoder. A small decoder receives the encoder's output plus mask tokens at masked positions, and is trained to reconstruct the pixels of the masked patches.</p>
+<pre><code>Encoder:  visible 25% of patches -&gt; features
+Decoder:  features + mask tokens at masked positions -&gt; reconstructed pixels
+Loss:     MSE between reconstructed and original pixels on masked patches only
+</code></pre>
+<p>Key design choices that make MAE work:</p>
+<ul>
+<li><strong>75% mask ratio</strong> — high. Forces the encoder to learn semantic features; reconstructing 25% would be near-trivial (neighbouring pixels are so correlated that a CNN could nail it).</li>
+<li><strong>Asymmetric encoder/decoder</strong> — the big ViT encoder only sees visible patches; a small decoder (8-layer, 512-dim) handles reconstruction. 3x faster pretraining than naive BEiT.</li>
+<li><strong>Pixel-space reconstruction target</strong> — simpler than BEiT's tokenised target and works better on ViT.</li>
+</ul>
+<p>After pretraining, discard the decoder. The encoder is the feature extractor.</p>
+<h3>Why 75% and not 15%</h3>
+<p>BERT masks 15% of tokens. MAE masks 75%. The difference is information density.</p>
+<ul>
+<li>Natural language has high entropy per token. Predicting 15% of tokens is still hard because each masked position has many plausible completions.</li>
+<li>Image patches have low entropy — an unmasked neighbourhood often determines the masked patch's pixels almost exactly. To make prediction require semantic understanding, you have to mask aggressively.</li>
+</ul>
+<p>75% is high enough that simple spatial extrapolation cannot solve the task; the encoder must represent the image content.</p>
+<h3>Linear-probe evaluation</h3>
+<p>After self-supervised pretraining, the standard evaluation is a <strong>linear probe</strong>: freeze the encoder, train a single linear classifier on top on ImageNet labels. Reports top-1 accuracy.</p>
+<ul>
+<li>SimCLR ResNet-50: ~71% (2020)</li>
+<li>DINO ViT-S/16: ~77% (2021)</li>
+<li>MAE ViT-L/16: ~76% (2022)</li>
+<li>DINOv2 ViT-g/14: ~86% (2023)</li>
+</ul>
+<p>Linear probe is a pure measure of feature quality; fine-tuning typically adds 2-5 points but also mixes in the effect of head retraining.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-6bf6d64445b9297e8ba0.png" alt="data-augmentation 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<h3>Step 1: Two-view augmentation pipeline</h3>
+<pre><code class="language-python">import torch
+import torchvision.transforms as T
+
+two_view_train = lambda: T.Compose([
+    T.RandomResizedCrop(96, scale=(0.2, 1.0)),
+    T.RandomHorizontalFlip(),
+    T.ColorJitter(0.4, 0.4, 0.4, 0.1),
+    T.RandomGrayscale(p=0.2),
+    T.ToTensor(),
+])
+
+
+class TwoViewDataset(torch.utils.data.Dataset):
+    def __init__(self, base):
+        self.base = base
+        self.aug = two_view_train()
+
+    def __len__(self):
+        return len(self.base)
+
+    def __getitem__(self, i):
+        img, _ = self.base[i]
+        v1 = self.aug(img)
+        v2 = self.aug(img)
+        return v1, v2
+</code></pre>
+<p>Each <strong>getitem</strong> returns two augmented views of the same image; labels are not needed.</p>
+<h3>Step 2: InfoNCE loss</h3>
+<pre><code class="language-python">import torch.nn.functional as F
+
+def info_nce(z1, z2, tau=0.1):
+    &quot;&quot;&quot;
+    z1, z2: (N, D) L2-normalised embeddings of paired views
+    &quot;&quot;&quot;
+    N, D = z1.shape
+    z = torch.cat([z1, z2], dim=0)  # (2N, D)
+    sim = z @ z.T / tau              # (2N, 2N)
+
+    mask = torch.eye(2 * N, dtype=torch.bool, device=z.device)
+    sim = sim.masked_fill(mask, float(&quot;-inf&quot;))
+
+    targets = torch.cat([torch.arange(N, 2 * N), torch.arange(0, N)]).to(z.device)
+    return F.cross_entropy(sim, targets)
+</code></pre>
+<p>L2-normalise embeddings before calling. <code>tau=0.1</code> is the SimCLR default; lower makes the loss sharper and requires more negatives.</p>
+<h3>Step 3: Sanity check InfoNCE</h3>
+<pre><code class="language-python">z1 = F.normalize(torch.randn(16, 32), dim=-1)
+z2 = z1.clone()
+loss_same = info_nce(z1, z2, tau=0.1).item()
+z2_random = F.normalize(torch.randn(16, 32), dim=-1)
+loss_random = info_nce(z1, z2_random, tau=0.1).item()
+print(f&quot;InfoNCE with identical pairs:  {loss_same:.3f}&quot;)
+print(f&quot;InfoNCE with random pairs:     {loss_random:.3f}&quot;)
+</code></pre>
+<p>Identical pairs should give a low loss (close to 0 for a large batch and cold temperature). Random pairs should give log(2N-1) = ~log(31) = ~3.4 with a 16-pair batch.</p>
+<h3>Step 4: MAE-style masking</h3>
+<pre><code class="language-python">def random_mask_indices(num_patches, mask_ratio=0.75, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    n_keep = int(num_patches * (1 - mask_ratio))
+    perm = torch.randperm(num_patches, generator=g)
+    visible = perm[:n_keep]
+    masked = perm[n_keep:]
+    return visible.sort().values, masked.sort().values
+
+
+num_patches = 196
+visible, masked = random_mask_indices(num_patches, mask_ratio=0.75)
+print(f&quot;visible: {len(visible)} / {num_patches}&quot;)
+print(f&quot;masked:  {len(masked)} / {num_patches}&quot;)
+</code></pre>
+<p>Simple, fast, and deterministic for a given seed. Real MAE implementations batch this and keep per-sample masks.</p>
+<h2>Use It</h2>
+<p>DINOv2 is the production standard in 2026:</p>
+<pre><code class="language-python">import torch
+from transformers import AutoImageProcessor, AutoModel
+
+processor = AutoImageProcessor.from_pretrained(&quot;facebook/dinov2-base&quot;)
+model = AutoModel.from_pretrained(&quot;facebook/dinov2-base&quot;)
+model.eval()
+
+# Per-image embeddings for zero-shot retrieval
+with torch.no_grad():
+    inputs = processor(images=[pil_image], return_tensors=&quot;pt&quot;)
+    outputs = model(**inputs)
+    embedding = outputs.last_hidden_state[:, 0]  # CLS token
+</code></pre>
+<p>The resulting 768-dim embedding is the backbone of modern image retrieval, dense correspondence, and zero-shot transfer pipelines. Fine-tuning on a downstream task rarely needs more than a linear head.</p>
+<p>For image-text embeddings, SigLIP or OpenCLIP is the equivalent; for MAE-style fine-tuning, the <code>timm</code> repo ships every MAE checkpoint.</p>
+<h2>Ship It</h2>
+<p>This lesson produces:</p>
+<ul>
+<li><code>outputs/prompt-ssl-pretraining-picker.md</code> — a prompt that picks SimCLR / MAE / DINOv2 given dataset size, compute, and downstream task.</li>
+<li><code>outputs/skill-linear-probe-runner.md</code> — a skill that writes the linear-probe evaluation for any frozen encoder + labelled dataset.</li>
+</ul>
+<h2>Exercises</h2>
+<ol>
+<li><strong>(Easy)</strong> Verify that InfoNCE loss drops when you decrease temperature for well-aligned embeddings and rises when you decrease temperature for random embeddings. Produce a plot <code>tau in [0.05, 0.1, 0.2, 0.5]</code> vs loss.</li>
+<li><strong>(Medium)</strong> Implement a DINO-style centre buffer. Show that without the centring, the student collapses to a constant vector within a few epochs.</li>
+<li><strong>(Hard)</strong> Train MAE on CIFAR-100 using the TinyUNet from Lesson 10 as the backbone. Report linear-probe accuracy at 10, 50, and 200 epochs. Show that a MAE-pretrained linear probe beats a from-scratch supervised linear probe on the same 1,000-image subset.</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Self-supervised</td>
+<td>&quot;Label-free&quot;</td>
+<td>A pretext task that produces useful representations from unlabelled data</td>
+</tr>
+<tr>
+<td>Pretext task</td>
+<td>&quot;The fake task&quot;</td>
+<td>The objective used during SSL (reconstruct patches, match views); discarded after pretraining</td>
+</tr>
+<tr>
+<td>Linear probe</td>
+<td>&quot;Frozen encoder + linear head&quot;</td>
+<td>Standard SSL evaluation: train only a linear classifier on top of frozen features</td>
+</tr>
+<tr>
+<td>InfoNCE</td>
+<td>&quot;Contrastive loss&quot;</td>
+<td>softmax over cosine similarities; positive pair is the target class, all others are negatives</td>
+</tr>
+<tr>
+<td>EMA teacher</td>
+<td>&quot;Moving-average teacher&quot;</td>
+<td>Teacher whose weights are an exponential moving average of the student's; used by BYOL, MoCo, DINO</td>
+</tr>
+<tr>
+<td>Mask ratio</td>
+<td>&quot;% of patches hidden&quot;</td>
+<td>Fraction of patches masked during MAE; 75% for vision, 15% for text</td>
+</tr>
+<tr>
+<td>Representation collapse</td>
+<td>&quot;Constant output&quot;</td>
+<td>SSL failure where the encoder outputs a constant vector for all inputs; prevented by centring, sharpening, or negatives</td>
+</tr>
+<tr>
+<td>DINOv2</td>
+<td>&quot;Production SSL backbone&quot;</td>
+<td>Meta's 2023 self-supervised ViT; strongest general-purpose image features in 2026</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2002.05709" rel="noreferrer" data-network="true">SimCLR (Chen et al., 2020) <small>↗ 需要联网</small></a> — contrastive learning reference</li>
+<li><a href="https://arxiv.org/abs/2104.14294" rel="noreferrer" data-network="true">DINO (Caron et al., 2021) <small>↗ 需要联网</small></a> — teacher-student with momentum, centring, sharpening</li>
+<li><a href="https://arxiv.org/abs/2111.06377" rel="noreferrer" data-network="true">MAE (He et al., 2022) <small>↗ 需要联网</small></a> — masked autoencoder pretraining for ViT</li>
+<li><a href="https://arxiv.org/abs/2304.07193" rel="noreferrer" data-network="true">DINOv2 (Oquab et al., 2023) <small>↗ 需要联网</small></a> — scaling self-supervised ViT to production features</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-04-computer-vision--17-self-supervised-vision.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-04-computer-vision--17-self-supervised-vision.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/04-computer-vision/17-self-supervised-vision/code/main.py">phases/04-computer-vision/17-self-supervised-vision/code/main.py</a><details><summary>查看原始文本</summary><pre><code>import torch
+import torch.nn.functional as F
+
+
+def info_nce(z1, z2, tau=0.1):
+    N, D = z1.shape
+    z = torch.cat([z1, z2], dim=0)
+    sim = z @ z.T / tau
+    mask = torch.eye(2 * N, dtype=torch.bool, device=z.device)
+    sim = sim.masked_fill(mask, float(&quot;-inf&quot;))
+    targets = torch.cat([torch.arange(N, 2 * N), torch.arange(0, N)]).to(z.device)
+    return F.cross_entropy(sim, targets)
+
+
+def random_mask_indices(num_patches, mask_ratio=0.75, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    n_keep = int(num_patches * (1 - mask_ratio))
+    perm = torch.randperm(num_patches, generator=g)
+    visible = perm[:n_keep]
+    masked = perm[n_keep:]
+    return visible.sort().values, masked.sort().values
+
+
+class DinoHead(torch.nn.Module):
+    &quot;&quot;&quot;
+    Toy DINO head to demonstrate centring + sharpening.
+    Real DINO uses a deeper MLP.
+    &quot;&quot;&quot;
+
+    def __init__(self, in_dim=64, out_dim=128, momentum=0.9):
+        super().__init__()
+        self.proj = torch.nn.Linear(in_dim, out_dim)
+        self.register_buffer(&quot;centre&quot;, torch.zeros(out_dim))
+        self.momentum = momentum
+
+    def student(self, x, temp=0.1):
+        return F.log_softmax(self.proj(x) / temp, dim=-1)
+
+    def teacher(self, x, temp=0.04):
+        out = self.proj(x)
+        return F.softmax((out - self.centre) / temp, dim=-1).detach()
+
+    @torch.no_grad()
+    def update_centre(self, teacher_out):
+        self.centre.mul_(self.momentum).add_(teacher_out.mean(dim=0), alpha=1 - self.momentum)
+
+
+def main():
+    torch.manual_seed(0)
+
+    print(&quot;[info_nce]&quot;)
+    z = F.normalize(torch.randn(16, 32), dim=-1)
+    loss_identical = info_nce(z, z, tau=0.1).item()
+    z_random = F.normalize(torch.randn(16, 32), dim=-1)
+    loss_random = info_nce(z, z_random, tau=0.1).item()
+    print(f&quot;  identical pairs:  {loss_identical:.3f}  (should be low)&quot;)
+    print(f&quot;  random pairs:     {loss_random:.3f}  (should be near log(2N-1) = {torch.log(torch.tensor(31.0)):.3f})&quot;)
+
+    print(&quot;\n[mae mask]&quot;)
+    visible, masked = random_mask_indices(196, mask_ratio=0.75)
+    print(f&quot;  visible: {len(visible)} / 196&quot;)
+    print(f&quot;  masked:  {len(masked)} / 196&quot;)
+    print(f&quot;  first 5 visible indices: {visible[:5].tolist()}&quot;)
+
+    print(&quot;\n[dino centring demo]&quot;)
+    head = DinoHead(in_dim=64, out_dim=16)
+    feats = torch.randn(64, 64)
+    teacher_out = head.teacher(feats)
+    print(f&quot;  teacher output max col mean before update: {teacher_out.mean(dim=0).max().item():.3f}&quot;)
+    head.update_centre(head.proj(feats))
+    teacher_out_after = head.teacher(feats)
+    print(f&quot;  teacher output max col mean after update:  {teacher_out_after.mean(dim=0).max().item():.3f}&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/04-computer-vision/17-self-supervised-vision/outputs/prompt-ssl-pretraining-picker.md">phases/04-computer-vision/17-self-supervised-vision/outputs/prompt-ssl-pretraining-picker.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: prompt-ssl-pretraining-picker
+description: Pick SimCLR / MAE / DINOv2 given dataset size, compute, and downstream task
+phase: 4
+lesson: 17
+---
+
+You are a self-supervised pretraining selector.
+
+## Inputs
+
+- `unlabelled_images`: how many available
+- `backbone`: ResNet | ViT
+- `downstream_task`: classification | detection | segmentation | retrieval
+- `compute_gpu_hours`: approximate training budget
+
+## Precedence
+
+Evaluate rules top-down; first match wins. Earlier rules short-circuit later ones. All numeric boundaries are non-overlapping: a rule that says `&lt; 1,000,000` never fires for the exact value 1,000,000 — that goes to the next band.
+
+## Decision
+
+1. `compute_gpu_hours &lt; 200` -&gt; **do not run SSL from scratch**. No SSL recipe converges in that budget. Emit `method: none, use_pretrained: DINOv2, reason: compute_budget_too_small`.
+
+2. `unlabelled_images &lt; 100,000` -&gt; **do not run SSL**. A pretrained checkpoint dominates anything you can train here. Emit `method: none, use_pretrained: DINOv2`.
+
+3. `downstream_task == retrieval` -&gt; **DINOv2**. Linear separability of DINOv2 features is the strongest across backbones; this rule overrides every backbone rule that follows.
+
+4. `downstream_task in [detection, segmentation]` and `backbone == ViT` -&gt; **MAE**. Dense reconstruction targets align with dense prediction. This rule overrides rule 6.
+
+5. `downstream_task in [detection, segmentation]` and `backbone == ResNet` -&gt; **DenseCL** (contrastive with dense projection head) or **PixPro**; if neither is available in your stack, fall back to **MoCo v3** and document the mismatch.
+
+6. `backbone == ResNet` (remaining classification cases) -&gt; **MoCo v3**.
+
+7. `backbone == ViT` and `unlabelled_images &gt;= 100,000,000` and `compute_gpu_hours &gt;= 5,000` -&gt; **DINOv2-style**. Downgrade to MAE if compute falls below 5,000 GPU hours.
+
+8. `backbone == ViT` and `1,000,000 &lt;= unlabelled_images &lt; 100,000,000` and `compute_gpu_hours &gt;= 1,000` -&gt; **MAE**.
+
+9. `backbone == ViT` and `100,000 &lt;= unlabelled_images &lt; 1,000,000` -&gt; **use a pretrained DINOv2 checkpoint**; do not re-pretrain from scratch. Emit `method: none, use_pretrained: DINOv2`.
+
+## Output
+
+```
+[pretraining]
+  method:          SimCLR | MoCo v3 | DINO | DINOv2 | MAE | DenseCL | PixPro | none
+  use_pretrained:  &lt;checkpoint name if method == none&gt;
+  epochs:          &lt;int if method != none&gt;
+  batch:           &lt;int&gt;
+  aug:             &lt;list&gt;
+  eval:            linear_probe | kNN | fine-tune
+
+[warnings]
+  - &lt;compute headroom&gt;
+  - &lt;batch size floor for contrastive methods&gt;
+  - &lt;downstream mismatch when a fallback was selected&gt;
+```
+
+## Rules
+
+- Never recommend SimCLR with batch size &lt; 1024; at smaller batches, MoCo&#39;s queue structure trains faster and lands at similar quality.
+- When `compute_gpu_hours` is provided, always include a one-line sanity check against the picked method&#39;s known GPU-hour ranges; flag insufficient budget explicitly.
+- Do not mix &quot;emit a method&quot; and &quot;use pretrained&quot; in the same row. If rule 1, 2, or 9 fires, the method is `none` and the pretrained checkpoint is the output.
+- If a fallback path in rule 5 was taken (ResNet + dense task), note the theoretical mismatch so the reader knows why a dense-specific variant would have been preferable.
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/04-computer-vision/17-self-supervised-vision/outputs/skill-linear-probe-runner.md">phases/04-computer-vision/17-self-supervised-vision/outputs/skill-linear-probe-runner.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: skill-linear-probe-runner
+description: Write the complete linear-probe evaluation for any frozen encoder and labelled dataset
+version: 1.0.0
+phase: 4
+lesson: 17
+tags: [self-supervised, evaluation, linear-probe, pytorch]
+---
+
+# Linear Probe Runner
+
+Evaluate a frozen encoder&#39;s features by training a single linear classifier on top. The standard evaluation for every self-supervised paper.
+
+## When to use
+
+- Comparing self-supervised checkpoints.
+- Tracking feature quality over pretraining epochs.
+- Deciding whether a pretrained encoder is good enough for a downstream task without fine-tuning.
+
+## Inputs
+
+- `encoder`: frozen `nn.Module` returning a fixed-dim feature per image.
+- `feature_dim`: dimensionality of the encoder output.
+- `train_dataset`: labelled dataset (image, class_id).
+- `val_dataset`: held-out set.
+- `num_classes`: task classes.
+- `epochs`: typically 100 for ImageNet-scale, 50 for smaller datasets.
+
+## Steps
+
+1. Set encoder to eval mode and `requires_grad=False` on every parameter.
+2. Feature-extract both train and val sets once. Store as numpy arrays or a memory-mapped file.
+3. Train a `nn.Linear(feature_dim, num_classes)` on the cached features with SGD + cosine schedule.
+4. Standard hyperparameters: `lr=0.1`, `momentum=0.9`, `weight_decay=0`, `batch_size=1024`. Linear probe is surprisingly sensitive to `lr` — sweep if accuracy is poor.
+5. Report top-1 accuracy on val at the end of training.
+
+## Output template
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from torch.optim import SGD
+from torch.optim.lr_scheduler import CosineAnnealingLR
+
+def extract(encoder, loader, device=&quot;cpu&quot;):
+    encoder.eval()
+    feats, labels = [], []
+    with torch.no_grad():
+        for x, y in loader:
+            f = encoder(x.to(device)).cpu()
+            feats.append(f)
+            labels.append(y)
+    return torch.cat(feats), torch.cat(labels)
+
+
+def linear_probe(encoder, feature_dim, train_loader, val_loader,
+                 num_classes, epochs=50, lr=0.1, device=&quot;cpu&quot;):
+    for p in encoder.parameters():
+        p.requires_grad = False
+
+    f_train, y_train = extract(encoder, train_loader, device)
+    f_val, y_val = extract(encoder, val_loader, device)
+
+    head = nn.Linear(feature_dim, num_classes).to(device)
+    opt = SGD(head.parameters(), lr=lr, momentum=0.9, weight_decay=0)
+    sched = CosineAnnealingLR(opt, T_max=epochs)
+
+    ds = torch.utils.data.TensorDataset(f_train, y_train)
+    train_iter = DataLoader(ds, batch_size=1024, shuffle=True)
+
+    best_val = 0.0
+    for ep in range(epochs):
+        head.train()
+        for x, y in train_iter:
+            x, y = x.to(device), y.to(device)
+            loss = F.cross_entropy(head(x), y)
+            opt.zero_grad(); loss.backward(); opt.step()
+        sched.step()
+
+        head.eval()
+        with torch.no_grad():
+            acc = (head(f_val.to(device)).argmax(-1).cpu() == y_val).float().mean().item()
+        best_val = max(best_val, acc)
+    return best_val
+```
+
+## Report
+
+```
+[linear probe]
+  encoder:     &lt;name + pretrain checkpoint&gt;
+  feature_dim: &lt;int&gt;
+  epochs:      &lt;int&gt;
+  best_val_top1: &lt;float&gt;
+```
+
+## Rules
+
+- Never update encoder weights during linear probe; that would be a fine-tune, not a probe.
+- Precompute features once; retraining the encoder on every epoch wastes 100x compute.
+- Use SGD with cosine schedule and no weight decay; Adam sometimes underperforms here.
+- Sweep learning rates at least once per encoder family; the optimum varies across SSL methods.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. Why does SimCLR need batch sizes of 512-8192 while supervised ImageNet training works with batch 256?</legend><label class="option"><input type="radio" name="q0" value="0"> Each sample needs many negative examples to produce a useful contrastive signal; the batch itself is the pool of negatives. Small batches starve the InfoNCE loss of negatives and training collapses or stalls</label><label class="option"><input type="radio" name="q0" value="1"> Batch norm requires it</label><label class="option"><input type="radio" name="q0" value="2"> Contrastive loss divides by batch size</label><label class="option"><input type="radio" name="q0" value="3"> SimCLR is slower</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. What prevents DINO from collapsing to a constant output?</legend><label class="option"><input type="radio" name="q1" value="0"> Large batch size</label><label class="option"><input type="radio" name="q1" value="1"> The momentum schedule</label><label class="option"><input type="radio" name="q1" value="2"> Strong augmentation alone</label><label class="option"><input type="radio" name="q1" value="3"> A combination of centring (subtract per-dimension EMA mean from the teacher output) and sharpening (low teacher temperature); centring stops one dimension from dominating, sharpening stops the output collapsing to uniform</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. MAE masks 75% of patches. BERT masks 15% of tokens. Why the difference?</legend><label class="option"><input type="radio" name="q2" value="0"> 75% is arbitrary</label><label class="option"><input type="radio" name="q2" value="1"> BERT requires 15% by design</label><label class="option"><input type="radio" name="q2" value="2"> Image patches have low entropy — neighbours are highly correlated — so masking only 15% would be trivially solvable by local extrapolation. Masking 75% forces the encoder to learn global semantic features to reconstruct the missing patches</label><label class="option"><input type="radio" name="q2" value="3"> Text tokens are larger than image patches</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. After self-supervised pretraining, the &#39;linear probe&#39; evaluation trains only what?</legend><label class="option"><input type="radio" name="q3" value="0"> A full MLP classifier head</label><label class="option"><input type="radio" name="q3" value="1"> The entire encoder</label><label class="option"><input type="radio" name="q3" value="2"> The positional embedding</label><label class="option"><input type="radio" name="q3" value="3"> A single linear classifier on top of the frozen encoder features; this isolates feature quality from fine-tuning dynamics</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. Why does MAE use an asymmetric encoder-decoder design (big encoder on 25% visible patches, small decoder on all tokens)?</legend><label class="option"><input type="radio" name="q4" value="0"> The decoder needs its own backbone</label><label class="option"><input type="radio" name="q4" value="1"> Memory constraints</label><label class="option"><input type="radio" name="q4" value="2"> Masked tokens confuse self-attention</label><label class="option"><input type="radio" name="q4" value="3"> The encoder never processes mask tokens; a small decoder only handles reconstruction. This makes encoder FLOPs proportional to visible patches (1/4 of full input) and lets pretraining run 3x faster than naive designs that process all tokens through the full encoder</label><p data-feedback="4"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/04-computer-vision/16-vision-pipeline-capstone/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/04-computer-vision/18-open-vocab-clip/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/04-computer-vision/17-self-supervised-vision/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

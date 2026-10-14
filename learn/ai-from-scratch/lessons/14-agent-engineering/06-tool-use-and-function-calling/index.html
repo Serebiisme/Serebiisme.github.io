@@ -1,0 +1,805 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>工具使用和功能调用 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-14-agent-engineering" data-lesson="14-agent-engineering/06-tool-use-and-function-calling" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/14-agent-engineering/">Agent 工程</a> / LESSON 06</p><h1 class="lesson-title">工具使用和功能调用</h1><p>Tool Use and Function Calling</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>工具使用和功能调用</h1>
+<blockquote>
+<p>工具former (Schick等同,2023) 开始自主监督工具注释.伯克利函数调用领袖板 V4 (Patil等同,2025) 设定了2026年条:40%的代理,30%的多转,10%的现场,10%的非现场,10%的幻觉.单转是解决的.记忆,动态决策和长视线工具链不是.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python (stdlib)
+<strong>Prerequisites:</strong> Phase 14 · 01 (Agent Loop), Phase 13 · 01 (Function Calling Deep Dive)
+<strong>Time:</strong> ~60 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>解释Toolformer的自我监督训练信号:只在执行后节点损失时保留工具注释.</li>
+<li>列出BFCL V4的五个评估类别,并列出每个评估类别的标准.</li>
+<li>实现一个使用方案验证,引证强制和执行沙盒的 stdlib 工具登记.</li>
+<li>诊断2026年出现的三个问题:长视野工具链,动态决策和记忆.</li>
+</ul>
+<h2>问题</h2>
+<p>早期工具使用被问到:模型能预测一个正确的函数调用吗?现代工具使用问:模型链工具可以跨越40步,具有内存,有部分可观测性,从工具故障中恢复,而不产生幻觉的工具?</p>
+<p>工具创始人建立了基线:模型可以学习在自主监督下何时调用工具.BFCL V4定义了2026年评估目标.</p>
+<h2>概念</h2>
+<h3>工具former (Schick等人,NeurIPS 2023)</h3>
+<p>想法:让模型用候选人 API 调用来注释自己的预训练库.对于每个候选人,执行它.只要包括工具结果,就会减少下一个代币的损失. 选的库.</p>
+<p>工具包括:计算器,质量检测系统,搜索引擎,翻译器,日历.自监测信号纯粹是关于工具是否有助于预测文本没有人类标签.</p>
+<p>规模结果:工具使用出现规模.较小的模型受工具注释的影响;较大的模型获益.这就是为什么2026年边界模型具有强大的工具使用,而大多数7B模型需要明确的工具使用细节调节才能靠谱.</p>
+<h3>伯克利函数调用排名表 V4 (帕蒂尔等人,ICML 2025)</h3>
+<p>根据&quot;2026年&quot;的实际评估,</p>
+<ul>
+<li><strong>Agentic (40%)</strong> 完全代理轨迹:记忆,多轮,动态决策.</li>
+<li>**Multi-Turn (30%)**与工具链进行互动对话.</li>
+<li>**Live (10%)**用户提交的真实提示 (更硬的分布).</li>
+<li>**Non-Live (10%)**合成试验案例.</li>
+<li>**Hallucination (10%)**检测不应调用任何工具时.</li>
+</ul>
+<p>V3引入了基于状态的评估:在工具序列之后,检查API的实际状态 (例如&quot;文件是否创建?&quot;) 而不是与工具调用的AST匹配. V4增加了网页搜索,内存和格式敏感性类别.</p>
+<p>关键2026发现:单转函数调用几乎解决了.失败集中在记忆中 (跨转中运载文本),动态决策 (基于先前结果选择工具),长视线链 (20多步后漂移) 和幻觉检测 (拒绝调用当没有工具合适时).</p>
+<h3>工具方案</h3>
+<p>每个提供商都有一个方案.</p>
+<pre><code>name: string
+description: string (what it does, when to use it)
+input_schema: JSON Schema (properties, required, types, enums)
+</code></pre>
+<p>人类用途 <code>input_schema</code>直接使用.<code>function.parameters</code>两个都接受JSON方案.描述承载量,模型阅读它们来选择正确的工具.不良的工具描述是错误的工具失败的第一根原因.</p>
+<h3>证据验证</h3>
+<p>没有工具的呼叫.</p>
+<ol>
+<li>**Type coercion.**模型可能会返回一个字符串 &quot;5&quot;,该字符串表示 int. 如果不含糊,强迫;如果不,拒绝.</li>
+<li>**Enum validation.**如果该方案说<code>status in {&quot;open&quot;, &quot;closed&quot;}</code>及模型排放量<code>&quot;in_progress&quot;</code>拒绝使用描述错误.</li>
+<li>**Required fields.**错失的需要字段 -&gt; 立即回到模型,而不是崩.</li>
+<li>**Format validation.**通过混凝土仪验证日期,电子邮件,URL,而不是regex.</li>
+</ol>
+<p>每次验证失败都应返回结构性观察,以便模型能够再次尝试正确的形状.</p>
+<h3>并行工具调用</h3>
+<p>现代提供商支持平行工具调用,</p>
+<ol>
+<li>模型发出3个工具调用,具有不同的<code>tool_use_id</code>其他</li>
+<li>运行时间执行它们 (如果独立,则并行).</li>
+<li>每个结果都回归为<code>tool_result</code>相关的块<code>tool_use_id</code>现在,我们要去.</li>
+</ol>
+<p>工程规则:把相关性ID视为承载,交换它们,你得到错误工具到错误结果的路由.</p>
+<h3>沙盒</h3>
+<p>简短版本:每个工具都应该指定阅读/写面,网络访问,时间限,内存盖. 概括 <code>run_shell(cmd)</code>是红旗;具体<code>git_status()</code>这更安全.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-44dac769e833c8e625c1.png" alt="tool-routing 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<p><code>code/main.py</code>执行生产形工具登记册:</p>
+<ul>
+<li>通过JSON Schema的子集验证器 (仅在stdlib).</li>
+<li>工具注册,包含描述,输入方案,时间限和执行器.</li>
+<li>证据强制和证实.</li>
+<li>配合工具发送与相关身份证.</li>
+<li>错误观测作为结构字符串.</li>
+</ul>
+<p>运行它:</p>
+<pre><code>python3 code/main.py
+</code></pre>
+<p>痕迹显示一个小代理在一次轮回召唤三个工具, 一次故意错误的呼叫被拒绝,</p>
+<h2>用它</h2>
+<p>每个提供商都有自己的工具方案.如果需要多提供商,请使用翻译层 (OpenAI Agents SDK,Vercel AI SDK,LangChain工具适配器).BFCL是参考基准.</p>
+<h2>运送它</h2>
+<p><code>outputs/skill-tool-registry.md</code>包含描述质量检查 (每个工具的描述是否告诉模型何时使用它?).</p>
+<h2>运动</h2>
+<ol>
+<li>添加一个&quot;无操作&quot;工具,允许模型明确拒绝使用任何其他工具.</li>
+<li>强制性是什么原因?</li>
+<li>增加每种工具的时间和断路器 (在连续3次故障后拒绝60年的工具). 这改变了模型恢复方式的情况.</li>
+<li>阅读BFCL V4描述. 选择一个类别 (例如&quot;多转&quot;) 并通过代理运行10个示例提示. 报告通过率.</li>
+<li>让我们把SDLB验证器转移到Pydantic或Zod.</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Function calling</td>
+<td>&quot;Tool use&quot;</td>
+<td>Structured-output tool invocation with validated schema</td>
+</tr>
+<tr>
+<td>Toolformer</td>
+<td>&quot;Self-supervised tool annotation&quot;</td>
+<td>Schick 2023 — keep tool calls whose results reduce next-token loss</td>
+</tr>
+<tr>
+<td>BFCL</td>
+<td>&quot;Berkeley Function Calling Leaderboard&quot;</td>
+<td>2026 benchmark: 40% agentic, 30% multi-turn, 10% live, 10% non-live, 10% hallucination</td>
+</tr>
+<tr>
+<td>Tool schema</td>
+<td>&quot;Function signature for the model&quot;</td>
+<td>name, description, JSON Schema of arguments</td>
+</tr>
+<tr>
+<td>tool_use_id</td>
+<td>&quot;Correlation ID&quot;</td>
+<td>Ties a tool call to its result; essential for parallel dispatch</td>
+</tr>
+<tr>
+<td>Hallucination detection</td>
+<td>&quot;Know when not to call&quot;</td>
+<td>V4 category: refuse to call when no tool fits</td>
+</tr>
+<tr>
+<td>Argument coercion</td>
+<td>&quot;String-to-int repair&quot;</td>
+<td>Narrow fixes for predictable schema-mismatch; reject if ambiguous</td>
+</tr>
+<tr>
+<td>Sandboxing</td>
+<td>&quot;Tool execution boundary&quot;</td>
+<td>Per-tool read/write surface, network, timeout, memory cap</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2302.04761" rel="noreferrer" data-network="true">Schick et al., Toolformer (arXiv:2302.04761) <small>↗ 需要联网</small></a>自主监督工具注释</li>
+<li><a href="https://gorilla.cs.berkeley.edu/leaderboard.html" rel="noreferrer" data-network="true">Berkeley Function Calling Leaderboard (V4) <small>↗ 需要联网</small></a>2026年评估基准</li>
+<li><a href="https://platform.claude.com/docs/en/agent-sdk/overview" rel="noreferrer" data-network="true">Anthropic, Tool use documentation <small>↗ 需要联网</small></a> Claude Agent SDK中的生产工具方案</li>
+<li><a href="https://openai.github.io/openai-agents-python/" rel="noreferrer" data-network="true">OpenAI Agents SDK docs <small>↗ 需要联网</small></a>功能工具类型和Guardails</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Tool Use and Function Calling</h1>
+<blockquote>
+<p>Toolformer (Schick et al., 2023) started self-supervised tool annotation. Berkeley Function Calling Leaderboard V4 (Patil et al., 2025) sets the 2026 bar: 40% agentic, 30% multi-turn, 10% live, 10% non-live, 10% hallucination. Single-turn is solved. Memory, dynamic decision-making, and long-horizon tool chains are not.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python (stdlib)
+<strong>Prerequisites:</strong> Phase 14 · 01 (Agent Loop), Phase 13 · 01 (Function Calling Deep Dive)
+<strong>Time:</strong> ~60 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Explain Toolformer's self-supervised training signal: keep tool annotations only when execution reduces next-token loss.</li>
+<li>Name BFCL V4's five evaluation categories and what each measures.</li>
+<li>Implement a stdlib tool registry with schema validation, argument coercion, and execution sandboxing.</li>
+<li>Diagnose the three 2026 open problems: long-horizon tool chaining, dynamic decision-making, and memory.</li>
+</ul>
+<h2>The Problem</h2>
+<p>Early tool use asked: can the model predict a correct function call? Modern tool use asks: can the model chain tools across 40 steps, with memory, with partial observability, with recovery from tool failures, without hallucinating tools that do not exist?</p>
+<p>Toolformer established the baseline: models can learn when to call tools with self-supervision. BFCL V4 defines the 2026 evaluation target. The gap between them is the space production agents live in.</p>
+<h2>The Concept</h2>
+<h3>Toolformer (Schick et al., NeurIPS 2023)</h3>
+<p>Idea: let the model annotate its own pretraining corpus with candidate API calls. For each candidate, execute it. Keep the annotation only if including the tool result reduces loss on the next token. Fine-tune on the filtered corpus.</p>
+<p>Tools covered: calculator, QA system, search engines, translator, calendar. The self-supervision signal is purely about whether the tool helps predict text — no human labels.</p>
+<p>Scale result: tool use emerges at scale. Smaller models hurt from tool annotations; larger models gain. This is why 2026 frontier models have strong tool use baked in while most 7B models need explicit tool-use fine-tuning to be reliable.</p>
+<h3>Berkeley Function Calling Leaderboard V4 (Patil et al., ICML 2025)</h3>
+<p>BFCL is the 2026 de facto evaluation. V4 composition:</p>
+<ul>
+<li><strong>Agentic (40%)</strong> — full agent trajectories: memory, multi-turn, dynamic decisions.</li>
+<li><strong>Multi-Turn (30%)</strong> — interactive conversations with tool chains.</li>
+<li><strong>Live (10%)</strong> — user-submitted real prompts (harder distribution).</li>
+<li><strong>Non-Live (10%)</strong> — synthetic test cases.</li>
+<li><strong>Hallucination (10%)</strong> — detect when no tool should be called.</li>
+</ul>
+<p>V3 introduced state-based evaluation: after a tool sequence, check the API's actual state (e.g. &quot;is the file created?&quot;) rather than match the AST of the tool calls. V4 added web search, memory, and format sensitivity categories.</p>
+<p>Key 2026 finding: single-turn function calling is near-solved. Failures concentrate in memory (carrying context across turns), dynamic decision-making (choosing tools based on prior results), long-horizon chains (drift after 20+ steps), and hallucination detection (refusing to call when no tool fits).</p>
+<h3>Tool schema</h3>
+<p>Every provider has a schema. They differ in details but share the same shape:</p>
+<pre><code>name: string
+description: string (what it does, when to use it)
+input_schema: JSON Schema (properties, required, types, enums)
+</code></pre>
+<p>Anthropic uses <code>input_schema</code> directly. OpenAI uses <code>function.parameters</code>. Both accept JSON Schema. Descriptions are load-bearing — the model reads them to pick the right tool. Bad tool descriptions are the #1 root cause of wrong-tool-picked failures.</p>
+<h3>Argument validation</h3>
+<p>Trust no tool call. Validate:</p>
+<ol>
+<li><strong>Type coercion.</strong> Model may return a string &quot;5&quot; where the schema says int. Coerce if unambiguous; reject if not.</li>
+<li><strong>Enum validation.</strong> If the schema says <code>status in {&quot;open&quot;, &quot;closed&quot;}</code> and model emits <code>&quot;in_progress&quot;</code>, reject with a descriptive error.</li>
+<li><strong>Required fields.</strong> Missing required field -&gt; immediate error observation back to the model, not a crash.</li>
+<li><strong>Format validation.</strong> Dates, emails, URLs — validate with concrete parsers, not regex.</li>
+</ol>
+<p>Every validation failure should return a structured observation so the model can retry with the correct shape.</p>
+<h3>Parallel tool calls</h3>
+<p>Modern providers support parallel tool calls in one assistant turn. The loop:</p>
+<ol>
+<li>Model emits 3 tool calls with distinct <code>tool_use_id</code>s.</li>
+<li>Runtime executes them (in parallel if independent).</li>
+<li>Each result goes back as a <code>tool_result</code> block correlated by <code>tool_use_id</code>.</li>
+</ol>
+<p>Engineering rule: treat correlation IDs as load-bearing. Swap them and you get wrong-tool-to-wrong-result routing.</p>
+<h3>Sandboxing</h3>
+<p>Tool execution is the sandbox boundary. See Lesson 09 for detail. Short version: every tool should specify read/write surface, network access, timeout, memory cap. Generic <code>run_shell(cmd)</code> is a red flag; specific <code>git_status()</code> is safer.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-44dac769e833c8e625c1.png" alt="tool-routing 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<p><code>code/main.py</code> implements a production-shape tool registry:</p>
+<ul>
+<li>JSON Schema subset validator (stdlib only).</li>
+<li>Tool registration with description, input schema, timeout, and executor.</li>
+<li>Argument coercion and enum validation.</li>
+<li>Parallel tool dispatch with correlation IDs.</li>
+<li>Error observations as structured strings.</li>
+</ul>
+<p>Run it:</p>
+<pre><code>python3 code/main.py
+</code></pre>
+<p>The trace shows a mini agent calling three tools in one turn, with one deliberately malformed call that is rejected with a descriptive error the model can act on.</p>
+<h2>Use It</h2>
+<p>Every provider has its own tool schema — Anthropic, OpenAI, Gemini, Bedrock. Use a translation layer (OpenAI Agents SDK, Vercel AI SDK, LangChain tool adapter) if you need multi-provider. BFCL is the reference benchmark — run it against your agent before shipping if tool use is central to the product.</p>
+<h2>Ship It</h2>
+<p><code>outputs/skill-tool-registry.md</code> generates a tool catalog, schema, and registry for a given task domain. Includes description-quality checks (does each tool's description tell the model when to use it?).</p>
+<h2>Exercises</h2>
+<ol>
+<li>Add a &quot;no-op&quot; tool that lets the model explicitly refuse to use any other tool. Measure on a BFCL-like hallucination test.</li>
+<li>Implement argument coercion for int-as-string and float-as-string. Where does coercion start to hide real bugs?</li>
+<li>Add a per-tool timeout and a circuit breaker (refuse the tool for 60s after 3 consecutive failures). What does this change about how the model recovers?</li>
+<li>Read BFCL V4 description. Pick one category (e.g. &quot;multi-turn&quot;) and run 10 example prompts through your agent. Report pass rate.</li>
+<li>Port the stdlib validator to Pydantic or Zod. What did Pydantic/Zod catch that the toy missed?</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Function calling</td>
+<td>&quot;Tool use&quot;</td>
+<td>Structured-output tool invocation with validated schema</td>
+</tr>
+<tr>
+<td>Toolformer</td>
+<td>&quot;Self-supervised tool annotation&quot;</td>
+<td>Schick 2023 — keep tool calls whose results reduce next-token loss</td>
+</tr>
+<tr>
+<td>BFCL</td>
+<td>&quot;Berkeley Function Calling Leaderboard&quot;</td>
+<td>2026 benchmark: 40% agentic, 30% multi-turn, 10% live, 10% non-live, 10% hallucination</td>
+</tr>
+<tr>
+<td>Tool schema</td>
+<td>&quot;Function signature for the model&quot;</td>
+<td>name, description, JSON Schema of arguments</td>
+</tr>
+<tr>
+<td>tool_use_id</td>
+<td>&quot;Correlation ID&quot;</td>
+<td>Ties a tool call to its result; essential for parallel dispatch</td>
+</tr>
+<tr>
+<td>Hallucination detection</td>
+<td>&quot;Know when not to call&quot;</td>
+<td>V4 category: refuse to call when no tool fits</td>
+</tr>
+<tr>
+<td>Argument coercion</td>
+<td>&quot;String-to-int repair&quot;</td>
+<td>Narrow fixes for predictable schema-mismatch; reject if ambiguous</td>
+</tr>
+<tr>
+<td>Sandboxing</td>
+<td>&quot;Tool execution boundary&quot;</td>
+<td>Per-tool read/write surface, network, timeout, memory cap</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2302.04761" rel="noreferrer" data-network="true">Schick et al., Toolformer (arXiv:2302.04761) <small>↗ 需要联网</small></a> — self-supervised tool annotation</li>
+<li><a href="https://gorilla.cs.berkeley.edu/leaderboard.html" rel="noreferrer" data-network="true">Berkeley Function Calling Leaderboard (V4) <small>↗ 需要联网</small></a> — 2026 eval benchmark</li>
+<li><a href="https://platform.claude.com/docs/en/agent-sdk/overview" rel="noreferrer" data-network="true">Anthropic, Tool use documentation <small>↗ 需要联网</small></a> — production tool schema in the Claude Agent SDK</li>
+<li><a href="https://openai.github.io/openai-agents-python/" rel="noreferrer" data-network="true">OpenAI Agents SDK docs <small>↗ 需要联网</small></a> — function tool type and Guardrails</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-14-agent-engineering--06-tool-use-and-function-calling.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-14-agent-engineering--06-tool-use-and-function-calling.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/14-agent-engineering/06-tool-use-and-function-calling/code/main.py">phases/14-agent-engineering/06-tool-use-and-function-calling/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Stdlib tool registry with JSON Schema subset validation and parallel dispatch.
+
+Subset: required fields, string/int/number/bool/array/object, enum, minimum/maximum.
+Returns structured observations for every validation failure so an agent can retry.
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, Callable
+
+
+@dataclass
+class ToolDef:
+    name: str
+    description: str
+    input_schema: dict[str, Any]
+    executor: Callable[..., str]
+    timeout_s: float = 5.0
+
+
+@dataclass
+class ToolCall:
+    tool_use_id: str
+    name: str
+    args: dict[str, Any]
+
+
+@dataclass
+class ToolResult:
+    tool_use_id: str
+    ok: bool
+    content: str
+
+
+def _coerce(value: Any, schema: dict[str, Any]) -&gt; tuple[Any, str | None]:
+    t = schema.get(&quot;type&quot;)
+    if t == &quot;integer&quot;:
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value, None
+        if isinstance(value, str):
+            try:
+                return int(value), None
+            except ValueError:
+                return value, f&quot;cannot coerce string {value!r} to integer&quot;
+        return value, f&quot;expected integer, got {type(value).__name__}&quot;
+    if t == &quot;number&quot;:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value), None
+        if isinstance(value, str):
+            try:
+                return float(value), None
+            except ValueError:
+                return value, f&quot;cannot coerce string {value!r} to number&quot;
+        return value, f&quot;expected number, got {type(value).__name__}&quot;
+    if t == &quot;boolean&quot;:
+        if isinstance(value, bool):
+            return value, None
+        return value, f&quot;expected boolean, got {type(value).__name__}&quot;
+    if t == &quot;string&quot;:
+        if isinstance(value, str):
+            return value, None
+        return value, f&quot;expected string, got {type(value).__name__}&quot;
+    if t == &quot;array&quot;:
+        if isinstance(value, list):
+            return value, None
+        return value, f&quot;expected array, got {type(value).__name__}&quot;
+    if t == &quot;object&quot;:
+        if isinstance(value, dict):
+            return value, None
+        return value, f&quot;expected object, got {type(value).__name__}&quot;
+    return value, None
+
+
+def validate(args: dict[str, Any], schema: dict[str, Any]) -&gt; tuple[dict[str, Any], list[str]]:
+    errors: list[str] = []
+    props = schema.get(&quot;properties&quot;, {})
+    required = schema.get(&quot;required&quot;, [])
+    out: dict[str, Any] = {}
+
+    for name in required:
+        if name not in args:
+            errors.append(f&quot;missing required: {name}&quot;)
+
+    for name, value in args.items():
+        prop = props.get(name)
+        if prop is None:
+            errors.append(f&quot;unknown field: {name}&quot;)
+            continue
+        coerced, err = _coerce(value, prop)
+        if err:
+            errors.append(f&quot;{name}: {err}&quot;)
+            continue
+        if &quot;enum&quot; in prop and coerced not in prop[&quot;enum&quot;]:
+            errors.append(f&quot;{name}: {coerced!r} not in {prop[&#39;enum&#39;]}&quot;)
+            continue
+        if prop.get(&quot;type&quot;) in (&quot;number&quot;, &quot;integer&quot;):
+            if &quot;minimum&quot; in prop and coerced &lt; prop[&quot;minimum&quot;]:
+                errors.append(f&quot;{name}: {coerced} &lt; minimum {prop[&#39;minimum&#39;]}&quot;)
+                continue
+            if &quot;maximum&quot; in prop and coerced &gt; prop[&quot;maximum&quot;]:
+                errors.append(f&quot;{name}: {coerced} &gt; maximum {prop[&#39;maximum&#39;]}&quot;)
+                continue
+        out[name] = coerced
+
+    return out, errors
+
+
+class ToolRegistry:
+    def __init__(self) -&gt; None:
+        self._tools: dict[str, ToolDef] = {}
+
+    def register(self, tool: ToolDef) -&gt; None:
+        self._tools[tool.name] = tool
+
+    def catalog(self) -&gt; list[dict[str, Any]]:
+        return [
+            {&quot;name&quot;: t.name, &quot;description&quot;: t.description,
+             &quot;input_schema&quot;: t.input_schema}
+            for t in self._tools.values()
+        ]
+
+    def dispatch(self, call: ToolCall) -&gt; ToolResult:
+        tool = self._tools.get(call.name)
+        if tool is None:
+            return ToolResult(call.tool_use_id, False,
+                              f&quot;error: unknown tool {call.name!r}&quot;)
+        validated, errors = validate(call.args, tool.input_schema)
+        if errors:
+            return ToolResult(call.tool_use_id, False,
+                              &quot;validation error: &quot; + &quot;; &quot;.join(errors))
+        try:
+            return ToolResult(call.tool_use_id, True, tool.executor(**validated))
+        except Exception as e:
+            return ToolResult(call.tool_use_id, False,
+                              f&quot;execution error: {type(e).__name__}: {e}&quot;)
+
+    def dispatch_many(self, calls: list[ToolCall]) -&gt; list[ToolResult]:
+        return [self.dispatch(c) for c in calls]
+
+
+def add(a: int, b: int) -&gt; str:
+    return str(a + b)
+
+
+def multiply(a: int, b: int) -&gt; str:
+    return str(a * b)
+
+
+def classify(status: str) -&gt; str:
+    return f&quot;classified as {status}&quot;
+
+
+def main() -&gt; None:
+    print(&quot;=&quot; * 70)
+    print(&quot;TOOL USE and FUNCTION CALLING — Phase 14, Lesson 06&quot;)
+    print(&quot;=&quot; * 70)
+
+    reg = ToolRegistry()
+    reg.register(ToolDef(
+        name=&quot;add&quot;,
+        description=&quot;Add two integers a and b. Use for any integer addition.&quot;,
+        input_schema={
+            &quot;type&quot;: &quot;object&quot;,
+            &quot;properties&quot;: {&quot;a&quot;: {&quot;type&quot;: &quot;integer&quot;}, &quot;b&quot;: {&quot;type&quot;: &quot;integer&quot;}},
+            &quot;required&quot;: [&quot;a&quot;, &quot;b&quot;],
+        },
+        executor=add,
+    ))
+    reg.register(ToolDef(
+        name=&quot;multiply&quot;,
+        description=&quot;Multiply two integers a and b. Prefer multiplication over looped addition.&quot;,
+        input_schema={
+            &quot;type&quot;: &quot;object&quot;,
+            &quot;properties&quot;: {&quot;a&quot;: {&quot;type&quot;: &quot;integer&quot;}, &quot;b&quot;: {&quot;type&quot;: &quot;integer&quot;}},
+            &quot;required&quot;: [&quot;a&quot;, &quot;b&quot;],
+        },
+        executor=multiply,
+    ))
+    reg.register(ToolDef(
+        name=&quot;classify&quot;,
+        description=&quot;Classify a status as one of the allowed labels.&quot;,
+        input_schema={
+            &quot;type&quot;: &quot;object&quot;,
+            &quot;properties&quot;: {&quot;status&quot;: {&quot;type&quot;: &quot;string&quot;,
+                                       &quot;enum&quot;: [&quot;open&quot;, &quot;closed&quot;, &quot;pending&quot;]}},
+            &quot;required&quot;: [&quot;status&quot;],
+        },
+        executor=classify,
+    ))
+
+    print(&quot;\ncatalog (as presented to the model)&quot;)
+    for entry in reg.catalog():
+        print(f&quot;  - {entry[&#39;name&#39;]}: {entry[&#39;description&#39;]}&quot;)
+
+    calls = [
+        ToolCall(&quot;u01&quot;, &quot;add&quot;, {&quot;a&quot;: 2, &quot;b&quot;: 3}),
+        ToolCall(&quot;u02&quot;, &quot;multiply&quot;, {&quot;a&quot;: &quot;4&quot;, &quot;b&quot;: 5}),
+        ToolCall(&quot;u03&quot;, &quot;classify&quot;, {&quot;status&quot;: &quot;in_progress&quot;}),
+        ToolCall(&quot;u04&quot;, &quot;classify&quot;, {&quot;status&quot;: &quot;open&quot;}),
+        ToolCall(&quot;u05&quot;, &quot;subtract&quot;, {&quot;a&quot;: 1, &quot;b&quot;: 2}),
+    ]
+    print(&quot;\nparallel dispatch (5 calls in one turn)&quot;)
+    for result in reg.dispatch_many(calls):
+        tag = &quot;OK &quot; if result.ok else &quot;ERR&quot;
+        print(f&quot;  {result.tool_use_id} {tag}: {result.content}&quot;)
+
+    print()
+    print(&quot;observation shape: every validation failure is a structured error&quot;)
+    print(&quot;string the agent can read and retry against. never raise to the loop.&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/14-agent-engineering/06-tool-use-and-function-calling/code/main.ts">phases/14-agent-engineering/06-tool-use-and-function-calling/code/main.ts</a><details><summary>查看原始文本</summary><pre><code>// Phase 14 Lesson 06 — tool use and function calling, in TypeScript.
+//
+// Stdlib tool registry with JSON Schema subset validation and parallel dispatch.
+// Subset: required fields, string/integer/number/boolean/array/object,
+// enum, minimum/maximum. Every validation failure becomes a structured
+// observation so an agent can retry.
+//
+// References:
+//   OpenAI function-calling   https://platform.openai.com/docs/guides/function-calling
+//   Anthropic tool-use        https://platform.claude.com/docs/en/agents-and-tools/tool-use/overview
+//   JSON Schema 2020-12       https://json-schema.org/draft/2020-12
+//
+// Run: npx tsx code/main.ts
+
+type Primitive = &quot;integer&quot; | &quot;number&quot; | &quot;boolean&quot; | &quot;string&quot; | &quot;array&quot; | &quot;object&quot;;
+
+type PropSchema = {
+  type: Primitive;
+  enum?: unknown[];
+  minimum?: number;
+  maximum?: number;
+};
+
+type ToolInputSchema = {
+  type: &quot;object&quot;;
+  properties: Record&lt;string, PropSchema&gt;;
+  required?: string[];
+};
+
+type ToolArgs = Record&lt;string, unknown&gt;;
+
+type ToolDef = {
+  name: string;
+  description: string;
+  inputSchema: ToolInputSchema;
+  executor: (args: ToolArgs) =&gt; string;
+  timeoutMs?: number;
+};
+
+type ToolCall = {
+  toolUseId: string;
+  name: string;
+  args: ToolArgs;
+};
+
+type ToolResult = {
+  toolUseId: string;
+  ok: boolean;
+  content: string;
+};
+
+function describeType(value: unknown): string {
+  if (value === null) return &quot;null&quot;;
+  if (Array.isArray(value)) return &quot;array&quot;;
+  if (typeof value === &quot;number&quot; &amp;&amp; Number.isInteger(value)) return &quot;integer&quot;;
+  return typeof value;
+}
+
+function coerce(value: unknown, schema: PropSchema): { value: unknown; error: string | null } {
+  const t = schema.type;
+  if (t === &quot;integer&quot;) {
+    if (typeof value === &quot;number&quot; &amp;&amp; Number.isInteger(value)) return { value, error: null };
+    if (typeof value === &quot;string&quot;) {
+      const parsed = Number(value);
+      if (Number.isInteger(parsed)) return { value: parsed, error: null };
+      return { value, error: `cannot coerce string ${JSON.stringify(value)} to integer` };
+    }
+    return { value, error: `expected integer, got ${describeType(value)}` };
+  }
+  if (t === &quot;number&quot;) {
+    if (typeof value === &quot;number&quot;) return { value, error: null };
+    if (typeof value === &quot;string&quot;) {
+      const parsed = Number(value);
+      if (Number.isFinite(parsed)) return { value: parsed, error: null };
+      return { value, error: `cannot coerce string ${JSON.stringify(value)} to number` };
+    }
+    return { value, error: `expected number, got ${describeType(value)}` };
+  }
+  if (t === &quot;boolean&quot;) {
+    if (typeof value === &quot;boolean&quot;) return { value, error: null };
+    return { value, error: `expected boolean, got ${describeType(value)}` };
+  }
+  if (t === &quot;string&quot;) {
+    if (typeof value === &quot;string&quot;) return { value, error: null };
+    return { value, error: `expected string, got ${describeType(value)}` };
+  }
+  if (t === &quot;array&quot;) {
+    if (Array.isArray(value)) return { value, error: null };
+    return { value, error: `expected array, got ${describeType(value)}` };
+  }
+  if (t === &quot;object&quot;) {
+    if (typeof value === &quot;object&quot; &amp;&amp; value !== null &amp;&amp; !Array.isArray(value)) {
+      return { value, error: null };
+    }
+    return { value, error: `expected object, got ${describeType(value)}` };
+  }
+  return { value, error: null };
+}
+
+function validate(args: ToolArgs, schema: ToolInputSchema): { out: ToolArgs; errors: string[] } {
+  const errors: string[] = [];
+  const props = schema.properties;
+  const required = schema.required ?? [];
+  const out: ToolArgs = {};
+
+  for (const name of required) {
+    if (!(name in args)) errors.push(`missing required: ${name}`);
+  }
+
+  for (const [name, value] of Object.entries(args)) {
+    const prop = props[name];
+    if (!prop) {
+      errors.push(`unknown field: ${name}`);
+      continue;
+    }
+    const { value: coerced, error } = coerce(value, prop);
+    if (error) {
+      errors.push(`${name}: ${error}`);
+      continue;
+    }
+    if (prop.enum &amp;&amp; !prop.enum.includes(coerced as never)) {
+      errors.push(`${name}: ${JSON.stringify(coerced)} not in ${JSON.stringify(prop.enum)}`);
+      continue;
+    }
+    if (prop.type === &quot;number&quot; || prop.type === &quot;integer&quot;) {
+      const numVal = coerced as number;
+      if (prop.minimum !== undefined &amp;&amp; numVal &lt; prop.minimum) {
+        errors.push(`${name}: ${numVal} &lt; minimum ${prop.minimum}`);
+        continue;
+      }
+      if (prop.maximum !== undefined &amp;&amp; numVal &gt; prop.maximum) {
+        errors.push(`${name}: ${numVal} &gt; maximum ${prop.maximum}`);
+        continue;
+      }
+    }
+    out[name] = coerced;
+  }
+
+  return { out, errors };
+}
+
+class ToolRegistry {
+  private tools = new Map&lt;string, ToolDef&gt;();
+
+  register(tool: ToolDef): void {
+    this.tools.set(tool.name, tool);
+  }
+
+  catalog(): Array&lt;Pick&lt;ToolDef, &quot;name&quot; | &quot;description&quot; | &quot;inputSchema&quot;&gt;&gt; {
+    return [...this.tools.values()].map((t) =&gt; ({
+      name: t.name,
+      description: t.description,
+      inputSchema: t.inputSchema,
+    }));
+  }
+
+  dispatch(call: ToolCall): ToolResult {
+    const tool = this.tools.get(call.name);
+    if (!tool) {
+      return { toolUseId: call.toolUseId, ok: false, content: `error: unknown tool ${JSON.stringify(call.name)}` };
+    }
+    const { out, errors } = validate(call.args, tool.inputSchema);
+    if (errors.length &gt; 0) {
+      return {
+        toolUseId: call.toolUseId,
+        ok: false,
+        content: `validation error: ${errors.join(&quot;; &quot;)}`,
+      };
+    }
+    try {
+      return { toolUseId: call.toolUseId, ok: true, content: tool.executor(out) };
+    } catch (err) {
+      const e = err as Error;
+      return {
+        toolUseId: call.toolUseId,
+        ok: false,
+        content: `execution error: ${e.name}: ${e.message}`,
+      };
+    }
+  }
+
+  dispatchMany(calls: ToolCall[]): ToolResult[] {
+    return calls.map((c) =&gt; this.dispatch(c));
+  }
+}
+
+function add(args: ToolArgs): string {
+  const a = args.a as number;
+  const b = args.b as number;
+  return String(a + b);
+}
+
+function multiply(args: ToolArgs): string {
+  const a = args.a as number;
+  const b = args.b as number;
+  return String(a * b);
+}
+
+function classify(args: ToolArgs): string {
+  return `classified as ${args.status as string}`;
+}
+
+function main(): void {
+  console.log(&quot;=&quot;.repeat(70));
+  console.log(&quot;TOOL USE and FUNCTION CALLING — Phase 14, Lesson 06 (TypeScript port)&quot;);
+  console.log(&quot;=&quot;.repeat(70));
+
+  const reg = new ToolRegistry();
+  reg.register({
+    name: &quot;add&quot;,
+    description: &quot;Add two integers a and b. Use for any integer addition.&quot;,
+    inputSchema: {
+      type: &quot;object&quot;,
+      properties: { a: { type: &quot;integer&quot; }, b: { type: &quot;integer&quot; } },
+      required: [&quot;a&quot;, &quot;b&quot;],
+    },
+    executor: add,
+  });
+  reg.register({
+    name: &quot;multiply&quot;,
+    description: &quot;Multiply two integers a and b. Prefer multiplication over looped addition.&quot;,
+    inputSchema: {
+      type: &quot;object&quot;,
+      properties: { a: { type: &quot;integer&quot; }, b: { type: &quot;integer&quot; } },
+      required: [&quot;a&quot;, &quot;b&quot;],
+    },
+    executor: multiply,
+  });
+  reg.register({
+    name: &quot;classify&quot;,
+    description: &quot;Classify a status as one of the allowed labels.&quot;,
+    inputSchema: {
+      type: &quot;object&quot;,
+      properties: {
+        status: { type: &quot;string&quot;, enum: [&quot;open&quot;, &quot;closed&quot;, &quot;pending&quot;] },
+      },
+      required: [&quot;status&quot;],
+    },
+    executor: classify,
+  });
+
+  console.log(&quot;\ncatalog (as presented to the model)&quot;);
+  for (const entry of reg.catalog()) {
+    console.log(`  - ${entry.name}: ${entry.description}`);
+  }
+
+  const calls: ToolCall[] = [
+    { toolUseId: &quot;u01&quot;, name: &quot;add&quot;, args: { a: 2, b: 3 } },
+    { toolUseId: &quot;u02&quot;, name: &quot;multiply&quot;, args: { a: &quot;4&quot;, b: 5 } },
+    { toolUseId: &quot;u03&quot;, name: &quot;classify&quot;, args: { status: &quot;in_progress&quot; } },
+    { toolUseId: &quot;u04&quot;, name: &quot;classify&quot;, args: { status: &quot;open&quot; } },
+    { toolUseId: &quot;u05&quot;, name: &quot;subtract&quot;, args: { a: 1, b: 2 } },
+  ];
+
+  console.log(&quot;\nparallel dispatch (5 calls in one turn)&quot;);
+  for (const result of reg.dispatchMany(calls)) {
+    const tag = result.ok ? &quot;OK &quot; : &quot;ERR&quot;;
+    console.log(`  ${result.toolUseId} ${tag}: ${result.content}`);
+  }
+
+  console.log();
+  console.log(&quot;observation shape: every validation failure is a structured error&quot;);
+  console.log(&quot;string the agent can read and retry against. never raise to the loop.&quot;);
+}
+
+main();
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/14-agent-engineering/06-tool-use-and-function-calling/outputs/skill-tool-registry.md">phases/14-agent-engineering/06-tool-use-and-function-calling/outputs/skill-tool-registry.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: tool-registry
+description: Build a production tool catalog and registry with JSON Schema validation, parallel dispatch, and observability.
+version: 1.0.0
+phase: 14
+lesson: 06
+tags: [function-calling, tools, schema, validation, bfcl, parallel-tools]
+---
+
+Given a task domain, produce a tool catalog that an agent can use reliably across the BFCL V4 axes (agentic, multi-turn, live, non-live, hallucination).
+
+Produce:
+
+1. Tool definitions. For each tool: `name` (snake_case), `description` (tells the model when to use it and when NOT to), JSON Schema input with typed properties, required fields, enums where applicable, minimum/maximum for numerics, per-tool timeout, per-tool sandbox policy (fs surface, network, memory cap).
+2. Description quality check. Run each description through &quot;does this tell the model when to pick this tool over the others?&quot; If two tools have overlapping descriptions, refuse and rewrite.
+3. Parallel-dispatch plan. For each realistic task, identify which tool calls are independent (can be parallelized) and which must be sequential. Emit an expected dispatch graph.
+4. Validation policy. Enum checks, type coercion rules (e.g. &quot;accept int-as-string, reject float-as-string&quot;), required-field enforcement. Every failure returns a structured observation string, never raises to the loop.
+5. Observability. Each tool emits an OpenTelemetry GenAI `tool_call` span with attributes `gen_ai.tool.name`, `gen_ai.tool.call.id`, `gen_ai.tool.call.arguments`, `gen_ai.tool.call.result` (reference, not inline, when content policy requires).
+
+Hard rejects:
+
+- Generic shell/command-exec tool. Refuse and break into specific verbs (`git_status`, `fs_read`, `npm_test`).
+- Missing enums when the parameter has a closed set of values. Enum validation is the cheapest way to catch drift.
+- Same description for two different tools. The model cannot pick between them reliably.
+- `description` that only names the tool (&quot;Adds two numbers&quot;). Include WHEN to pick it over alternatives.
+- No timeout. Every tool call must have a ceiling.
+
+Refusal rules:
+
+- If the tool list exceeds 30 tools for a single agent, refuse and recommend subagent delegation (Lesson 17).
+- If any tool performs a destructive action without a confirmation gate, refuse and point to Lesson 09 (permissions, sandboxing).
+- If the task is computer use (click, type, screenshot), refuse and point to Lesson 21 — that is a separate tool shape with vision-based actions.
+
+Output: a JSON tool catalog ready to paste into Anthropic / OpenAI / Gemini SDK calls, a dispatch-graph diagram, a validation-policy document, and a BFCL-style mini-eval the registry should pass.
+
+End with a &quot;what to read next&quot; pointer: Lesson 09 (sandboxing), Lesson 23 (OTel GenAI spans), or Lesson 30 (eval-driven).
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. What signal does Toolformer use to decide whether to keep a candidate tool annotation?</legend><label class="option"><input type="radio" name="q0" value="0"> Whether the tool returns within 100 ms</label><label class="option"><input type="radio" name="q0" value="1"> Human label agreement</label><label class="option"><input type="radio" name="q0" value="2"> Whether including the tool result reduces next-token loss on surrounding text</label><label class="option"><input type="radio" name="q0" value="3"> Whether the tool emits valid JSON</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. What is the BFCL V4 split that the lesson reports?</legend><label class="option"><input type="radio" name="q1" value="0"> 100% single-turn</label><label class="option"><input type="radio" name="q1" value="1"> 50% live, 50% synthetic</label><label class="option"><input type="radio" name="q1" value="2"> 33% agentic, 33% planning, 33% reflection</label><label class="option"><input type="radio" name="q1" value="3"> 40% agentic, 30% multi-turn, 10% live, 10% non-live, 10% hallucination</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. Why is a tool&#39;s description load-bearing?</legend><label class="option"><input type="radio" name="q2" value="0"> It is what the user sees in the UI</label><label class="option"><input type="radio" name="q2" value="1"> The model reads it to choose the right tool; bad descriptions are the top cause of wrong-tool failures</label><label class="option"><input type="radio" name="q2" value="2"> It is required by JSON Schema</label><label class="option"><input type="radio" name="q2" value="3"> It controls billing buckets</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. What role does tool_use_id play in parallel tool calling?</legend><label class="option"><input type="radio" name="q3" value="0"> It correlates each tool result with its originating call so results returning out of order route correctly</label><label class="option"><input type="radio" name="q3" value="1"> It authorizes the call against an API key</label><label class="option"><input type="radio" name="q3" value="2"> It compresses the JSON payload</label><label class="option"><input type="radio" name="q3" value="3"> It enables caching</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. Which class of failure does V3 state-based evaluation try to catch?</legend><label class="option"><input type="radio" name="q4" value="0"> Token leakage</label><label class="option"><input type="radio" name="q4" value="1"> Schema versioning drift</label><label class="option"><input type="radio" name="q4" value="2"> Slow tool execution</label><label class="option"><input type="radio" name="q4" value="3"> AST-matching tool calls that look right but leave the API in the wrong state</label><p data-feedback="4"></p></fieldset><fieldset><legend>6. Which 2026 problem does the lesson NOT list among the open ones for function calling?</legend><label class="option"><input type="radio" name="q5" value="0"> Long-horizon tool chaining</label><label class="option"><input type="radio" name="q5" value="1"> Token-level decoding speed</label><label class="option"><input type="radio" name="q5" value="2"> Dynamic decision-making across many tools</label><label class="option"><input type="radio" name="q5" value="3"> Memory across turns</label><p data-feedback="5"></p></fieldset><fieldset><legend>7. Why is a generic run_shell(cmd) tool called a red flag in this lesson?</legend><label class="option"><input type="radio" name="q6" value="0"> It cannot be called in parallel</label><label class="option"><input type="radio" name="q6" value="1"> It widens the sandbox boundary; specific tools like git_status() bound read/write surface and risk</label><label class="option"><input type="radio" name="q6" value="2"> It is slow</label><label class="option"><input type="radio" name="q6" value="3"> Providers reject it</label><p data-feedback="6"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/14-agent-engineering/05-self-refine-and-critic/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/14-agent-engineering/07-memory-virtual-context-memgpt/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/14-agent-engineering/06-tool-use-and-function-calling/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

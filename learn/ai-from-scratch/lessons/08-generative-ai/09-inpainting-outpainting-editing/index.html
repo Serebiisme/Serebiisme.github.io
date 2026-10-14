@@ -1,0 +1,596 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>涂料,外涂料和图像编辑 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-08-generative-ai" data-lesson="08-generative-ai/09-inpainting-outpainting-editing" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/08-generative-ai/">生成式 AI</a> / LESSON 09</p><h1 class="lesson-title">涂料,外涂料和图像编辑</h1><p>Inpainting, Outpainting &amp; Image Editing</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>涂料,外涂料和图像编辑</h1>
+<blockquote>
+<p>文字到图像创造了新的东西.涂料修复了旧的东西.在生产中,70%的可收费图像工作是编辑.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 8 · 07 (Latent Diffusion), Phase 8 · 08 (ControlNet &amp; LoRA)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>问题</h2>
+<p>客户端发送一个完美的产品照片,背景上有一个分散注意力的标志.你想删除标志,让其他的所有内容都像素相同.你不能从零开始运行文字到图像.结果将会有不同的颜色,不同的照明,不同的产品角度.你想再生 <em>只有</em>面具区域,你希望再生尊重周围的环境.</p>
+<p>这就是涂料.</p>
+<ul>
+<li>**Inpainting.**罩内再生, 保持像素外.</li>
+<li>**Outpainting.**罩外面 (或外面) 再生,保持内部.</li>
+<li>**Image editing.**恢复整个图像,但保持对原始的语义或结构性忠诚度 (SDEdit,InstructPix2Pix).</li>
+</ul>
+<p>它们使用了相同的原理, 它们使用了相同的原理, 它们使用了相同的方法,</p>
+<h2>概念</h2>
+<p><img src="/learn/ai-from-scratch/files/phases/08-generative-ai/09-inpainting-outpainting-editing/assets/inpainting.svg" alt="Inpainting: mask-aware denoising with context-preserving reinjection" loading="lazy"></p>
+<h3>简单的做法 (以及为什么它是错误的)</h3>
+<p>通过面具运行标准的文字到图像. 在每一步采样时,用前方传播的清洁图像取代无面膜的噪音隐藏区域. 它运行不好. 边界的文物流血,因为模型没有有关在面膜区域的信息.</p>
+<h3>适当的涂料模型</h3>
+<p>运行改造的U-网, 采用9个输入频道, 而不是4个:</p>
+<pre><code>input = concat([ noisy_latent (4ch), encoded_image (4ch), mask (1ch) ], dim=channel)
+</code></pre>
+<p>另外,这些频道是VAE编码的源图像的副本,加上一个单频道面具.在训练时,你随机地掩盖图像的区域,并训练模型只表示面具区域,而未掩盖的区域则作为清洁的条件信号.在推断时,模型可以&quot;看到&quot;周围面具区域的内容并产生一致的完成.</p>
+<p>它们都使用9通道 (或模拟) 输入.<code>StableDiffusionInpaintPipeline</code>现在<code>FluxFillPipeline</code>现在,我们要去.</p>
+<h3>免费编辑</h3>
+<p>添加噪音到源图片中等程度<code>t</code>然后从 <code>t</code>没有再训练,选择开始<code>t</code>为了创造自由而交易忠诚:</p>
+<ul>
+<li><code>t/T = 0.3</code>→几乎与源头相同,小的风格变化</li>
+<li><code>t/T = 0.6</code>→ 修改量度较小,保持粗的结构</li>
+<li><code>t/T = 0.9</code>→ 由于近噪音,最小的源源保存</li>
+</ul>
+<h3>导读Pix2Pix (布鲁克斯等, 2023)</h3>
+<p>调整一个扩散模型<code>(input_image, instruction, output_image)</code>在推断时,对输入图像和文本指令进行条件 (&quot;让它落日&quot;&quot;,添加龙&quot;).两个CFG尺度:图像尺度和文本尺度.</p>
+<h3>复刻 (Lugmayr等, 2022)</h3>
+<p>保持标准无条件扩散模型.在每一步反转时,再样本偶尔跳回更的状态,再生.避免边界文物.当你没有训练有素的涂料模型时使用.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-f91d5adaab5b50af565e.png" alt="inpaint-mask-reinject 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<p><code>code/main.py</code>在5维数据上,我们将一个DDPM训练在5维混合数据上,每个样本是5个浮动从两个集群中的一个.在推断时,我们&quot;掩盖&quot;5个维度中的2个,每一步都注射了无声前进的无声三个,并只再生了掩盖的维度.</p>
+<h3>步骤1:5-DDPM数据</h3>
+<pre><code class="language-python">def sample_data(rng):
+    cluster = rng.choice([0, 1])
+    center = [-1.0] * 5 if cluster == 0 else [1.0] * 5
+    return [c + rng.gauss(0, 0.2) for c in center], cluster
+</code></pre>
+<h3>步骤2:在所有5个线上进行列车断</h3>
+<p>标准的DDPM. 网输出预测5D噪音输入5D噪音输入.</p>
+<h3>步骤3:在推断时,面具意识的反向</h3>
+<pre><code class="language-python">def inpaint_step(x_t, mask, clean_image, alpha_bars, t, rng):
+    # replace unmasked dims with a freshly noised version of the clean source
+    a_bar = alpha_bars[t]
+    for i in range(len(x_t)):
+        if not mask[i]:
+            x_t[i] = math.sqrt(a_bar) * clean_image[i] + math.sqrt(1 - a_bar) * rng.gauss(0, 1)
+    # ...then run the normal reverse step on x_t
+</code></pre>
+<p>实际的图像涂料使用9通道输入,因为纹理一致性更重要.</p>
+<h3>步骤4:外涂</h3>
+<p>涂料是涂料面具倒:掩盖新的 (以前没有) 布,填补其余的原始.相同的训练目标.</p>
+<h2>陷</h2>
+<ul>
+<li>**Seams.**简单的方法会留下可见的边界,因为梯度信息不会通过面具流动.</li>
+<li>**Mask leakage.**如果调整图像的未蒙面区域质量低或噪音,它会污染面具内部的产物.</li>
+<li>**CFG interacts with mask size.**低调度,低调度,低调度,低调度.</li>
+<li>**SDEdit fidelity cliff.**开始的<code>t/T = 0.5</code>为了<code>t/T = 0.6</code>检查和检查点.</li>
+<li>**Prompt mismatch.**提示应该描述整个图像,而不仅仅是新内容.</li>
+</ul>
+<h2>用它</h2>
+<table>
+<thead>
+<tr>
+<th>Task</th>
+<th>Pipeline</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Remove object, small mask</td>
+<td>SD-Inpaint or Flux-Fill, standard prompt</td>
+</tr>
+<tr>
+<td>Replace sky</td>
+<td>SD-Inpaint + &quot;blue sky at sunset&quot;</td>
+</tr>
+<tr>
+<td>Extend canvas</td>
+<td>SDXL outpaint mode (8px feather) or Flux-Fill with outpaint mask</td>
+</tr>
+<tr>
+<td>Regenerate hand / face</td>
+<td>SD-Inpaint with prompt re-describing the subject + ControlNet-Openpose</td>
+</tr>
+<tr>
+<td>Change style of one region</td>
+<td>SDEdit at <code>t/T=0.5</code> on masked region</td>
+</tr>
+<tr>
+<td>&quot;Make it sunset&quot;</td>
+<td>InstructPix2Pix or Flux-Kontext</td>
+</tr>
+<tr>
+<td>Background replacement</td>
+<td>SAM mask → SD-Inpaint</td>
+</tr>
+<tr>
+<td>Ultra-high-fidelity</td>
+<td>Flux-Fill or GPT-Image (hosted) for hardest cases</td>
+</tr>
+</tbody>
+</table>
+<p>通过SAM (Meta's Segment Anything, 2023) + 扩散油漆,将2026年的背景删除管道进行.SAM 2 (2024) 在视频上工作.</p>
+<h2>运送它</h2>
+<p>保存<code>outputs/skill-editing-pipeline.md</code>技能采用原始图像+编辑描述+可选面具 (或 SAM提示) 输出:面具生成方法,基模型,CFG尺度 (图像+文本),SDEdit-t或涂料模式,以及QA检查清单.</p>
+<h2>运动</h2>
+<ol>
+<li>**Easy.**在<code>code/main.py</code>面膜的尺寸分数从0.2到0.8之间.</li>
+<li>**Medium.**执行重涂:每次10次倒车步骤,跳回5步 (添加噪音) 并重新表现.测量它是否减少了面具边缘的边界残留.</li>
+<li>**Hard.**使用拥抱面部扩散器进行比较:SD 1.5 涂料 + 控制网-开放面部 vs 流动.1- 填写20个面部再生任务. 分别进行遵守和身份保护.</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Inpainting</td>
+<td>&quot;Fill the hole&quot;</td>
+<td>Regenerate inside a mask; keep outside pixels.</td>
+</tr>
+<tr>
+<td>Outpainting</td>
+<td>&quot;Extend the canvas&quot;</td>
+<td>Regenerate outside the canvas; keep inside.</td>
+</tr>
+<tr>
+<td>9-channel U-Net</td>
+<td>&quot;Proper inpainting model&quot;</td>
+<td>U-Net with <code>noisy | encoded-source | mask</code> as input.</td>
+</tr>
+<tr>
+<td>SDEdit</td>
+<td>&quot;Img2img with noise level&quot;</td>
+<td>Noise to time <code>t</code>, denoise with new prompt.</td>
+</tr>
+<tr>
+<td>InstructPix2Pix</td>
+<td>&quot;Text-only edits&quot;</td>
+<td>Fine-tuned diffusion on (image, instruction, output) triples.</td>
+</tr>
+<tr>
+<td>RePaint</td>
+<td>&quot;No retraining&quot;</td>
+<td>Re-noise periodically during reverse to reduce seams.</td>
+</tr>
+<tr>
+<td>SAM</td>
+<td>&quot;Segment Anything&quot;</td>
+<td>Mask generator by clicks or boxes; pairs with inpaint.</td>
+</tr>
+<tr>
+<td>Flux-Kontext</td>
+<td>&quot;Edit with context&quot;</td>
+<td>Flux variant that accepts a reference image + instruction for edits.</td>
+</tr>
+</tbody>
+</table>
+<h2>制作说明:编辑管道对延迟敏感</h2>
+<p>编辑图像的用户预计将在5秒内进行回路.在10242时进行30步的SDXL-Inpaint是L4上3-4秒,加上SAM面具生成 (~200ms) 和VAE编码/解码 (~500ms组合).在生产框架中,这是TTFT绑定而不是吞吐量绑定的批量1,低同步性,尽量减少每个阶段:</p>
+<ul>
+<li>**SAM-H is the slow one.**在10242时,SAM-H是~200ms;在SAM-ViT-B时,SAM-H是~40ms,质量损失较小.SAM 2 (视频) 增加了时间的上空费用;不要用于单次图像编辑.</li>
+<li><strong>Skip the encode when possible.</strong> <code>pipe.image_processor.preprocess(img)</code>如果您有以前的 latenc (典型的反复编辑 UI),直接通过 <code>latents=...</code>跳过一个VAE编码.</li>
+<li>**Mask dilation matters for throughput too.**面具的小部分意味着大部分U-Net前进通行都是浪费的 (不面具的像素无论如何都被紧).<code>diffusers</code> <code>StableDiffusionInpaintPipeline</code>运行全 U-Net不管;只有9通道正确涂料的变体利用隐蔽计算.</li>
+<li>**Flux-Kontext is the 2025 answer.**单一前进过渡<code>(source_image, instruction)</code>没有单独的面具,没有SDEdit噪声扫描. 在H100上,它在1.5秒内发出编辑.建筑课:崩阶段.</li>
+</ul>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2201.09865" rel="noreferrer" data-network="true">Lugmayr et al. (2022). RePaint: Inpainting using Denoising Diffusion Probabilistic Models <small>↗ 需要联网</small></a>无培训的涂料.</li>
+<li><a href="https://arxiv.org/abs/2108.01073" rel="noreferrer" data-network="true">Meng et al. (2022). SDEdit: Guided Image Synthesis and Editing with Stochastic Differential Equations <small>↗ 需要联网</small></a> 死亡</li>
+<li><a href="https://arxiv.org/abs/2211.09800" rel="noreferrer" data-network="true">Brooks, Holynski, Efros (2023). InstructPix2Pix <small>↗ 需要联网</small></a>编辑文本说明.</li>
+<li><a href="https://arxiv.org/abs/2304.02643" rel="noreferrer" data-network="true">Kirillov et al. (2023). Segment Anything <small>↗ 需要联网</small></a>SAM,面具来源.</li>
+<li><a href="https://arxiv.org/abs/2408.00714" rel="noreferrer" data-network="true">Ravi et al. (2024). SAM 2: Segment Anything in Images and Videos <small>↗ 需要联网</small></a>视频 SAM.</li>
+<li><a href="https://arxiv.org/abs/2208.01626" rel="noreferrer" data-network="true">Hertz et al. (2022). Prompt-to-Prompt Image Editing with Cross-Attention Control <small>↗ 需要联网</small></a>注意力级编辑.</li>
+<li><a href="https://blackforestlabs.ai/flux-1-tools/" rel="noreferrer" data-network="true">Black Forest Labs (2024). Flux.1-Fill and Flux.1-Kontext <small>↗ 需要联网</small></a> 2024 年工具</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Inpainting, Outpainting &amp; Image Editing</h1>
+<blockquote>
+<p>Text-to-image makes new things. Inpainting fixes old ones. In production, 70% of billable image work is editing — swap a background, remove a logo, extend the canvas, regenerate a hand. Inpainting is where diffusion earns its keep.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 8 · 07 (Latent Diffusion), Phase 8 · 08 (ControlNet &amp; LoRA)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>The Problem</h2>
+<p>A client sends a perfect product photo with a distracting sign in the background. You want to erase the sign and leave everything else pixel-identical. You cannot run text-to-image from scratch — the result will have a different color, different lighting, different product angle. You want to regenerate <em>only</em> the masked region, and you want the regeneration to respect the surrounding context.</p>
+<p>That is inpainting. Variants:</p>
+<ul>
+<li><strong>Inpainting.</strong> Regenerate inside a mask, keep outside pixels.</li>
+<li><strong>Outpainting.</strong> Regenerate outside a mask (or beyond the canvas), keep inside.</li>
+<li><strong>Image editing.</strong> Regenerate the whole image but keep semantic or structural fidelity to the original (SDEdit, InstructPix2Pix).</li>
+</ul>
+<p>Every diffusion pipeline in 2026 ships an inpainting mode. Flux.1-Fill, Stable Diffusion Inpaint, SDXL-Inpaint, DALL-E 3 Edit. They work on the same principle.</p>
+<h2>The Concept</h2>
+<p><img src="/learn/ai-from-scratch/files/phases/08-generative-ai/09-inpainting-outpainting-editing/assets/inpainting.svg" alt="Inpainting: mask-aware denoising with context-preserving reinjection" loading="lazy"></p>
+<h3>The naive approach (and why it's wrong)</h3>
+<p>Run standard text-to-image with a mask. At each sampling step, replace the unmasked region of the noisy latent with the forward-diffused clean image. It works... badly. Boundary artifacts bleed through because the model has no information about what is in the masked region.</p>
+<h3>The proper inpainting model</h3>
+<p>Train a modified U-Net that takes 9 input channels instead of 4:</p>
+<pre><code>input = concat([ noisy_latent (4ch), encoded_image (4ch), mask (1ch) ], dim=channel)
+</code></pre>
+<p>The extra channels are a copy of the VAE-encoded source image plus a single-channel mask. At training time, you randomly mask regions of the image and train the model to denoise only the masked region while the unmasked region is given as a clean conditioning signal. At inference, the model can &quot;see&quot; what surrounds the masked region and produces coherent completions.</p>
+<p>SD-Inpaint, SDXL-Inpaint, Flux-Fill all use this 9-channel (or analog) input. Diffusers <code>StableDiffusionInpaintPipeline</code>, <code>FluxFillPipeline</code>.</p>
+<h3>SDEdit (Meng et al., 2022) — free editing</h3>
+<p>Add noise to the source image up to some intermediate <code>t</code>, then run the reverse chain from <code>t</code> down to 0 with a new prompt. No retraining. The choice of starting <code>t</code> trades fidelity for creative freedom:</p>
+<ul>
+<li><code>t/T = 0.3</code> → nearly identical to source, small stylistic changes</li>
+<li><code>t/T = 0.6</code> → moderate edits, preserves coarse structure</li>
+<li><code>t/T = 0.9</code> → generated from near-noise, minimal source preservation</li>
+</ul>
+<h3>InstructPix2Pix (Brooks et al., 2023)</h3>
+<p>Fine-tune a diffusion model on <code>(input_image, instruction, output_image)</code> triples. At inference, condition on both the input image and a text instruction (&quot;make it sunset&quot;, &quot;add a dragon&quot;). Two CFG scales: image scale and text scale.</p>
+<h3>RePaint (Lugmayr et al., 2022)</h3>
+<p>Keep a standard unconditional diffusion model. At each reverse step, resample — jump back to a noisier state occasionally and regenerate. Avoids boundary artifacts. Used when you don't have a trained inpainting model.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-f91d5adaab5b50af565e.png" alt="inpaint-mask-reinject 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<p><code>code/main.py</code> implements a toy 1-D inpainting scheme on 5-dimensional data. We train a DDPM on 5-D mixture data where each sample is 5 floats from one of two clusters. At inference, we &quot;mask&quot; 2 of the 5 dimensions, inject the noisy-forward version of the unmasked three at each step, and regenerate only the masked dimensions.</p>
+<h3>Step 1: 5-D DDPM data</h3>
+<pre><code class="language-python">def sample_data(rng):
+    cluster = rng.choice([0, 1])
+    center = [-1.0] * 5 if cluster == 0 else [1.0] * 5
+    return [c + rng.gauss(0, 0.2) for c in center], cluster
+</code></pre>
+<h3>Step 2: train denoiser over all 5 dims</h3>
+<p>Standard DDPM. Net outputs 5-D noise prediction for 5-D noisy input.</p>
+<h3>Step 3: at inference, mask-aware reverse</h3>
+<pre><code class="language-python">def inpaint_step(x_t, mask, clean_image, alpha_bars, t, rng):
+    # replace unmasked dims with a freshly noised version of the clean source
+    a_bar = alpha_bars[t]
+    for i in range(len(x_t)):
+        if not mask[i]:
+            x_t[i] = math.sqrt(a_bar) * clean_image[i] + math.sqrt(1 - a_bar) * rng.gauss(0, 1)
+    # ...then run the normal reverse step on x_t
+</code></pre>
+<p>This is the naive approach and it works on toy 1-D data. Real image inpainting uses the 9-channel input because texture coherence matters more.</p>
+<h3>Step 4: outpainting</h3>
+<p>Outpainting is inpainting with the mask inverted: mask the new (previously non-existent) canvas, fill the rest with the original. Identical training objective.</p>
+<h2>Pitfalls</h2>
+<ul>
+<li><strong>Seams.</strong> The naive approach leaves visible boundaries because gradient info doesn't flow across the mask. Fix: dilate the mask by 8-16 pixels, or use a proper inpainting model.</li>
+<li><strong>Mask leakage.</strong> If the conditioning image's unmasked region is low-quality or noisy, it pollutes the generation inside the mask. Denoise or blur slightly.</li>
+<li><strong>CFG interacts with mask size.</strong> High CFG on a small mask = saturated patch. Reduce CFG for small edits.</li>
+<li><strong>SDEdit fidelity cliff.</strong> Going from <code>t/T = 0.5</code> to <code>t/T = 0.6</code> can lose the subject's identity. Sweep and checkpoint.</li>
+<li><strong>Prompt mismatch.</strong> The prompt should describe the <em>whole</em> image, not just the new content. &quot;A cat sitting on a chair&quot; not &quot;a cat&quot;.</li>
+</ul>
+<h2>Use It</h2>
+<table>
+<thead>
+<tr>
+<th>Task</th>
+<th>Pipeline</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Remove object, small mask</td>
+<td>SD-Inpaint or Flux-Fill, standard prompt</td>
+</tr>
+<tr>
+<td>Replace sky</td>
+<td>SD-Inpaint + &quot;blue sky at sunset&quot;</td>
+</tr>
+<tr>
+<td>Extend canvas</td>
+<td>SDXL outpaint mode (8px feather) or Flux-Fill with outpaint mask</td>
+</tr>
+<tr>
+<td>Regenerate hand / face</td>
+<td>SD-Inpaint with prompt re-describing the subject + ControlNet-Openpose</td>
+</tr>
+<tr>
+<td>Change style of one region</td>
+<td>SDEdit at <code>t/T=0.5</code> on masked region</td>
+</tr>
+<tr>
+<td>&quot;Make it sunset&quot;</td>
+<td>InstructPix2Pix or Flux-Kontext</td>
+</tr>
+<tr>
+<td>Background replacement</td>
+<td>SAM mask → SD-Inpaint</td>
+</tr>
+<tr>
+<td>Ultra-high-fidelity</td>
+<td>Flux-Fill or GPT-Image (hosted) for hardest cases</td>
+</tr>
+</tbody>
+</table>
+<p>SAM (Meta's Segment Anything, 2023) + diffusion inpaint is the 2026 background-removal pipeline. SAM 2 (2024) works on video.</p>
+<h2>Ship It</h2>
+<p>Save <code>outputs/skill-editing-pipeline.md</code>. Skill takes an original image + edit description + optional mask (or SAM prompt) and outputs: mask-generation approach, base model, CFG scales (image + text), SDEdit-t or inpainting mode, and QA checklist.</p>
+<h2>Exercises</h2>
+<ol>
+<li><strong>Easy.</strong> In <code>code/main.py</code>, vary the fraction of dimensions masked from 0.2 to 0.8. At what fraction does the inpaint quality (residual in masked dims) equal unconditional generation?</li>
+<li><strong>Medium.</strong> Implement RePaint: at every 10th reverse step, jump back 5 steps (add noise) and re-denoise. Measure whether it reduces boundary residual at the mask edge.</li>
+<li><strong>Hard.</strong> Use Hugging Face diffusers to compare: SD 1.5 Inpaint + ControlNet-Openpose vs Flux.1-Fill on 20 face-regeneration tasks. Score pose adherence and identity preservation separately.</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Inpainting</td>
+<td>&quot;Fill the hole&quot;</td>
+<td>Regenerate inside a mask; keep outside pixels.</td>
+</tr>
+<tr>
+<td>Outpainting</td>
+<td>&quot;Extend the canvas&quot;</td>
+<td>Regenerate outside the canvas; keep inside.</td>
+</tr>
+<tr>
+<td>9-channel U-Net</td>
+<td>&quot;Proper inpainting model&quot;</td>
+<td>U-Net with <code>noisy | encoded-source | mask</code> as input.</td>
+</tr>
+<tr>
+<td>SDEdit</td>
+<td>&quot;Img2img with noise level&quot;</td>
+<td>Noise to time <code>t</code>, denoise with new prompt.</td>
+</tr>
+<tr>
+<td>InstructPix2Pix</td>
+<td>&quot;Text-only edits&quot;</td>
+<td>Fine-tuned diffusion on (image, instruction, output) triples.</td>
+</tr>
+<tr>
+<td>RePaint</td>
+<td>&quot;No retraining&quot;</td>
+<td>Re-noise periodically during reverse to reduce seams.</td>
+</tr>
+<tr>
+<td>SAM</td>
+<td>&quot;Segment Anything&quot;</td>
+<td>Mask generator by clicks or boxes; pairs with inpaint.</td>
+</tr>
+<tr>
+<td>Flux-Kontext</td>
+<td>&quot;Edit with context&quot;</td>
+<td>Flux variant that accepts a reference image + instruction for edits.</td>
+</tr>
+</tbody>
+</table>
+<h2>Production note: edit pipelines are latency-sensitive</h2>
+<p>Users editing an image expect sub-5-second round trips. A 30-step SDXL-Inpaint at 1024² is 3-4 s on an L4, plus SAM mask generation (~200 ms) and VAE encode/decode (~500 ms combined). In production framing, this is TTFT-bound rather than throughput-bound — batch 1, low concurrency, minimize every stage:</p>
+<ul>
+<li><strong>SAM-H is the slow one.</strong> SAM-H at 1024² is ~200 ms; SAM-ViT-B is ~40 ms with minor quality loss. SAM 2 (video) adds temporal overhead; do not use it for single-image edits.</li>
+<li><strong>Skip the encode when possible.</strong> <code>pipe.image_processor.preprocess(img)</code> encodes to latents. If you have the latents from the previous generation (typical in iterative-edit UIs), pass them directly via <code>latents=...</code> to skip one VAE encode.</li>
+<li><strong>Mask dilation matters for throughput too.</strong> A small mask means most of the U-Net forward pass is wasted (the unmasked pixels are clamped anyway). <code>diffusers</code>' <code>StableDiffusionInpaintPipeline</code> runs the full U-Net regardless; only the 9-channel proper-inpaint variants exploit masked compute.</li>
+<li><strong>Flux-Kontext is the 2025 answer.</strong> Single forward pass over <code>(source_image, instruction)</code> — no separate mask, no SDEdit noise sweep. On an H100 it ships an edit in ~1.5 s. The architectural lesson: collapse the stages.</li>
+</ul>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2201.09865" rel="noreferrer" data-network="true">Lugmayr et al. (2022). RePaint: Inpainting using Denoising Diffusion Probabilistic Models <small>↗ 需要联网</small></a> — training-free inpainting.</li>
+<li><a href="https://arxiv.org/abs/2108.01073" rel="noreferrer" data-network="true">Meng et al. (2022). SDEdit: Guided Image Synthesis and Editing with Stochastic Differential Equations <small>↗ 需要联网</small></a> — SDEdit.</li>
+<li><a href="https://arxiv.org/abs/2211.09800" rel="noreferrer" data-network="true">Brooks, Holynski, Efros (2023). InstructPix2Pix <small>↗ 需要联网</small></a> — text-instruction editing.</li>
+<li><a href="https://arxiv.org/abs/2304.02643" rel="noreferrer" data-network="true">Kirillov et al. (2023). Segment Anything <small>↗ 需要联网</small></a> — SAM, the mask source.</li>
+<li><a href="https://arxiv.org/abs/2408.00714" rel="noreferrer" data-network="true">Ravi et al. (2024). SAM 2: Segment Anything in Images and Videos <small>↗ 需要联网</small></a> — video SAM.</li>
+<li><a href="https://arxiv.org/abs/2208.01626" rel="noreferrer" data-network="true">Hertz et al. (2022). Prompt-to-Prompt Image Editing with Cross-Attention Control <small>↗ 需要联网</small></a> — attention-level editing.</li>
+<li><a href="https://blackforestlabs.ai/flux-1-tools/" rel="noreferrer" data-network="true">Black Forest Labs (2024). Flux.1-Fill and Flux.1-Kontext <small>↗ 需要联网</small></a> — 2024 tooling.</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-08-generative-ai--09-inpainting-outpainting-editing.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-08-generative-ai--09-inpainting-outpainting-editing.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/08-generative-ai/09-inpainting-outpainting-editing/code/main.py">phases/08-generative-ai/09-inpainting-outpainting-editing/code/main.py</a><details><summary>查看原始文本</summary><pre><code>import math
+import random
+
+
+def sin_embed(t, T, dim=8):
+    out = []
+    half = dim // 2
+    for i in range(half):
+        freq = 1.0 / (10000 ** (i / max(half - 1, 1)))
+        out.append(math.sin(t * freq))
+        out.append(math.cos(t * freq))
+    return out[:dim]
+
+
+def tanh(v):
+    return [math.tanh(x) for x in v]
+
+
+def tanh_grad(h):
+    return [1 - x * x for x in h]
+
+
+def matmul(W, x):
+    return [sum(w * xi for w, xi in zip(row, x)) for row in W]
+
+
+def add(a, b):
+    return [x + y for x, y in zip(a, b)]
+
+
+def randn_matrix(rows, cols, rng, scale=0.3):
+    return [[rng.gauss(0, scale) for _ in range(cols)] for _ in range(rows)]
+
+
+def init_net(x_dim, t_dim, hidden, rng):
+    return {
+        &quot;W1&quot;: randn_matrix(hidden, x_dim + t_dim, rng),
+        &quot;b1&quot;: [0.0] * hidden,
+        &quot;W2&quot;: randn_matrix(hidden, hidden, rng),
+        &quot;b2&quot;: [0.0] * hidden,
+        &quot;W3&quot;: randn_matrix(x_dim, hidden, rng),
+        &quot;b3&quot;: [0.0] * x_dim,
+    }
+
+
+def forward(x_t, t_emb, net):
+    inp = list(x_t) + list(t_emb)
+    pre1 = add(matmul(net[&quot;W1&quot;], inp), net[&quot;b1&quot;])
+    h1 = tanh(pre1)
+    pre2 = add(matmul(net[&quot;W2&quot;], h1), net[&quot;b2&quot;])
+    h2 = tanh(pre2)
+    out = add(matmul(net[&quot;W3&quot;], h2), net[&quot;b3&quot;])
+    return out, {&quot;inp&quot;: inp, &quot;h1&quot;: h1, &quot;h2&quot;: h2}
+
+
+def backward(target, out, cache, net):
+    grads = {k: None for k in net}
+    for p in net:
+        if isinstance(net[p][0], list):
+            grads[p] = [[0.0] * len(net[p][0]) for _ in net[p]]
+        else:
+            grads[p] = [0.0] * len(net[p])
+    d_out = [2 * (a - b) for a, b in zip(out, target)]
+    for i in range(len(d_out)):
+        grads[&quot;b3&quot;][i] += d_out[i]
+        for j in range(len(cache[&quot;h2&quot;])):
+            grads[&quot;W3&quot;][i][j] += d_out[i] * cache[&quot;h2&quot;][j]
+    d_h2 = [sum(net[&quot;W3&quot;][i][j] * d_out[i] for i in range(len(d_out)))
+            for j in range(len(cache[&quot;h2&quot;]))]
+    d_pre2 = [d_h2[j] * tanh_grad(cache[&quot;h2&quot;])[j] for j in range(len(cache[&quot;h2&quot;]))]
+    for j in range(len(cache[&quot;h2&quot;])):
+        grads[&quot;b2&quot;][j] += d_pre2[j]
+        for k in range(len(cache[&quot;h1&quot;])):
+            grads[&quot;W2&quot;][j][k] += d_pre2[j] * cache[&quot;h1&quot;][k]
+    d_h1 = [sum(net[&quot;W2&quot;][j][k] * d_pre2[j] for j in range(len(cache[&quot;h2&quot;])))
+            for k in range(len(cache[&quot;h1&quot;]))]
+    d_pre1 = [d_h1[j] * tanh_grad(cache[&quot;h1&quot;])[j] for j in range(len(cache[&quot;h1&quot;]))]
+    for j in range(len(cache[&quot;h1&quot;])):
+        grads[&quot;b1&quot;][j] += d_pre1[j]
+        for k in range(len(cache[&quot;inp&quot;])):
+            grads[&quot;W1&quot;][j][k] += d_pre1[j] * cache[&quot;inp&quot;][k]
+    return grads
+
+
+def apply(net, grads, lr):
+    for k, v in net.items():
+        if isinstance(v[0], list):
+            for i in range(len(v)):
+                for j in range(len(v[i])):
+                    v[i][j] -= lr * grads[k][i][j]
+        else:
+            for i in range(len(v)):
+                v[i] -= lr * grads[k][i]
+
+
+def make_schedule(T):
+    betas = [1e-4 + (0.02 - 1e-4) * t / (T - 1) for t in range(T)]
+    alphas = [1 - b for b in betas]
+    bars, cum = [], 1.0
+    for a in alphas:
+        cum *= a
+        bars.append(cum)
+    return alphas, bars
+
+
+def sample_data(rng, d=5):
+    cluster = rng.choice([0, 1])
+    center = [-1.0 if cluster == 0 else 1.0] * d
+    return [c + rng.gauss(0, 0.2) for c in center], cluster
+
+
+def train(net, alpha_bars, T, steps, lr, t_dim, d, rng):
+    for step in range(steps):
+        x0, _ = sample_data(rng, d)
+        t = rng.randrange(T)
+        eps = [rng.gauss(0, 1) for _ in range(d)]
+        a_bar = alpha_bars[t]
+        x_t = [math.sqrt(a_bar) * x0[i] + math.sqrt(1 - a_bar) * eps[i] for i in range(d)]
+        t_emb = sin_embed(t, T, t_dim)
+        out, cache = forward(x_t, t_emb, net)
+        grads = backward(eps, out, cache, net)
+        apply(net, grads, lr)
+
+
+def sample_unconditional(net, alphas, alpha_bars, T, t_dim, d, rng):
+    x = [rng.gauss(0, 1) for _ in range(d)]
+    for t in range(T - 1, -1, -1):
+        t_emb = sin_embed(t, T, t_dim)
+        eps_hat, _ = forward(x, t_emb, net)
+        beta_t = 1 - alphas[t]
+        mean = [(x[i] - beta_t / math.sqrt(1 - alpha_bars[t]) * eps_hat[i]) / math.sqrt(alphas[t])
+                for i in range(d)]
+        if t &gt; 0:
+            x = [mean[i] + math.sqrt(beta_t) * rng.gauss(0, 1) for i in range(d)]
+        else:
+            x = mean
+    return x
+
+
+def inpaint(net, alphas, alpha_bars, T, t_dim, d, clean, mask, rng):
+    &quot;&quot;&quot;mask[i] == True means that dim is to be regenerated. Unmasked dims pinned to clean.&quot;&quot;&quot;
+    x = [rng.gauss(0, 1) for _ in range(d)]
+    for t in range(T - 1, -1, -1):
+        a_bar = alpha_bars[t]
+        for i in range(d):
+            if not mask[i]:
+                x[i] = math.sqrt(a_bar) * clean[i] + math.sqrt(1 - a_bar) * rng.gauss(0, 1)
+        t_emb = sin_embed(t, T, t_dim)
+        eps_hat, _ = forward(x, t_emb, net)
+        beta_t = 1 - alphas[t]
+        mean = [(x[i] - beta_t / math.sqrt(1 - alpha_bars[t]) * eps_hat[i]) / math.sqrt(alphas[t])
+                for i in range(d)]
+        if t &gt; 0:
+            x = [mean[i] + math.sqrt(beta_t) * rng.gauss(0, 1) for i in range(d)]
+        else:
+            x = mean
+    for i in range(d):
+        if not mask[i]:
+            x[i] = clean[i]
+    return x
+
+
+def main():
+    rng = random.Random(5)
+    T, t_dim, hidden, d = 40, 8, 32, 5
+    alphas, alpha_bars = make_schedule(T)
+    net = init_net(d, t_dim, hidden, rng)
+
+    print(&quot;=== training 5-D DDPM on two-cluster mixture ===&quot;)
+    train(net, alpha_bars, T, steps=5000, lr=0.01, t_dim=t_dim, d=d, rng=rng)
+
+    print()
+    print(&quot;=== inpainting: pin dims 0-2, regenerate dims 3-4 ===&quot;)
+    for trial in range(5):
+        clean, cluster = sample_data(rng, d)
+        mask = [False, False, False, True, True]
+        out = inpaint(net, alphas, alpha_bars, T, t_dim, d, clean, mask, rng)
+        label = &quot;neg cluster&quot; if cluster == 0 else &quot;pos cluster&quot;
+        print(f&quot;  {label}: pinned={[f&#39;{clean[i]:+.2f}&#39; for i in range(3)]}  &quot;
+              f&quot;filled={[f&#39;{out[i]:+.2f}&#39; for i in range(3, 5)]}&quot;)
+
+    print()
+    print(&quot;=== outpainting (mask dims 0-1, pin 2-4) ===&quot;)
+    for trial in range(3):
+        clean, cluster = sample_data(rng, d)
+        mask = [True, True, False, False, False]
+        out = inpaint(net, alphas, alpha_bars, T, t_dim, d, clean, mask, rng)
+        print(f&quot;  pinned tail=[{clean[2]:+.2f}, {clean[3]:+.2f}, {clean[4]:+.2f}]  &quot;
+              f&quot;filled head=[{out[0]:+.2f}, {out[1]:+.2f}]&quot;)
+
+    print()
+    print(&quot;takeaway: the filled dims match the cluster sign of the pinned dims.&quot;)
+    print(&quot;          that is why inpainting looks coherent with the surroundings.&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/08-generative-ai/09-inpainting-outpainting-editing/outputs/skill-editing-pipeline.md">phases/08-generative-ai/09-inpainting-outpainting-editing/outputs/skill-editing-pipeline.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: editing-pipeline
+description: Plan an image-editing pipeline from source + edit description to a ready-to-ship output.
+version: 1.0.0
+phase: 8
+lesson: 09
+tags: [inpaint, outpaint, edit, sam]
+---
+
+Given source image, target edit (remove X, replace Y with Z, extend canvas, restyle region, change season / time-of-day), and quality bar (draft / portfolio / print), output:
+
+1. Mask strategy. Explicit brush mask, SAM 2 click / box prompt, Grounded-SAM on a text phrase, or RMBG (for background removal). One-sentence reason.
+2. Base model + mode. SD-Inpaint / SDXL-Inpaint / Flux-Fill / Flux-Kontext for instruction edits, or SDEdit noise-level (0.3 / 0.6 / 0.9) if no mask.
+3. Prompt scaffolding. Describe the whole image after edit, not only the new content. Include negative prompt.
+4. CFG + strength + feather. Mask feather 8-16 px; CFG ~5-7 for SDXL-inpaint, 3-4 for Flux. Strength 0.8-1.0 for full regenerate, 0.3-0.5 for preserve.
+5. Guardrails. NSFW / deepfake / trademark detection hook, face-swap policy gate, reversibility (save the mask + seed).
+
+Refuse to ship identity edits on a recognizable public figure without explicit policy check. Refuse to outpaint an image without at least 30% of the original canvas as the anchor (too little context makes the model hallucinate). Flag any SDEdit run with t/T &amp;gt; 0.7 and fidelity target &quot;preserve subject&quot; as a likely mismatch.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原课程未提供测验。</p></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/08-generative-ai/08-controlnet-lora-conditioning/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/08-generative-ai/10-video-generation/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/08-generative-ai/09-inpainting-outpainting-editing/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

@@ -1,0 +1,688 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>注意 变量 滑动窗口,稀疏,差异性 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-07-transformers-deep-dive" data-lesson="07-transformers-deep-dive/15-attention-variants" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/07-transformers-deep-dive/">深入 Transformer</a> / LESSON 15</p><h1 class="lesson-title">注意 变量 滑动窗口,稀疏,差异性</h1><p>Attention Variants — Sliding Window, Sparse, Differential</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>注意 变量 滑动窗口,稀疏,差异性</h1>
+<blockquote>
+<p>完全的注意力是圆. 每个代币都看到每一个代币,而记忆支付了代价. 四种变体折曲圆形,恢复了成本的一半.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 7 · 02 (Self-Attention), Phase 7 · 03 (Multi-Head), Phase 7 · 12 (KV Cache / Flash Attention)
+<strong>Time:</strong> ~60 minutes</p>
+<h2>问题</h2>
+<p>完全注意力成本<code>O(N²)</code>记忆力和<code>O(N²)</code>对于一个128K文本的Llama 3 70B,这就是每层16亿注意力输入,乘以80层.闪光注意力 (课 12) 隐藏了<code>O(N²)</code>激活存储器,但不会改变算术成本 每个代币仍然会关注其他代币.</p>
+<p>三类变体改变了注意力矩阵本身的拓学:</p>
+<ol>
+<li>**Sliding window attention (SWA).**每个代币都会在一个固定的邻居窗口中,而不是完整的预सर्ग.<code>O(N · W)</code>在哪里<code>W</code>马2/3,米斯特拉尔7B的第一层,菲-3-龙.</li>
+<li>**Sparse / block attention.**只有选择的对<code>(i, j)</code>长,大鸟,开AI稀疏变压器.</li>
+<li>**Differential attention.**计算两个注意力地图,使用不同的Q/K投影,减去一个.杀死&quot;注意力沉浸器&quot;,使重量流入第一几个代币.微软的DIFF变压器 (2024).</li>
+</ol>
+<p>它们共存.2026年边界模型经常混合它们:大多数层都是SWA-1024,每五层都是全球全关注,少数是分区头,清理检索.Gemma3的5:1 SWA-to-global ratio是当前的教科书默认.</p>
+<h2>概念</h2>
+<h3>滑动窗口注意 (SWA)</h3>
+<p>每个查询在位置<code>i</code>仅在职位<code>[i - W, i]</code>(因果性SWA) 或<code>[i - W/2, i + W/2]</code>窗外的代币得到了<code>-inf</code>在分数矩阵中.</p>
+<pre><code>full causal:           sliding window (W=4):
+positions 0-7          positions 0-7, W=4
+    0 1 2 3 4 5 6 7        0 1 2 3 4 5 6 7
+0 | x                0 |  x
+1 | x x              1 |  x x
+2 | x x x            2 |  x x x
+3 | x x x x          3 |  x x x x
+4 | x x x x x        4 |    x x x x
+5 | x x x x x x      5 |      x x x x
+6 | x x x x x x x    6 |        x x x x
+7 | x x x x x x x x  7 |          x x x x
+</code></pre>
+<p>为了<code>N = 8192</code>其他<code>W = 1024</code>预期的数值矩阵有1024 × 8192个非零行  8 × 减少.</p>
+<p>**KV cache shrinks with SWA.**只有最后一个<code>W</code>对于Gemma-3ish配置 (1024窗口, 128K文本),KV缓存量下降 128x.</p>
+<p>**Quality cost.**仅使用SWA的变压器与远程检索斗争.解决方案:将SWA层与全注意层交换.Gemma 3使用 5:1 SWA:全球.Mistral 7B使用了因果性SWA堆,信息通过重叠窗户&quot;向前流动&quot;.<code>W</code>在此之后<code>L</code>模型可以参加的层次<code>L × W</code>返回代币.</p>
+<h3>缩/阻注意力</h3>
+<p>选择一个<code>N × N</code>率模式是提前的.</p>
+<ul>
+<li>**Local + strided (OpenAI sparse transformer).**待在最后一个<code>W</code>代币加上每一个<code>stride</code>捕捉了当地和远程的<code>O(N · sqrt(N))</code>计算.</li>
+<li>**Longformer / BigBird.**局部窗口+一个小组全球代币 (例如 <code>[CLS]</code>) 随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随时随的随时随时随时随时随的随时随时随时随的随时随时随时随时随的随时随时随时随的随时随时随的随时随的随时随的随时随时随的随时随的随时随的随时随的随的随时随的随的随时随的随的随的随时随时随的随的随的随的随的随的随的随的随的随的随的随的随的随的随的随的随的随的随的随的随的随的随的.</li>
+<li>**Native Sparse Attention (DeepSeek, 2025).**了解哪些区块的<code>(Q, K)</code>核层面的零块,可以兼容FlashAttention.</li>
+</ul>
+<p>稀疏注意是一个核工程故事.数学很简单 (掩盖分数矩阵);获胜来自从未将零条目加载到SRAM中.FlashAttention-3和2026 FlexAttention API在 PyTorch中实现了自定义稀疏模式的第一类.</p>
+<h3>变化注意 (DIFF变压器, 2024)</h3>
+<p>定期关注有一个&quot;注意力沉没&quot;问题:软max强迫每一行总和到1,所以不想关注任何特定的代币在第一个代币 (或第一几个) 上掉了重量. 这就会窃取应该进入真实内容的容量.</p>
+<p>差异性注意力通过计算来解决这个问题<strong>two</strong>关注地图和减值:</p>
+<pre><code>A1 = softmax(Q1 K1^T / √d)
+A2 = softmax(Q2 K2^T / √d)
+DiffAttn = (A1 - λ · A2) V
+</code></pre>
+<p>在哪里<code>λ</code>取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取取</p>
+<p>报告结果 (微软 2024): 510%较低的困惑,在相同的训练长度下效果较长的环境 1.52x,针在子中更敏的检索.</p>
+<h3>变量比较</h3>
+<table>
+<thead>
+<tr>
+<th>Variant</th>
+<th>Compute</th>
+<th>KV cache</th>
+<th>Quality vs full</th>
+<th>Production use</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Full attention</td>
+<td>O(N²)</td>
+<td>O(N) per layer</td>
+<td>baseline</td>
+<td>every model's default layer</td>
+</tr>
+<tr>
+<td>SWA (window 1024)</td>
+<td>O(N·W)</td>
+<td>O(W) per layer</td>
+<td>-0.1 ppl, good with global layers</td>
+<td>Gemma 2/3, Phi-3-Long</td>
+</tr>
+<tr>
+<td>Local + strided sparse</td>
+<td>O(N·√N)</td>
+<td>mixed</td>
+<td>similar to SWA</td>
+<td>OpenAI sparse transformer, Longformer</td>
+</tr>
+<tr>
+<td>BigBird (local + global + random)</td>
+<td>O(N) approx</td>
+<td>mixed</td>
+<td>matches full at 2× context</td>
+<td>early long-context BERT</td>
+</tr>
+<tr>
+<td>Native Sparse (DeepSeek-V3.2)</td>
+<td>O(N · active fraction)</td>
+<td>O(N)</td>
+<td>within 0.05 ppl</td>
+<td>DeepSeek-V3.2, 2025</td>
+</tr>
+<tr>
+<td>Differential</td>
+<td>O(2·N²)</td>
+<td>O(2N)</td>
+<td>-5 to -10% ppl</td>
+<td>DIFF Transformer, early 2026 models</td>
+</tr>
+</tbody>
+</table>
+<figure><img src="/learn/ai-from-scratch/figures/figure-22820e6ce3cdd15ff2af.png" alt="gqa-kv-sharing 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<p>看到<code>code/main.py</code>我们实施了一个因果化面具比较器,显示一个玩具序列的全,SWA,本地+步骤,和差别注意力.</p>
+<h3>步骤1:完整的因果性面具 (基线)</h3>
+<pre><code class="language-python">def causal_mask(n):
+    return [[0.0 if j &lt;= i else float(&quot;-inf&quot;) for j in range(n)] for i in range(n)]
+</code></pre>
+<p>从第七课开始的基线.</p>
+<h3>步骤2:滑窗因果化面具</h3>
+<pre><code class="language-python">def swa_mask(n, window):
+    M = [[float(&quot;-inf&quot;)] * n for _ in range(n)]
+    for i in range(n):
+        lo = max(0, i - window + 1)
+        for j in range(lo, i + 1):
+            M[i][j] = 0.0
+    return M
+</code></pre>
+<p>一个参数<code>window</code>为了<code>window &gt;= n</code>由于你已经开始恢复了完全的因果性注意力.<code>window = 1</code>每个代币只能为自己提供服务.</p>
+<h3>步骤3:局部+步骤稀疏面具</h3>
+<pre><code class="language-python">def strided_mask(n, window, stride):
+    M = [[float(&quot;-inf&quot;)] * n for _ in range(n)]
+    for i in range(n):
+        lo = max(0, i - window + 1)
+        for j in range(lo, i + 1):
+            M[i][j] = 0.0
+        for j in range(0, i + 1, stride):
+            M[i][j] = 0.0
+    return M
+</code></pre>
+<p>密集的地方窗户加上每一个<code>stride</code>接收场在日志步骤增加了额外的层次.</p>
+<h3>步骤4: 差异性注意</h3>
+<pre><code class="language-python">def diff_attention(Q1, K1, Q2, K2, V, lam):
+    A1 = softmax_causal(Q1 @ K1.T / sqrt_d)
+    A2 = softmax_causal(Q2 @ K2.T / sqrt_d)
+    return (A1 - lam * A2) @ V
+</code></pre>
+<p>在代码中,我们比较单对差的注意力-沉热地图,看着洗崩.</p>
+<h3>步骤5: KV缓存尺寸</h3>
+<p>按每层打印缓存尺寸<code>N = 131072</code>对于每个变体.SWA和稀有变体下降了10100×. 差异性双倍. 意识地支付你的内存账单.</p>
+<h2>用它</h2>
+<p>2026年生产模式:</p>
+<pre><code class="language-python">from transformers import AutoModelForCausalLM
+# Gemma 3 mixes SWA (window=1024) and global layers at 5:1.
+model = AutoModelForCausalLM.from_pretrained(&quot;google/gemma-3-27b-it&quot;)
+# print(model.config.sliding_window, model.config.layer_types)
+</code></pre>
+<p>在 PyTorch 2.5+ 中,FlexAttention 接受一个面具功能:</p>
+<pre><code class="language-python">from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+
+def swa_pattern(b, h, q_idx, kv_idx):
+    return (q_idx - kv_idx &lt; 1024) &amp; (q_idx &gt;= kv_idx)
+
+mask = create_block_mask(swa_pattern, B=batch, H=heads, Q_LEN=n, KV_LEN=n)
+out = flex_attention(q, k, v, block_mask=mask)
+</code></pre>
+<p>这将编译成一个定制的Triton内核.在普通模式的FlashAttention-3速度的10%内,面具函数是Python调用.</p>
+<p><strong>When to pick each:</strong></p>
+<ul>
+<li><strong>Pure full attention</strong>每层到16K的文本,或者检索质量至关重要时.</li>
+<li><strong>SWA + global mix</strong>长文本 (&gt;32K),训练和推断内存. 2026年默认超过32K.</li>
+<li><strong>Sparse block attention</strong>定制内核,定制模式. 专用工作负载 (检索,音频) 预留.</li>
+<li><strong>Differential attention</strong>任何注意力污染造成伤害的工作负载 (长文本RAG,子子子).</li>
+</ul>
+<h2>运送它</h2>
+<p>看到<code>outputs/skill-attention-variant-picker.md</code>技能选择一个针对新模型的注意力拓,因为目标背景长度,检索要求和训练/推理计算配置.</p>
+<h2>运动</h2>
+<ol>
+<li>**Easy.**跑步<code>code/main.py</code>检查SWA<code>window=4</code>检查查,每行最后4个代币以外的所有东西都是零的.<code>window=n</code>完全因果注意力的重复比特相同.</li>
+<li>**Medium.**执行因果性SWA<code>window=1024</code>训练1000步小小, 什么值减值与全注意力?</li>
+<li>**Hard.**在顶点模型中实现Gemma-3式 5:1层混合 (5 SWA, 1 全球).在匹配参数时,对纯SWA和纯全球基线进行损失,内存和生成质量进行比较.</li>
+<li>**Hard.**通过学习的学习者来实现分别注意力<code>λ</code>按头.训练一个合成检索任务 (一个针,2000个分心器).在匹配的参数上测量检索精度与单次注意的基线.</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Sliding window attention (SWA)</td>
+<td>&quot;Local attention&quot;</td>
+<td>Each query attends to its last <code>W</code> tokens; KV cache shrinks to <code>O(W)</code>.</td>
+</tr>
+<tr>
+<td>Effective receptive field</td>
+<td>&quot;How far back the model sees&quot;</td>
+<td>In an <code>L</code>-layer SWA stack with window <code>W</code>, up to <code>L × W</code> tokens.</td>
+</tr>
+<tr>
+<td>Longformer / BigBird</td>
+<td>&quot;Local + global + random&quot;</td>
+<td>Sparse patterns with a few always-attending global tokens; early long-context approach.</td>
+</tr>
+<tr>
+<td>Native Sparse Attention</td>
+<td>&quot;DeepSeek's kernel trick&quot;</td>
+<td>Learn block-level sparsity; skip zero blocks at the kernel level while keeping quality.</td>
+</tr>
+<tr>
+<td>Differential attention</td>
+<td>&quot;Two maps, one subtracts&quot;</td>
+<td>DIFF Transformer: subtract a learned <code>λ</code> times a second attention map from the first to cancel attention sinks.</td>
+</tr>
+<tr>
+<td>Attention sink</td>
+<td>&quot;Weight bleeds to token 0&quot;</td>
+<td>Softmax normalization forces rows to sum to 1; uninformative queries dump weight on position 0.</td>
+</tr>
+<tr>
+<td>FlexAttention</td>
+<td>&quot;Mask-as-Python&quot;</td>
+<td>PyTorch 2.5+ API that compiles arbitrary mask functions into FlashAttention-shape kernels.</td>
+</tr>
+<tr>
+<td>Layer type mix</td>
+<td>&quot;5:1 SWA-to-global&quot;</td>
+<td>Interleave sparse and full attention layers in a stack to keep quality at lower memory.</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2004.05150" rel="noreferrer" data-network="true">Beltagy, Peters, Cohan (2020). Longformer: The Long-Document Transformer <small>↗ 需要联网</small></a>可行滑动窗口+全球标志纸.</li>
+<li><a href="https://arxiv.org/abs/2007.14062" rel="noreferrer" data-network="true">Zaheer et al. (2020). Big Bird: Transformers for Longer Sequences <small>↗ 需要联网</small></a>本地+全球+随机.</li>
+<li><a href="https://arxiv.org/abs/1904.10509" rel="noreferrer" data-network="true">Child et al. (2019). Generating Long Sequences with Sparse Transformers <small>↗ 需要联网</small></a>OpenAI的本地+步骤模式.</li>
+<li><a href="https://arxiv.org/abs/2408.00118" rel="noreferrer" data-network="true">Gemma Team (2024). Gemma 2: Improving Open Language Models at a Practical Size <small>↗ 需要联网</small></a>全球混合物:1:</li>
+<li><a href="https://arxiv.org/abs/2503.19786" rel="noreferrer" data-network="true">Gemma Team (2025). Gemma 3 technical report <small>↗ 需要联网</small></a>5:1的混合和窗口=1024现在是教科书默认的.</li>
+<li><a href="https://arxiv.org/abs/2410.05258" rel="noreferrer" data-network="true">Ye et al. (2024). Differential Transformer <small>↗ 需要联网</small></a> DIFF变压器纸.</li>
+<li><a href="https://arxiv.org/abs/2502.11089" rel="noreferrer" data-network="true">Yuan et al. (2025). Native Sparse Attention <small>↗ 需要联网</small></a>深度搜索V3.2的学习度注意力.</li>
+<li><a href="https://pytorch.org/blog/flexattention/" rel="noreferrer" data-network="true">PyTorch — FlexAttention blog and docs <small>↗ 需要联网</small></a>使用它中的面具作为可调用模式的API参考.</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Attention Variants — Sliding Window, Sparse, Differential</h1>
+<blockquote>
+<p>Full attention is a circle. Every token sees every token, and memory pays the price. Four variants bend the shape of the circle and recover half the cost.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 7 · 02 (Self-Attention), Phase 7 · 03 (Multi-Head), Phase 7 · 12 (KV Cache / Flash Attention)
+<strong>Time:</strong> ~60 minutes</p>
+<h2>The Problem</h2>
+<p>Full attention costs <code>O(N²)</code> memory and <code>O(N²)</code> compute in sequence length. For a 128K-context Llama 3 70B that is 16 billion attention entries per layer, times 80 layers. Flash Attention (Lesson 12) hides the <code>O(N²)</code> activation memory but does not change the arithmetic cost — every token still attends to every other token.</p>
+<p>Three classes of variants change the topology of the attention matrix itself:</p>
+<ol>
+<li><strong>Sliding window attention (SWA).</strong> Each token attends to a fixed window of neighbors, not the full prefix. Memory and compute drop to <code>O(N · W)</code> where <code>W</code> is the window. Gemma 2/3, Mistral 7B's first layers, Phi-3-Long.</li>
+<li><strong>Sparse / block attention.</strong> Only selected pairs <code>(i, j)</code> get scored; the rest are forced to zero weight. Longformer, BigBird, OpenAI sparse transformer.</li>
+<li><strong>Differential attention.</strong> Compute two attention maps with separate Q/K projections, subtract one from the other. Kills the &quot;attention sink&quot; that bleeds weight into the first few tokens. Microsoft's DIFF Transformer (2024).</li>
+</ol>
+<p>These coexist. A 2026 frontier model often mixes them: most layers are SWA-1024, every fifth is global full attention, and a handful are differential heads that clean up retrieval. Gemma 3's 5:1 SWA-to-global ratio is the current textbook default.</p>
+<h2>The Concept</h2>
+<h3>Sliding Window Attention (SWA)</h3>
+<p>Each query at position <code>i</code> attends only to positions in <code>[i - W, i]</code> (causal SWA) or <code>[i - W/2, i + W/2]</code> (bidirectional). Tokens outside the window get <code>-inf</code> in the score matrix.</p>
+<pre><code>full causal:           sliding window (W=4):
+positions 0-7          positions 0-7, W=4
+    0 1 2 3 4 5 6 7        0 1 2 3 4 5 6 7
+0 | x                0 |  x
+1 | x x              1 |  x x
+2 | x x x            2 |  x x x
+3 | x x x x          3 |  x x x x
+4 | x x x x x        4 |    x x x x
+5 | x x x x x x      5 |      x x x x
+6 | x x x x x x x    6 |        x x x x
+7 | x x x x x x x x  7 |          x x x x
+</code></pre>
+<p>For <code>N = 8192</code> and <code>W = 1024</code>, the score matrix has 1024 × 8192 non-zero rows in expectation — an 8× reduction.</p>
+<p><strong>KV cache shrinks with SWA.</strong> Only the last <code>W</code> tokens of K and V need to be kept per layer. For a Gemma-3-ish config (1024 window, 128K context), KV cache drops 128×.</p>
+<p><strong>Quality cost.</strong> SWA-only transformers struggle with long-range retrieval. The fix: interleave SWA layers with full-attention layers. Gemma 3 uses 5:1 SWA:global. Mistral 7B used a causal-SWA stack where information &quot;flows forward&quot; through overlapping windows — each layer extends effective receptive field by <code>W</code>, and after <code>L</code> layers the model can attend <code>L × W</code> tokens back.</p>
+<h3>Sparse / Block Attention</h3>
+<p>Pick an <code>N × N</code> sparsity pattern ahead of time. Three canonical shapes:</p>
+<ul>
+<li><strong>Local + strided (OpenAI sparse transformer).</strong> Attend to the last <code>W</code> tokens plus every <code>stride</code>-th token before that. Captures both local and long-range at <code>O(N · sqrt(N))</code> compute.</li>
+<li><strong>Longformer / BigBird.</strong> Local window + a small set of global tokens (e.g. <code>[CLS]</code>) that attend to everyone and are attended by everyone + random-sparse links. Empirical 2× context at matched quality.</li>
+<li><strong>Native Sparse Attention (DeepSeek, 2025).</strong> Learn which blocks of <code>(Q, K)</code> matter; skip the zero blocks at kernel level. FlashAttention-compatible.</li>
+</ul>
+<p>Sparse attention is a kernel-engineering story. The math is simple (mask the score matrix); the win comes from never loading the zero entries into SRAM. FlashAttention-3 and the 2026 FlexAttention API make custom sparse patterns first-class in PyTorch.</p>
+<h3>Differential Attention (DIFF Transformer, 2024)</h3>
+<p>Regular attention has an &quot;attention sink&quot; problem: softmax forces every row to sum to 1, so tokens that don't want to attend to anything in particular dump weight on the first token (or the first few). This steals capacity that should have gone to real content.</p>
+<p>Differential attention fixes this by computing <strong>two</strong> attention maps and subtracting:</p>
+<pre><code>A1 = softmax(Q1 K1^T / √d)
+A2 = softmax(Q2 K2^T / √d)
+DiffAttn = (A1 - λ · A2) V
+</code></pre>
+<p>where <code>λ</code> is a learned scalar (typically 0.5–0.8). A1 captures real content weights; A2 captures the sink. Subtraction cancels the sink, reallocates weight to relevant tokens.</p>
+<p>Reported results (Microsoft 2024): 5–10% lower perplexity, 1.5–2× longer effective context at same trained length, sharper needle-in-haystack retrieval.</p>
+<h3>Variant Comparison</h3>
+<table>
+<thead>
+<tr>
+<th>Variant</th>
+<th>Compute</th>
+<th>KV cache</th>
+<th>Quality vs full</th>
+<th>Production use</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Full attention</td>
+<td>O(N²)</td>
+<td>O(N) per layer</td>
+<td>baseline</td>
+<td>every model's default layer</td>
+</tr>
+<tr>
+<td>SWA (window 1024)</td>
+<td>O(N·W)</td>
+<td>O(W) per layer</td>
+<td>-0.1 ppl, good with global layers</td>
+<td>Gemma 2/3, Phi-3-Long</td>
+</tr>
+<tr>
+<td>Local + strided sparse</td>
+<td>O(N·√N)</td>
+<td>mixed</td>
+<td>similar to SWA</td>
+<td>OpenAI sparse transformer, Longformer</td>
+</tr>
+<tr>
+<td>BigBird (local + global + random)</td>
+<td>O(N) approx</td>
+<td>mixed</td>
+<td>matches full at 2× context</td>
+<td>early long-context BERT</td>
+</tr>
+<tr>
+<td>Native Sparse (DeepSeek-V3.2)</td>
+<td>O(N · active fraction)</td>
+<td>O(N)</td>
+<td>within 0.05 ppl</td>
+<td>DeepSeek-V3.2, 2025</td>
+</tr>
+<tr>
+<td>Differential</td>
+<td>O(2·N²)</td>
+<td>O(2N)</td>
+<td>-5 to -10% ppl</td>
+<td>DIFF Transformer, early 2026 models</td>
+</tr>
+</tbody>
+</table>
+<figure><img src="/learn/ai-from-scratch/figures/figure-22820e6ce3cdd15ff2af.png" alt="gqa-kv-sharing 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<p>See <code>code/main.py</code>. We implement a causal mask comparator that shows full, SWA, local+strided, and differential attention side by side on a toy sequence.</p>
+<h3>Step 1: full causal mask (baseline)</h3>
+<pre><code class="language-python">def causal_mask(n):
+    return [[0.0 if j &lt;= i else float(&quot;-inf&quot;) for j in range(n)] for i in range(n)]
+</code></pre>
+<p>Baseline from Lesson 07. Lower triangular; zero weight above the diagonal.</p>
+<h3>Step 2: sliding window causal mask</h3>
+<pre><code class="language-python">def swa_mask(n, window):
+    M = [[float(&quot;-inf&quot;)] * n for _ in range(n)]
+    for i in range(n):
+        lo = max(0, i - window + 1)
+        for j in range(lo, i + 1):
+            M[i][j] = 0.0
+    return M
+</code></pre>
+<p>One parameter — <code>window</code>. For <code>window &gt;= n</code>, you recover full causal attention. For <code>window = 1</code>, each token attends only to itself.</p>
+<h3>Step 3: local + strided sparse mask</h3>
+<pre><code class="language-python">def strided_mask(n, window, stride):
+    M = [[float(&quot;-inf&quot;)] * n for _ in range(n)]
+    for i in range(n):
+        lo = max(0, i - window + 1)
+        for j in range(lo, i + 1):
+            M[i][j] = 0.0
+        for j in range(0, i + 1, stride):
+            M[i][j] = 0.0
+    return M
+</code></pre>
+<p>Dense local window plus every <code>stride</code>-th token back to the start of the sequence. Receptive field grows in log steps with additional layers.</p>
+<h3>Step 4: differential attention</h3>
+<pre><code class="language-python">def diff_attention(Q1, K1, Q2, K2, V, lam):
+    A1 = softmax_causal(Q1 @ K1.T / sqrt_d)
+    A2 = softmax_causal(Q2 @ K2.T / sqrt_d)
+    return (A1 - lam * A2) @ V
+</code></pre>
+<p>Two attention passes, subtract with a learned mixing coefficient. In the code we compare the attention-sink heatmap of single vs differential and watch the sink collapse.</p>
+<h3>Step 5: KV cache sizes</h3>
+<p>Print the cache size per layer at <code>N = 131072</code> for each variant. SWA and sparse variants drop by 10–100×. Differential doubles. Pay your memory bill consciously.</p>
+<h2>Use It</h2>
+<p>2026 production patterns:</p>
+<pre><code class="language-python">from transformers import AutoModelForCausalLM
+# Gemma 3 mixes SWA (window=1024) and global layers at 5:1.
+model = AutoModelForCausalLM.from_pretrained(&quot;google/gemma-3-27b-it&quot;)
+# print(model.config.sliding_window, model.config.layer_types)
+</code></pre>
+<p>FlexAttention in PyTorch 2.5+ accepts a mask function:</p>
+<pre><code class="language-python">from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+
+def swa_pattern(b, h, q_idx, kv_idx):
+    return (q_idx - kv_idx &lt; 1024) &amp; (q_idx &gt;= kv_idx)
+
+mask = create_block_mask(swa_pattern, B=batch, H=heads, Q_LEN=n, KV_LEN=n)
+out = flex_attention(q, k, v, block_mask=mask)
+</code></pre>
+<p>This compiles to a custom Triton kernel. Within 10% of FlashAttention-3 speed for common patterns, and the mask function is a Python callable.</p>
+<p><strong>When to pick each:</strong></p>
+<ul>
+<li><strong>Pure full attention</strong> — every layer up to ~16K context, or when retrieval quality is paramount.</li>
+<li><strong>SWA + global mix</strong> — long context (&gt;32K), training and inference memory-bound. The 2026 default above 32K.</li>
+<li><strong>Sparse block attention</strong> — custom kernel, custom pattern. Reserved for specialized workloads (retrieval, audio).</li>
+<li><strong>Differential attention</strong> — any workload where attention-sink contamination hurts (long-context RAG, needle-in-haystack).</li>
+</ul>
+<h2>Ship It</h2>
+<p>See <code>outputs/skill-attention-variant-picker.md</code>. The skill picks an attention topology for a new model given target context length, retrieval demands, and training/inference compute profile.</p>
+<h2>Exercises</h2>
+<ol>
+<li><strong>Easy.</strong> Run <code>code/main.py</code>. Verify SWA at <code>window=4</code> zeroes everything outside the last 4 tokens per row. Verify <code>window=n</code> reproduces full causal attention bit-identically.</li>
+<li><strong>Medium.</strong> Implement causal SWA with <code>window=1024</code> on top of the Lesson 07 capstone. Train for 1,000 steps on tinyshakespeare. How much does val loss regress vs full attention? How much does peak memory drop?</li>
+<li><strong>Hard.</strong> Implement a Gemma-3-style 5:1 layer mix (5 SWA, 1 global) in the capstone model. Compare loss, memory, and generation quality against pure-SWA and pure-global baselines at matched parameters.</li>
+<li><strong>Hard.</strong> Implement differential attention with a learned <code>λ</code> per head. Train on a synthetic retrieval task (one needle, 2,000 distractors). Measure retrieval accuracy vs a single-attention baseline at matched parameters.</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Sliding window attention (SWA)</td>
+<td>&quot;Local attention&quot;</td>
+<td>Each query attends to its last <code>W</code> tokens; KV cache shrinks to <code>O(W)</code>.</td>
+</tr>
+<tr>
+<td>Effective receptive field</td>
+<td>&quot;How far back the model sees&quot;</td>
+<td>In an <code>L</code>-layer SWA stack with window <code>W</code>, up to <code>L × W</code> tokens.</td>
+</tr>
+<tr>
+<td>Longformer / BigBird</td>
+<td>&quot;Local + global + random&quot;</td>
+<td>Sparse patterns with a few always-attending global tokens; early long-context approach.</td>
+</tr>
+<tr>
+<td>Native Sparse Attention</td>
+<td>&quot;DeepSeek's kernel trick&quot;</td>
+<td>Learn block-level sparsity; skip zero blocks at the kernel level while keeping quality.</td>
+</tr>
+<tr>
+<td>Differential attention</td>
+<td>&quot;Two maps, one subtracts&quot;</td>
+<td>DIFF Transformer: subtract a learned <code>λ</code> times a second attention map from the first to cancel attention sinks.</td>
+</tr>
+<tr>
+<td>Attention sink</td>
+<td>&quot;Weight bleeds to token 0&quot;</td>
+<td>Softmax normalization forces rows to sum to 1; uninformative queries dump weight on position 0.</td>
+</tr>
+<tr>
+<td>FlexAttention</td>
+<td>&quot;Mask-as-Python&quot;</td>
+<td>PyTorch 2.5+ API that compiles arbitrary mask functions into FlashAttention-shape kernels.</td>
+</tr>
+<tr>
+<td>Layer type mix</td>
+<td>&quot;5:1 SWA-to-global&quot;</td>
+<td>Interleave sparse and full attention layers in a stack to keep quality at lower memory.</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2004.05150" rel="noreferrer" data-network="true">Beltagy, Peters, Cohan (2020). Longformer: The Long-Document Transformer <small>↗ 需要联网</small></a> — the canonical sliding-window + global-token paper.</li>
+<li><a href="https://arxiv.org/abs/2007.14062" rel="noreferrer" data-network="true">Zaheer et al. (2020). Big Bird: Transformers for Longer Sequences <small>↗ 需要联网</small></a> — local + global + random.</li>
+<li><a href="https://arxiv.org/abs/1904.10509" rel="noreferrer" data-network="true">Child et al. (2019). Generating Long Sequences with Sparse Transformers <small>↗ 需要联网</small></a> — OpenAI's local+strided pattern.</li>
+<li><a href="https://arxiv.org/abs/2408.00118" rel="noreferrer" data-network="true">Gemma Team (2024). Gemma 2: Improving Open Language Models at a Practical Size <small>↗ 需要联网</small></a> — the 1:1 SWA:global mix.</li>
+<li><a href="https://arxiv.org/abs/2503.19786" rel="noreferrer" data-network="true">Gemma Team (2025). Gemma 3 technical report <small>↗ 需要联网</small></a> — the 5:1 mix with window=1024 that's now the textbook default.</li>
+<li><a href="https://arxiv.org/abs/2410.05258" rel="noreferrer" data-network="true">Ye et al. (2024). Differential Transformer <small>↗ 需要联网</small></a> — DIFF Transformer paper.</li>
+<li><a href="https://arxiv.org/abs/2502.11089" rel="noreferrer" data-network="true">Yuan et al. (2025). Native Sparse Attention <small>↗ 需要联网</small></a> — DeepSeek-V3.2's learned-sparsity attention.</li>
+<li><a href="https://pytorch.org/blog/flexattention/" rel="noreferrer" data-network="true">PyTorch — FlexAttention blog and docs <small>↗ 需要联网</small></a> — API reference for the mask-as-callable pattern in Use It.</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-07-transformers-deep-dive--15-attention-variants.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-07-transformers-deep-dive--15-attention-variants.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/07-transformers-deep-dive/15-attention-variants/code/main.py">phases/07-transformers-deep-dive/15-attention-variants/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Attention variants: full, sliding-window, local+strided sparse, differential.
+
+Pure stdlib. We compare the structure of the score mask and the KV cache
+size per variant at a realistic long-context budget.
+&quot;&quot;&quot;
+
+import math
+
+
+NEG_INF = float(&quot;-inf&quot;)
+
+
+def causal_mask(n):
+    M = [[NEG_INF] * n for _ in range(n)]
+    for i in range(n):
+        for j in range(i + 1):
+            M[i][j] = 0.0
+    return M
+
+
+def swa_mask(n, window):
+    M = [[NEG_INF] * n for _ in range(n)]
+    for i in range(n):
+        lo = max(0, i - window + 1)
+        for j in range(lo, i + 1):
+            M[i][j] = 0.0
+    return M
+
+
+def strided_mask(n, window, stride):
+    M = [[NEG_INF] * n for _ in range(n)]
+    for i in range(n):
+        lo = max(0, i - window + 1)
+        for j in range(lo, i + 1):
+            M[i][j] = 0.0
+        for j in range(0, i + 1, stride):
+            M[i][j] = 0.0
+    return M
+
+
+def count_nonmasked(M):
+    return sum(1 for row in M for v in row if v == 0.0)
+
+
+def render(M, label):
+    n = len(M)
+    print(f&quot;{label}  ({count_nonmasked(M)} / {n*n} cells attended)&quot;)
+    for i in range(n):
+        cells = &quot;&quot;.join(&quot;x&quot; if M[i][j] == 0.0 else &quot;.&quot; for j in range(n))
+        print(f&quot;  {i:&gt;2} | {cells}&quot;)
+    print()
+
+
+def softmax(xs):
+    m = max(xs)
+    exps = [math.exp(x - m) for x in xs]
+    s = sum(exps)
+    return [e / s for e in exps]
+
+
+def attention_row(q, Ks, Vs, mask_row):
+    d = len(q)
+    scores = []
+    for k, m in zip(Ks, mask_row):
+        if m == NEG_INF:
+            scores.append(NEG_INF)
+        else:
+            s = sum(qi * ki for qi, ki in zip(q, k)) / math.sqrt(d)
+            scores.append(s)
+    finite = [s for s in scores if s != NEG_INF]
+    if not finite:
+        return [0.0] * len(Vs[0]), [0.0] * len(scores)
+    shifted = softmax(finite)
+    weights = []
+    k = 0
+    for s in scores:
+        if s == NEG_INF:
+            weights.append(0.0)
+        else:
+            weights.append(shifted[k])
+            k += 1
+    d_v = len(Vs[0])
+    out = [0.0] * d_v
+    for w, v in zip(weights, Vs):
+        for j in range(d_v):
+            out[j] += w * v[j]
+    return out, weights
+
+
+def diff_attention_row(q1, q2, K1, K2, V, mask_row, lam):
+    _, w1 = attention_row(q1, K1, V, mask_row)
+    _, w2 = attention_row(q2, K2, V, mask_row)
+    diff = [a - lam * b for a, b in zip(w1, w2)]
+    d_v = len(V[0])
+    out = [0.0] * d_v
+    for w, v in zip(diff, V):
+        for j in range(d_v):
+            out[j] += w * v[j]
+    return out, diff
+
+
+def kv_cache_bytes(n_layers, n_kv_heads, d_head, seq_len, dtype_bytes=2):
+    return 2 * n_layers * n_kv_heads * d_head * seq_len * dtype_bytes
+
+
+def main():
+    print(&quot;=== attention mask shapes on an 8-token sequence ===&quot;)
+    print()
+    render(causal_mask(8), &quot;full causal&quot;)
+    render(swa_mask(8, window=4), &quot;sliding window (W=4)&quot;)
+    render(strided_mask(8, window=2, stride=3), &quot;local (W=2) + strided (stride=3)&quot;)
+
+    print(&quot;=== attention sink: one &#39;noisy&#39; query on 8 random tokens ===&quot;)
+    import random
+    rng = random.Random(0)
+    d = 8
+    K = [[rng.gauss(0, 1) for _ in range(d)] for _ in range(8)]
+    V = [[rng.gauss(0, 1) for _ in range(d)] for _ in range(8)]
+    q = [rng.gauss(0, 1) for _ in range(d)]
+    mask = causal_mask(8)[7]
+    _, w_single = attention_row(q, K, V, mask)
+    print(f&quot;single attn weights: &quot; + &quot; &quot;.join(f&quot;{w:.3f}&quot; for w in w_single))
+    print(f&quot;  (notice the weight bleeding to position 0 — the attention sink)&quot;)
+
+    q1 = q[:]
+    q2 = [x + 0.2 * rng.gauss(0, 1) for x in q]
+    K2 = [[x + 0.2 * rng.gauss(0, 1) for x in row] for row in K]
+    _, w_diff = diff_attention_row(q1, q2, K, K2, V, mask, lam=0.5)
+    print(f&quot;diff   attn weights: &quot; + &quot; &quot;.join(f&quot;{w:+.3f}&quot; for w in w_diff))
+    print(f&quot;  (lambda=0.5 subtracts the sink component; negative weights allowed)&quot;)
+    print()
+
+    print(&quot;=== KV cache @ 128K context, Llama-3-70B-ish (80 layers, 8 KV heads, d_head=128, fp16) ===&quot;)
+    n_layers, n_kv_heads, d_head = 80, 8, 128
+    N = 131072
+    full = kv_cache_bytes(n_layers, n_kv_heads, d_head, N)
+
+    print(f&quot;  full attention              : {full / 1e9:&gt;6.1f} GB&quot;)
+    for window in (4096, 1024):
+        reduced = full * (window / N)
+        print(f&quot;  SWA window={window:&gt;5}             : {reduced / 1e9:&gt;6.1f} GB   ({N/window:.0f}x shrink)&quot;)
+
+    gemma3_ratio = 1 / 6
+    gemma_total = full * (5 / 6) * (1024 / N) + full * (1 / 6)
+    print(f&quot;  Gemma-3 mix (5:1, W=1024)   : {gemma_total / 1e9:&gt;6.1f} GB   ({full/gemma_total:.1f}x shrink)&quot;)
+
+    diff = full * 2
+    print(f&quot;  differential attention (2x) : {diff / 1e9:&gt;6.1f} GB   (pays 2x for sink-free weights)&quot;)
+    print()
+    print(&quot;takeaway: SWA is the cheapest long-context win.&quot;)
+    print(&quot;          Gemma 3&#39;s 5:1 mix keeps enough global layers for retrieval&quot;)
+    print(&quot;          while shrinking KV ~6x vs pure full attention.&quot;)
+    print(&quot;          DIFF attention pays 2x KV for sink-free, sharper retrieval.&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/07-transformers-deep-dive/15-attention-variants/outputs/skill-attention-variant-picker.md">phases/07-transformers-deep-dive/15-attention-variants/outputs/skill-attention-variant-picker.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: attention-variant-picker
+description: Pick a full / sliding-window / sparse / differential attention topology for a new model given context length, retrieval demands, and compute profile.
+version: 1.0.0
+phase: 7
+lesson: 15
+tags: [attention, transformer, long-context, inference, memory]
+---
+
+# Attention Variant Picker
+
+Help a developer choose and justify an attention topology for a new transformer, or for an existing one they&#39;re extending to longer context.
+
+## Inputs to gather
+
+1. **Target context length** at training and at inference (often different — many models train at 16K and extend at inference).
+2. **Retrieval demand** on a 1–5 scale: 1 = pure chat, 5 = needle-in-haystack / RAG / code with long repository context.
+3. **Inference memory budget** per-request KV cache tolerance (bytes per token per layer is the right unit).
+4. **Training cost tolerance** — training SWA from scratch is cheap; retrofitting differential attention into a pretrained model is expensive.
+5. **Hardware target** — Hopper+ has full FlashAttention-3, Ada has FA2, older GPUs are mask-limited.
+
+## Decision rules
+
+- **Context ≤ 16K and retrieval ≤ 3**: full attention with FlashAttention. Don&#39;t optimize prematurely.
+- **Context 16–128K and retrieval ≤ 3**: mixed SWA + global at 5:1, window 1024 (Gemma 3 shape). Keeps retrieval workable while collapsing KV.
+- **Context &gt; 128K**: full SWA with a global layer every 4–6 layers, plus position interpolation / YaRN scaling (Lesson 04).
+- **Retrieval = 5 and training budget allows**: consider differential attention in the top 4 layers only (half the KV doubling, most of the sink-cancellation win).
+- **You&#39;re shipping a public API**: prefer stable patterns (full, SWA, Gemma-3 mix). Skip native-sparse / DIFF unless you have kernel engineers.
+- **You can&#39;t change the base model**: SWA can be retrofitted at inference via masking; differential and sparse can&#39;t.
+
+## Always flag
+
+- Pure-SWA models below 7B often lose measurably on reasoning benchmarks. Recommend against.
+- Window size &lt; 512 is almost never right. Go bigger or use a different topology.
+- Differential attention reports in the paper are on small models (3–7B). Scale-up evidence is thin as of early 2026.
+- Every variant interacts with RoPE / YaRN scaling (Lesson 04). State the position scheme explicitly.
+
+## Output format
+
+Return:
+
+1. **Recommendation** — a single named topology (e.g. &quot;Gemma-3 mix, W=1024, 5:1 SWA:global&quot;).
+2. **Justification** — map each input to the decision rule above.
+3. **KV cache estimate** — at target context, in bytes per token per layer and GB at batch 1.
+4. **Migration path** — if the base model is already trained, how to retrofit.
+5. **Known risks** — which benchmarks / workloads might regress.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原课程未提供测验。</p></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/07-transformers-deep-dive/14-build-a-transformer-capstone/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/07-transformers-deep-dive/16-speculative-decoding/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/07-transformers-deep-dive/15-attention-variants/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

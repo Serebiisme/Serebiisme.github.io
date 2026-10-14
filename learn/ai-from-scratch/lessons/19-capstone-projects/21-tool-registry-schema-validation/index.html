@@ -1,0 +1,593 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>工具注册表与方案验证 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-19-capstone-projects" data-lesson="19-capstone-projects/21-tool-registry-schema-validation" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/19-capstone-projects/">综合项目</a> / LESSON 21</p><h1 class="lesson-title">工具注册表与方案验证</h1><p>Tool Registry with Schema Validation</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>工具注册表与方案验证</h1>
+<blockquote>
+<p>工具不能验证的工具是代理不能调用的工具. 在构建工具之前,建立注册表和方案检查器.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 13 lessons 01-07, Phase 14 lesson 01
+<strong>Time:</strong> ~90 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>保持一个输入的工具名称 → schema → 处理器登记,发送者可以一次询问,然后信任.</li>
+<li>实现一个JSON Schema 2020-12子集,涵盖了工具调用中90%的关键字.</li>
+<li>返回精确的,Json指针形状的错误路径,以便模型在一次回路中自行纠正.</li>
+<li>拒绝重新注册,没有明确的覆盖,因为无声覆盖是生产工具目录的流动方式.</li>
+<li>保持验证器纯净 (无输入/运输,无时间,无全球)</li>
+</ul>
+<figure><img src="/learn/ai-from-scratch/figures/figure-9348a79ad73d7c32e95a.png" alt="cf-registry-validate 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>为什么注册表在工具之前</h2>
+<p>2026年,编码代理的注册工具超过模型可以在单一的文本窗口中合适的数量. 无关紧要的带将记录200个工具,在任何转折时,表面上出现10到40个. 记录是&quot;有什么工具&quot;,&quot;他们的论点有什么形状&quot;,以及&quot;我叫什么处理器&quot;.</p>
+<p>我们避免的错误是没有计划的运输手机,或者没有验证的运输手机.这两者都是共同的.这两者都将下一个层 (第23课中的发送器) 变成了一个猜测游戏,唯一的失败模式是从处理器那里的堆痕迹.</p>
+<h2>工具记录是什么样子</h2>
+<pre><code class="language-text">ToolRecord
+  name        : str          (unique, lowercase alphanumeric and underscore segments separated by dots, e.g., snake_case.segment.case)
+  description : str          (one line, shown to the model)
+  schema      : dict         (JSON Schema 2020-12 subset)
+  handler     : Callable     (async or sync, returns Any)
+  idempotent  : bool         (dispatcher uses this for retry decisions)
+  timeout_ms  : int          (override per-tool dispatcher default)
+</code></pre>
+<p>验证器触摸的仅一个是该方案.处理器对此不透明.我们故意将它们分开.该方案是数据.处理器是代码.将它们混合诱惑你将验证逻辑放入处理器中,这是我们正在阻止的错误.</p>
+<h2>基于 JSON 方案 2020-12 的子集</h2>
+<p>整个2020-12规范是一篇论文.我们需要八个关键字.</p>
+<pre><code class="language-text">type           string / number / integer / boolean / object / array / null
+properties     map of property name -&gt; schema
+required       list of property names
+enum           list of allowed primitive values
+minLength      integer, applies to strings
+maxLength      integer, applies to strings
+pattern        ECMA-262-compatible regex, applies to strings
+items          schema applied to every array element
+</code></pre>
+<p>对于一个工具API所需要的内容来说,这足够了.我们不添加的关键字 (oneOf, anyOf, allOf, $ref,条件) 在生产方案中是有效的,但将验证器转化为一个循环的树步行器.我们正在构建一个注册表,而不是一个JSON方案引擎.</p>
+<h2>标志器错误路径</h2>
+<p>当验证失败时,验证器返回错误列表.每个错误都带有json指针路径进入输入.指针是属性名称和数组指数的斜率先定序列.</p>
+<pre><code class="language-text">{&quot;a&quot;: {&quot;b&quot;: [1, 2, &quot;x&quot;]}}
+                    ^
+                    /a/b/2
+</code></pre>
+<p>如果一个方案要求 模型读错误路径比它读句子更好.<code>args.user.email</code>如果模型通过整数,则错误应该是<code>/user/email</code>随着<code>expected_type: string</code>模型在下一次电话中没有自然语言的解决方案.</p>
+<h2>登记和过失</h2>
+<p><code>register(name, schema, handler, **opts)</code>默认拒绝重新登记.<code>override=True</code>两个部分的代码库默默地注册相同的工具名称是生产中需要一周的错误.</p>
+<p>登记库揭示了三种阅读方法.<code>get(name)</code>报价或升级.<code>validate(name, args)</code>返回一个<code>Ok</code>没有任何错误.<code>names()</code>返回工具名称以注册顺序.</p>
+<h2>验证器是什么,不是什么</h2>
+<p>它是单次通过图案树,复制性. 它是纯的. 它不调用处理器. 它不强迫类型 (一个字符串)<code>&quot;42&quot;</code>没有通过一个数字方案.</p>
+<p>经验证通过后,恶意处理器仍然可能会行为不当.第二十三课中的发送器添加时间限和沙盒层.登记器添加形状.</p>
+<h2>形状</h2>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-a0b80ed84c92992bfa6e.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h2>如何读取代码</h2>
+<p><code>code/main.py</code>定义<code>ToolRegistry</code>现在<code>ToolRecord</code>现在<code>ValidationError</code>验证器发送在<code>schema[&quot;type&quot;]</code>(或处理一个方案<code>enum</code>任何类型验证器都会返回一个空清单或一个列表<code>ValidationError</code>顶级步行器将错误连接在一起,并随着下降预先将路径段段.</p>
+<p><code>code/tests/test_registry.py</code>覆盖注册,过失,验证成功,验证失败,路径以及子集中的每个关键字.</p>
+<h2>走得更远</h2>
+<p>两次扩展将需要一旦这个课程落地<code>$ref</code>解决一个地方定义区块的问题,<code>additionalProperties: false</code>它们都很小,随着工具目录的增长,它们都增加了50个工具.</p>
+<p>下一堂课 (二十二) 构建了JSON-RPC工作室运输,该系统将该注册表显示给模型客户端.</p>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Tool Registry with Schema Validation</h1>
+<blockquote>
+<p>A tool the agent cannot validate is a tool the agent cannot call. Build the registry and the schema checker before you build the tools.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 13 lessons 01-07, Phase 14 lesson 01
+<strong>Time:</strong> ~90 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Hold a typed registry of tool name → schema → handler that the dispatcher can ask once and trust afterwards.</li>
+<li>Implement a JSON Schema 2020-12 subset that covers the keywords ninety percent of tool calls actually use.</li>
+<li>Return precise, json-pointer-shaped error paths so the model can self-correct in one round trip.</li>
+<li>Reject re-registration without explicit override, since silent overwrites are how production tool catalogs drift.</li>
+<li>Keep the validator pure (no I/O, no time, no globals) so it can be re-run on a replay log.</li>
+</ul>
+<figure><img src="/learn/ai-from-scratch/figures/figure-9348a79ad73d7c32e95a.png" alt="cf-registry-validate 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Why the registry comes before the tool</h2>
+<p>A coding agent in 2026 has more registered tools than the model can fit in a single context window. A non-trivial harness will register two hundred tools and surface ten to forty at any given turn. The registry is the source of truth for &quot;what tools exist,&quot; &quot;what shape do their arguments take,&quot; and &quot;what handler do I call.&quot; Once those three answers are pinned, the rest of the harness can stop guessing.</p>
+<p>The mistake we are avoiding is shipping handlers without schemas, or shipping schemas without validation. Both are common. Both turn the next layer (the dispatcher in lesson twenty-three) into a guessing game where the only failure mode is a stack trace from the handler.</p>
+<h2>What a tool record looks like</h2>
+<pre><code class="language-text">ToolRecord
+  name        : str          (unique, lowercase alphanumeric and underscore segments separated by dots, e.g., snake_case.segment.case)
+  description : str          (one line, shown to the model)
+  schema      : dict         (JSON Schema 2020-12 subset)
+  handler     : Callable     (async or sync, returns Any)
+  idempotent  : bool         (dispatcher uses this for retry decisions)
+  timeout_ms  : int          (override per-tool dispatcher default)
+</code></pre>
+<p>The schema is the only field the validator touches. The handler is opaque to it. We separate them on purpose. The schema is data. The handler is code. Mixing them tempts you to put validation logic inside the handler, which is the bug we are stopping.</p>
+<h2>The JSON Schema 2020-12 subset</h2>
+<p>The full 2020-12 spec is a paper. We need eight keywords.</p>
+<pre><code class="language-text">type           string / number / integer / boolean / object / array / null
+properties     map of property name -&gt; schema
+required       list of property names
+enum           list of allowed primitive values
+minLength      integer, applies to strings
+maxLength      integer, applies to strings
+pattern        ECMA-262-compatible regex, applies to strings
+items          schema applied to every array element
+</code></pre>
+<p>That is enough to cover what a tool API actually needs. The keywords we are not adding (oneOf, anyOf, allOf, $ref, conditionals) are valid in production schemas but turn the validator into a tree walker with cycles. We are building a registry, not a JSON Schema engine.</p>
+<h2>Json pointer error paths</h2>
+<p>When validation fails, the validator returns a list of errors. Each error carries a json-pointer path into the input. A pointer is a slash-prefixed sequence of property names and array indices.</p>
+<pre><code class="language-text">{&quot;a&quot;: {&quot;b&quot;: [1, 2, &quot;x&quot;]}}
+                    ^
+                    /a/b/2
+</code></pre>
+<p>The model reads error paths better than it reads sentences. If a schema requires <code>args.user.email</code> and the model passed an integer, the error should be <code>/user/email</code> with <code>expected_type: string</code>. The model fixes that in the next call without a round of natural language.</p>
+<h2>Registration and override</h2>
+<p><code>register(name, schema, handler, **opts)</code> rejects re-registration by default. The caller has to pass <code>override=True</code> to replace. This is operational hygiene. Two parts of the codebase silently registering the same tool name is the kind of bug that takes a week to find in production.</p>
+<p>The registry exposes three read methods. <code>get(name)</code> returns the record or raises. <code>validate(name, args)</code> returns an <code>Ok</code> or a list of errors. <code>names()</code> returns the tool names in registration order.</p>
+<h2>What the validator is and is not</h2>
+<p>It is a single pass over the schema tree, recursive. It is pure. It does not call handlers. It does not coerce types (a string <code>&quot;42&quot;</code> does not pass a number schema). It does not silently truncate.</p>
+<p>It is not a security boundary. A malicious handler can still misbehave after validation passes. The dispatcher in lesson twenty-three adds timeout and sandbox layers. The registry adds shape.</p>
+<h2>Shape</h2>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-a0b80ed84c92992bfa6e.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h2>How to read the code</h2>
+<p><code>code/main.py</code> defines <code>ToolRegistry</code>, <code>ToolRecord</code>, <code>ValidationError</code>, and the eight validator functions. The validator dispatches on <code>schema[&quot;type&quot;]</code> (or treats a schema with <code>enum</code> as untyped enum check). Each type validator returns either an empty list or a list of <code>ValidationError</code>. The top-level walker concatenates errors and prepends path segments as it descends.</p>
+<p><code>code/tests/test_registry.py</code> covers registration, override, validation success, validation failure with paths, and every keyword in the subset.</p>
+<h2>Going further</h2>
+<p>The two extensions you will want once this lesson lands are <code>$ref</code> resolution against a local definitions block, and <code>additionalProperties: false</code> for strict shape. Both are small. Both are common to add as the tool catalog grows past fifty tools. We left them out of the lesson to keep the file under one read.</p>
+<p>The next lesson (twenty-two) builds the JSON-RPC stdio transport that surfaces this registry to a model client. The lesson after (twenty-three) wraps both behind a dispatcher with timeouts and retries.</p>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-19-capstone-projects--21-tool-registry-schema-validation.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-19-capstone-projects--21-tool-registry-schema-validation.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/21-tool-registry-schema-validation/code/main.py">phases/19-capstone-projects/21-tool-registry-schema-validation/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Tool registry with JSON Schema 2020-12 subset validation.
+
+Conceptual references:
+- ./docs/en.md (this lesson)
+- IETF draft draft-bhutton-json-schema-2020-12 (subset: type, properties,
+  required, enum, minLength, maxLength, pattern, items)
+- RFC 6901 (JSON Pointer for error paths)
+
+Stdlib only. Run: python3 code/main.py
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import json
+import re
+from dataclasses import dataclass, field
+from typing import Any, Callable
+
+
+PRIMITIVE_TYPE_MAP: dict[str, tuple[type, ...]] = {
+    &quot;string&quot;: (str,),
+    &quot;integer&quot;: (int,),
+    &quot;number&quot;: (int, float),
+    &quot;boolean&quot;: (bool,),
+    &quot;object&quot;: (dict,),
+    &quot;array&quot;: (list,),
+    &quot;null&quot;: (type(None),),
+}
+
+ALLOWED_KEYWORDS = {
+    &quot;type&quot;, &quot;properties&quot;, &quot;required&quot;, &quot;enum&quot;,
+    &quot;minLength&quot;, &quot;maxLength&quot;, &quot;pattern&quot;, &quot;items&quot;, &quot;description&quot;,
+}
+
+
+@dataclass
+class ValidationError:
+    path: str
+    keyword: str
+    message: str
+
+    def to_dict(self) -&gt; dict:
+        return {&quot;path&quot;: self.path, &quot;keyword&quot;: self.keyword, &quot;message&quot;: self.message}
+
+
+@dataclass
+class Ok:
+    pass
+
+
+@dataclass
+class ToolRecord:
+    name: str
+    description: str
+    schema: dict
+    handler: Callable[..., Any]
+    idempotent: bool = False
+    timeout_ms: int = 30_000
+
+
+class ToolRegistry:
+    &quot;&quot;&quot;Name-keyed table of tool records with schema validation.&quot;&quot;&quot;
+
+    _NAME_RE = re.compile(r&quot;^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)*$&quot;)
+
+    def __init__(self) -&gt; None:
+        self._records: dict[str, ToolRecord] = {}
+        self._order: list[str] = []
+
+    def register(
+        self,
+        name: str,
+        schema: dict,
+        handler: Callable[..., Any],
+        description: str = &quot;&quot;,
+        idempotent: bool = False,
+        timeout_ms: int = 30_000,
+        override: bool = False,
+    ) -&gt; ToolRecord:
+        if not self._NAME_RE.match(name):
+            raise ValueError(f&quot;tool name {name!r} must match {self._NAME_RE.pattern}&quot;)
+        if name in self._records and not override:
+            raise ValueError(f&quot;tool {name!r} already registered; pass override=True to replace&quot;)
+        validate_schema_shape(schema)
+        rec = ToolRecord(
+            name=name, description=description, schema=schema, handler=handler,
+            idempotent=idempotent, timeout_ms=timeout_ms,
+        )
+        if name not in self._records:
+            self._order.append(name)
+        self._records[name] = rec
+        return rec
+
+    def get(self, name: str) -&gt; ToolRecord:
+        if name not in self._records:
+            raise KeyError(f&quot;unknown tool {name!r}&quot;)
+        return self._records[name]
+
+    def names(self) -&gt; list[str]:
+        return list(self._order)
+
+    def validate(self, name: str, args: Any) -&gt; Ok | list[ValidationError]:
+        rec = self.get(name)
+        errors: list[ValidationError] = []
+        _walk(rec.schema, args, &quot;&quot;, errors)
+        if errors:
+            return errors
+        return Ok()
+
+
+def validate_schema_shape(schema: dict) -&gt; None:
+    &quot;&quot;&quot;Reject schemas using keywords outside the supported subset.&quot;&quot;&quot;
+    if not isinstance(schema, dict):
+        raise ValueError(&quot;schema must be a dict&quot;)
+    unknown = set(schema.keys()) - ALLOWED_KEYWORDS
+    if unknown:
+        raise ValueError(f&quot;unsupported schema keywords: {sorted(unknown)}&quot;)
+    t = schema.get(&quot;type&quot;)
+    if t is not None and t not in PRIMITIVE_TYPE_MAP:
+        raise ValueError(f&quot;unsupported type: {t!r}&quot;)
+    enum_vals = schema.get(&quot;enum&quot;)
+    if enum_vals is not None and not isinstance(enum_vals, list):
+        raise ValueError(&quot;enum must be a list&quot;)
+    min_len = schema.get(&quot;minLength&quot;)
+    if min_len is not None:
+        if isinstance(min_len, bool) or not isinstance(min_len, int) or min_len &lt; 0:
+            raise ValueError(&quot;minLength must be a non-negative integer&quot;)
+    max_len = schema.get(&quot;maxLength&quot;)
+    if max_len is not None:
+        if isinstance(max_len, bool) or not isinstance(max_len, int) or max_len &lt; 0:
+            raise ValueError(&quot;maxLength must be a non-negative integer&quot;)
+    if min_len is not None and max_len is not None and min_len &gt; max_len:
+        raise ValueError(&quot;minLength cannot be greater than maxLength&quot;)
+    pattern = schema.get(&quot;pattern&quot;)
+    if pattern is not None and not isinstance(pattern, str):
+        raise ValueError(&quot;pattern must be a string&quot;)
+    props = schema.get(&quot;properties&quot;)
+    if props is not None:
+        if not isinstance(props, dict):
+            raise ValueError(&quot;properties must be a dict&quot;)
+        for pname, psub in props.items():
+            if not isinstance(pname, str):
+                raise ValueError(&quot;property names must be strings&quot;)
+            validate_schema_shape(psub)
+    items = schema.get(&quot;items&quot;)
+    if items is not None:
+        validate_schema_shape(items)
+    req = schema.get(&quot;required&quot;)
+    if req is not None:
+        if not isinstance(req, list) or not all(isinstance(x, str) for x in req):
+            raise ValueError(&quot;required must be list[str]&quot;)
+
+
+def _path(prefix: str, segment: str | int) -&gt; str:
+    seg = str(segment).replace(&quot;~&quot;, &quot;~0&quot;).replace(&quot;/&quot;, &quot;~1&quot;)
+    return f&quot;{prefix}/{seg}&quot;
+
+
+def _type_matches(value: Any, expected: str) -&gt; bool:
+    types = PRIMITIVE_TYPE_MAP[expected]
+    if expected == &quot;boolean&quot;:
+        return isinstance(value, bool)
+    if expected in (&quot;integer&quot;, &quot;number&quot;):
+        if isinstance(value, bool):
+            return False
+        return isinstance(value, types)
+    return isinstance(value, types)
+
+
+def _walk(schema: dict, value: Any, path: str, errs: list[ValidationError]) -&gt; None:
+    t = schema.get(&quot;type&quot;)
+    if t is not None and not _type_matches(value, t):
+        errs.append(ValidationError(
+            path=path or &quot;/&quot;,
+            keyword=&quot;type&quot;,
+            message=f&quot;expected {t}, got {type(value).__name__}&quot;,
+        ))
+        return
+    if &quot;enum&quot; in schema:
+        if value not in schema[&quot;enum&quot;]:
+            errs.append(ValidationError(
+                path=path or &quot;/&quot;,
+                keyword=&quot;enum&quot;,
+                message=f&quot;value {value!r} not in {schema[&#39;enum&#39;]!r}&quot;,
+            ))
+            return
+    if t == &quot;string&quot;:
+        _check_string(schema, value, path, errs)
+    elif t == &quot;object&quot;:
+        _check_object(schema, value, path, errs)
+    elif t == &quot;array&quot;:
+        _check_array(schema, value, path, errs)
+
+
+def _check_string(schema: dict, value: str, path: str, errs: list[ValidationError]) -&gt; None:
+    if &quot;minLength&quot; in schema and len(value) &lt; schema[&quot;minLength&quot;]:
+        errs.append(ValidationError(
+            path=path or &quot;/&quot;, keyword=&quot;minLength&quot;,
+            message=f&quot;length {len(value)} &lt; minLength {schema[&#39;minLength&#39;]}&quot;,
+        ))
+    if &quot;maxLength&quot; in schema and len(value) &gt; schema[&quot;maxLength&quot;]:
+        errs.append(ValidationError(
+            path=path or &quot;/&quot;, keyword=&quot;maxLength&quot;,
+            message=f&quot;length {len(value)} &gt; maxLength {schema[&#39;maxLength&#39;]}&quot;,
+        ))
+    if &quot;pattern&quot; in schema:
+        try:
+            if not re.search(schema[&quot;pattern&quot;], value):
+                errs.append(ValidationError(
+                    path=path or &quot;/&quot;, keyword=&quot;pattern&quot;,
+                    message=f&quot;value {value!r} does not match pattern {schema[&#39;pattern&#39;]!r}&quot;,
+                ))
+        except re.error as exc:
+            errs.append(ValidationError(
+                path=path or &quot;/&quot;, keyword=&quot;pattern&quot;,
+                message=f&quot;invalid regex: {exc}&quot;,
+            ))
+
+
+def _check_object(schema: dict, value: dict, path: str, errs: list[ValidationError]) -&gt; None:
+    required = schema.get(&quot;required&quot;, [])
+    for req_name in required:
+        if req_name not in value:
+            errs.append(ValidationError(
+                path=_path(path, req_name),
+                keyword=&quot;required&quot;,
+                message=f&quot;missing required property {req_name!r}&quot;,
+            ))
+    props = schema.get(&quot;properties&quot;, {})
+    for prop_name, prop_value in value.items():
+        if prop_name in props:
+            _walk(props[prop_name], prop_value, _path(path, prop_name), errs)
+
+
+def _check_array(schema: dict, value: list, path: str, errs: list[ValidationError]) -&gt; None:
+    items_schema = schema.get(&quot;items&quot;)
+    if items_schema is None:
+        return
+    for idx, item in enumerate(value):
+        _walk(items_schema, item, _path(path, idx), errs)
+
+
+def _demo() -&gt; None:
+    registry = ToolRegistry()
+
+    def get_user(id: int) -&gt; dict:
+        return {&quot;id&quot;: id, &quot;name&quot;: &quot;ada&quot;}
+
+    registry.register(
+        name=&quot;db.get_user&quot;,
+        description=&quot;Fetch a user record by id.&quot;,
+        schema={
+            &quot;type&quot;: &quot;object&quot;,
+            &quot;required&quot;: [&quot;id&quot;],
+            &quot;properties&quot;: {
+                &quot;id&quot;: {&quot;type&quot;: &quot;integer&quot;},
+                &quot;fields&quot;: {
+                    &quot;type&quot;: &quot;array&quot;,
+                    &quot;items&quot;: {&quot;type&quot;: &quot;string&quot;, &quot;enum&quot;: [&quot;id&quot;, &quot;name&quot;, &quot;email&quot;]},
+                },
+            },
+        },
+        handler=get_user,
+        idempotent=True,
+    )
+
+    cases = [
+        {&quot;id&quot;: 42, &quot;fields&quot;: [&quot;id&quot;, &quot;name&quot;]},
+        {&quot;id&quot;: &quot;forty-two&quot;},
+        {&quot;fields&quot;: [&quot;id&quot;]},
+        {&quot;id&quot;: 1, &quot;fields&quot;: [&quot;id&quot;, &quot;phone&quot;]},
+    ]
+    report = []
+    for c in cases:
+        result = registry.validate(&quot;db.get_user&quot;, c)
+        if isinstance(result, Ok):
+            report.append({&quot;args&quot;: c, &quot;ok&quot;: True})
+        else:
+            report.append({&quot;args&quot;: c, &quot;ok&quot;: False, &quot;errors&quot;: [e.to_dict() for e in result]})
+    print(json.dumps({&quot;tools&quot;: registry.names(), &quot;cases&quot;: report}, indent=2))
+
+
+if __name__ == &quot;__main__&quot;:
+    _demo()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/21-tool-registry-schema-validation/code/tests/test_registry.py">phases/19-capstone-projects/21-tool-registry-schema-validation/code/tests/test_registry.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Tests for ToolRegistry and JSON Schema subset validator.&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import os
+import sys
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(HERE))
+
+from main import (  # noqa: E402
+    Ok,
+    ToolRecord,
+    ToolRegistry,
+    ValidationError,
+    validate_schema_shape,
+)
+
+
+class TestRegistration(unittest.TestCase):
+    def test_register_returns_record(self) -&gt; None:
+        r = ToolRegistry()
+        rec = r.register(
+            &quot;fs.read&quot;,
+            schema={&quot;type&quot;: &quot;object&quot;, &quot;properties&quot;: {&quot;path&quot;: {&quot;type&quot;: &quot;string&quot;}}, &quot;required&quot;: [&quot;path&quot;]},
+            handler=lambda path: open(path).read(),
+            description=&quot;Read file&quot;,
+        )
+        self.assertIsInstance(rec, ToolRecord)
+        self.assertEqual(rec.name, &quot;fs.read&quot;)
+        self.assertEqual(r.names(), [&quot;fs.read&quot;])
+
+    def test_duplicate_rejected_without_override(self) -&gt; None:
+        r = ToolRegistry()
+        r.register(&quot;a&quot;, schema={&quot;type&quot;: &quot;string&quot;}, handler=lambda x: x)
+        with self.assertRaises(ValueError):
+            r.register(&quot;a&quot;, schema={&quot;type&quot;: &quot;integer&quot;}, handler=lambda x: x)
+
+    def test_override_replaces(self) -&gt; None:
+        r = ToolRegistry()
+        r.register(&quot;a&quot;, schema={&quot;type&quot;: &quot;string&quot;}, handler=lambda x: x)
+        r.register(&quot;a&quot;, schema={&quot;type&quot;: &quot;integer&quot;}, handler=lambda x: x, override=True)
+        self.assertEqual(r.get(&quot;a&quot;).schema[&quot;type&quot;], &quot;integer&quot;)
+        self.assertEqual(r.names(), [&quot;a&quot;])
+
+    def test_invalid_name_rejected(self) -&gt; None:
+        r = ToolRegistry()
+        with self.assertRaises(ValueError):
+            r.register(&quot;Bad-Name&quot;, schema={&quot;type&quot;: &quot;string&quot;}, handler=lambda x: x)
+        with self.assertRaises(ValueError):
+            r.register(&quot;1starts-with-digit&quot;, schema={&quot;type&quot;: &quot;string&quot;}, handler=lambda x: x)
+
+    def test_unknown_keyword_rejected(self) -&gt; None:
+        with self.assertRaises(ValueError):
+            validate_schema_shape({&quot;type&quot;: &quot;object&quot;, &quot;oneOf&quot;: []})
+
+    def test_unknown_type_rejected(self) -&gt; None:
+        with self.assertRaises(ValueError):
+            validate_schema_shape({&quot;type&quot;: &quot;tuple&quot;})
+
+    def test_get_unknown_raises(self) -&gt; None:
+        r = ToolRegistry()
+        with self.assertRaises(KeyError):
+            r.get(&quot;nope&quot;)
+
+
+class TestValidatorTypes(unittest.TestCase):
+    def setUp(self) -&gt; None:
+        self.r = ToolRegistry()
+
+    def test_string_ok(self) -&gt; None:
+        self.r.register(&quot;s&quot;, schema={&quot;type&quot;: &quot;string&quot;}, handler=lambda x: x)
+        self.assertIsInstance(self.r.validate(&quot;s&quot;, &quot;hi&quot;), Ok)
+
+    def test_string_wrong_type(self) -&gt; None:
+        self.r.register(&quot;s&quot;, schema={&quot;type&quot;: &quot;string&quot;}, handler=lambda x: x)
+        errs = self.r.validate(&quot;s&quot;, 42)
+        self.assertIsInstance(errs, list)
+        self.assertEqual(errs[0].keyword, &quot;type&quot;)
+        self.assertEqual(errs[0].path, &quot;/&quot;)
+
+    def test_integer_vs_boolean(self) -&gt; None:
+        self.r.register(&quot;n&quot;, schema={&quot;type&quot;: &quot;integer&quot;}, handler=lambda x: x)
+        errs = self.r.validate(&quot;n&quot;, True)
+        self.assertIsInstance(errs, list)
+        self.assertEqual(errs[0].keyword, &quot;type&quot;)
+
+    def test_number_accepts_int_and_float(self) -&gt; None:
+        self.r.register(&quot;n&quot;, schema={&quot;type&quot;: &quot;number&quot;}, handler=lambda x: x)
+        self.assertIsInstance(self.r.validate(&quot;n&quot;, 1), Ok)
+        self.assertIsInstance(self.r.validate(&quot;n&quot;, 1.5), Ok)
+
+    def test_null_type(self) -&gt; None:
+        self.r.register(&quot;z&quot;, schema={&quot;type&quot;: &quot;null&quot;}, handler=lambda x: x)
+        self.assertIsInstance(self.r.validate(&quot;z&quot;, None), Ok)
+        errs = self.r.validate(&quot;z&quot;, 0)
+        self.assertIsInstance(errs, list)
+
+
+class TestValidatorKeywords(unittest.TestCase):
+    def setUp(self) -&gt; None:
+        self.r = ToolRegistry()
+
+    def test_min_max_length(self) -&gt; None:
+        self.r.register(&quot;s&quot;, schema={&quot;type&quot;: &quot;string&quot;, &quot;minLength&quot;: 2, &quot;maxLength&quot;: 4},
+                        handler=lambda x: x)
+        self.assertIsInstance(self.r.validate(&quot;s&quot;, &quot;abc&quot;), Ok)
+        e1 = self.r.validate(&quot;s&quot;, &quot;a&quot;)
+        self.assertIsInstance(e1, list)
+        self.assertEqual(e1[0].keyword, &quot;minLength&quot;)
+        e2 = self.r.validate(&quot;s&quot;, &quot;abcde&quot;)
+        self.assertIsInstance(e2, list)
+        self.assertEqual(e2[0].keyword, &quot;maxLength&quot;)
+
+    def test_pattern(self) -&gt; None:
+        self.r.register(&quot;s&quot;, schema={&quot;type&quot;: &quot;string&quot;, &quot;pattern&quot;: r&quot;^[a-z]+$&quot;},
+                        handler=lambda x: x)
+        self.assertIsInstance(self.r.validate(&quot;s&quot;, &quot;abc&quot;), Ok)
+        errs = self.r.validate(&quot;s&quot;, &quot;abc1&quot;)
+        self.assertIsInstance(errs, list)
+        self.assertEqual(errs[0].keyword, &quot;pattern&quot;)
+
+    def test_enum(self) -&gt; None:
+        self.r.register(&quot;s&quot;, schema={&quot;type&quot;: &quot;string&quot;, &quot;enum&quot;: [&quot;a&quot;, &quot;b&quot;]},
+                        handler=lambda x: x)
+        self.assertIsInstance(self.r.validate(&quot;s&quot;, &quot;a&quot;), Ok)
+        errs = self.r.validate(&quot;s&quot;, &quot;c&quot;)
+        self.assertIsInstance(errs, list)
+        self.assertEqual(errs[0].keyword, &quot;enum&quot;)
+
+    def test_required_missing(self) -&gt; None:
+        self.r.register(&quot;o&quot;, schema={
+            &quot;type&quot;: &quot;object&quot;,
+            &quot;properties&quot;: {&quot;id&quot;: {&quot;type&quot;: &quot;integer&quot;}},
+            &quot;required&quot;: [&quot;id&quot;],
+        }, handler=lambda **kw: kw)
+        errs = self.r.validate(&quot;o&quot;, {})
+        self.assertIsInstance(errs, list)
+        self.assertEqual(errs[0].keyword, &quot;required&quot;)
+        self.assertEqual(errs[0].path, &quot;/id&quot;)
+
+    def test_nested_path(self) -&gt; None:
+        self.r.register(&quot;o&quot;, schema={
+            &quot;type&quot;: &quot;object&quot;,
+            &quot;properties&quot;: {
+                &quot;user&quot;: {
+                    &quot;type&quot;: &quot;object&quot;,
+                    &quot;properties&quot;: {&quot;email&quot;: {&quot;type&quot;: &quot;string&quot;}},
+                    &quot;required&quot;: [&quot;email&quot;],
+                },
+            },
+            &quot;required&quot;: [&quot;user&quot;],
+        }, handler=lambda **kw: kw)
+        errs = self.r.validate(&quot;o&quot;, {&quot;user&quot;: {&quot;email&quot;: 0}})
+        self.assertIsInstance(errs, list)
+        self.assertEqual(errs[0].path, &quot;/user/email&quot;)
+
+    def test_array_items(self) -&gt; None:
+        self.r.register(&quot;a&quot;, schema={
+            &quot;type&quot;: &quot;array&quot;,
+            &quot;items&quot;: {&quot;type&quot;: &quot;integer&quot;},
+        }, handler=lambda x: x)
+        self.assertIsInstance(self.r.validate(&quot;a&quot;, [1, 2, 3]), Ok)
+        errs = self.r.validate(&quot;a&quot;, [1, &quot;x&quot;, 3])
+        self.assertIsInstance(errs, list)
+        self.assertEqual(errs[0].path, &quot;/1&quot;)
+
+    def test_multiple_errors_collected(self) -&gt; None:
+        self.r.register(&quot;o&quot;, schema={
+            &quot;type&quot;: &quot;object&quot;,
+            &quot;properties&quot;: {
+                &quot;a&quot;: {&quot;type&quot;: &quot;string&quot;},
+                &quot;b&quot;: {&quot;type&quot;: &quot;integer&quot;},
+            },
+            &quot;required&quot;: [&quot;a&quot;, &quot;b&quot;],
+        }, handler=lambda **kw: kw)
+        errs = self.r.validate(&quot;o&quot;, {})
+        self.assertIsInstance(errs, list)
+        self.assertEqual(len(errs), 2)
+        paths = {e.path for e in errs}
+        self.assertEqual(paths, {&quot;/a&quot;, &quot;/b&quot;})
+
+
+if __name__ == &quot;__main__&quot;:
+    unittest.main()
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. Why register a tool&#39;s schema separately from its handler?</legend><label class="option"><input type="radio" name="q0" value="0"> Because handlers cannot return JSON</label><label class="option"><input type="radio" name="q0" value="1"> So the validator stays pure data, and the handler stays opaque code</label><label class="option"><input type="radio" name="q0" value="2"> Because schemas must be compiled</label><label class="option"><input type="radio" name="q0" value="3"> Because schemas have to live in YAML</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. Which keywords are intentionally outside the subset this lesson implements?</legend><label class="option"><input type="radio" name="q1" value="0"> items, enum</label><label class="option"><input type="radio" name="q1" value="1"> oneOf, anyOf, $ref, allOf</label><label class="option"><input type="radio" name="q1" value="2"> minLength, maxLength, pattern</label><label class="option"><input type="radio" name="q1" value="3"> type, properties, required</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. Why does register() reject duplicates by default?</legend><label class="option"><input type="radio" name="q2" value="0"> Because the schema cannot be re-validated</label><label class="option"><input type="radio" name="q2" value="1"> Silent overwrites are the cause of production tool catalog drift</label><label class="option"><input type="radio" name="q2" value="2"> Because the registry cannot store more than one record per name</label><label class="option"><input type="radio" name="q2" value="3"> Because handlers cannot be replaced</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. What does the validator do when a schema specifies type integer but receives the value True?</legend><label class="option"><input type="radio" name="q3" value="0"> Coerces to integer silently</label><label class="option"><input type="radio" name="q3" value="1"> Treats it as 1 and passes</label><label class="option"><input type="radio" name="q3" value="2"> Raises an unhandled exception</label><label class="option"><input type="radio" name="q3" value="3"> Returns a type error because bool is not integer in this validator</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. When the input object is {&#39;user&#39;: {&#39;email&#39;: 0}} and the schema requires user.email to be a string, what is the error path?</legend><label class="option"><input type="radio" name="q4" value="0"> /user</label><label class="option"><input type="radio" name="q4" value="1"> /user/email</label><label class="option"><input type="radio" name="q4" value="2"> /</label><label class="option"><input type="radio" name="q4" value="3"> user.email</label><p data-feedback="4"></p></fieldset><fieldset><legend>6. Why is the registry not a security boundary?</legend><label class="option"><input type="radio" name="q5" value="0"> Because handlers are async</label><label class="option"><input type="radio" name="q5" value="1"> Because handlers can still misbehave after validation passes</label><label class="option"><input type="radio" name="q5" value="2"> Because the registry is in-process</label><label class="option"><input type="radio" name="q5" value="3"> Because the schema is JSON</label><p data-feedback="5"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/19-capstone-projects/20-agent-harness-loop-contract/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/19-capstone-projects/22-jsonrpc-stdio-transport/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/19-capstone-projects/21-tool-registry-schema-validation/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

@@ -1,0 +1,173 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>Durable Agent Jobs · Serebii Labs</title></head><body data-pack="ai-from-scratch-project-durable-agent-jobs" data-lesson="" data-project="durable-agent-jobs"><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow">PROJECT / durable-agent-jobs</p><h1 class="lesson-title">Durable Agent Jobs</h1><p class="notice">本站中文导读 + 原作者英文全文 · 代码运行未验证</p><p>这是原课程的「Durable Agent Jobs」实践项目。先阅读下方原始目标与阶段说明，再按课序实现功能、运行评分器并比较参考实现。英文全文未缩写；中文长文尚未翻译。</p><p>练习骨架 starter：原项目未提供，勿将 solution 当作骨架；参考实现 solution：11 个文件。运行前按 README 准备依赖与输入；模型、数据或在线服务不包含在离线阅读包中。</p><div class="save-panel"><button type="button" data-save>保存本项目阅读资料</button><span data-save-status role="status">未检测离线状态</span></div><p><a download href="/learn/ai-from-scratch/downloads/project-durable-agent-jobs.zip">下载完整项目 ZIP（需联网，或单独保存）</a> <button data-save-download="/learn/ai-from-scratch/downloads/project-durable-agent-jobs.zip" type="button">单独保存项目 ZIP</button></p><section><h2>学习目标（原作者）</h2><ul><li>Create jobs with stable identity</li><li>Claim with a lease and version</li><li>Finish or reclaim expired work</li><li>Write and recover atomic snapshots</li></ul></section><section class="prose" lang="en"><h1>Durable Agent Jobs</h1>
+<p>Build a local report queue you can interrupt between claim, output and completion. Restart another worker against the same directory and inspect exactly which work repeats. The finished artifact accepts your text records and writes one content-bound receipt per job.</p>
+<p>Go is a good fit for a small standalone worker binary and explicit filesystem operations. The core and CLI use only its standard library. Four stages take about 8 hours. You need Go 1.22+, Python 3.10+ for the grader, Linux or macOS, and basic structs, pointers, errors and JSON. Start with <a href="https://go.dev/tour/" rel="noreferrer" data-network="true">A Tour of Go <small>↗ 需要联网</small></a> if those concepts are new. Learn the <a href="https://pkg.go.dev/os" rel="noreferrer" data-network="true">os filesystem APIs <small>↗ 需要联网</small></a> alongside stage 4.</p>
+<h2>Build and run your version</h2>
+<p>From the repository root:</p>
+<pre><code class="language-bash">python3 scripts/project_test.py durable-agent-jobs --init /tmp/durable-agent-jobs-work
+python3 scripts/project_test.py durable-agent-jobs --stage 1 --path /tmp/durable-agent-jobs-work --strict
+</code></pre>
+<p>The first command supplies typed contracts, a CLI and sample input. The first test intentionally fails until you implement <code>stage1.go</code>. Continue through the four stages, then grade and run your completed workspace:</p>
+<pre><code class="language-bash">python3 scripts/project_test.py durable-agent-jobs --all --path /tmp/durable-agent-jobs-work --strict --report /tmp/durable-learner.json
+cd /tmp/durable-agent-jobs-work
+go build -o /tmp/durable-learner .
+/tmp/durable-learner demo --input samples/jobs.json
+</code></pre>
+<p>The demo calls your binary in separate processes. Only a complete learner report establishes local completion; reference tests do not award a certificate.</p>
+<h2>Run the reference with your own data</h2>
+<pre><code class="language-bash">cd projects/durable-agent-jobs/solution
+go build -o /tmp/durable-jobs .
+STORE=$(mktemp -d /tmp/durable-jobs.XXXXXX)
+/tmp/durable-jobs enqueue --store &quot;$STORE&quot; --input samples/jobs.json
+/tmp/durable-jobs worker --store &quot;$STORE&quot; --max-jobs 100
+/tmp/durable-jobs status --store &quot;$STORE&quot;
+</code></pre>
+<p>Input is a JSON array of <code>{ &quot;id&quot;: &quot;report-one&quot;, &quot;text&quot;: &quot;your report text&quot; }</code>. Edit a copy of the supplied sample or pass your own path. Identical repeated enqueue is safe. A changed payload under an existing ID conflicts. Output receipts include SHA256, UTF-8 byte length and whitespace-delimited word count; this worker does not generate or send a report through a model.</p>
+<p>For a repeatable crash, use a new store:</p>
+<pre><code class="language-bash">CRASH_STORE=$(mktemp -d /tmp/durable-crash.XXXXXX)
+/tmp/durable-jobs enqueue --store &quot;$CRASH_STORE&quot; --input samples/jobs.json
+/tmp/durable-jobs worker --store &quot;$CRASH_STORE&quot; --now-ms 100 --lease-ms 10 --crash-after effect
+/tmp/durable-jobs status --store &quot;$CRASH_STORE&quot;
+/tmp/durable-jobs worker --store &quot;$CRASH_STORE&quot; --now-ms 111 --lease-ms 10 --max-jobs 100
+/tmp/durable-jobs status --store &quot;$CRASH_STORE&quot;
+</code></pre>
+<p>The crash command intentionally exits 86. Before recovery, <code>incident-summary</code> is running v1 and its receipt already exists: 95 bytes, 11 words. After recovery it is completed v4, attempts 2, and the worker reports <code>reused_effect: true</code>. The second sample completes v2 with a 79-byte, 12-word receipt. Change <code>--crash-after effect</code> to <code>claim</code> to observe recovery before an output exists. <code>go run . demo</code> automates the effect-crash sequence and cleans up only its own temporary directory.</p>
+<p><code>--now-ms</code> is an injected test clock. Omit it for real wall-clock execution. <code>--delay-ms 500</code> lets another process recover an expired claim before the old one finishes. Stale completions fail; two ordinary worker processes can claim different jobs safely.</p>
+<h2>Learn each boundary</h2>
+<ol>
+<li><a href="/learn/ai-from-scratch/projects/durable-agent-jobs/#01-create-jobs-with-stable-identity">Create stable job identities</a>.</li>
+<li><a href="/learn/ai-from-scratch/projects/durable-agent-jobs/#02-claim-with-a-lease-and-version">Claim with a version and lease</a>.</li>
+<li><a href="/learn/ai-from-scratch/projects/durable-agent-jobs/#03-finish-or-reclaim-expired-work">Reclaim and fence old workers</a>.</li>
+<li><a href="/learn/ai-from-scratch/projects/durable-agent-jobs/#04-write-and-recover-atomic-snapshots">Persist snapshots and recover effects</a>.</li>
+</ol>
+<p><a href="/learn/ai-from-scratch/files/projects/durable-agent-jobs/API.md">API.md</a> defines the integration contract. Call the binary from any language and parse its JSON. The grader builds the chosen workspace and tests actual crashes, concurrent workers, stale completion, changed input and corrupt-state preservation:</p>
+<pre><code class="language-bash">python3 scripts/project_test.py durable-agent-jobs --all --solution --strict
+</code></pre>
+<h2>Honest limits</h2>
+<p>The store coordinates cooperating processes on one local POSIX filesystem with advisory locks. Do not put it on NFS, bypass the wrapper, share it with untrusted writers, or treat it as an authenticated service. Windows needs a different locking implementation.</p>
+<p>Execution is at least once. The local immutable receipt makes this particular effect idempotent; it does not make arbitrary payments, email or remote writes exactly once. A crash may leave temporary files or an unreferenced input. Snapshot rename and file sync protect process recovery but do not promise power-loss durability without directory sync. At the attempt cap, jobs remain visible for manual reconciliation. The artifact is a learning-sized queue with a 4 MiB snapshot limit and no scheduling, heartbeat renewal or remote transport.</p>
+</section><section id="01-create-jobs-with-stable-identity"><h2>01-create-jobs-with-stable-identity · 原始阶段说明</h2><div class="prose" lang="en"><h1>Create jobs with stable identity</h1>
+<blockquote>
+<p>A report request arrives twice because the producer lost its acknowledgement. Two deliveries should refer to one job.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Go
+<strong>Prerequisites:</strong> Go structs, pointers, errors, JSON files and a shell; complete earlier stages in order.
+<strong>Stage:</strong> 1 of 4
+<strong>Time:</strong> ~2 hours</p>
+<h2>What you build</h2>
+<p>Give retries one identity. Implement <code>stage1.go</code> in your initialized workspace. The supplied CLI calls your implementation; it does not import the reference solution.</p>
+<h2>Work through the mechanism</h2>
+<p>A job is the durable record of an intention. Your function creates that record without executing the intention. Keep <code>ID</code>, <code>State</code>, <code>Version</code>, <code>LeaseUntil</code> and <code>Attempts</code> visible instead of compressing them into a boolean. A boolean cannot tell you whether another worker currently owns the work.</p>
+<p>For <code>report-1</code>, return queued, version 0, attempts 0 and lease 0. Reject <code>../report</code>, an empty string, uppercase initials, spaces and identifiers longer than 64 characters. The accepted form is a lowercase letter followed by lowercase letters, digits or hyphens. Do not trim an invalid identifier into a different valid identity.</p>
+<p>The supplied CLI later stores <code>{id,text}</code> separately from the job state. Enqueueing the same identifier and identical text is a no-op; changing the text under an existing identifier is a conflict. This is how a producer can retry without accidentally replacing work that already ran.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-ba22ae1fddb799799033.png" alt="pj-durable-agent-jobs-1 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Your contract</h2>
+<pre><code class="language-go">func NewJob(id string) (Job, error)
+</code></pre>
+<p>Keep the public signature and errors in <code>types.go</code>. Rejected calls must preserve the caller's prior state. Read <a href="/learn/ai-from-scratch/files/projects/durable-agent-jobs/API.md">the project API</a> for the final artifact's file and process boundaries.</p>
+<h2>Implementation hint</h2>
+<p>Check the whole identifier before constructing a Job. A zero-value Job has an empty state, so return the explicit queued state only on success.</p>
+<h2>Verify your work</h2>
+<p>From the repository root:</p>
+<pre><code class="language-bash">python3 scripts/project_test.py durable-agent-jobs --stage 1 --path /tmp/durable-agent-jobs-work --strict
+</code></pre>
+<p>The grader exercises your selected workspace, including the earlier stages. Its reference mode is a separate instructor check and does not earn learner completion.</p>
+<h2>Investigate a failure</h2>
+<p>Create <code>a</code>, then try <code>a </code> and <code>a/</code>. Explain why trimming or path cleaning would make a retry ambiguous. Extend the payload with a report format only after deciding whether format changes require a new identifier.</p>
+<h2>Sources and limits</h2>
+<p>Study the standard-library <a href="https://pkg.go.dev/os" rel="noreferrer" data-network="true">os package <small>↗ 需要联网</small></a>, <a href="https://pkg.go.dev/context" rel="noreferrer" data-network="true">context <small>↗ 需要联网</small></a> and <a href="https://go.dev/blog/pipelines" rel="noreferrer" data-network="true">Go pipelines guide <small>↗ 需要联网</small></a> as needed. These exercises and samples are original. Process recovery is demonstrated on one host; the README names the filesystem and evaluation limits you must preserve when adapting the artifact.</p>
+</div></section><section id="02-claim-with-a-lease-and-version"><h2>02-claim-with-a-lease-and-version · 原始阶段说明</h2><div class="prose" lang="en"><h1>Claim with a lease and version</h1>
+<blockquote>
+<p>The claim is the moment a worker acquires permission to act. Persist it before starting the work.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Go
+<strong>Prerequisites:</strong> Complete stage 1; understand its exported types and failure contracts.
+<strong>Stage:</strong> 2 of 4
+<strong>Time:</strong> ~2 hours</p>
+<h2>What you build</h2>
+<p>Reserve an execution window. Implement <code>stage2.go</code> in your initialized workspace. The supplied CLI calls your implementation; it does not import the reference solution.</p>
+<h2>Work through the mechanism</h2>
+<p>Start with queued version 0, attempts 0. A claim at 100 ms for 10 ms with expected version 0 becomes running version 1, attempts 1, lease 110. The lease interval is [100,110): its right endpoint is excluded.</p>
+<p>Two workers may read version 0. Only the first successful claim may proceed. Checking the expected version after changing the record would lose the evidence needed to reject the second worker. Validate state, expected version, attempt cap, clock and overflow before assigning any field.</p>
+<p><code>ClaimJob</code> is a pure in-memory transition. The supplied <code>ClaimNext</code> wrapper holds an operating-system file lock across load, transition and Save. Separate processes open the same <code>ledger.lock</code>; a crash releases the kernel lock. <code>jobs.json</code> is replaced while that stable lock file stays in place. Locking the renamed snapshot itself would let processes lock different file objects.</p>
+<p>The attempt counter survives recovery. A job that crashes three times should remain visible as queued with attempts 3 when the cap is 3; silently clearing the counter would create an unlimited retry loop.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-f994e6e026eadf690398.png" alt="pj-durable-agent-jobs-2 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Your contract</h2>
+<pre><code class="language-go">func ClaimJob(j *Job, expected int, now, ttl int64, maxAttempts int) error
+</code></pre>
+<p>Keep the public signature and errors in <code>types.go</code>. Rejected calls must preserve the caller's prior state. Read <a href="/learn/ai-from-scratch/files/projects/durable-agent-jobs/API.md">the project API</a> for the final artifact's file and process boundaries.</p>
+<h2>Implementation hint</h2>
+<p>Write every rejection as an early return. Check <code>now &gt; MaxInt64-ttl</code> before addition. Only then assign lease, version, attempt count and state.</p>
+<h2>Verify your work</h2>
+<p>From the repository root:</p>
+<pre><code class="language-bash">python3 scripts/project_test.py durable-agent-jobs --stage 2 --path /tmp/durable-agent-jobs-work --strict
+</code></pre>
+<p>The grader exercises your selected workspace, including the earlier stages. Its reference mode is a separate instructor check and does not earn learner completion.</p>
+<h2>Investigate a failure</h2>
+<p>Predict the snapshot after two callers both supply expected 0. Then set maxAttempts 1 and reclaim the first attempt. Why does the next claim fail even though the state is queued?</p>
+<h2>Sources and limits</h2>
+<p>Study the standard-library <a href="https://pkg.go.dev/os" rel="noreferrer" data-network="true">os package <small>↗ 需要联网</small></a>, <a href="https://pkg.go.dev/context" rel="noreferrer" data-network="true">context <small>↗ 需要联网</small></a> and <a href="https://go.dev/blog/pipelines" rel="noreferrer" data-network="true">Go pipelines guide <small>↗ 需要联网</small></a> as needed. These exercises and samples are original. Process recovery is demonstrated on one host; the README names the filesystem and evaluation limits you must preserve when adapting the artifact.</p>
+</div></section><section id="03-finish-or-reclaim-expired-work"><h2>03-finish-or-reclaim-expired-work · 原始阶段说明</h2><div class="prose" lang="en"><h1>Finish or reclaim expired work</h1>
+<blockquote>
+<p>A slow worker can wake after another worker has already completed its job. Its old receipt must not rewrite the ledger.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Go
+<strong>Prerequisites:</strong> Complete stages 1 through 2; understand their exported types and failure contracts.
+<strong>Stage:</strong> 3 of 4
+<strong>Time:</strong> ~2 hours</p>
+<h2>What you build</h2>
+<p>Separate completion from permission. Implement <code>stage3.go</code> in your initialized workspace. The supplied CLI calls your implementation; it does not import the reference solution.</p>
+<h2>Work through the mechanism</h2>
+<p>Worker A owns version 1 until 110. At 110, finishing version 1 fails. Reclaim changes running v1 to queued v2 and clears the lease, while keeping attempts 1. Worker B claims queued v2 and receives running v3 with attempts 2. A late completion from A still carries 1, so it fails even if its clock says 105. The version check protects against a stale view of time.</p>
+<p>Worker B completes before its expiry, producing completed v4. Completion is a new state transition; its version is not the claim version. Duplicate calls to <code>Finish</code> fail because the job is no longer running. This differs deliberately from an idempotent output receipt: ledger transitions and business effects have separate contracts.</p>
+<p>Use the CLI's <code>--now-ms</code> only for repeatable experiments. Normal workers call the current wall clock at claim and finish. An injected fixed clock proves version fencing but does not model a real clock moving during computation. Multiple machines with independent clocks need a coordinator-owned time authority.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-0163dd013abb6bf19458.png" alt="pj-durable-agent-jobs-3 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Your contract</h2>
+<pre><code class="language-go">func Finish(j *Job, expected int, now int64) error
+func Reclaim(j *Job, now int64) bool
+</code></pre>
+<p>Keep the public signature and errors in <code>types.go</code>. Rejected calls must preserve the caller's prior state. Read <a href="/learn/ai-from-scratch/files/projects/durable-agent-jobs/API.md">the project API</a> for the final artifact's file and process boundaries.</p>
+<h2>Implementation hint</h2>
+<p>Reclaim must test both running state and expiry. A queued or completed record should remain byte-for-byte unchanged. Finish must check the current version as well as the lease.</p>
+<h2>Verify your work</h2>
+<p>From the repository root:</p>
+<pre><code class="language-bash">python3 scripts/project_test.py durable-agent-jobs --stage 3 --path /tmp/durable-agent-jobs-work --strict
+</code></pre>
+<p>The grader exercises your selected workspace, including the earlier stages. Its reference mode is a separate instructor check and does not earn learner completion.</p>
+<h2>Investigate a failure</h2>
+<p>Test 109 and 110 against lease 110. Then allow A to finish after B has claimed v3. Describe why extending A's timeout cannot restore A's authority.</p>
+<h2>Sources and limits</h2>
+<p>Study the standard-library <a href="https://pkg.go.dev/os" rel="noreferrer" data-network="true">os package <small>↗ 需要联网</small></a>, <a href="https://pkg.go.dev/context" rel="noreferrer" data-network="true">context <small>↗ 需要联网</small></a> and <a href="https://go.dev/blog/pipelines" rel="noreferrer" data-network="true">Go pipelines guide <small>↗ 需要联网</small></a> as needed. These exercises and samples are original. Process recovery is demonstrated on one host; the README names the filesystem and evaluation limits you must preserve when adapting the artifact.</p>
+</div></section><section id="04-write-and-recover-atomic-snapshots"><h2>04-write-and-recover-atomic-snapshots · 原始阶段说明</h2><div class="prose" lang="en"><h1>Write and recover atomic snapshots</h1>
+<blockquote>
+<p>A crash can happen after an output exists but before the queue records completion. Make that gap reproducible.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Go
+<strong>Prerequisites:</strong> Complete stages 1 through 3; understand their exported types and failure contracts.
+<strong>Stage:</strong> 4 of 4
+<strong>Time:</strong> ~2 hours</p>
+<h2>What you build</h2>
+<p>Recover the effect and the ledger. Implement <code>stage4.go</code> in your initialized workspace. The supplied CLI calls your implementation; it does not import the reference solution.</p>
+<h2>Work through the mechanism</h2>
+<p>Validate every job and reject duplicate identifiers before opening a temporary snapshot. Write in the destination directory, sync the file, close it, then rename it over <code>jobs.json</code>. The loader bounds the file at 4 MiB and rejects truncated JSON, unknown fields and trailing documents. A failed validation must preserve the previous snapshot.</p>
+<p>The composed worker persists its claim, reads its immutable input, creates <code>effects/&lt;id&gt;.json</code>, then persists completion. The receipt contains the input SHA256, byte count and word count. A temporary receipt is synced, then linked into its final name without replacement. If that final receipt already contains the expected values, recovery reuses it.</p>
+<p>Run <code>go run . demo</code> from your completed workspace. The demo starts a real worker that exits 86 after writing the first effect. Status shows running v1 with one receipt. The next worker uses logical time 111, reclaims and claims v3, observes the existing receipt and completes v4 with <code>reused_effect: true</code>. The second sample job completes normally.</p>
+<p>Atomic rename protects readers from partial JSON. It does not turn the input, receipt and ledger into one transaction. A producer crash can leave an unreferenced input file; an identical enqueue safely adopts it. File sync without directory sync is not a proof of power-loss durability. These exercises establish process-crash recovery on a local filesystem.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-7fd554432bb63f11b7bc.png" alt="pj-durable-agent-jobs-4 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Your contract</h2>
+<pre><code class="language-go">func ValidateJobs(jobs []Job) error
+func Save(file string, jobs []Job) error
+func Load(file string) ([]Job, error)
+</code></pre>
+<p>Keep the public signature and errors in <code>types.go</code>. Rejected calls must preserve the caller's prior state. Read <a href="/learn/ai-from-scratch/files/projects/durable-agent-jobs/API.md">the project API</a> for the final artifact's file and process boundaries.</p>
+<h2>Implementation hint</h2>
+<p>Keep the old snapshot until every operation on the temporary file succeeds. Do not defer away a Close error. Follow <code>runner.go</code> to see how your functions compose under one lock.</p>
+<h2>Verify your work</h2>
+<p>From the repository root:</p>
+<pre><code class="language-bash">python3 scripts/project_test.py durable-agent-jobs --stage 4 --path /tmp/durable-agent-jobs-work --strict
+</code></pre>
+<p>The grader exercises your selected workspace, including the earlier stages. Its reference mode is a separate instructor check and does not earn learner completion.</p>
+<h2>Investigate a failure</h2>
+<p>Run the crash-after-claim experiment from the README, then crash-after-effect. Count receipt files before and after each recovery. Replace the receipt with an HTTP payment call on paper: what idempotency key and durable receiver contract would you need?</p>
+<h2>Sources and limits</h2>
+<p>Study the standard-library <a href="https://pkg.go.dev/os" rel="noreferrer" data-network="true">os package <small>↗ 需要联网</small></a>, <a href="https://pkg.go.dev/context" rel="noreferrer" data-network="true">context <small>↗ 需要联网</small></a> and <a href="https://go.dev/blog/pipelines" rel="noreferrer" data-network="true">Go pipelines guide <small>↗ 需要联网</small></a> as needed. These exercises and samples are original. Process recovery is demonstrated on one host; the README names the filesystem and evaluation limits you must preserve when adapting the artifact.</p>
+</div></section><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

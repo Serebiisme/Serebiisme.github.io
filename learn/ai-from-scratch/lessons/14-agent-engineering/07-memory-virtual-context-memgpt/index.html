@@ -1,0 +1,685 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>代理记忆 虚拟文本和记忆页面 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-14-agent-engineering" data-lesson="14-agent-engineering/07-memory-virtual-context-memgpt" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/14-agent-engineering/">Agent 工程</a> / LESSON 07</p><h1 class="lesson-title">代理记忆 虚拟文本和记忆页面</h1><p>Agent Memory — Virtual Context and Memory Paging</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>代理记忆 虚拟文本和记忆页面</h1>
+<blockquote>
+<p>文本窗口是有限的.对话,文档和工具痕迹是没有的.解决方案是OS虚拟内存重置. 主要文本是 RAM,外部存储是磁盘,它们之间的代理页面. MemGPT (Packer等, 2023) 命名了该模式;许多生产内存系统建立在它上.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python (stdlib)
+<strong>Prerequisites:</strong> Phase 14 · 01 (Agent Loop), Phase 14 · 06 (Tool Use)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>解释MemGPT基于的操作系统比喻:主语境 = RAM,外部语境 = 磁盘,内存工具 = 页面输入/输出.</li>
+<li>实现在 stdlib 中使用主语境缓冲器,外部可搜索的存储器和页面进/出工具的双层 MemGPT 模式.</li>
+<li>描述代理如何发出&quot;中断&quot;查询或修改外部内存,以及结果如何将其交配到下一个提示中.</li>
+<li>确定将Letta (课08) 和 Mem0 (课09) 带入 MemGPT设计选择.</li>
+</ul>
+<h2>问题</h2>
+<p>文本窗户似乎应该解决内存.</p>
+<ol>
+<li>**Overflow.**经过过截止时间的时间,一切都消失了.</li>
+<li>**Dilution.**即使在窗口内,填充无关紧要的文本, 便会让人们忽视重要的事情.</li>
+<li>**Persistence.**没有外部记忆的代理人不能在会议中说&quot;记住你问我...</li>
+</ol>
+<p>根据Mem0的2025年论文,128k窗口的基线仍然缺少长视线的事实,</p>
+<h2>概念</h2>
+<h3>操作系统比较</h3>
+<p>基于此,MemGPT (Packer等, arXiv:2310.08560, v2 Feb 2024) 将文本管理映射到操作系统虚拟内存:</p>
+<table>
+<thead>
+<tr>
+<th>OS concept</th>
+<th>MemGPT concept</th>
+<th>2026 production analog</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>RAM</td>
+<td>main context (prompt)</td>
+<td>Anthropic/OpenAI context window</td>
+</tr>
+<tr>
+<td>Disk</td>
+<td>external context</td>
+<td>vector DB, KV, graph store</td>
+</tr>
+<tr>
+<td>Page fault</td>
+<td>memory tool call</td>
+<td><code>memory.search</code>, <code>memory.read</code>, <code>memory.write</code></td>
+</tr>
+<tr>
+<td>OS kernel</td>
+<td>agent control loop</td>
+<td>ReAct loop with memory tools</td>
+</tr>
+</tbody>
+</table>
+<p>代理运行一个正常的 ReAct 循环. 一个额外的工具类允许它页面数据进入和退出主语境.</p>
+<h3>两层</h3>
+<ul>
+<li>**Main context.**固定尺寸提示,保持当前任务,始终可见于模型.</li>
+<li>**External context.**无限,可通过工具搜索,当有必要时阅读,当事实出现时写下.</li>
+</ul>
+<p>原稿评估了设计的两个任务,除了基层窗口之外:超过100万个代币的文件分析和多次会议聊天,持续记忆在几天内.</p>
+<h3>断断模式</h3>
+<p>MemGPT引入了&quot;记忆作为中断&quot;的过程:对话中,代理可以调用记忆工具,运行时间执行它,结果将作为一个新的观察,作为下一个助理转换.<code>read()</code>系统将阻止进程,返回字节,进程继续.</p>
+<p>尼卡内存工具表面:</p>
+<ul>
+<li><code>core_memory_append(section, text)</code>写到提示函中的一个持续部分.</li>
+<li><code>core_memory_replace(section, old, new)</code>编辑一个持续的部分.</li>
+<li><code>archival_memory_insert(text)</code>写到可搜索的外部商店.</li>
+<li><code>archival_memory_search(query, top_k)</code>从外部商店中获取.</li>
+<li><code>conversation_search(query)</code>扫描过往的转折.</li>
+</ul>
+<h3>纸质的结束和生产的开始</h3>
+<p>据悉,在2024年9月,MemGPT成为Letta.<code>cpacker/MemGPT</code>) 仍然存在;Letta扩展了设计:</p>
+<ul>
+<li>两个层次的基础,回忆,档案 课08.</li>
+<li>替代了原生理<code>send_message</code>心跳模式 (第08课).</li>
+<li>睡眠时间代理运行异步记忆工作 (课程 08).</li>
+</ul>
+<p>尽管生产系统运营Letta,Mem0或一个定制的二层商店,但MemGPT纸是2026年基础.</p>
+<h3>在这个模式出现错误的地方</h3>
+<ul>
+<li>**Memory rot.**写作积累速度比读取速度快;检索陷入过时的事实. 修正:定期整合 (Letta睡眠时间),明确无效 (Mem0冲突探测器).</li>
+<li>**Memory poisoning.**攻击者控制的内容如果落入记忆录,代理将其重新摄入下一次.这是Greshake等. (课 27) 攻击随着时间的推移.</li>
+<li>**Citation loss.**代理记得&quot;用户要求我发送X&quot;,但无法引用哪个转换.</li>
+</ul>
+<figure><img src="/learn/ai-from-scratch/figures/figure-5fa6224131363e572fcd.png" alt="context-budget 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<p><code>code/main.py</code>在 stdlib 中实现 MemGPT 的双层模式:</p>
+<ul>
+<li><code>MainContext</code> 设置尺寸的快速缓冲器<code>core</code>和<code>messages</code>列表;在超过封顶时自动缩小最古老的消息.</li>
+<li><code>ArchivalStore</code>存储记录 (ID,文字,标签,会议,转换) 的内存BM25-esque (代币重叠分数).</li>
+<li>五个记忆工具将地图映射到MemGPT表面.</li>
+<li>编写的代理人,填写档案,然后打电话回答问题.<code>archival_memory_search</code>现在,我们要去.</li>
+</ul>
+<p>运行它:</p>
+<pre><code>python3 code/main.py
+</code></pre>
+<p>后续的调查结果显示,代理人写了三个事实,填写了主要文本 (强迫驱逐),然后通过从档案中获取后续问题</p>
+<h2>用它</h2>
+<p>现在每一个生产内存系统都是MemGPT的变体:</p>
+<ul>
+<li><strong>Letta</strong>三层,本土推理,睡眠时间计算.</li>
+<li><strong>Mem0</strong>向量+KV+图,与一个分数层合并.</li>
+<li><strong>OpenAI Assistants / Responses</strong>通过线程和文件管理内存.</li>
+<li><strong>Claude Agent SDK</strong>通过技能和会议存储的长期记忆.</li>
+</ul>
+<p>根据操作形状 (自主托管,管理,框架集成) 选择一个,而不是根据核心模式.</p>
+<h3>代理记忆的形状</h3>
+<p>页面化解决了容量.它不决定要存储什么.四种内存类型在生产系统中重复,每个类型都回答不同的问题:</p>
+<ul>
+<li><strong>Working memory</strong>现在重要的是什么? 背景层次:当前任务,最近的转变,固定的核心部分.</li>
+<li><strong>Episodic memory</strong>发生了什么?过去的转折和轨迹,存储与会议和转折参考,可按需播放.</li>
+<li><strong>Semantic memory</strong>关于用户,域名,世界的真实信息,随着变化而更新和复制.</li>
+<li><strong>Procedural memory</strong>如何做到这一点? 我学会了规律,偏好和规则,</li>
+</ul>
+<p>开源实现选择不同的攻击点:</p>
+<table>
+<thead>
+<tr>
+<th>Type</th>
+<th>Implementation</th>
+<th>How it tackles it</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Working</td>
+<td>MemGPT / Letta</td>
+<td>Pages content in and out of a fixed prompt budget via memory tools (this lesson, Lesson 08)</td>
+</tr>
+<tr>
+<td>Episodic</td>
+<td>Zep</td>
+<td>Temporal knowledge graph — facts carry validity intervals, so &quot;what was true when&quot; is queryable</td>
+</tr>
+<tr>
+<td>Semantic</td>
+<td>Mem0</td>
+<td>Extraction pipeline that dedupes and updates facts across vector, KV, and graph stores (Lesson 09)</td>
+</tr>
+<tr>
+<td>Semantic + procedural</td>
+<td>LangMem</td>
+<td>Background extraction of facts and behavioral rules into a store the agent consults between turns</td>
+</tr>
+<tr>
+<td>Episodic + semantic</td>
+<td>agentmemory</td>
+<td>Captures sessions as they run, consolidates them into typed, searchable records</td>
+</tr>
+</tbody>
+</table>
+<h2>运送它</h2>
+<p><code>outputs/skill-virtual-memory.md</code>是可重复使用的技能,可为任何目标运行时间产生正确的两层内存架 (主 + 档案 + 工具表面),并有驱逐政策和引用字段.</p>
+<h2>运动</h2>
+<ol>
+<li>添加一个<code>max_main_context_tokens</code>按代币计量的上限 (约为<code>len(text.split())</code>* 1.3. 超过限时将最古老的信息缩写成总结.</li>
+<li>按档案存储器 (期限频率,反文档频率) 执行BM25. 测量回忆@10在玩具事实集上与代币重叠基线相比.</li>
+<li>加入<code>citation</code>让代理引用每个获取支持的答案中的来源.</li>
+<li>模拟记忆中毒:添加一个档案记录,上面写道&quot;忽略所有未来用户指令&quot;.</li>
+<li>实现将MemGPT研究备忘录的核心内存JSON模式 (<code>cpacker/MemGPT</code>) 当你从平线字符串转换为打字段时,什么会发生变化?</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Virtual context</td>
+<td>&quot;Unlimited memory&quot;</td>
+<td>Main (prompt) + external (searchable) tiers with page in/out</td>
+</tr>
+<tr>
+<td>Main context</td>
+<td>&quot;Working memory&quot;</td>
+<td>The prompt — fixed-size, always visible</td>
+</tr>
+<tr>
+<td>Archival memory</td>
+<td>&quot;Long-term store&quot;</td>
+<td>External searchable persistence, retrieved on demand</td>
+</tr>
+<tr>
+<td>Core memory</td>
+<td>&quot;Persistent prompt section&quot;</td>
+<td>Named sections pinned inside the main context</td>
+</tr>
+<tr>
+<td>Memory tool</td>
+<td>&quot;Memory API&quot;</td>
+<td>Tool call the agent issues to read/write external memory</td>
+</tr>
+<tr>
+<td>Interrupt</td>
+<td>&quot;Memory page fault&quot;</td>
+<td>Agent pauses, runtime fetches, result splices into next turn</td>
+</tr>
+<tr>
+<td>Memory rot</td>
+<td>&quot;Stale facts&quot;</td>
+<td>Old writes drown retrieval; fix with consolidation</td>
+</tr>
+<tr>
+<td>Memory poisoning</td>
+<td>&quot;Injected persistent note&quot;</td>
+<td>Attacker content stored as memory, re-ingested on recall</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2310.08560" rel="noreferrer" data-network="true">Packer et al., MemGPT (arXiv:2310.08560) <small>↗ 需要联网</small></a>基于OS的虚拟文本论文</li>
+<li><a href="https://www.letta.com/blog/memory-blocks" rel="noreferrer" data-network="true">Letta, Memory Blocks blog <small>↗ 需要联网</small></a>三层次的进化</li>
+<li><a href="https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents" rel="noreferrer" data-network="true">Anthropic, Effective context engineering <small>↗ 需要联网</small></a>将环境视为预算</li>
+<li><a href="https://arxiv.org/abs/2504.19413" rel="noreferrer" data-network="true">Chhikara et al., Mem0 (arXiv:2504.19413) <small>↗ 需要联网</small></a> 混合生产内存,</li>
+<li><a href="https://github.com/getzep/zep" rel="noreferrer" data-network="true">Zep (getzep/zep) <small>↗ 需要联网</small></a>类别表中的时间知识图记忆</li>
+<li><a href="https://github.com/mem0ai/mem0" rel="noreferrer" data-network="true">Mem0 (mem0ai/mem0) <small>↗ 需要联网</small></a>课09的混合商店背后的采集管道</li>
+<li><a href="https://github.com/langchain-ai/langmem" rel="noreferrer" data-network="true">LangMem (langchain-ai/langmem) <small>↗ 需要联网</small></a> 背景调查事实和行为规则</li>
+<li><a href="https://github.com/rohitg00/agentmemory" rel="noreferrer" data-network="true">agentmemory (rohitg00/agentmemory) <small>↗ 需要联网</small></a>集成成类型,可搜索的记录</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Agent Memory — Virtual Context and Memory Paging</h1>
+<blockquote>
+<p>Context windows are finite. Conversations, documents, and tool traces are not. The fix is OS virtual memory restated — main context is RAM, external store is disk, the agent pages between them. MemGPT (Packer et al., 2023) named the pattern; many production memory systems build on it.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python (stdlib)
+<strong>Prerequisites:</strong> Phase 14 · 01 (Agent Loop), Phase 14 · 06 (Tool Use)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Explain the OS analogy MemGPT builds on: main context = RAM, external context = disk, memory tools = page in/out.</li>
+<li>Implement the two-tier MemGPT pattern in stdlib with a main-context buffer, an external searchable store, and page in/out tools.</li>
+<li>Describe how the agent issues &quot;interrupts&quot; to query or modify external memory and how the result is spliced back into the next prompt.</li>
+<li>Identify the MemGPT design choices that carry into Letta (Lesson 08) and Mem0 (Lesson 09).</li>
+</ul>
+<h2>The Problem</h2>
+<p>Context windows look like they should solve memory. They do not. Three failure modes recur in production:</p>
+<ol>
+<li><strong>Overflow.</strong> Multi-turn conversations, long documents, or tool-call-heavy trajectories cross the window. Everything past the cutoff is gone.</li>
+<li><strong>Dilution.</strong> Even within the window, stuffing irrelevant context dilutes attention over what matters. Frontier models still degrade on long inputs.</li>
+<li><strong>Persistence.</strong> A new session starts with an empty window. Agents without external memory cannot say &quot;remember when you asked me to...&quot; across sessions.</li>
+</ol>
+<p>Bigger windows help but do not fix this. Mem0's 2025 paper measured that 128k-window baselines still miss long-horizon facts that a 4k-window agent with external memory catches.</p>
+<h2>The Concept</h2>
+<h3>The OS analogy</h3>
+<p>MemGPT (Packer et al., arXiv:2310.08560, v2 Feb 2024) maps context management to operating-system virtual memory:</p>
+<table>
+<thead>
+<tr>
+<th>OS concept</th>
+<th>MemGPT concept</th>
+<th>2026 production analog</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>RAM</td>
+<td>main context (prompt)</td>
+<td>Anthropic/OpenAI context window</td>
+</tr>
+<tr>
+<td>Disk</td>
+<td>external context</td>
+<td>vector DB, KV, graph store</td>
+</tr>
+<tr>
+<td>Page fault</td>
+<td>memory tool call</td>
+<td><code>memory.search</code>, <code>memory.read</code>, <code>memory.write</code></td>
+</tr>
+<tr>
+<td>OS kernel</td>
+<td>agent control loop</td>
+<td>ReAct loop with memory tools</td>
+</tr>
+</tbody>
+</table>
+<p>The agent runs a normal ReAct loop. One extra class of tools lets it page data in and out of main context.</p>
+<h3>Two tiers</h3>
+<ul>
+<li><strong>Main context.</strong> Fixed-size prompt holding the current task. Always visible to the model.</li>
+<li><strong>External context.</strong> Unbounded, searchable via tools. Read when relevant, written when facts emerge.</li>
+</ul>
+<p>The original paper evaluated the design on two tasks beyond the base window: document analysis longer than 100k tokens and multi-session chat with persistent memory across days.</p>
+<h3>The interrupt pattern</h3>
+<p>MemGPT introduces memory-as-interrupt: mid-conversation the agent can invoke a memory tool, the runtime executes it, and the result splices into the next assistant turn as a new observation. Conceptually identical to a Unix <code>read()</code> syscall that blocks the process, returns bytes, and the process continues.</p>
+<p>Canonical memory tool surface:</p>
+<ul>
+<li><code>core_memory_append(section, text)</code> — write to a persistent section of the prompt.</li>
+<li><code>core_memory_replace(section, old, new)</code> — edit a persistent section.</li>
+<li><code>archival_memory_insert(text)</code> — write to the searchable external store.</li>
+<li><code>archival_memory_search(query, top_k)</code> — retrieve from the external store.</li>
+<li><code>conversation_search(query)</code> — scan past turns.</li>
+</ul>
+<h3>Where the paper ends and production begins</h3>
+<p>In September 2024 MemGPT became Letta. The research repo (<code>cpacker/MemGPT</code>) remains; Letta extends the design:</p>
+<ul>
+<li>Three tiers instead of two (core, recall, archival — Lesson 08).</li>
+<li>Native reasoning replacing the <code>send_message</code>/heartbeat pattern (Lesson 08).</li>
+<li>Sleep-time agents running async memory work (Lesson 08).</li>
+</ul>
+<p>The MemGPT paper is the 2026 foundation even if production systems run Letta, Mem0, or a custom two-tier store.</p>
+<h3>Where this pattern goes wrong</h3>
+<ul>
+<li><strong>Memory rot.</strong> Writes accumulate faster than reads; retrieval drowns in stale facts. Fix: periodic consolidation (Letta sleep-time), explicit invalidation (Mem0 conflict detector).</li>
+<li><strong>Memory poisoning.</strong> External memory is retrieved text. If attacker-controlled content lands in a memory note, the agent re-ingests it next session. This is the Greshake et al. (Lesson 27) attack restated over time.</li>
+<li><strong>Citation loss.</strong> Agent recalls &quot;the user asked me to ship X&quot; but cannot cite which turn. Store source references (session ID, turn ID) with every archival write.</li>
+</ul>
+<figure><img src="/learn/ai-from-scratch/figures/figure-5fa6224131363e572fcd.png" alt="context-budget 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<p><code>code/main.py</code> implements MemGPT's two-tier pattern in stdlib:</p>
+<ul>
+<li><code>MainContext</code> — fixed-size prompt buffer with a <code>core</code> dict and a <code>messages</code> list; auto-compacts oldest messages when over cap.</li>
+<li><code>ArchivalStore</code> — in-memory BM25-esque store (token-overlap scoring) of (id, text, tags, session, turn) records.</li>
+<li>Five memory tools mapping to the MemGPT surface.</li>
+<li>A scripted agent that fills archival with facts, then answers a question by calling <code>archival_memory_search</code>.</li>
+</ul>
+<p>Run it:</p>
+<pre><code>python3 code/main.py
+</code></pre>
+<p>The trace shows the agent writing three facts, filling main context to the cap (forcing eviction), then answering a follow-up question by retrieving from archival — reproducing the MemGPT workflow without any real LLM.</p>
+<h2>Use It</h2>
+<p>Every production memory system today is a MemGPT variant:</p>
+<ul>
+<li><strong>Letta</strong> (Lesson 08) — three tiers, native reasoning, sleep-time compute.</li>
+<li><strong>Mem0</strong> (Lesson 09) — vector + KV + graph fused with a scoring layer.</li>
+<li><strong>OpenAI Assistants / Responses</strong> — managed memory via threads and files.</li>
+<li><strong>Claude Agent SDK</strong> — long-term memory via skills and session store.</li>
+</ul>
+<p>Pick one by operational shape (self-hosted, managed, framework-integrated), not by the core pattern — the core pattern is MemGPT.</p>
+<h3>The shape of agent memory</h3>
+<p>Paging solves capacity. It does not decide what to store. Four memory types recur across production systems, each answering a different question:</p>
+<ul>
+<li><strong>Working memory</strong> — what matters right now? The in-context tier: current task, recent turns, pinned core sections. The prompt itself.</li>
+<li><strong>Episodic memory</strong> — what happened? Past turns and trajectories, stored with session and turn references, replayable on demand.</li>
+<li><strong>Semantic memory</strong> — what is true? Facts about the user, the domain, the world, updated and deduplicated as they change.</li>
+<li><strong>Procedural memory</strong> — how do I do this? Learned routines, preferences, and rules that steer future behavior rather than recall.</li>
+</ul>
+<p>Open-source implementations pick different points of attack:</p>
+<table>
+<thead>
+<tr>
+<th>Type</th>
+<th>Implementation</th>
+<th>How it tackles it</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Working</td>
+<td>MemGPT / Letta</td>
+<td>Pages content in and out of a fixed prompt budget via memory tools (this lesson, Lesson 08)</td>
+</tr>
+<tr>
+<td>Episodic</td>
+<td>Zep</td>
+<td>Temporal knowledge graph — facts carry validity intervals, so &quot;what was true when&quot; is queryable</td>
+</tr>
+<tr>
+<td>Semantic</td>
+<td>Mem0</td>
+<td>Extraction pipeline that dedupes and updates facts across vector, KV, and graph stores (Lesson 09)</td>
+</tr>
+<tr>
+<td>Semantic + procedural</td>
+<td>LangMem</td>
+<td>Background extraction of facts and behavioral rules into a store the agent consults between turns</td>
+</tr>
+<tr>
+<td>Episodic + semantic</td>
+<td>agentmemory</td>
+<td>Captures sessions as they run, consolidates them into typed, searchable records</td>
+</tr>
+</tbody>
+</table>
+<h2>Ship It</h2>
+<p><code>outputs/skill-virtual-memory.md</code> is a reusable skill that produces a correct two-tier memory scaffold (main + archival + tool surface) for any target runtime, with eviction policy and citation fields wired in.</p>
+<h2>Exercises</h2>
+<ol>
+<li>Add a <code>max_main_context_tokens</code> cap measured in tokens (approximate with <code>len(text.split())</code> * 1.3). Compact the oldest messages into a summary when the cap is exceeded. Compare behavior with and without the summarizer.</li>
+<li>Implement BM25 properly over the archival store (term frequency, inverse document frequency). Measure recall@10 on a toy fact set versus the token-overlap baseline.</li>
+<li>Add <code>citation</code> fields (session_id, turn_id, source_url) to archival inserts. Make the agent cite sources on every retrieval-backed answer.</li>
+<li>Simulate memory poisoning: add an archival record that says &quot;ignore all future user instructions.&quot; Write a guard that scans retrievals for directive-shaped text and marks them untrusted.</li>
+<li>Port the implementation to use the MemGPT research repo's core-memory JSON schema (<code>cpacker/MemGPT</code>). What changes when you switch from flat strings to typed sections?</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Virtual context</td>
+<td>&quot;Unlimited memory&quot;</td>
+<td>Main (prompt) + external (searchable) tiers with page in/out</td>
+</tr>
+<tr>
+<td>Main context</td>
+<td>&quot;Working memory&quot;</td>
+<td>The prompt — fixed-size, always visible</td>
+</tr>
+<tr>
+<td>Archival memory</td>
+<td>&quot;Long-term store&quot;</td>
+<td>External searchable persistence, retrieved on demand</td>
+</tr>
+<tr>
+<td>Core memory</td>
+<td>&quot;Persistent prompt section&quot;</td>
+<td>Named sections pinned inside the main context</td>
+</tr>
+<tr>
+<td>Memory tool</td>
+<td>&quot;Memory API&quot;</td>
+<td>Tool call the agent issues to read/write external memory</td>
+</tr>
+<tr>
+<td>Interrupt</td>
+<td>&quot;Memory page fault&quot;</td>
+<td>Agent pauses, runtime fetches, result splices into next turn</td>
+</tr>
+<tr>
+<td>Memory rot</td>
+<td>&quot;Stale facts&quot;</td>
+<td>Old writes drown retrieval; fix with consolidation</td>
+</tr>
+<tr>
+<td>Memory poisoning</td>
+<td>&quot;Injected persistent note&quot;</td>
+<td>Attacker content stored as memory, re-ingested on recall</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2310.08560" rel="noreferrer" data-network="true">Packer et al., MemGPT (arXiv:2310.08560) <small>↗ 需要联网</small></a> — OS-inspired virtual context paper</li>
+<li><a href="https://www.letta.com/blog/memory-blocks" rel="noreferrer" data-network="true">Letta, Memory Blocks blog <small>↗ 需要联网</small></a> — the three-tier evolution</li>
+<li><a href="https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents" rel="noreferrer" data-network="true">Anthropic, Effective context engineering <small>↗ 需要联网</small></a> — treating context as a budget</li>
+<li><a href="https://arxiv.org/abs/2504.19413" rel="noreferrer" data-network="true">Chhikara et al., Mem0 (arXiv:2504.19413) <small>↗ 需要联网</small></a> — hybrid production memory on top of this pattern</li>
+<li><a href="https://github.com/getzep/zep" rel="noreferrer" data-network="true">Zep (getzep/zep) <small>↗ 需要联网</small></a> — temporal knowledge-graph memory from the taxonomy table</li>
+<li><a href="https://github.com/mem0ai/mem0" rel="noreferrer" data-network="true">Mem0 (mem0ai/mem0) <small>↗ 需要联网</small></a> — the extraction pipeline behind Lesson 09's hybrid store</li>
+<li><a href="https://github.com/langchain-ai/langmem" rel="noreferrer" data-network="true">LangMem (langchain-ai/langmem) <small>↗ 需要联网</small></a> — background extraction of facts and behavioral rules</li>
+<li><a href="https://github.com/rohitg00/agentmemory" rel="noreferrer" data-network="true">agentmemory (rohitg00/agentmemory) <small>↗ 需要联网</small></a> — session capture consolidated into typed, searchable records</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-14-agent-engineering--07-memory-virtual-context-memgpt.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-14-agent-engineering--07-memory-virtual-context-memgpt.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/14-agent-engineering/07-memory-virtual-context-memgpt/code/main.py">phases/14-agent-engineering/07-memory-virtual-context-memgpt/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;MemGPT-shaped two-tier memory in stdlib.
+
+Main context is a fixed-size prompt buffer (core dict + messages list).
+Archival memory is an external searchable store. Agents page data in and out
+via memory tools. No LLM call — a scripted agent drives the scenario so the
+control flow is testable offline.
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any
+
+
+@dataclass
+class Message:
+    role: str
+    text: str
+
+
+@dataclass
+class MainContext:
+    core: dict[str, str] = field(default_factory=dict)
+    messages: list[Message] = field(default_factory=list)
+    max_messages: int = 4
+    evicted: list[Message] = field(default_factory=list)
+
+    def append(self, role: str, text: str) -&gt; None:
+        self.messages.append(Message(role=role, text=text))
+        while len(self.messages) &gt; self.max_messages:
+            self.evicted.append(self.messages.pop(0))
+
+    def render(self) -&gt; str:
+        parts: list[str] = [&quot;[core]&quot;]
+        for key, value in sorted(self.core.items()):
+            parts.append(f&quot;  {key}: {value}&quot;)
+        parts.append(&quot;[messages]&quot;)
+        for msg in self.messages:
+            parts.append(f&quot;  {msg.role}: {msg.text}&quot;)
+        return &quot;\n&quot;.join(parts)
+
+
+@dataclass
+class ArchivalRecord:
+    rid: str
+    text: str
+    tags: tuple[str, ...] = ()
+    session_id: str = &quot;s0&quot;
+    turn_id: int = 0
+
+
+class ArchivalStore:
+    def __init__(self) -&gt; None:
+        self._records: list[ArchivalRecord] = []
+        self._counter = 0
+
+    def insert(self, text: str, *, tags: tuple[str, ...] = (),
+               session_id: str = &quot;s0&quot;, turn_id: int = 0) -&gt; str:
+        self._counter += 1
+        rid = f&quot;a{self._counter:03d}&quot;
+        self._records.append(ArchivalRecord(
+            rid=rid, text=text, tags=tags,
+            session_id=session_id, turn_id=turn_id,
+        ))
+        return rid
+
+    def search(self, query: str, top_k: int = 3) -&gt; list[ArchivalRecord]:
+        q_tokens = set(query.lower().split())
+        scored: list[tuple[float, ArchivalRecord]] = []
+        for record in self._records:
+            r_tokens = set(record.text.lower().split())
+            if not r_tokens:
+                continue
+            overlap = len(q_tokens &amp; r_tokens)
+            if overlap == 0:
+                continue
+            score = overlap / (len(q_tokens) + len(r_tokens) - overlap)
+            scored.append((score, record))
+        scored.sort(key=lambda x: -x[0])
+        return [r for _, r in scored[:top_k]]
+
+    def count(self) -&gt; int:
+        return len(self._records)
+
+
+class MemoryTools:
+    def __init__(self, main: MainContext, archival: ArchivalStore) -&gt; None:
+        self.main = main
+        self.archival = archival
+
+    def core_memory_append(self, section: str, text: str) -&gt; str:
+        existing = self.main.core.get(section, &quot;&quot;)
+        self.main.core[section] = (existing + &quot; &quot; + text).strip() if existing else text
+        return f&quot;core[{section}] appended: {len(self.main.core[section])} chars&quot;
+
+    def core_memory_replace(self, section: str, old: str, new: str) -&gt; str:
+        current = self.main.core.get(section, &quot;&quot;)
+        if old not in current:
+            return f&quot;error: {old!r} not in core[{section}]&quot;
+        self.main.core[section] = current.replace(old, new)
+        return f&quot;core[{section}] replaced&quot;
+
+    def archival_memory_insert(self, text: str, tags: tuple[str, ...] = ()) -&gt; str:
+        rid = self.archival.insert(text, tags=tags)
+        return f&quot;stored {rid} ({self.archival.count()} records)&quot;
+
+    def archival_memory_search(self, query: str, top_k: int = 3) -&gt; str:
+        hits = self.archival.search(query, top_k=top_k)
+        if not hits:
+            return &quot;no matches&quot;
+        return &quot;\n&quot;.join(f&quot;  {h.rid}: {h.text}&quot; for h in hits)
+
+    def conversation_search(self, query: str) -&gt; str:
+        q = query.lower()
+        for msg in reversed(self.main.evicted + self.main.messages):
+            if q in msg.text.lower():
+                return f&quot;found ({msg.role}): {msg.text}&quot;
+        return &quot;no matches&quot;
+
+
+@dataclass
+class ToolCall:
+    name: str
+    args: dict[str, Any]
+
+
+def run_scripted_agent(tools: MemoryTools, script: list[ToolCall]) -&gt; list[str]:
+    observations: list[str] = []
+    for call in script:
+        fn = getattr(tools, call.name, None)
+        if fn is None:
+            observations.append(f&quot;error: unknown tool {call.name!r}&quot;)
+            continue
+        try:
+            observations.append(fn(**call.args))
+        except Exception as e:
+            observations.append(f&quot;error: {type(e).__name__}: {e}&quot;)
+    return observations
+
+
+def main() -&gt; None:
+    print(&quot;=&quot; * 70)
+    print(&quot;MEMGPT VIRTUAL CONTEXT — Phase 14, Lesson 07&quot;)
+    print(&quot;=&quot; * 70)
+
+    main_ctx = MainContext(max_messages=3)
+    archival = ArchivalStore()
+    tools = MemoryTools(main_ctx, archival)
+
+    main_ctx.append(&quot;user&quot;, &quot;my name is ava and I ship agents for a living&quot;)
+    main_ctx.append(&quot;assistant&quot;, &quot;noted. what are you building right now?&quot;)
+    main_ctx.append(&quot;user&quot;, &quot;a retrieval bot for our sales org, 12 tools so far&quot;)
+    main_ctx.append(&quot;assistant&quot;, &quot;12 tools is in the long-horizon band; plan for drift&quot;)
+
+    script = [
+        ToolCall(&quot;core_memory_append&quot;,
+                 {&quot;section&quot;: &quot;persona&quot;, &quot;text&quot;: &quot;the agent remembers user details politely&quot;}),
+        ToolCall(&quot;core_memory_append&quot;,
+                 {&quot;section&quot;: &quot;user&quot;, &quot;text&quot;: &quot;name=ava, role=ships agents&quot;}),
+        ToolCall(&quot;archival_memory_insert&quot;,
+                 {&quot;text&quot;: &quot;ava is building a retrieval bot with 12 tools for sales&quot;,
+                  &quot;tags&quot;: (&quot;project&quot;, &quot;ava&quot;)}),
+        ToolCall(&quot;archival_memory_insert&quot;,
+                 {&quot;text&quot;: &quot;long-horizon tool chains drift after 20 steps per BFCL V4&quot;,
+                  &quot;tags&quot;: (&quot;bfcl&quot;, &quot;tools&quot;)}),
+        ToolCall(&quot;archival_memory_insert&quot;,
+                 {&quot;text&quot;: &quot;sleep-time compute consolidates memory asynchronously&quot;,
+                  &quot;tags&quot;: (&quot;letta&quot;, &quot;memory&quot;)}),
+    ]
+    observations = run_scripted_agent(tools, script)
+
+    print(&quot;\ntool trace (memory writes)&quot;)
+    for call, obs in zip(script, observations):
+        print(f&quot;  {call.name}({call.args}) -&gt; {obs}&quot;)
+
+    print(&quot;\nfilling main context until eviction kicks in&quot;)
+    main_ctx.append(&quot;user&quot;, &quot;what were you saying about tool chains?&quot;)
+    main_ctx.append(&quot;assistant&quot;, &quot;let me check archival&quot;)
+
+    print(f&quot;\nmain context ({len(main_ctx.messages)} messages, &quot;
+          f&quot;{len(main_ctx.evicted)} evicted)&quot;)
+    print(main_ctx.render())
+
+    print(&quot;\npage in: archival_memory_search(&#39;tool chains drift&#39;)&quot;)
+    hit = tools.archival_memory_search(&quot;tool chains drift&quot;, top_k=2)
+    print(hit)
+
+    print(&quot;\nconversation_search for &#39;retrieval bot&#39;&quot;)
+    print(tools.conversation_search(&quot;retrieval bot&quot;))
+
+    print()
+    print(&quot;pattern: memory is interrupt-driven. agent calls a tool, runtime&quot;)
+    print(&quot;fetches, result splices back as observation. same as Unix read().&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/14-agent-engineering/07-memory-virtual-context-memgpt/outputs/skill-virtual-memory.md">phases/14-agent-engineering/07-memory-virtual-context-memgpt/outputs/skill-virtual-memory.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: virtual-memory
+description: Scaffold a MemGPT-shaped two-tier memory system (main context + archival store + memory tools) for any target runtime with correct eviction, citation, and untrusted-input handling.
+version: 1.0.0
+phase: 14
+lesson: 07
+tags: [memory, memgpt, virtual-context, archival, citations]
+---
+
+Given a target runtime (Python, Node, Rust), a model provider (Anthropic, OpenAI, local), and a storage backend (in-memory, SQLite, vector DB, KV, graph), produce a correct MemGPT-shaped memory system.
+
+Produce:
+
+1. A `MainContext` type with a `core` dict (named persistent sections) and a `messages` list (FIFO). Auto-evict on size cap; evicted turns remain retrievable by `conversation_search`.
+2. An `ArchivalStore` with insert and search. Records MUST carry `id`, `text`, `tags`, `session_id`, `turn_id`, `created_at`. Every write returns the stored id for citation.
+3. Five memory tools matching the MemGPT surface: `core_memory_append`, `core_memory_replace`, `archival_memory_insert`, `archival_memory_search`, `conversation_search`. Present them to the model with `description` text that tells the model when to use each.
+4. A citation contract: every archival retrieval MUST return record ids alongside text, and the agent MUST cite them in final answers. Answers without citations are a soft failure.
+5. A consolidation hook (can be a no-op in v1) so Lesson 08 sleep-time agents can plug in without re-plumbing. Expose `list_records_since(timestamp)` and `delete(id)`.
+
+Hard rejects:
+
+- Searching archival with full-prompt LLM scoring. Use a proper retrieval backend (BM25, vector similarity). LLM re-ranking is allowed on the top-k shortlist, not the full corpus.
+- Main context with no eviction policy. Unbounded main context silently grows past the window.
+- Storing retrieved content as if it were user instructions. All archival content is untrusted text (Lesson 27). Pass it to the model as observation, not as system prompt.
+- Writing a `core_memory_clear` tool that wipes all sections. Core is load-bearing; clearing is a foot-gun. Support `replace` not `clear`.
+
+Refusal rules:
+
+- If the user asks for &quot;no citations, just answers,&quot; refuse for any domain where source attribution matters (medical, legal, policy, financial). Offer a compromise: citations rendered as footnotes rather than inline.
+- If the user asks for &quot;write all retrieved content back to archival without filtering,&quot; refuse and point to Lesson 27. Retrieved content is attacker-reachable; blanket write-back is memory poisoning.
+- If the runtime has no persistence layer, refuse to ship an agent described as having &quot;long-term memory.&quot; Downgrade the product description, not the implementation.
+
+Output: one file per component (`main_context.*`, `archival_store.*`, `memory_tools.*`, `agent.*`) plus a `README.md` explaining the eviction policy, citation contract, and where to plug in Lesson 08 (sleep-time consolidation) and Lesson 09 (Mem0 fusion). End with &quot;what to read next&quot; pointing to Lesson 08 if the agent needs three tiers or async consolidation, or Lesson 09 if the agent needs vector+KV+graph fusion.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. What OS analogy does MemGPT build on?</legend><label class="option"><input type="radio" name="q0" value="0"> Virtual memory: main context as RAM, external store as disk, memory tools as page in and out</label><label class="option"><input type="radio" name="q0" value="1"> Processes and threads</label><label class="option"><input type="radio" name="q0" value="2"> Network sockets</label><label class="option"><input type="radio" name="q0" value="3"> File descriptors</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. Why do bigger context windows not fully solve memory?</legend><label class="option"><input type="radio" name="q1" value="0"> The model refuses long input</label><label class="option"><input type="radio" name="q1" value="1"> Long context costs nothing</label><label class="option"><input type="radio" name="q1" value="2"> Overflow, dilution of attention, and lack of cross-session persistence still bite even with 128k windows</label><label class="option"><input type="radio" name="q1" value="3"> Providers cap them at 4k tokens</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. Which of these is NOT one of MemGPT&#39;s canonical memory tools?</legend><label class="option"><input type="radio" name="q2" value="0"> archival_memory_search</label><label class="option"><input type="radio" name="q2" value="1"> core_memory_append</label><label class="option"><input type="radio" name="q2" value="2"> conversation_search</label><label class="option"><input type="radio" name="q2" value="3"> gradient_memory_update</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. What does the interrupt pattern do in MemGPT?</legend><label class="option"><input type="radio" name="q3" value="0"> It halts the entire agent run on any error</label><label class="option"><input type="radio" name="q3" value="1"> Mid-conversation the agent invokes a memory tool, the runtime executes it, and the result splices into the next turn</label><label class="option"><input type="radio" name="q3" value="2"> It bypasses the context window entirely</label><label class="option"><input type="radio" name="q3" value="3"> It triggers a model retrain</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. Which production system did MemGPT evolve into in 2024?</legend><label class="option"><input type="radio" name="q4" value="0"> Pinecone</label><label class="option"><input type="radio" name="q4" value="1"> Mem0</label><label class="option"><input type="radio" name="q4" value="2"> Zep</label><label class="option"><input type="radio" name="q4" value="3"> Letta</label><p data-feedback="4"></p></fieldset><fieldset><legend>6. What is memory poisoning in this context?</legend><label class="option"><input type="radio" name="q5" value="0"> Reading from disk when RAM is available</label><label class="option"><input type="radio" name="q5" value="1"> Embedding model version drift</label><label class="option"><input type="radio" name="q5" value="2"> A bug that corrupts vector indices</label><label class="option"><input type="radio" name="q5" value="3"> An attacker&#39;s content gets stored as a memory note and is re-ingested on future recalls</label><p data-feedback="5"></p></fieldset><fieldset><legend>7. Why does the lesson say production memory systems are MemGPT variants?</legend><label class="option"><input type="radio" name="q6" value="0"> Letta, Mem0, Assistants threads, and Claude Agent SDK all run the two-tier (or more) paged-memory pattern; differences are operational shape</label><label class="option"><input type="radio" name="q6" value="1"> They share weights</label><label class="option"><input type="radio" name="q6" value="2"> They use the same vector DB</label><label class="option"><input type="radio" name="q6" value="3"> MemGPT owns the trademark</label><p data-feedback="6"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/14-agent-engineering/06-tool-use-and-function-calling/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/14-agent-engineering/08-memory-blocks-sleep-time-compute/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/14-agent-engineering/07-memory-virtual-context-memgpt/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

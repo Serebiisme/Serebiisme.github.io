@@ -121,7 +121,7 @@ function unpack(compressed, repository, revision) {
 function selectedEnglish(path) {
   return path.startsWith('phases/') || path.startsWith('projects/') || path.startsWith('learning-paths/')
     || ['LICENSE', 'README.md', 'ROADMAP.md', 'requirements.txt', 'glossary/terms.md', 'scripts/project_test.py', 'scripts/_lib.py', 'scripts/lesson_run.py', 'scripts/run_lesson_tests.py'].includes(path)
-    || /^site\/(?:figures[^/]*\.js|lesson-figures\.js|assets\/figures\/[^/]+)$/.test(path);
+    || /^site\/(?:figures[^/]*\.js|lesson-figures\.js|figures\/projects\/[^/]+\.js|assets\/figures\/[^/]+)$/.test(path);
 }
 
 export async function importSources({ sourceLock, destination, fetchImpl = fetch }) {

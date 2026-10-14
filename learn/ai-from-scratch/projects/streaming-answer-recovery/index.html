@@ -1,0 +1,125 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>Streaming Answer Recovery · Serebii Labs</title></head><body data-pack="ai-from-scratch-project-streaming-answer-recovery" data-lesson="" data-project="streaming-answer-recovery"><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow">PROJECT / streaming-answer-recovery</p><h1 class="lesson-title">Streaming Answer Recovery</h1><p class="notice">本站中文导读 + 原作者英文全文 · 代码运行未验证</p><p>这是原课程的「Streaming Answer Recovery」实践项目。先阅读下方原始目标与阶段说明，再按课序实现功能、运行评分器并比较参考实现。英文全文未缩写；中文长文尚未翻译。</p><p>练习骨架 starter：原项目未提供，勿将 solution 当作骨架；参考实现 solution：6 个文件。运行前按 README 准备依赖与输入；模型、数据或在线服务不包含在离线阅读包中。</p><div class="save-panel"><button type="button" data-save>保存本项目阅读资料</button><span data-save-status role="status">未检测离线状态</span></div><p><a download href="/learn/ai-from-scratch/downloads/project-streaming-answer-recovery.zip">下载完整项目 ZIP（需联网，或单独保存）</a> <button data-save-download="/learn/ai-from-scratch/downloads/project-streaming-answer-recovery.zip" type="button">单独保存项目 ZIP</button></p><section><h2>学习目标（原作者）</h2><ul></ul></section><section class="prose" lang="en"><h1>Streaming Answer Recovery</h1>
+<p>Build a browser answer view and local event stream for developers integrating assistant output. Handle split UTF-8 bytes, event IDs, reconnection, cancellation and partial citations. Preserve the difference between an interrupted draft and a completed answer, with a downloadable event trace to reproduce rendering failures.</p>
+<p>Standard libraries only. Four stages, approximately eight hours. TypeScript, Go implementations are exercised by the grader.</p>
+<h2>Build it</h2>
+<ol>
+<li><a href="/learn/ai-from-scratch/projects/streaming-answer-recovery/#01-decode-sse">Decode chunked bytes into complete events</a></li>
+<li><a href="/learn/ai-from-scratch/projects/streaming-answer-recovery/#02-stable-answer-state">Render text and citations by stable identity</a></li>
+<li><a href="/learn/ai-from-scratch/projects/streaming-answer-recovery/#03-reconnect-and-cancel">Handle reconnect and cancellation</a></li>
+<li><a href="/learn/ai-from-scratch/projects/streaming-answer-recovery/#04-trace-and-component">Export and replay an interrupted-answer trace</a></li>
+</ol>
+<pre><code class="language-bash">python3 scripts/project_test.py streaming-answer-recovery --init /tmp/streaming-answer-recovery-work
+python3 scripts/project_test.py streaming-answer-recovery --stage 1 --path /tmp/streaming-answer-recovery-work --strict
+python3 scripts/project_test.py streaming-answer-recovery --all --solution --strict
+</code></pre>
+<p>The fresh starter fails until you implement it. Reference-solution runs never grant learner completion certificates.</p>
+<h2>Run the actual interrupted stream</h2>
+<pre><code class="language-bash">cd projects/streaming-answer-recovery/solution
+python3 demo.py
+node --experimental-strip-types build-browser.ts /tmp/stream-browser
+</code></pre>
+<p>The demo builds the Go fixture, starts a finite loopback server, reads its URL and runs the TypeScript client twice. First output is interrupted Caf at event 1. Resume sends Last-Event-ID:1 and completes Café without duplicated text. The accepted-event trace is written to /tmp/aiefs-answer-trace.json and replayed by the actual state reducer.</p>
+<p>For your own SSE endpoint: <code>node --experimental-strip-types cli.ts URL /tmp/trace.json</code>. The CLI makes at most two connections. For browser integration, import <code>mount</code> from the generated answer.js and mount it with a same-origin SSE URL, or configure CORS on your own server. For a complete local browser run, use <code>go run . --listen 127.0.0.1:8137 --seconds 120 --web /tmp/stream-browser</code> and open localhost:8137. The Go fixture serves the generated page and /events on one origin; it does not grant cross-origin access. The finite server exits after the requested lifetime.</p>
+<p>The SSE parser supports UTF-8, CR/LF framing, comments, data fields, event type and persistent last ID. It ignores retry fields; reconnect policy belongs to the caller. The authored answer protocol requires contiguous positive numeric event IDs and payload type text/citation/complete. This is a teaching protocol, not an adapter for any specific LLM provider.</p>
+<p>Trace schema version 1 contains accepted events and status. It reproduces rendering state, including interrupted or cancelled answers; it does not retain partial transport bytes. Status completed requires an explicit complete event. <a href="https://html.spec.whatwg.org/multipage/server-sent-events.html" rel="noreferrer" data-network="true">WHATWG SSE <small>↗ 需要联网</small></a> defines framing and resume fields.</p>
+<h2>Completion evidence</h2>
+<pre><code class="language-bash">python3 scripts/project_test.py streaming-answer-recovery --all --path /tmp/streaming-answer-recovery-work --strict --report /tmp/streaming-answer-recovery-result.json
+</code></pre>
+<p>Local reports are unsigned, self-reported evidence. The editable figures calculate illustrative values; the CLI runs the actual implementation.</p>
+</section><section id="01-decode-sse"><h2>01-decode-sse · 原始阶段说明</h2><div class="prose" lang="en"><h1>Decode chunked bytes into complete events</h1>
+<blockquote>
+<p>Let UTF-8 and SSE framing survive arbitrary transport boundaries.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> TypeScript, Go
+<strong>Stage:</strong> 1 of 4
+<strong>Prerequisites:</strong> Basic functions, collections, JSON and the previous stages when applicable.
+<strong>Time:</strong> ~2 hours</p>
+<h2>What you build</h2>
+<p>Build an incremental UTF-8 decoder and line parser. Handle LF, CRLF and CR, even when the separator or multibyte character spans chunks. A blank line dispatches data; EOF by itself does not. Comments are ignored. Multiple data fields join with a newline.</p>
+<h2>Worked example</h2>
+<p>Split the two bytes of é across pushes. No replacement character should appear. <code>id: 1</code>, <code>data: Caf</code> and a blank line dispatch one event. An event without a new id inherits the previous id; an empty id resets it.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-3de83fedeff90e7ba57c.png" alt="pj-streaming-answer-recovery-1 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Implement the contract</h2>
+<p><code>new SSEDecoder().push(bytes:Uint8Array,final=false):Event[]</code>, where Event is <code>{id,event,data}</code>. Default event type is message. Ignore id values containing NUL. Final flush rejects truncated UTF-8 and discards un-dispatched data. This subset ignores retry fields.</p>
+<p>Reject malformed input before producing a partial artifact. The tests include held-out records separate from the demonstration fixture.</p>
+<h2>Run your work</h2>
+<pre><code class="language-bash">python3 scripts/project_test.py streaming-answer-recovery --init /tmp/streaming-answer-recovery-work
+python3 scripts/project_test.py streaming-answer-recovery --stage 1 --path /tmp/streaming-answer-recovery-work --strict
+</code></pre>
+<p>Initialization copies cumulative scaffolding without replacing your work. Implement the TODO functions in the first-stage starter; later-stage starter notes describe the new behavior. Tests import the learner workspace. Run the command in the README against your own input after passing the stage.</p>
+<h2>Inspect and extend</h2>
+<p>Try a trailing data line without a blank line. Explain why prematurely dispatching it can display incomplete JSON.</p>
+<p><a href="https://html.spec.whatwg.org/multipage/server-sent-events.html" rel="noreferrer" data-network="true">WHATWG server-sent events <small>↗ 需要联网</small></a>.</p>
+</div></section><section id="02-stable-answer-state"><h2>02-stable-answer-state · 原始阶段说明</h2><div class="prose" lang="en"><h1>Render text and citations by stable identity</h1>
+<blockquote>
+<p>Make duplicate delivery harmless while preserving incomplete state.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> TypeScript, Go
+<strong>Stage:</strong> 2 of 4
+<strong>Prerequisites:</strong> Basic functions, collections, JSON and the previous stages when applicable.
+<strong>Time:</strong> ~2 hours</p>
+<h2>What you build</h2>
+<p>The answer protocol adds contiguous positive integer IDs and JSON payloads to SSE. Text appends content, citation adds a labelled HTTP(S) URL and complete marks the answer done. Equal duplicate IDs are ignored; conflicting duplicate payloads, gaps and events after completion fail.</p>
+<h2>Worked example</h2>
+<p>Event 1 appends Caf. Replaying event 1 changes nothing. Event 2 appends é and more text. A citation does not imply completion. The answer remains draft until a complete event arrives.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-8c5ace0a67a3b0dfb058.png" alt="pj-streaming-answer-recovery-2 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Implement the contract</h2>
+<p><code>initial():Answer</code>; <code>apply(state,event):Answer</code>. Answer contains text, citations, status, lastID and accepted events. <code>interrupt(state)</code> preserves text and marks interrupted. <code>cancel(state)</code> marks a noncompleted answer cancelled; cancelled answers ignore subsequent events.</p>
+<p>Reject malformed input before producing a partial artifact. The tests include held-out records separate from the demonstration fixture.</p>
+<h2>Run your work</h2>
+<pre><code class="language-bash">python3 scripts/project_test.py streaming-answer-recovery --init /tmp/streaming-answer-recovery-work
+python3 scripts/project_test.py streaming-answer-recovery --stage 2 --path /tmp/streaming-answer-recovery-work --strict
+</code></pre>
+<p>Initialization copies cumulative scaffolding without replacing your work. Implement the TODO functions in the first-stage starter; later-stage starter notes describe the new behavior. Tests import the learner workspace. Run the command in the README against your own input after passing the stage.</p>
+<h2>Inspect and extend</h2>
+<p>Inject a javascript: citation and reject it before rendering. Citation text is content and is rendered with textContent.</p>
+<p><a href="https://pkg.go.dev/std" rel="noreferrer" data-network="true">Go standard library <small>↗ 需要联网</small></a> and <a href="https://nodejs.org/api/" rel="noreferrer" data-network="true">Node standard library <small>↗ 需要联网</small></a>. All fixtures and implementations are original.</p>
+</div></section><section id="03-reconnect-and-cancel"><h2>03-reconnect-and-cancel · 原始阶段说明</h2><div class="prose" lang="en"><h1>Handle reconnect and cancellation</h1>
+<blockquote>
+<p>Resume after the last accepted event, not the last partial byte.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> TypeScript, Go
+<strong>Stage:</strong> 3 of 4
+<strong>Prerequisites:</strong> Basic functions, collections, JSON and the previous stages when applicable.
+<strong>Time:</strong> ~2 hours</p>
+<h2>What you build</h2>
+<p>Go serves an authored SSE stream in three-byte writes and deliberately closes the first request halfway through é. TypeScript connect sends Last-Event-ID on the next request, creates a fresh decoder, preserves accepted answer state and handles AbortSignal cancellation.</p>
+<h2>Worked example</h2>
+<p>First connection accepts event 1 then ends with a truncated UTF-8 error: text Caf, status interrupted, lastID 1. Reconnect sends Last-Event-ID:1. Go emits complete event 2 onward, producing Café once, one citation and completed state.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-1e88186022cbd29f3128.png" alt="pj-streaming-answer-recovery-3 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Implement the contract</h2>
+<p>TypeScript <code>connect(url,state,onState,signal?):Promise&lt;Answer&gt;</code> bounds each connection to one MiB and marks failures interrupted. Cancel and release the response reader after malformed data, cancellation or application completion so failed streams cannot remain open. Go <code>Encode(StreamEvent)([]byte,error)</code>, <code>After(events,last)([]StreamEvent,error)</code>, <code>Handler(events)http.Handler</code>. No automatic reconnect loop is hidden; the caller chooses each connection.</p>
+<p>Reject malformed input before producing a partial artifact. The tests include held-out records separate from the demonstration fixture.</p>
+<h2>Run your work</h2>
+<pre><code class="language-bash">python3 scripts/project_test.py streaming-answer-recovery --init /tmp/streaming-answer-recovery-work
+python3 scripts/project_test.py streaming-answer-recovery --stage 3 --path /tmp/streaming-answer-recovery-work --strict
+</code></pre>
+<p>Initialization copies cumulative scaffolding without replacing your work. Implement the TODO functions in the first-stage starter; later-stage starter notes describe the new behavior. Tests import the learner workspace. Run the command in the README against your own input after passing the stage.</p>
+<h2>Inspect and extend</h2>
+<p>Abort between two events. A cancelled answer must keep its draft text and must not reconnect when the user clicks resume.</p>
+<p><a href="https://pkg.go.dev/std" rel="noreferrer" data-network="true">Go standard library <small>↗ 需要联网</small></a> and <a href="https://nodejs.org/api/" rel="noreferrer" data-network="true">Node standard library <small>↗ 需要联网</small></a>. All fixtures and implementations are original.</p>
+</div></section><section id="04-trace-and-component"><h2>04-trace-and-component · 原始阶段说明</h2><div class="prose" lang="en"><h1>Export and replay an interrupted-answer trace</h1>
+<blockquote>
+<p>Ship the browser component with a replayable accepted-event artifact.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> TypeScript, Go
+<strong>Stage:</strong> 4 of 4
+<strong>Prerequisites:</strong> Basic functions, collections, JSON and the previous stages when applicable.
+<strong>Time:</strong> ~2 hours</p>
+<h2>What you build</h2>
+<p>Serialize accepted events and terminal state as a version-1 trace. Replay rebuilds the answer by running apply on each event and checks that completion agrees with the event ledger. The reusable mount component provides resume, cancellation, citations and a trace download.</p>
+<h2>Worked example</h2>
+<p>Download immediately after the first interruption. Replay yields text Caf and status interrupted. Download after resuming and replay yields the completed Unicode answer with one citation. A trace claiming completed without a complete event fails.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-65f23169a7106642cbdd.png" alt="pj-streaming-answer-recovery-4 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Implement the contract</h2>
+<p><code>trace(state):string</code>; <code>replay(text):Answer</code>; <code>mount(host:HTMLElement,url:string):()=&gt;void</code>. The returned disposer aborts work and clears the host. build-browser.ts strips native TypeScript into an importable browser module; no framework runtime is required.</p>
+<p>Reject malformed input before producing a partial artifact. The tests include held-out records separate from the demonstration fixture.</p>
+<h2>Run your work</h2>
+<pre><code class="language-bash">python3 scripts/project_test.py streaming-answer-recovery --init /tmp/streaming-answer-recovery-work
+python3 scripts/project_test.py streaming-answer-recovery --stage 4 --path /tmp/streaming-answer-recovery-work --strict
+</code></pre>
+<p>Initialization copies cumulative scaffolding without replacing your work. Implement the TODO functions in the first-stage starter; later-stage starter notes describe the new behavior. Tests import the learner workspace. Run the command in the README against your own input after passing the stage.</p>
+<h2>Inspect and extend</h2>
+<p>Store transport-level byte traces separately if you need to reproduce decoder failures. This exported trace records accepted application events and status, not discarded partial bytes.</p>
+<p><a href="https://pkg.go.dev/std" rel="noreferrer" data-network="true">Go standard library <small>↗ 需要联网</small></a> and <a href="https://nodejs.org/api/" rel="noreferrer" data-network="true">Node standard library <small>↗ 需要联网</small></a>. All fixtures and implementations are original.</p>
+</div></section><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

@@ -1,0 +1,529 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>任何流媒体多元模型 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-12-multimodal-ai" data-lesson="12-multimodal-ai/16-mio-any-to-any-streaming" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/12-multimodal-ai/">多模态 AI</a> / LESSON 16</p><h1 class="lesson-title">任何流媒体多元模型</h1><p>MIO and Any-to-Any Streaming Multimodal Models</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>任何流媒体多元模型</h1>
+<blockquote>
+<p>GPT-4o 运输出了大多数开放模型无法复制的产品:一个听到声音,看到视频,并实时回复的代理. 开放生态系统的答案在2024年底是MIO (Wang等人,2024年9月). 通过MIO,文字,图像,语音和音乐都被标记,在交织的序列上训练一个因果变革器,并产生任何方式. 任何GPT (Zhan等人,2024年2月) 是概念的证明;MIO是扩大规模;统一-IO 2 (Allen AI,2023年12月) 是视觉+行动基础的表弟. 这一课中,有四个代币,一个变压器,</p>
+</blockquote>
+<p><strong>Type:</strong> Learn
+<strong>Languages:</strong> Python (stdlib, four-modality token allocator + streaming decode loop)
+<strong>Prerequisites:</strong> Phase 12 · 11 (Chameleon), Phase 6 (Speech and Audio)
+<strong>Time:</strong> ~120 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>设计一个共享词汇库,可以容纳文字,图像,语音和音乐代币,</li>
+<li>对于压缩+重建交易,比较SEED-Tokenizer (图像) 和SpeechTokenizer残余-VQ (言语).</li>
+<li>解释一个四阶段的课程,</li>
+<li>举个三个开放式任何菜谱及其主要的折扣:MIO,AnyGPT,Unified-IO 2.</li>
+</ul>
+<h2>问题</h2>
+<p>统一多模式模型很容易被声称,而且很难在规模上构建.到2024年,大多数&quot;任何到任何&quot;系统都被管道:视觉模型 →文本表示 →语音模型 →音频.每次跳跃都会失去信息,增加延迟,并复杂化训练.GPT-4o的演示视频显示了一个单个模型替代方案,后续反应;开放系统追踪了几个月.</p>
+<p>工程挑战:</p>
+<ul>
+<li>代币化必须存在于每个模式, 压缩不损失, 足以重建, 并以变压器能消耗的速度生产代币.</li>
+<li>一个单词库必须为文本 (32k+),图像 (16k+),语音 (4k+),音乐 (8k+) 配置空间.至少有四万多个条目.</li>
+<li>培训数据必须涵盖每个输入输出对 (文字→图像,图像→语音,语音→图像等) 或模型必须组成.</li>
+<li>输入必须流出代币足够快,以实现对话延迟 (&lt;500ms时间到第一音频字节).</li>
+</ul>
+<h2>概念</h2>
+<h3>对于四种方式的四个代币化器</h3>
+<p>子的标记器堆:</p>
+<ul>
+<li>文字:标准BPE,词汇~32000.</li>
+<li>图片:SEED-Tokenizer (2023) 量化VAE与单独的代码簿,4096条,每张图片的 32x32个代币.</li>
+<li>语音:语音托基尼泽残留-VQ (2023) 将16kHz波形编码成8个层次代码书;第一层是粗的内容,后层添加 prosody 和扬声器身份.</li>
+<li>音乐:类似的残余VQ (Meta的音乐Gen / Encodec家族),4-8本代码书.</li>
+</ul>
+<p>每种模式都产生整数代币.这些代币在共享词汇中获得不同 ID 范围:</p>
+<pre><code>text:   0..31999
+image:  32000..36095  (4096 image tokens)
+speech: 36096..40191  (4096 speech base tokens, plus residual layers)
+music:  40192..48383  (8192 music tokens)
+sep:    48384..48390  (&lt;image&gt;, &lt;speech&gt;, &lt;music&gt;, &lt;/...&gt;, etc.)
+</code></pre>
+<p>总数:约48万个词汇. 输入嵌入和输出投影覆盖了它.</p>
+<h3>流式解码</h3>
+<p>语音生成使用残留VQ.变压器预测基层 (层0) 语音代码;并行解码的残留定量器预测后层.每个层0代码大约为50ms的音频在16kHz.</p>
+<p>流量模式:</p>
+<ol>
+<li>用户在麦克风中说话;实时音频代码器每50ms就发出语音代码.</li>
+<li>随着其到达,MIO 消耗代币 (即时预填+增量前).</li>
+<li>输出代币随着生成而流出;一个平行语音解码器将它们转换为50-150ms延迟的音频样本.</li>
+<li>在MIO纸上,时间到第一个音频字节: ~300-500ms,接近GPT-4o的 ~250ms.</li>
+</ol>
+<p>迷你Omni (arXiv:2408.16725),GLM-4-Voice (arXiv:2412.02612),和Moshi (arXiv:2410.00037) 是互补流通语音LLM设计.</p>
+<h3>四阶段课程</h3>
+<p>国际教育局的培训课程:</p>
+<ol>
+<li>阶段1 排列.大规模的模式对体:文字图像,文字言语,文字音乐.每个对使用自己的代号词汇部分.训练共享词汇.</li>
+<li>阶段 2  交互式.多种方式交互式文件 (图像+视频的博客,转录的播客等).</li>
+<li>增强语音数据,提升语音质量,而不损失文本能力.</li>
+<li>阶段4 SFT. 指示调整各种模式:VQA,字幕写作,叙述,语音对话.</li>
+</ol>
+<p>错过一个阶段会降低特定的能力:跳过第二阶段,模型失去跨模式背景;跳过第三阶段,语言不佳.</p>
+<h3>视觉思想链</h3>
+<p>作为推理步骤,模型发射中间图像代币.为&quot;猫爬树吗?&quot;模型:</p>
+<ol>
+<li>发射<code>&lt;image&gt;</code>图像的图像或图案.</li>
+<li>发出分析图的文字.</li>
+<li>发出了最后的答案.</li>
+</ol>
+<p>预示中介图像作为一个划痕板. 基准在空间推理任务上改进. 这个想法反映了文字推理的思想链.</p>
+<h3>任何竞争对手</h3>
+<ul>
+<li>任何GPT (arXiv:2402.12226):四种模式 (文字,图像,语音,音乐),类似的设计.</li>
+<li>统一IO 2 (arXiv:2312.17172):增加视觉行动输出,深度,正常. 更多任务多样性,规模较小.</li>
+<li>简单的方法: 简单的方法: 简单的方法: 简单的方法:</li>
+<li>(arXiv:2305.11846):可复合的扩散;通过共享的隐形.</li>
+</ul>
+<p>任何GPT是它的概念祖先.</p>
+<h3>延迟预算</h3>
+<p>对于对话产品,每个组件的延迟是重要的:</p>
+<ul>
+<li>微信到音频代码: ~50ms.</li>
+<li>预填 (音频代币+历史):在8B模型上 ~100ms.</li>
+<li>输出标志: ~50ms.</li>
+<li>并行残留VQ+语音解码器: ~100-150ms.</li>
+</ul>
+<p>总时间到第一个音频字节: ~300ms最小.GPT-4o声称 ~250ms.Moshi声称 160ms.MIO/AnyGPT在公众基准的400-600ms范围.</p>
+<h3>为什么任何人都会坚持</h3>
+<p>即使在2026年,任何开放式模型都会在两个轴上追踪闭式模型:</p>
+<ul>
+<li>语音质量.残余VQ代码器是损失的;与ElevenLabs类语音相比,对话语音听起来是机器人.</li>
+<li>问模型&quot;唱你看到的歌&quot;仍然比纯视力任务更经常失败.</li>
+</ul>
+<p>这些是开放的研究问题.Qwen3-Omni (课时12.20) 是2025年最先进的开放尝试.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-efd142a428708a549e1a.png" alt="any-to-any-stream 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>用它</h2>
+<p><code>code/main.py</code>其他:</p>
+<ul>
+<li>定义了四种模式词汇分配,并打印了它.</li>
+<li>通过代币器路由器路由多模进口 (文字,图像,音频片段,音乐) 的列表.</li>
+<li>模拟传输解码,以计算延迟.</li>
+<li>计算预期的时间到第一个音频字节,给出编码器,预填和解码器延迟.</li>
+</ul>
+<h2>运送它</h2>
+<p>这一课产生了<code>outputs/skill-any-to-any-pipeline-auditor.md</code>鉴于对话性产品规格 (入门方式,出门方式,延迟目标),它审计了MIO家族设计选择,并计算了延迟预算.</p>
+<h2>运动</h2>
+<ol>
+<li>
+<p>您的产品接受语音输入,并返回语音输出. 终端延迟预算目标是什么?列出花时间的组件.</p>
+</li>
+<li>
+<p>语音托基尼泽残留-VQ使用8本代码书. 提出为什么平行解码残留水平是必要的 (相对于连续) 以及它带来的延迟节约.</p>
+</li>
+<li>
+<p>您的词汇有32k文字 +4k图像 +4k语音. 添加8k音乐和10个分离器.隐藏 dim4096的嵌入矩阵参数成本是多少?</p>
+</li>
+<li>
+<p>视觉思想链发出了中间的图像.</p>
+</li>
+<li>
+<p>阅读Moshi (arXiv:2410.00037).描述其&quot;内在单独论&quot;技术,并与MIO的视觉链思想进行比较.</p>
+</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Any-to-any</td>
+<td>&quot;Multimodal in/out&quot;</td>
+<td>A single model that accepts and emits text, image, speech, and music in any direction</td>
+</tr>
+<tr>
+<td>Residual-VQ</td>
+<td>&quot;Speech tokenizer stack&quot;</td>
+<td>Multi-codebook tokenization where each layer adds information; base layer is content, later layers are prosody</td>
+</tr>
+<tr>
+<td>SEED-Tokenizer</td>
+<td>&quot;Image codes&quot;</td>
+<td>Discrete image tokenizer with 4096-entry codebook used by MIO</td>
+</tr>
+<tr>
+<td>Chain-of-visual-thought</td>
+<td>&quot;Visual scratchpad&quot;</td>
+<td>The model generates an intermediate image as a reasoning step before its final answer</td>
+</tr>
+<tr>
+<td>Time-to-first-audio-byte</td>
+<td>&quot;TTFAB&quot;</td>
+<td>Latency from user voice to first audio output; &lt;500ms for conversational feel</td>
+</tr>
+<tr>
+<td>Four-stage curriculum</td>
+<td>&quot;Training recipe&quot;</td>
+<td>Alignment -&gt; interleaved -&gt; speech-enhanced -&gt; SFT, in that order</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2409.17692" rel="noreferrer" data-network="true">Wang et al. — MIO (arXiv:2409.17692) <small>↗ 需要联网</small></a></li>
+<li><a href="https://arxiv.org/abs/2402.12226" rel="noreferrer" data-network="true">Zhan et al. — AnyGPT (arXiv:2402.12226) <small>↗ 需要联网</small></a></li>
+<li><a href="https://arxiv.org/abs/2312.17172" rel="noreferrer" data-network="true">Lu et al. — Unified-IO 2 (arXiv:2312.17172) <small>↗ 需要联网</small></a></li>
+<li><a href="https://arxiv.org/abs/2309.05519" rel="noreferrer" data-network="true">Wu et al. — NExT-GPT (arXiv:2309.05519) <small>↗ 需要联网</small></a></li>
+<li><a href="https://arxiv.org/abs/2305.11846" rel="noreferrer" data-network="true">Tang et al. — CoDi (arXiv:2305.11846) <small>↗ 需要联网</small></a></li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>MIO and Any-to-Any Streaming Multimodal Models</h1>
+<blockquote>
+<p>GPT-4o ships a product most open models cannot replicate: an agent that hears voice, sees video, and speaks back in real time. The open-ecosystem answer by late 2024 was MIO (Wang et al., September 2024). MIO tokenizes text, image, speech, and music, trains one causal transformer over the interleaved sequences, and generates any modality to any modality. AnyGPT (Zhan et al., February 2024) was the proof of concept; MIO is the scale-up; Unified-IO 2 (Allen AI, December 2023) is the cousin with vision + action grounding. This lesson reads the any-to-any pattern — four tokenizers, one transformer, streaming-friendly decode.</p>
+</blockquote>
+<p><strong>Type:</strong> Learn
+<strong>Languages:</strong> Python (stdlib, four-modality token allocator + streaming decode loop)
+<strong>Prerequisites:</strong> Phase 12 · 11 (Chameleon), Phase 6 (Speech and Audio)
+<strong>Time:</strong> ~120 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Design a shared vocabulary that hosts text, image, speech, and music tokens without collisions.</li>
+<li>Compare SEED-Tokenizer (images) and SpeechTokenizer residual-VQ (speech) on compression + reconstruction trade-offs.</li>
+<li>Explain the four-stage curriculum that builds up any-to-any generation.</li>
+<li>Name the three open any-to-any recipes and their main trade-offs: MIO, AnyGPT, Unified-IO 2.</li>
+</ul>
+<h2>The Problem</h2>
+<p>A unified multimodal model is easy to claim and hard to build at scale. Most &quot;any-to-any&quot; systems until 2024 were pipelined: vision model → text representation → speech model → audio. Each hop loses information, adds latency, and complicates training. GPT-4o's demo video showed a single-model alternative with subsecond response; open systems trailed by months.</p>
+<p>The engineering challenges:</p>
+<ul>
+<li>Tokenizers must exist for every modality, compress losslessly-enough for reconstruction, and produce tokens at rates the transformer can consume.</li>
+<li>A single vocabulary must allocate space for text (32k+), image (16k+), speech (4k+), music (8k+). Forty-thousand-plus entries minimum.</li>
+<li>Training data must cover every input-output pair (text→image, image→speech, speech→image, etc.) or the model must compose.</li>
+<li>Inference must stream output tokens fast enough for conversational latency (&lt;500ms time-to-first-audio-byte).</li>
+</ul>
+<h2>The Concept</h2>
+<h3>Four tokenizers for four modalities</h3>
+<p>MIO's tokenizer stack:</p>
+<ul>
+<li>Text: standard BPE, vocab ~32000.</li>
+<li>Image: SEED-Tokenizer (2023) — quantized VAE with discrete codebook, 4096 entries, 32x32 tokens per image.</li>
+<li>Speech: SpeechTokenizer residual-VQ (2023) — encodes 16kHz waveform into 8 hierarchical codebooks; first level is coarse content, later levels add prosody and speaker identity.</li>
+<li>Music: similar residual-VQ (Meta's MusicGen / Encodec family), 4-8 codebooks.</li>
+</ul>
+<p>Each modality produces integer tokens. The tokens get disjoint ID ranges in the shared vocabulary:</p>
+<pre><code>text:   0..31999
+image:  32000..36095  (4096 image tokens)
+speech: 36096..40191  (4096 speech base tokens, plus residual layers)
+music:  40192..48383  (8192 music tokens)
+sep:    48384..48390  (&lt;image&gt;, &lt;speech&gt;, &lt;music&gt;, &lt;/...&gt;, etc.)
+</code></pre>
+<p>Total: ~48k vocabulary. The input embedding and output projection span all of it.</p>
+<h3>Streaming decode</h3>
+<p>Speech generation uses residual-VQ. The transformer predicts the base (layer 0) speech tokens; a parallel-decoded residual quantizer predicts the subsequent layers. Each layer 0 token is roughly 50ms of audio at 16kHz.</p>
+<p>The streaming pattern:</p>
+<ol>
+<li>User speaks into mic; real-time audio tokenizer emits speech tokens every 50ms.</li>
+<li>MIO consumes tokens as they arrive (prompt prefill + incremental forward).</li>
+<li>Output tokens stream out as generated; a parallel speech decoder converts them to audio samples with ~50-150ms latency.</li>
+<li>Time-to-first-audio-byte: ~300-500ms in MIO paper, approaching GPT-4o's ~250ms.</li>
+</ol>
+<p>Mini-Omni (arXiv:2408.16725), GLM-4-Voice (arXiv:2412.02612), and Moshi (arXiv:2410.00037) are complementary streaming speech-LLM designs. Moshi in particular achieves 160ms round-trip on a single GPU.</p>
+<h3>Four-stage curriculum</h3>
+<p>MIO's training curriculum:</p>
+<ol>
+<li>Stage 1 — alignment. Large-scale modality-pair corpora: text-image, text-speech, text-music. Each pair uses its own token vocabulary segment. Trains the shared vocabulary.</li>
+<li>Stage 2 — interleaved. Multi-modality interleaved documents (blogs with images + video, podcasts with transcripts, etc.). Trains cross-modality context.</li>
+<li>Stage 3 — speech-enhanced. Extra audio data to lift speech quality without losing text capability.</li>
+<li>Stage 4 — SFT. Instruction tuning across modalities: VQA, captioning, narration, speech-to-speech dialogue.</li>
+</ol>
+<p>Missing a stage degrades specific capabilities: skip stage 2 and the model loses cross-modality context; skip stage 3 and speech is poor.</p>
+<h3>Chain-of-visual-thought</h3>
+<p>MIO introduces chain-of-visual-thought: the model emits intermediate image tokens as a reasoning step. For &quot;is the cat climbing a tree?&quot; the model:</p>
+<ol>
+<li>Emits <code>&lt;image&gt;</code> tokens rendering the scene (from the input image or a sketch).</li>
+<li>Emits text analyzing the sketch.</li>
+<li>Emits the final answer.</li>
+</ol>
+<p>The rendered intermediate image serves as a scratchpad. Benchmarks improve on spatial-reasoning tasks. The idea mirrors chain-of-thought for text reasoning.</p>
+<h3>Competitors in any-to-any</h3>
+<ul>
+<li>AnyGPT (arXiv:2402.12226): 4 modalities (text, image, speech, music), similar design.</li>
+<li>Unified-IO 2 (arXiv:2312.17172): adds vision action outputs, depth, normals. More task diversity, smaller scale.</li>
+<li>NExT-GPT (arXiv:2309.05519): LLM + modality-specific diffusion decoders. Not a single-model approach.</li>
+<li>CoDi (arXiv:2305.11846): composable diffusion; any-to-any via shared latent.</li>
+</ul>
+<p>MIO is the closest to pure-token any-to-any. AnyGPT is its conceptual ancestor.</p>
+<h3>Latency budget</h3>
+<p>For a conversational product, every component's latency matters:</p>
+<ul>
+<li>Mic to audio tokens: ~50ms.</li>
+<li>Prefill (audio tokens + history): ~100ms on an 8B model.</li>
+<li>First output token: ~50ms.</li>
+<li>Parallel residual-VQ + speech decoder: ~100-150ms.</li>
+</ul>
+<p>Total time-to-first-audio-byte: ~300ms minimum. GPT-4o claims ~250ms. Moshi claims 160ms. MIO/AnyGPT are in the 400-600ms range per public benchmarks.</p>
+<h3>Why any-to-any stays hard</h3>
+<p>Even in 2026, open any-to-any models trail closed ones on two axes:</p>
+<ul>
+<li>Speech quality. The residual-VQ tokenizer is lossy; conversational speech sounds robotic compared to ElevenLabs-class voices.</li>
+<li>Cross-modality reasoning. Asking the model &quot;sing about what you see&quot; still fails more often than pure-vision tasks.</li>
+</ul>
+<p>These are open research problems. Qwen3-Omni (Lesson 12.20) is the most advanced open attempt in 2025.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-efd142a428708a549e1a.png" alt="any-to-any-stream 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Use It</h2>
+<p><code>code/main.py</code>:</p>
+<ul>
+<li>Defines the four-modality vocabulary allocation and prints it.</li>
+<li>Routes a list of multimodal inputs (text, image, audio-clip, music) through the tokenizer router.</li>
+<li>Simulates streaming decode for a text-to-speech response with latency counting.</li>
+<li>Computes the expected time-to-first-audio-byte given encoder, prefill, and decoder latencies.</li>
+</ul>
+<h2>Ship It</h2>
+<p>This lesson produces <code>outputs/skill-any-to-any-pipeline-auditor.md</code>. Given a conversational product spec (modalities in, modalities out, latency target), it audits the MIO-family design choices and computes the latency budget.</p>
+<h2>Exercises</h2>
+<ol>
+<li>
+<p>Your product accepts speech input and returns speech output. What's the end-to-end latency budget target? List the components that spend time.</p>
+</li>
+<li>
+<p>SpeechTokenizer residual-VQ uses 8 codebooks. Propose why parallel-decoding the residual levels is necessary (vs sequential) and what latency savings it brings.</p>
+</li>
+<li>
+<p>Your vocabulary has 32k text + 4k image + 4k speech. Add 8k music and ~10 separators. What is the embedding-matrix parameter cost at hidden dim 4096?</p>
+</li>
+<li>
+<p>Chain-of-visual-thought emits an intermediate image. What kinds of questions benefit? What kinds are hurt by the extra tokens?</p>
+</li>
+<li>
+<p>Read Moshi (arXiv:2410.00037). Describe its &quot;inner monologue&quot; technique and compare to MIO's chain-of-visual-thought.</p>
+</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Any-to-any</td>
+<td>&quot;Multimodal in/out&quot;</td>
+<td>A single model that accepts and emits text, image, speech, and music in any direction</td>
+</tr>
+<tr>
+<td>Residual-VQ</td>
+<td>&quot;Speech tokenizer stack&quot;</td>
+<td>Multi-codebook tokenization where each layer adds information; base layer is content, later layers are prosody</td>
+</tr>
+<tr>
+<td>SEED-Tokenizer</td>
+<td>&quot;Image codes&quot;</td>
+<td>Discrete image tokenizer with 4096-entry codebook used by MIO</td>
+</tr>
+<tr>
+<td>Chain-of-visual-thought</td>
+<td>&quot;Visual scratchpad&quot;</td>
+<td>The model generates an intermediate image as a reasoning step before its final answer</td>
+</tr>
+<tr>
+<td>Time-to-first-audio-byte</td>
+<td>&quot;TTFAB&quot;</td>
+<td>Latency from user voice to first audio output; &lt;500ms for conversational feel</td>
+</tr>
+<tr>
+<td>Four-stage curriculum</td>
+<td>&quot;Training recipe&quot;</td>
+<td>Alignment -&gt; interleaved -&gt; speech-enhanced -&gt; SFT, in that order</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2409.17692" rel="noreferrer" data-network="true">Wang et al. — MIO (arXiv:2409.17692) <small>↗ 需要联网</small></a></li>
+<li><a href="https://arxiv.org/abs/2402.12226" rel="noreferrer" data-network="true">Zhan et al. — AnyGPT (arXiv:2402.12226) <small>↗ 需要联网</small></a></li>
+<li><a href="https://arxiv.org/abs/2312.17172" rel="noreferrer" data-network="true">Lu et al. — Unified-IO 2 (arXiv:2312.17172) <small>↗ 需要联网</small></a></li>
+<li><a href="https://arxiv.org/abs/2309.05519" rel="noreferrer" data-network="true">Wu et al. — NExT-GPT (arXiv:2309.05519) <small>↗ 需要联网</small></a></li>
+<li><a href="https://arxiv.org/abs/2305.11846" rel="noreferrer" data-network="true">Tang et al. — CoDi (arXiv:2305.11846) <small>↗ 需要联网</small></a></li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-12-multimodal-ai--16-mio-any-to-any-streaming.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-12-multimodal-ai--16-mio-any-to-any-streaming.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/12-multimodal-ai/16-mio-any-to-any-streaming/code/main.py">phases/12-multimodal-ai/16-mio-any-to-any-streaming/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;MIO-style four-modality tokenizer allocation + streaming decode latency calc.
+
+Stdlib. Prints the vocab layout and a step-by-step latency trace for a
+spoken-dialogue request where MIO consumes speech, generates speech.
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+@dataclass
+class VocabSlot:
+    name: str
+    start: int
+    size: int
+
+    @property
+    def end(self) -&gt; int:
+        return self.start + self.size
+
+
+def build_vocab() -&gt; list[VocabSlot]:
+    slots = []
+    cursor = 0
+    plan = [
+        (&quot;text BPE&quot;,      32000),
+        (&quot;image SEED&quot;,     4096),
+        (&quot;speech L0&quot;,      4096),
+        (&quot;speech L1..L7&quot;, 4096),
+        (&quot;music&quot;,          8192),
+        (&quot;&lt;image&gt;&quot;,           1),
+        (&quot;&lt;/image&gt;&quot;,          1),
+        (&quot;&lt;speech&gt;&quot;,          1),
+        (&quot;&lt;/speech&gt;&quot;,         1),
+        (&quot;&lt;music&gt;&quot;,           1),
+        (&quot;&lt;/music&gt;&quot;,          1),
+    ]
+    for name, size in plan:
+        slots.append(VocabSlot(name=name, start=cursor, size=size))
+        cursor += size
+    return slots
+
+
+def print_vocab(slots: list[VocabSlot]) -&gt; None:
+    print(&quot;\nSHARED VOCABULARY LAYOUT&quot;)
+    print(&quot;-&quot; * 60)
+    print(f&quot;  {&#39;slot&#39;:&lt;18}{&#39;start&#39;:&gt;8}{&#39;end&#39;:&gt;8}{&#39;size&#39;:&gt;8}&quot;)
+    for s in slots:
+        print(f&quot;  {s.name:&lt;18}{s.start:&gt;8}{s.end:&gt;8}{s.size:&gt;8}&quot;)
+    total = slots[-1].end
+    print(f&quot;  {&#39;TOTAL&#39;:&lt;18}{total:&gt;8}{&#39;(vocab size)&#39;:&gt;16}&quot;)
+
+
+def route_inputs(inputs: list[dict]) -&gt; list[dict]:
+    &quot;&quot;&quot;Classify each input and assign a tokenizer path.&quot;&quot;&quot;
+    routed = []
+    for inp in inputs:
+        kind = inp[&quot;kind&quot;]
+        if kind == &quot;text&quot;:
+            path = &quot;BPE&quot;
+        elif kind == &quot;image&quot;:
+            path = &quot;SEED-Tokenizer&quot;
+        elif kind in (&quot;speech&quot;, &quot;voice&quot;):
+            path = &quot;SpeechTokenizer residual-VQ&quot;
+        elif kind == &quot;music&quot;:
+            path = &quot;Encodec&quot;
+        else:
+            path = &quot;UNKNOWN&quot;
+        routed.append({**inp, &quot;path&quot;: path})
+    return routed
+
+
+@dataclass
+class LatencyTrace:
+    label: str
+    ms: float
+
+
+def streaming_decode_latency(
+    prompt_audio_seconds: float = 2.0,
+    model_size_b: int = 8,
+) -&gt; list[LatencyTrace]:
+    trace = []
+    trace.append(LatencyTrace(&quot;mic audio -&gt; speech tokens&quot;,
+                              prompt_audio_seconds * 20))
+    trace.append(LatencyTrace(&quot;prefill prompt tokens&quot;,
+                              80 * (model_size_b / 8.0)))
+    trace.append(LatencyTrace(&quot;first output token&quot;,
+                              40 * (model_size_b / 8.0)))
+    trace.append(LatencyTrace(&quot;residual-VQ layers 1..7&quot;,
+                              30))
+    trace.append(LatencyTrace(&quot;speech decoder (Encodec-like)&quot;,
+                              80))
+    return trace
+
+
+def print_trace(trace: list[LatencyTrace]) -&gt; None:
+    print(&quot;\nSTREAMING DECODE LATENCY (time-to-first-audio-byte)&quot;)
+    print(&quot;-&quot; * 60)
+    total = 0.0
+    for t in trace:
+        total += t.ms
+        print(f&quot;  {t.label:&lt;38}  +{t.ms:&gt;5.0f} ms   (cumul {total:&gt;6.0f})&quot;)
+    print(&quot;-&quot; * 60)
+    print(f&quot;  total TTFAB: {total:.0f} ms&quot;)
+    if total &lt; 500:
+        print(f&quot;  -&gt; conversational feel (GPT-4o-class)&quot;)
+    elif total &lt; 800:
+        print(f&quot;  -&gt; acceptable (first-gen open any-to-any)&quot;)
+    else:
+        print(f&quot;  -&gt; sluggish, consider smaller model or parallel decode&quot;)
+
+
+def demo_chain_of_visual_thought() -&gt; None:
+    print(&quot;\nCHAIN-OF-VISUAL-THOUGHT (MIO)&quot;)
+    print(&quot;-&quot; * 60)
+    prompt = &quot;Is the cat climbing the tree in this photo?&quot;
+    steps = [
+        &quot;user text -&gt; vision tokens&quot;,
+        &quot;model sketches intermediate image &lt;image&gt; ... &lt;/image&gt;&quot;,
+        &quot;model emits text analysis of sketch&quot;,
+        &quot;model concludes with yes/no + justification&quot;,
+    ]
+    print(f&quot;  prompt: {prompt}&quot;)
+    for i, s in enumerate(steps, 1):
+        print(f&quot;    step {i}: {s}&quot;)
+    print(&quot;  wins on spatial-reasoning benchmarks; hurts latency.&quot;)
+
+
+def main() -&gt; None:
+    print(&quot;=&quot; * 60)
+    print(&quot;MIO ANY-TO-ANY STREAMING (Phase 12, Lesson 16)&quot;)
+    print(&quot;=&quot; * 60)
+
+    vocab = build_vocab()
+    print_vocab(vocab)
+
+    print(&quot;\nROUTER: four inputs -&gt; four tokenizers&quot;)
+    print(&quot;-&quot; * 60)
+    inputs = [
+        {&quot;kind&quot;: &quot;text&quot;,   &quot;payload&quot;: &quot;Hello&quot;},
+        {&quot;kind&quot;: &quot;image&quot;,  &quot;payload&quot;: &quot;cat.png&quot;},
+        {&quot;kind&quot;: &quot;voice&quot;,  &quot;payload&quot;: &quot;user.wav&quot;},
+        {&quot;kind&quot;: &quot;music&quot;,  &quot;payload&quot;: &quot;loop.mp3&quot;},
+    ]
+    for r in route_inputs(inputs):
+        print(f&quot;  {r[&#39;kind&#39;]:&lt;8}  &#39;{r[&#39;payload&#39;]}&#39;  -&gt; {r[&#39;path&#39;]}&quot;)
+
+    trace = streaming_decode_latency(prompt_audio_seconds=2.0, model_size_b=8)
+    print_trace(trace)
+
+    demo_chain_of_visual_thought()
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/12-multimodal-ai/16-mio-any-to-any-streaming/outputs/skill-any-to-any-pipeline-auditor.md">phases/12-multimodal-ai/16-mio-any-to-any-streaming/outputs/skill-any-to-any-pipeline-auditor.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: any-to-any-pipeline-auditor
+description: Audit a conversational any-to-any design and compute the latency budget for a MIO / AnyGPT / Moshi-family stack.
+version: 1.0.0
+phase: 12
+lesson: 16
+tags: [mio, anygpt, moshi, any-to-any, streaming, ttfab]
+---
+
+Given a conversational product (speech in / speech out, optional vision, optional music), a model size, and a target latency, audit the any-to-any design and produce a viable configuration.
+
+Produce:
+
+1. Modality mix. Which modalities in, which out. Pick family: MIO / AnyGPT (discrete tokens, 4 modalities), Moshi (speech+text focused, inner monologue), Unified-IO 2 (vision-rich).
+2. Shared vocabulary plan. ID ranges for text + image + speech + music + separators. Total size typically 40-50k.
+3. Tokenizer stack. BPE + SEED + SpeechTokenizer-RVQ + Encodec. Highlight which are still bottlenecks (speech quality typically).
+4. Training curriculum. Four-stage MIO recipe, or two-stage for speech-focused Moshi.
+5. TTFAB latency budget. Mic encoder + prefill + first token + residual decode + speech decoder. Compare to ~500ms conversational bar.
+6. Quality-vs-latency pareto. Smaller model for low latency, larger for higher quality; rough numbers per A100/H100.
+
+Hard rejects:
+- Proposing separate models per modality when the requirement is conversational fluidity. The pipeline latency stacks and feels worse.
+- Using a speech tokenizer with only 1 codebook layer. Quality will be robotic for any production voice.
+- Claiming MIO&#39;s TTFAB matches GPT-4o. It does not yet; Moshi 160ms is the closest open number.
+
+Refusal rules:
+- If target TTFAB &lt;200ms, refuse MIO-scale (8B+) and recommend Moshi-class (7B, tuned for speech) or a smaller speech-specialized model.
+- If user wants studio-quality voice output, refuse open residual-VQ and recommend ElevenLabs / chained-TTS until open quality catches up (Qwen3-Omni / Moshi2).
+- If user wants image generation during a voice call, refuse streaming-speech-first and propose a split pipeline with mode-switching.
+
+Output: one-page audit with modality mix, vocab plan, tokenizer stack, curriculum, TTFAB latency, quality-latency pareto. End with arXiv 2409.17692 (MIO), 2410.00037 (Moshi), 2402.12226 (AnyGPT).
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原课程未提供测验。</p></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/12-multimodal-ai/15-janus-pro-decoupled-encoders/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/12-multimodal-ai/17-video-language-temporal-grounding/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/12-multimodal-ai/16-mio-any-to-any-streaming/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

@@ -1,0 +1,1130 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>装载训练过的重量 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-19-capstone-projects" data-lesson="19-capstone-projects/37-loading-pretrained-weights" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/19-capstone-projects/">综合项目</a> / LESSON 37</p><h1 class="lesson-title">装载训练过的重量</h1><p>Loading Pretrained Weights</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>装载训练过的重量</h1>
+<blockquote>
+<p>从零开始训练1200万参数模型是一个预算决定;加载已发布的检查点是星期二.本课程将预训练的GPT-2风格重量从安全感器文件中加载到35课时的确切架构中,并将参数名称映射片段进行散步,智能产生了继续证明负载工作.没有网络,没有第三方加载器,没有不透明的魔术.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 19 lessons 30 to 36
+<strong>Time:</strong> ~90 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>阅读一个安全感应器文件<code>safetensors</code>检查子名称和形状.</li>
+<li>根据教程35GPT模型,每个预训练的参数名称都将被映射到一个参数中.</li>
+<li>处理公布的GPT-2重量和该轨道中的模型之间的两个名称公约: <code>wte/wpe/h.N.attn.c_attn/c_proj</code>其他<code>mlp.c_fc/c_proj</code>根据当地名称<code>tok_embed/pos_embed/blocks.N.attn.qkv/out_proj</code>其他<code>mlp.fc1/fc2</code>现在,我们要去.</li>
+<li>在任何重量分配发生之前,检测和拒绝与明显错误的形状不匹配.</li>
+<li>生成加载权重的短续集,并确认代币来自加载分布,而不是随机初始化.</li>
+</ul>
+<h2>问题</h2>
+<p>发布的权重不适用于您的架构.它们包含原始实现使用的名称.预训练文件有<code>transformer.h.0.attn.c_attn.weight</code>形状<code>(2304, 768)</code>您的模型预计<code>blocks.0.attn.qkv.weight</code>形状<code>(2304, 768)</code>(在不同的布局会议中相同的矩阵) 或您的模型使用<code>nn.Linear</code>输入的矩阵存储.同一个参数显示出三个微妙不同的身份 (名称,形状,字节布局),加载器必须协调所有三个.</p>
+<p>随着一个模块的复制,它将正确的子放在错误的地方,你得到了一个模型,它产生了无稽之谈.一个模块拒绝复制,但没有记录任何东西,让你猜测哪个子没有降落.<code>LoadReport</code>总结了击中,错失和形状不一致,</p>
+<h2>概念</h2>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-640531d65dc7644e7eb8.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>名称地图表只是一个从字符串到字符串的函数.形状检查是一个如果. 赋值发生在内<code>torch.no_grad()</code>报告中包含了每个名字的结果.</p>
+<h3>基因二级命名公约</h3>
+<p>发表的GPT-2权重以以下名称命名:</p>
+<table>
+<thead>
+<tr>
+<th>Pretrained name</th>
+<th>Shape</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>wte.weight</code></td>
+<td>(50257, 768)</td>
+<td>Token embedding</td>
+</tr>
+<tr>
+<td><code>wpe.weight</code></td>
+<td>(1024, 768)</td>
+<td>Position embedding</td>
+</tr>
+<tr>
+<td><code>h.N.ln_1.weight</code></td>
+<td>(768,)</td>
+<td>LayerNorm 1 scale at block N</td>
+</tr>
+<tr>
+<td><code>h.N.ln_1.bias</code></td>
+<td>(768,)</td>
+<td>LayerNorm 1 shift at block N</td>
+</tr>
+<tr>
+<td><code>h.N.attn.c_attn.weight</code></td>
+<td>(768, 2304)</td>
+<td>Fused QKV linear weight</td>
+</tr>
+<tr>
+<td><code>h.N.attn.c_attn.bias</code></td>
+<td>(2304,)</td>
+<td>Fused QKV linear bias</td>
+</tr>
+<tr>
+<td><code>h.N.attn.c_proj.weight</code></td>
+<td>(768, 768)</td>
+<td>Attention output projection</td>
+</tr>
+<tr>
+<td><code>h.N.attn.c_proj.bias</code></td>
+<td>(768,)</td>
+<td>Attention output projection bias</td>
+</tr>
+<tr>
+<td><code>h.N.ln_2.weight</code></td>
+<td>(768,)</td>
+<td>LayerNorm 2 scale</td>
+</tr>
+<tr>
+<td><code>h.N.ln_2.bias</code></td>
+<td>(768,)</td>
+<td>LayerNorm 2 shift</td>
+</tr>
+<tr>
+<td><code>h.N.mlp.c_fc.weight</code></td>
+<td>(768, 3072)</td>
+<td>MLP fc1 weight</td>
+</tr>
+<tr>
+<td><code>h.N.mlp.c_fc.bias</code></td>
+<td>(3072,)</td>
+<td>MLP fc1 bias</td>
+</tr>
+<tr>
+<td><code>h.N.mlp.c_proj.weight</code></td>
+<td>(3072, 768)</td>
+<td>MLP fc2 weight</td>
+</tr>
+<tr>
+<td><code>h.N.mlp.c_proj.bias</code></td>
+<td>(768,)</td>
+<td>MLP fc2 bias</td>
+</tr>
+<tr>
+<td><code>ln_f.weight</code></td>
+<td>(768,)</td>
+<td>Final LayerNorm scale</td>
+</tr>
+<tr>
+<td><code>ln_f.bias</code></td>
+<td>(768,)</td>
+<td>Final LayerNorm shift</td>
+</tr>
+</tbody>
+</table>
+<p>两次惊喜计划.<code>c_attn</code>现在<code>c_proj</code>现在<code>c_fc</code>线性图像是存储的,与矩阵相对的转移.<code>nn.Linear.weight</code>运载器在分配过程中转移.LM头根本不在文件中;模型依赖于重量绑定.<code>wte</code>现在,我们可以把头部设置为一个字母.<code>wte</code>接地.</p>
+<h3>地方命名大会</h3>
+<p>在此轨道中的模型使用描述名称:</p>
+<table>
+<thead>
+<tr>
+<th>Local name</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>tok_embed.weight</code></td>
+<td>Token embedding</td>
+</tr>
+<tr>
+<td><code>pos_embed.weight</code></td>
+<td>Position embedding</td>
+</tr>
+<tr>
+<td><code>blocks.N.ln1.scale</code></td>
+<td>LayerNorm 1 scale at block N</td>
+</tr>
+<tr>
+<td><code>blocks.N.ln1.shift</code></td>
+<td>LayerNorm 1 shift</td>
+</tr>
+<tr>
+<td><code>blocks.N.attn.qkv.weight</code></td>
+<td>Fused QKV</td>
+</tr>
+<tr>
+<td><code>blocks.N.attn.qkv.bias</code></td>
+<td>Fused QKV bias</td>
+</tr>
+<tr>
+<td><code>blocks.N.attn.out_proj.weight</code></td>
+<td>Attention output projection</td>
+</tr>
+<tr>
+<td><code>blocks.N.attn.out_proj.bias</code></td>
+<td>Output projection bias</td>
+</tr>
+<tr>
+<td><code>blocks.N.ln2.scale</code></td>
+<td>LayerNorm 2 scale</td>
+</tr>
+<tr>
+<td><code>blocks.N.ln2.shift</code></td>
+<td>LayerNorm 2 shift</td>
+</tr>
+<tr>
+<td><code>blocks.N.mlp.fc1.weight</code></td>
+<td>MLP fc1</td>
+</tr>
+<tr>
+<td><code>blocks.N.mlp.fc1.bias</code></td>
+<td>MLP fc1 bias</td>
+</tr>
+<tr>
+<td><code>blocks.N.mlp.fc2.weight</code></td>
+<td>MLP fc2</td>
+</tr>
+<tr>
+<td><code>blocks.N.mlp.fc2.bias</code></td>
+<td>MLP fc2 bias</td>
+</tr>
+<tr>
+<td><code>final_ln.scale</code></td>
+<td>Final LayerNorm scale</td>
+</tr>
+<tr>
+<td><code>final_ln.shift</code></td>
+<td>Final LayerNorm shift</td>
+</tr>
+</tbody>
+</table>
+<p>图表是一个固定函数,课程将它作为一个命令,</p>
+<h3>子固定</h3>
+<p>实际GPT-2重量为0.5GB.演示程序不下载它们;它在首次运行时生成一个小的安全感应器装置,与精确的GPT-2命名公约和适合d_model 192的12块模型的形状而不是768.该装置具有适当的结构来执行加载器中的每个代码路径.将该装置换为实际文件,加载器无需修改.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-be91225f6272cc359651.png" alt="cc-weight-remap 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<p><code>code/main.py</code>执行:</p>
+<ul>
+<li>经历了这段经验.<code>GPTModel</code>所以这门课程是自封的.</li>
+<li><code>make_pretrained_to_local(num_layers)</code>通过此,我们可以扩大每个层次的输入.</li>
+<li><code>load_safetensors(model, path)</code>它们可以进行代码,绘制它们,检查形状,转换 conv1d式的权重,并分配在<code>torch.no_grad()</code>返回一个<code>LoadReport</code>现在,我们要去.</li>
+<li><code>make_stub_safetensors(path, cfg)</code>它们可以生成一个具有精确预先训练的命名规则的固定文件.</li>
+<li>创建一个演示<code>outputs/gpt2-stub.safetensors</code>在第一次运行时,构建一个新型模型,从随机 init生成的连续性录取,加载了,捕获了另一个连续性,打印了两者,并验证了两者是否不同 (负载实际上改变了模型).</li>
+</ul>
+<p>运行它:</p>
+<pre><code class="language-bash">python3 code/main.py
+</code></pre>
+<p>输出:固定路径,每名负载日志, a <code>LoadReport</code>总结,在负载前的延续,在负载后的延续,以及在单个故意被注入装置中的坏子上出现的形状不匹配,从而实现故障路径.</p>
+<h2>堆</h2>
+<ul>
+<li><code>safetensors</code>对于磁盘格式和流媒体读器.</li>
+<li><code>torch</code>对于模型和任务数学.</li>
+<li>没有.<code>transformers</code>没有<code>huggingface_hub</code>没有网络通话.</li>
+</ul>
+<h2>野生生产模式</h2>
+<p>只有三个模式使载体能够与你不创造的重量接触.</p>
+<p>**Always validate the file before any assignment.**打开文件,列出每个子名称及其dtype和形状,运行完整的映射,并只在成功后开始分配.</p>
+<p>**Log every assignment with the source name and the destination name.**记器告诉你哪个子落在哪里; 替代方法是读取六.<code>LoadReport</code>在本课程中,数据类 <code>loaded</code>现在<code>missing</code>现在<code>unexpected</code>其他<code>shape_mismatch</code>列表并在结尾打印总结.</p>
+<p>**The LM head is a weight tying alias, not a separate copy.**设置<code>model.lm_head.weight = model.tok_embed.weight</code>装载后<code>tok_embed</code>复制嵌入矩阵成一个新的图案.<code>lm_head.weight</code>参数打破结合, 静静地加倍参数数.</p>
+<h2>用它</h2>
+<ul>
+<li>载体可以用于使用预训练命名公约的任何安全传感器文件.真正的GPT-2文件 (小/中/大/xl) 没有代码更改工作;只有模型配置不同.</li>
+<li>根据该规则,在使用该规则的基础上, 测量量量和测量量量量均保持相同.</li>
+<li>负载后的智能生成是一个快速的门户:如果负载后的样本看起来像负载前的样本,负载没有改变模型,这意味着地图静默错过了每个子.</li>
+</ul>
+<h2>运动</h2>
+<ol>
+<li>添加一个<code>dtype</code>对于载体来说,每个子被投向目标d类型的参数 (<code>bfloat16</code>现在<code>float16</code>现在<code>float32</code>) 在任务期间. 确认<code>float32</code>模型可以降低到<code>bfloat16</code>并且仍然产生.</li>
+<li>添加一个<code>expected_layers</code>拒绝加载一个检查站的论点<code>h.N</code>指数不符合模型的指数<code>num_layers</code>现在,我们要去.</li>
+<li>插入载体到课35代函数中,并生成两个侧面的样本:一个来自随机 init,一个来自载体.</li>
+<li>添加出口路径:使用预训练命名公约将当前模型状态写入新型安全感器文件. 循环访问加载器并确认报告没有任何形状不一致.</li>
+<li>延长时间<code>NAME_MAP</code>处理LLaMA命名公约 (无偏见,RMSNorm,合并的qkv布局) 并重新运行加载器在您生成的LLaMA固定器上.</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Name map</td>
+<td>&quot;Key remapping&quot;</td>
+<td>The function from pretrained tensor names to local parameter names; usually a literal dict with one entry per layer index expanded over a loop</td>
+</tr>
+<tr>
+<td>Shape mismatch</td>
+<td>&quot;Bad shape&quot;</td>
+<td>The pretrained tensor exists under the mapped name but its dimensions disagree with the local parameter; the loader refuses to assign and logs the pair</td>
+</tr>
+<tr>
+<td>Transpose-on-load</td>
+<td>&quot;Conv1d layout&quot;</td>
+<td>Published GPT-2 stores attention and MLP projections in the transpose of what nn.Linear expects; the loader transposes during assignment</td>
+</tr>
+<tr>
+<td>Weight tying alias</td>
+<td>&quot;Shared LM head&quot;</td>
+<td>Setting model.lm_head.weight = model.tok_embed.weight so the head and embedding share storage; the head is not in the file because of this</td>
+</tr>
+<tr>
+<td>Load report</td>
+<td>&quot;Coverage summary&quot;</td>
+<td>A small dataclass that tracks loaded, missing, unexpected, and shape_mismatch lists; printing it is how you tell whether the load succeeded</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li>阶段19课 35 对于接收重量的建筑.</li>
+<li>训练循环的第19阶段课程36:</li>
+<li>阶段10课时,我们将对记忆紧张时的载重进行量化.</li>
+<li>第十阶段课程13 (构建一个完整的LLM管道)</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Loading Pretrained Weights</h1>
+<blockquote>
+<p>Training a 124 million parameter model from scratch is a budget decision; loading a published checkpoint is a Tuesday. This lesson loads pretrained GPT-2 style weights from a safetensors file into the exact architecture from lesson 35, walks the parameter name mapping piece by piece, and sanity generates a continuation to prove the load worked. No network, no third party loaders, no opaque magic.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 19 lessons 30 to 36
+<strong>Time:</strong> ~90 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Read a safetensors file with the <code>safetensors</code> Python library and inspect the tensor names and shapes.</li>
+<li>Map each pretrained parameter name onto a parameter inside the lesson 35 GPT model.</li>
+<li>Handle the two name conventions that differ between published GPT-2 weights and the model in this track: <code>wte/wpe/h.N.attn.c_attn/c_proj</code> and <code>mlp.c_fc/c_proj</code> versus the locally named <code>tok_embed/pos_embed/blocks.N.attn.qkv/out_proj</code> and <code>mlp.fc1/fc2</code>.</li>
+<li>Detect and refuse a shape mismatch with a clear error before any weight assignment happens.</li>
+<li>Generate a short continuation with the loaded weights and confirm the tokens come from the loaded distribution, not the randomly initialized one.</li>
+</ul>
+<h2>The Problem</h2>
+<p>Published weights are not packaged for your architecture. They carry the names the original implementation used. The pretrained file has <code>transformer.h.0.attn.c_attn.weight</code> of shape <code>(2304, 768)</code>; your model expects <code>blocks.0.attn.qkv.weight</code> of shape <code>(2304, 768)</code> (which is the same matrix in a different layout convention) or your model uses <code>nn.Linear</code> which stores the matrix transposed. The same parameter shows up with three subtly different identities (name, shape, byte layout) and the loader has to reconcile all three.</p>
+<p>A loader that copies blindly puts the right tensor in the wrong place and you get a model that generates nonsense. A loader that refuses to copy when the shape differs but logs nothing leaves you guessing which tensor failed to land. The loader in this lesson is explicit: every assignment is logged, every shape is checked, and a <code>LoadReport</code> summarizes hits, misses, and shape mismatches so you can read what happened.</p>
+<h2>The Concept</h2>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-640531d65dc7644e7eb8.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>The name mapper is just a function from string to string. The shape check is one if. The assignment happens inside <code>torch.no_grad()</code> so autograd does not track the load. The report holds the outcome of every name.</p>
+<h3>The GPT-2 naming convention</h3>
+<p>Published GPT-2 weights live under names like:</p>
+<table>
+<thead>
+<tr>
+<th>Pretrained name</th>
+<th>Shape</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>wte.weight</code></td>
+<td>(50257, 768)</td>
+<td>Token embedding</td>
+</tr>
+<tr>
+<td><code>wpe.weight</code></td>
+<td>(1024, 768)</td>
+<td>Position embedding</td>
+</tr>
+<tr>
+<td><code>h.N.ln_1.weight</code></td>
+<td>(768,)</td>
+<td>LayerNorm 1 scale at block N</td>
+</tr>
+<tr>
+<td><code>h.N.ln_1.bias</code></td>
+<td>(768,)</td>
+<td>LayerNorm 1 shift at block N</td>
+</tr>
+<tr>
+<td><code>h.N.attn.c_attn.weight</code></td>
+<td>(768, 2304)</td>
+<td>Fused QKV linear weight</td>
+</tr>
+<tr>
+<td><code>h.N.attn.c_attn.bias</code></td>
+<td>(2304,)</td>
+<td>Fused QKV linear bias</td>
+</tr>
+<tr>
+<td><code>h.N.attn.c_proj.weight</code></td>
+<td>(768, 768)</td>
+<td>Attention output projection</td>
+</tr>
+<tr>
+<td><code>h.N.attn.c_proj.bias</code></td>
+<td>(768,)</td>
+<td>Attention output projection bias</td>
+</tr>
+<tr>
+<td><code>h.N.ln_2.weight</code></td>
+<td>(768,)</td>
+<td>LayerNorm 2 scale</td>
+</tr>
+<tr>
+<td><code>h.N.ln_2.bias</code></td>
+<td>(768,)</td>
+<td>LayerNorm 2 shift</td>
+</tr>
+<tr>
+<td><code>h.N.mlp.c_fc.weight</code></td>
+<td>(768, 3072)</td>
+<td>MLP fc1 weight</td>
+</tr>
+<tr>
+<td><code>h.N.mlp.c_fc.bias</code></td>
+<td>(3072,)</td>
+<td>MLP fc1 bias</td>
+</tr>
+<tr>
+<td><code>h.N.mlp.c_proj.weight</code></td>
+<td>(3072, 768)</td>
+<td>MLP fc2 weight</td>
+</tr>
+<tr>
+<td><code>h.N.mlp.c_proj.bias</code></td>
+<td>(768,)</td>
+<td>MLP fc2 bias</td>
+</tr>
+<tr>
+<td><code>ln_f.weight</code></td>
+<td>(768,)</td>
+<td>Final LayerNorm scale</td>
+</tr>
+<tr>
+<td><code>ln_f.bias</code></td>
+<td>(768,)</td>
+<td>Final LayerNorm shift</td>
+</tr>
+</tbody>
+</table>
+<p>Two surprises to plan for. The <code>c_attn</code>, <code>c_proj</code>, <code>c_fc</code> linears are stored with the matrix transposed relative to what <code>nn.Linear.weight</code> expects. The loader transposes during assignment. The LM head is not in the file at all; the model relies on weight tying with <code>wte</code>, so the head is set by aliasing once <code>wte</code> lands.</p>
+<h3>The local naming convention</h3>
+<p>The model in this track uses descriptive names:</p>
+<table>
+<thead>
+<tr>
+<th>Local name</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>tok_embed.weight</code></td>
+<td>Token embedding</td>
+</tr>
+<tr>
+<td><code>pos_embed.weight</code></td>
+<td>Position embedding</td>
+</tr>
+<tr>
+<td><code>blocks.N.ln1.scale</code></td>
+<td>LayerNorm 1 scale at block N</td>
+</tr>
+<tr>
+<td><code>blocks.N.ln1.shift</code></td>
+<td>LayerNorm 1 shift</td>
+</tr>
+<tr>
+<td><code>blocks.N.attn.qkv.weight</code></td>
+<td>Fused QKV</td>
+</tr>
+<tr>
+<td><code>blocks.N.attn.qkv.bias</code></td>
+<td>Fused QKV bias</td>
+</tr>
+<tr>
+<td><code>blocks.N.attn.out_proj.weight</code></td>
+<td>Attention output projection</td>
+</tr>
+<tr>
+<td><code>blocks.N.attn.out_proj.bias</code></td>
+<td>Output projection bias</td>
+</tr>
+<tr>
+<td><code>blocks.N.ln2.scale</code></td>
+<td>LayerNorm 2 scale</td>
+</tr>
+<tr>
+<td><code>blocks.N.ln2.shift</code></td>
+<td>LayerNorm 2 shift</td>
+</tr>
+<tr>
+<td><code>blocks.N.mlp.fc1.weight</code></td>
+<td>MLP fc1</td>
+</tr>
+<tr>
+<td><code>blocks.N.mlp.fc1.bias</code></td>
+<td>MLP fc1 bias</td>
+</tr>
+<tr>
+<td><code>blocks.N.mlp.fc2.weight</code></td>
+<td>MLP fc2</td>
+</tr>
+<tr>
+<td><code>blocks.N.mlp.fc2.bias</code></td>
+<td>MLP fc2 bias</td>
+</tr>
+<tr>
+<td><code>final_ln.scale</code></td>
+<td>Final LayerNorm scale</td>
+</tr>
+<tr>
+<td><code>final_ln.shift</code></td>
+<td>Final LayerNorm shift</td>
+</tr>
+</tbody>
+</table>
+<p>The mapping is a fixed function. The lesson ships it as a dict that the loader iterates.</p>
+<h3>The stub fixture</h3>
+<p>Real GPT-2 weights are 0.5 GB. The demo does not download them; it generates a small safetensors fixture at first run, with the exact GPT-2 naming convention and shapes appropriate to a 12-block model at d_model 192 instead of 768. The fixture has the right structure to exercise every code path in the loader. Swap the fixture for the real file and the loader works without modification.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-be91225f6272cc359651.png" alt="cc-weight-remap 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<p><code>code/main.py</code> implements:</p>
+<ul>
+<li>A small replica of the lesson 35 <code>GPTModel</code> so this lesson is self contained.</li>
+<li><code>make_pretrained_to_local(num_layers)</code> which expands the per-layer entries.</li>
+<li><code>load_safetensors(model, path)</code> which iterates names, maps them, checks shape, transposes the conv1d-style weights, and assigns under <code>torch.no_grad()</code>. Returns a <code>LoadReport</code>.</li>
+<li><code>make_stub_safetensors(path, cfg)</code> which generates a fixture file with the exact pretrained naming convention.</li>
+<li>A demo that creates <code>outputs/gpt2-stub.safetensors</code> on first run, builds a fresh model, captures one generated continuation from random init, loads the stub, captures another continuation, prints both, and verifies the two are different (the load actually changed the model).</li>
+</ul>
+<p>Run it:</p>
+<pre><code class="language-bash">python3 code/main.py
+</code></pre>
+<p>Output: the fixture path, a per-name load log, a <code>LoadReport</code> summary, a continuation before the load, a continuation after the load, and a shape mismatch on a single intentionally bad tensor injected into the fixture so the failure path is exercised.</p>
+<h2>Stack</h2>
+<ul>
+<li><code>safetensors</code> for the on disk format and a streaming reader.</li>
+<li><code>torch</code> for the model and the assignment math.</li>
+<li>No <code>transformers</code>, no <code>huggingface_hub</code>, no network calls.</li>
+</ul>
+<h2>Production patterns in the wild</h2>
+<p>Three patterns make the loader survive contact with weights you did not create.</p>
+<p><strong>Always validate the file before any assignment.</strong> Open the file, list every tensor name with its dtype and shape, run the full mapping with shape checks, and only on success start assigning. Half-loaded models are silent failure machines.</p>
+<p><strong>Log every assignment with the source name and the destination name.</strong> When something looks wrong, the log tells you which tensor landed where; the alternative is reading hexdumps. The <code>LoadReport</code> dataclass in this lesson tracks <code>loaded</code>, <code>missing</code>, <code>unexpected</code>, and <code>shape_mismatch</code> lists and prints a summary at the end.</p>
+<p><strong>The LM head is a weight tying alias, not a separate copy.</strong> Setting <code>model.lm_head.weight = model.tok_embed.weight</code> after loading <code>tok_embed</code> is the canonical pattern. Copying the embedding matrix into a fresh <code>lm_head.weight</code> parameter breaks tying and quietly doubles your parameter count.</p>
+<h2>Use It</h2>
+<ul>
+<li>The loader works for any safetensors file that uses the pretrained naming convention. Real GPT-2 files (small / medium / large / xl) work without code changes; only the model config differs.</li>
+<li>The same pattern extends to LLaMA, Mistral, Qwen weights once you update the name map. The shape checks and the report stay identical.</li>
+<li>Sanity generation after a load is a quick gate: if the post-load samples look like the pre-load samples, the load did not change the model, which means the mapping silently missed every tensor.</li>
+</ul>
+<h2>Exercises</h2>
+<ol>
+<li>Add a <code>dtype</code> argument to the loader that casts each tensor to a target dtype (<code>bfloat16</code>, <code>float16</code>, <code>float32</code>) during assignment. Confirm a <code>float32</code> model can be downcast to <code>bfloat16</code> and still generate.</li>
+<li>Add an <code>expected_layers</code> argument that refuses to load a checkpoint whose <code>h.N</code> indices do not match the model's <code>num_layers</code>.</li>
+<li>Plug the loader into the lesson 35 generation function and produce two side by side samples: one from random init, one from the loaded fixture.</li>
+<li>Add an export path: write the current model state into a fresh safetensors file using the pretrained naming convention. Round trip the loader and confirm the report has zero shape mismatches.</li>
+<li>Extend <code>NAME_MAP</code> to handle the LLaMA naming convention (no biases, RMSNorm, fused qkv layout) and re-run the loader on a stub LLaMA fixture you generate.</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Name map</td>
+<td>&quot;Key remapping&quot;</td>
+<td>The function from pretrained tensor names to local parameter names; usually a literal dict with one entry per layer index expanded over a loop</td>
+</tr>
+<tr>
+<td>Shape mismatch</td>
+<td>&quot;Bad shape&quot;</td>
+<td>The pretrained tensor exists under the mapped name but its dimensions disagree with the local parameter; the loader refuses to assign and logs the pair</td>
+</tr>
+<tr>
+<td>Transpose-on-load</td>
+<td>&quot;Conv1d layout&quot;</td>
+<td>Published GPT-2 stores attention and MLP projections in the transpose of what nn.Linear expects; the loader transposes during assignment</td>
+</tr>
+<tr>
+<td>Weight tying alias</td>
+<td>&quot;Shared LM head&quot;</td>
+<td>Setting model.lm_head.weight = model.tok_embed.weight so the head and embedding share storage; the head is not in the file because of this</td>
+</tr>
+<tr>
+<td>Load report</td>
+<td>&quot;Coverage summary&quot;</td>
+<td>A small dataclass that tracks loaded, missing, unexpected, and shape_mismatch lists; printing it is how you tell whether the load succeeded</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li>Phase 19 lesson 35 for the architecture that receives the weights.</li>
+<li>Phase 19 lesson 36 for the training loop that produces a checkpoint of the same shape.</li>
+<li>Phase 10 lesson 11 (quantization) for what to do with the loaded weights when memory is tight.</li>
+<li>Phase 10 lesson 13 (building a complete LLM pipeline) for the full lifecycle around load and inference.</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-19-capstone-projects--37-loading-pretrained-weights.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-19-capstone-projects--37-loading-pretrained-weights.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/37-loading-pretrained-weights/code/main.py">phases/19-capstone-projects/37-loading-pretrained-weights/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Load pretrained GPT-2-style weights from safetensors into the lesson 35 architecture.
+
+Reads a safetensors file using the `safetensors` library, maps the pretrained
+parameter names (`wte`, `wpe`, `h.N.attn.c_attn`, ...) onto the local names
+(`tok_embed`, `pos_embed`, `blocks.N.attn.qkv`, ...), checks shapes, transposes
+the conv1d-style weight layout used by published GPT-2 checkpoints, and assigns
+under `torch.no_grad()`. The LM head is a weight tying alias on `tok_embed`,
+so it is not in the file.
+
+To keep the demo offline, `make_stub_safetensors` generates a fixture at first
+run with the exact pretrained naming convention. Swap the fixture for a real
+GPT-2 file and the loader works without modification.
+
+Run: python3 code/main.py
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from safetensors import safe_open
+from safetensors.torch import save_file
+
+HERE = Path(__file__).resolve().parent
+OUTPUTS = HERE.parent / &quot;outputs&quot;
+OUTPUTS.mkdir(parents=True, exist_ok=True)
+STUB_PATH = OUTPUTS / &quot;gpt2-stub.safetensors&quot;
+
+
+@dataclass
+class ModelConfig:
+    &quot;&quot;&quot;Configuration aligned with the lesson 35 reference; the stub uses a smaller d_model.&quot;&quot;&quot;
+
+    vocab_size: int = 50257
+    context_length: int = 1024
+    d_model: int = 768
+    num_heads: int = 12
+    num_layers: int = 12
+    mlp_expansion: int = 4
+    dropout: float = 0.0
+    use_bias: bool = True
+    weight_tying: bool = True
+
+
+class LayerNorm(nn.Module):
+    def __init__(self, d_model: int, eps: float = 1e-5) -&gt; None:
+        super().__init__()
+        self.eps = eps
+        self.scale = nn.Parameter(torch.ones(d_model))
+        self.shift = nn.Parameter(torch.zeros(d_model))
+
+    def forward(self, x: torch.Tensor) -&gt; torch.Tensor:
+        mean = x.mean(dim=-1, keepdim=True)
+        var = x.var(dim=-1, keepdim=True, unbiased=False)
+        return self.scale * (x - mean) / torch.sqrt(var + self.eps) + self.shift
+
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, cfg: ModelConfig) -&gt; None:
+        super().__init__()
+        if cfg.d_model % cfg.num_heads != 0:
+            raise ValueError(&quot;d_model must be divisible by num_heads&quot;)
+        self.d_model = cfg.d_model
+        self.num_heads = cfg.num_heads
+        self.head_dim = cfg.d_model // cfg.num_heads
+        self.context_length = cfg.context_length
+        self.qkv = nn.Linear(cfg.d_model, 3 * cfg.d_model, bias=cfg.use_bias)
+        self.out_proj = nn.Linear(cfg.d_model, cfg.d_model, bias=cfg.use_bias)
+        self.attn_dropout = nn.Dropout(cfg.dropout)
+        self.resid_dropout = nn.Dropout(cfg.dropout)
+        mask = torch.triu(
+            torch.ones(cfg.context_length, cfg.context_length, dtype=torch.bool),
+            diagonal=1,
+        )
+        self.register_buffer(&quot;causal_mask&quot;, mask, persistent=False)
+
+    def forward(self, x: torch.Tensor) -&gt; torch.Tensor:
+        batch, seq, dim = x.shape
+        qkv = self.qkv(x)
+        q, k, v = qkv.split(self.d_model, dim=-1)
+        q = q.view(batch, seq, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(batch, seq, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(batch, seq, self.num_heads, self.head_dim).transpose(1, 2)
+        scores = q @ k.transpose(-2, -1) / math.sqrt(self.head_dim)
+        scores = scores.masked_fill(self.causal_mask[:seq, :seq], float(&quot;-inf&quot;))
+        attn = F.softmax(scores, dim=-1)
+        attn = self.attn_dropout(attn)
+        out = (attn @ v).transpose(1, 2).contiguous().view(batch, seq, dim)
+        return self.resid_dropout(self.out_proj(out))
+
+
+class FeedForward(nn.Module):
+    def __init__(self, cfg: ModelConfig) -&gt; None:
+        super().__init__()
+        hidden = cfg.mlp_expansion * cfg.d_model
+        self.fc1 = nn.Linear(cfg.d_model, hidden, bias=cfg.use_bias)
+        self.act = nn.GELU(approximate=&quot;tanh&quot;)
+        self.fc2 = nn.Linear(hidden, cfg.d_model, bias=cfg.use_bias)
+        self.dropout = nn.Dropout(cfg.dropout)
+
+    def forward(self, x: torch.Tensor) -&gt; torch.Tensor:
+        return self.dropout(self.fc2(self.act(self.fc1(x))))
+
+
+class TransformerBlock(nn.Module):
+    def __init__(self, cfg: ModelConfig) -&gt; None:
+        super().__init__()
+        self.ln1 = LayerNorm(cfg.d_model)
+        self.attn = MultiHeadAttention(cfg)
+        self.ln2 = LayerNorm(cfg.d_model)
+        self.mlp = FeedForward(cfg)
+
+    def forward(self, x: torch.Tensor) -&gt; torch.Tensor:
+        x = x + self.attn(self.ln1(x))
+        x = x + self.mlp(self.ln2(x))
+        return x
+
+
+class GPTModel(nn.Module):
+    def __init__(self, cfg: ModelConfig) -&gt; None:
+        super().__init__()
+        self.cfg = cfg
+        self.tok_embed = nn.Embedding(cfg.vocab_size, cfg.d_model)
+        self.pos_embed = nn.Embedding(cfg.context_length, cfg.d_model)
+        self.embed_dropout = nn.Dropout(cfg.dropout)
+        self.blocks = nn.ModuleList([TransformerBlock(cfg) for _ in range(cfg.num_layers)])
+        self.final_ln = LayerNorm(cfg.d_model)
+        self.lm_head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
+        if cfg.weight_tying:
+            self.lm_head.weight = self.tok_embed.weight
+        self.register_buffer(
+            &quot;position_ids&quot;,
+            torch.arange(cfg.context_length, dtype=torch.long),
+            persistent=False,
+        )
+
+    def forward(self, tokens: torch.Tensor) -&gt; torch.Tensor:
+        batch, seq = tokens.shape
+        if seq &gt; self.cfg.context_length:
+            raise ValueError(
+                f&quot;sequence length {seq} exceeds context_length={self.cfg.context_length}&quot;
+            )
+        tok = self.tok_embed(tokens)
+        pos = self.pos_embed(self.position_ids[:seq])
+        x = self.embed_dropout(tok + pos)
+        for block in self.blocks:
+            x = block(x)
+        return self.lm_head(self.final_ln(x))
+
+
+@dataclass
+class LoadReport:
+    &quot;&quot;&quot;Outcome of a load. Print this; it tells you whether the load succeeded.&quot;&quot;&quot;
+
+    loaded: list[tuple[str, str, tuple[int, ...]]] = field(default_factory=list)
+    missing: list[str] = field(default_factory=list)
+    unexpected: list[str] = field(default_factory=list)
+    shape_mismatch: list[tuple[str, tuple[int, ...], tuple[int, ...]]] = field(default_factory=list)
+
+    def summary(self) -&gt; str:
+        return (
+            f&quot;loaded={len(self.loaded)} &quot;
+            f&quot;missing={len(self.missing)} &quot;
+            f&quot;unexpected={len(self.unexpected)} &quot;
+            f&quot;shape_mismatch={len(self.shape_mismatch)}&quot;
+        )
+
+    def ok(self) -&gt; bool:
+        return not self.missing and not self.shape_mismatch
+
+
+# Names that are stored transposed in published GPT-2 checkpoints.
+# The published format uses tensorflow conv1d layout; nn.Linear expects (out, in).
+CONV1D_SUFFIXES = (&quot;c_attn.weight&quot;, &quot;c_proj.weight&quot;, &quot;c_fc.weight&quot;)
+
+
+def make_pretrained_to_local(num_layers: int) -&gt; dict[str, str]:
+    &quot;&quot;&quot;Return the full pretrained-&gt;local name map for a model with `num_layers` blocks.&quot;&quot;&quot;
+    mapping: dict[str, str] = {
+        &quot;wte.weight&quot;: &quot;tok_embed.weight&quot;,
+        &quot;wpe.weight&quot;: &quot;pos_embed.weight&quot;,
+        &quot;ln_f.weight&quot;: &quot;final_ln.scale&quot;,
+        &quot;ln_f.bias&quot;: &quot;final_ln.shift&quot;,
+    }
+    for layer in range(num_layers):
+        prefix_src = f&quot;h.{layer}&quot;
+        prefix_dst = f&quot;blocks.{layer}&quot;
+        mapping[f&quot;{prefix_src}.ln_1.weight&quot;] = f&quot;{prefix_dst}.ln1.scale&quot;
+        mapping[f&quot;{prefix_src}.ln_1.bias&quot;] = f&quot;{prefix_dst}.ln1.shift&quot;
+        mapping[f&quot;{prefix_src}.ln_2.weight&quot;] = f&quot;{prefix_dst}.ln2.scale&quot;
+        mapping[f&quot;{prefix_src}.ln_2.bias&quot;] = f&quot;{prefix_dst}.ln2.shift&quot;
+        mapping[f&quot;{prefix_src}.attn.c_attn.weight&quot;] = f&quot;{prefix_dst}.attn.qkv.weight&quot;
+        mapping[f&quot;{prefix_src}.attn.c_attn.bias&quot;] = f&quot;{prefix_dst}.attn.qkv.bias&quot;
+        mapping[f&quot;{prefix_src}.attn.c_proj.weight&quot;] = f&quot;{prefix_dst}.attn.out_proj.weight&quot;
+        mapping[f&quot;{prefix_src}.attn.c_proj.bias&quot;] = f&quot;{prefix_dst}.attn.out_proj.bias&quot;
+        mapping[f&quot;{prefix_src}.mlp.c_fc.weight&quot;] = f&quot;{prefix_dst}.mlp.fc1.weight&quot;
+        mapping[f&quot;{prefix_src}.mlp.c_fc.bias&quot;] = f&quot;{prefix_dst}.mlp.fc1.bias&quot;
+        mapping[f&quot;{prefix_src}.mlp.c_proj.weight&quot;] = f&quot;{prefix_dst}.mlp.fc2.weight&quot;
+        mapping[f&quot;{prefix_src}.mlp.c_proj.bias&quot;] = f&quot;{prefix_dst}.mlp.fc2.bias&quot;
+    return mapping
+
+
+def _needs_transpose(pretrained_name: str) -&gt; bool:
+    return any(pretrained_name.endswith(suffix) for suffix in CONV1D_SUFFIXES)
+
+
+def load_safetensors(model: GPTModel, path: Path, verbose: bool = True) -&gt; LoadReport:
+    &quot;&quot;&quot;Load weights into model. Refuse to assign on shape mismatch. Returns a report.&quot;&quot;&quot;
+    if not path.exists():
+        raise FileNotFoundError(f&quot;safetensors file not found: {path}&quot;)
+
+    mapping = make_pretrained_to_local(model.cfg.num_layers)
+    local_params = dict(model.named_parameters())
+    report = LoadReport()
+
+    seen_local: set[str] = set()
+    pending: list[tuple[str, str, torch.Tensor]] = []
+    with safe_open(str(path), framework=&quot;pt&quot;) as reader:
+        pretrained_names = list(reader.keys())
+        for src_name in pretrained_names:
+            local_name = mapping.get(src_name)
+            if local_name is None:
+                report.unexpected.append(src_name)
+                if verbose:
+                    print(f&quot;  [skip] {src_name} (no mapping)&quot;)
+                continue
+            if local_name not in local_params:
+                report.unexpected.append(src_name)
+                if verbose:
+                    print(f&quot;  [skip] {src_name} -&gt; {local_name} (no such parameter)&quot;)
+                continue
+
+            tensor = reader.get_tensor(src_name)
+            if _needs_transpose(src_name):
+                tensor = tensor.t().contiguous()
+
+            target = local_params[local_name]
+            if tuple(tensor.shape) != tuple(target.shape):
+                report.shape_mismatch.append(
+                    (src_name, tuple(tensor.shape), tuple(target.shape))
+                )
+                if verbose:
+                    print(
+                        f&quot;  [bad ] {src_name} -&gt; {local_name} &quot;
+                        f&quot;src_shape={tuple(tensor.shape)} dst_shape={tuple(target.shape)}&quot;
+                    )
+                continue
+
+            pending.append((src_name, local_name, tensor))
+
+    if report.shape_mismatch:
+        expected = set(local_params.keys())
+        for name in sorted(expected - seen_local):
+            report.missing.append(name)
+        return report
+
+    with torch.no_grad():
+        for src_name, local_name, tensor in pending:
+            target = local_params[local_name]
+            target.copy_(tensor.to(device=target.device, dtype=target.dtype))
+            seen_local.add(local_name)
+            report.loaded.append((src_name, local_name, tuple(tensor.shape)))
+            if verbose:
+                print(f&quot;  [ok  ] {src_name} -&gt; {local_name} shape={tuple(tensor.shape)}&quot;)
+
+    if model.cfg.weight_tying:
+        if model.lm_head.weight.data_ptr() != model.tok_embed.weight.data_ptr():
+            model.lm_head.weight = model.tok_embed.weight
+        seen_local.add(&quot;lm_head.weight&quot;)
+
+    expected = set(local_params.keys())
+    for name in sorted(expected - seen_local):
+        report.missing.append(name)
+
+    return report
+
+
+def make_stub_safetensors(path: Path, cfg: ModelConfig, seed: int = 42) -&gt; None:
+    &quot;&quot;&quot;Generate a fixture file with the pretrained naming convention.
+
+    Tensors are random but reproducible from `seed`. Shapes match what a real
+    GPT-2 checkpoint of `cfg` shape would carry, including the conv1d transpose
+    for `c_attn`, `c_proj`, `c_fc`.
+    &quot;&quot;&quot;
+    generator = torch.Generator().manual_seed(seed)
+
+    def randn(*shape: int) -&gt; torch.Tensor:
+        return torch.randn(*shape, generator=generator, dtype=torch.float32)
+
+    tensors: dict[str, torch.Tensor] = {}
+    tensors[&quot;wte.weight&quot;] = randn(cfg.vocab_size, cfg.d_model) * 0.02
+    tensors[&quot;wpe.weight&quot;] = randn(cfg.context_length, cfg.d_model) * 0.02
+    tensors[&quot;ln_f.weight&quot;] = torch.ones(cfg.d_model)
+    tensors[&quot;ln_f.bias&quot;] = torch.zeros(cfg.d_model)
+
+    hidden = cfg.mlp_expansion * cfg.d_model
+    for layer in range(cfg.num_layers):
+        tensors[f&quot;h.{layer}.ln_1.weight&quot;] = torch.ones(cfg.d_model)
+        tensors[f&quot;h.{layer}.ln_1.bias&quot;] = torch.zeros(cfg.d_model)
+        tensors[f&quot;h.{layer}.ln_2.weight&quot;] = torch.ones(cfg.d_model)
+        tensors[f&quot;h.{layer}.ln_2.bias&quot;] = torch.zeros(cfg.d_model)
+        tensors[f&quot;h.{layer}.attn.c_attn.weight&quot;] = (
+            randn(3 * cfg.d_model, cfg.d_model).t().contiguous() * 0.02
+        )
+        tensors[f&quot;h.{layer}.attn.c_attn.bias&quot;] = torch.zeros(3 * cfg.d_model)
+        tensors[f&quot;h.{layer}.attn.c_proj.weight&quot;] = (
+            randn(cfg.d_model, cfg.d_model).t().contiguous() * 0.02
+        )
+        tensors[f&quot;h.{layer}.attn.c_proj.bias&quot;] = torch.zeros(cfg.d_model)
+        tensors[f&quot;h.{layer}.mlp.c_fc.weight&quot;] = (
+            randn(hidden, cfg.d_model).t().contiguous() * 0.02
+        )
+        tensors[f&quot;h.{layer}.mlp.c_fc.bias&quot;] = torch.zeros(hidden)
+        tensors[f&quot;h.{layer}.mlp.c_proj.weight&quot;] = (
+            randn(cfg.d_model, hidden).t().contiguous() * 0.02
+        )
+        tensors[f&quot;h.{layer}.mlp.c_proj.bias&quot;] = torch.zeros(cfg.d_model)
+
+    save_file(tensors, str(path))
+
+
+@torch.no_grad()
+def quick_generate(model: GPTModel, prompt: torch.Tensor, n: int, seed: int = 0) -&gt; list[int]:
+    torch.manual_seed(seed)
+    model.eval()
+    tokens = prompt.clone()
+    for _ in range(n):
+        window = tokens[:, -model.cfg.context_length :]
+        logits = model(window)
+        next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+        tokens = torch.cat([tokens, next_token], dim=1)
+    return tokens.tolist()[0]
+
+
+def _state_fingerprint(model: GPTModel) -&gt; float:
+    &quot;&quot;&quot;Sum of L2 norms across parameters; coarse fingerprint that changes on load.&quot;&quot;&quot;
+    return float(sum(p.detach().norm().item() for p in model.parameters()))
+
+
+def demo() -&gt; None:
+    torch.manual_seed(0)
+
+    cfg = ModelConfig(
+        vocab_size=256,
+        context_length=64,
+        d_model=192,
+        num_heads=6,
+        num_layers=4,
+        mlp_expansion=4,
+        dropout=0.0,
+    )
+    print(f&quot;model config            : vocab={cfg.vocab_size} d_model={cfg.d_model} layers={cfg.num_layers}&quot;)
+
+    print(f&quot;\nWriting stub fixture to : {STUB_PATH}&quot;)
+    make_stub_safetensors(STUB_PATH, cfg, seed=42)
+    print(f&quot;  file size             : {STUB_PATH.stat().st_size:,} bytes&quot;)
+
+    print(&quot;\nBuilding fresh model (random init)...&quot;)
+    model = GPTModel(cfg)
+    before_fp = _state_fingerprint(model)
+    prompt = torch.tensor([[7, 11, 13, 17]], dtype=torch.long)
+    before_tokens = quick_generate(model, prompt, n=8, seed=0)
+    print(f&quot;  fingerprint           : {before_fp:.4f}&quot;)
+    print(f&quot;  sample (random init)  : {before_tokens}&quot;)
+
+    print(&quot;\nLoading stub...&quot;)
+    report = load_safetensors(model, STUB_PATH, verbose=False)
+    print(f&quot;  report                : {report.summary()}&quot;)
+    if not report.ok():
+        print(&quot;  WARNING: load did not complete cleanly&quot;)
+    else:
+        print(&quot;  load ok&quot;)
+
+    after_fp = _state_fingerprint(model)
+    after_tokens = quick_generate(model, prompt, n=8, seed=0)
+    print(f&quot;  fingerprint after load: {after_fp:.4f}&quot;)
+    print(f&quot;  sample (loaded)       : {after_tokens}&quot;)
+
+    assert before_fp != after_fp, &quot;fingerprint should change after load&quot;
+    assert before_tokens != after_tokens, &quot;sample should change after load&quot;
+
+    print(&quot;\nWeight tying check after load:&quot;)
+    tied = model.lm_head.weight.data_ptr() == model.tok_embed.weight.data_ptr()
+    print(f&quot;  lm_head tied to tok_embed: {tied}&quot;)
+    assert tied
+
+    print(&quot;\nShape mismatch path: injecting a bad tensor and reloading...&quot;)
+    bad_path = OUTPUTS / &quot;gpt2-bad.safetensors&quot;
+    bad_tensors = {}
+    with safe_open(str(STUB_PATH), framework=&quot;pt&quot;) as reader:
+        for name in reader.keys():
+            bad_tensors[name] = reader.get_tensor(name)
+    bad_tensors[&quot;wte.weight&quot;] = torch.randn(cfg.vocab_size, cfg.d_model + 1)
+    save_file(bad_tensors, str(bad_path))
+    bad_model = GPTModel(cfg)
+    bad_report = load_safetensors(bad_model, bad_path, verbose=False)
+    print(f&quot;  bad report            : {bad_report.summary()}&quot;)
+    assert bad_report.shape_mismatch, &quot;expected at least one shape mismatch&quot;
+    print(f&quot;  first mismatch        : {bad_report.shape_mismatch[0]}&quot;)
+
+    bad_path.unlink()
+    print(&quot;\nPretrained weight load check passed.&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    demo()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/37-loading-pretrained-weights/code/tests/test_load.py">phases/19-capstone-projects/37-loading-pretrained-weights/code/tests/test_load.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Unit tests for the safetensors loader, name mapper, and shape checks.&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+import torch
+from safetensors import safe_open
+from safetensors.torch import save_file
+
+HERE = Path(__file__).resolve()
+CODE_DIR = HERE.parent.parent
+sys.path.insert(0, str(CODE_DIR))
+
+from main import (
+    CONV1D_SUFFIXES,
+    GPTModel,
+    ModelConfig,
+    _needs_transpose,
+    _state_fingerprint,
+    load_safetensors,
+    make_pretrained_to_local,
+    make_stub_safetensors,
+    quick_generate,
+)
+
+
+def _tiny_cfg(**overrides) -&gt; ModelConfig:
+    base = dict(
+        vocab_size=64,
+        context_length=16,
+        d_model=32,
+        num_heads=4,
+        num_layers=2,
+        mlp_expansion=4,
+        dropout=0.0,
+    )
+    base.update(overrides)
+    return ModelConfig(**base)
+
+
+class NameMapTests(unittest.TestCase):
+    def test_expands_per_layer_keys(self):
+        mapping = make_pretrained_to_local(num_layers=2)
+        self.assertIn(&quot;h.0.attn.c_attn.weight&quot;, mapping)
+        self.assertIn(&quot;h.1.attn.c_attn.weight&quot;, mapping)
+        self.assertEqual(mapping[&quot;h.0.attn.c_attn.weight&quot;], &quot;blocks.0.attn.qkv.weight&quot;)
+        self.assertEqual(mapping[&quot;wte.weight&quot;], &quot;tok_embed.weight&quot;)
+        self.assertEqual(mapping[&quot;ln_f.weight&quot;], &quot;final_ln.scale&quot;)
+        self.assertEqual(mapping[&quot;ln_f.bias&quot;], &quot;final_ln.shift&quot;)
+
+    def test_no_layers_outside_range(self):
+        mapping = make_pretrained_to_local(num_layers=2)
+        self.assertNotIn(&quot;h.2.attn.c_attn.weight&quot;, mapping)
+
+    def test_layer_norm_weight_maps_to_scale_and_bias_to_shift(self):
+        mapping = make_pretrained_to_local(num_layers=1)
+        self.assertEqual(mapping[&quot;h.0.ln_1.weight&quot;], &quot;blocks.0.ln1.scale&quot;)
+        self.assertEqual(mapping[&quot;h.0.ln_1.bias&quot;], &quot;blocks.0.ln1.shift&quot;)
+
+
+class TransposeTests(unittest.TestCase):
+    def test_only_conv1d_suffixes_transpose(self):
+        for suffix in CONV1D_SUFFIXES:
+            self.assertTrue(_needs_transpose(f&quot;h.0.{suffix}&quot;))
+        self.assertFalse(_needs_transpose(&quot;h.0.attn.c_attn.bias&quot;))
+        self.assertFalse(_needs_transpose(&quot;h.0.ln_1.weight&quot;))
+        self.assertFalse(_needs_transpose(&quot;wte.weight&quot;))
+
+
+class LoaderTests(unittest.TestCase):
+    def test_load_changes_state_fingerprint(self):
+        cfg = _tiny_cfg()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / &quot;stub.safetensors&quot;
+            make_stub_safetensors(path, cfg, seed=1)
+            model = GPTModel(cfg)
+            before = _state_fingerprint(model)
+            report = load_safetensors(model, path, verbose=False)
+            after = _state_fingerprint(model)
+            self.assertTrue(report.ok(), report.summary())
+            self.assertNotAlmostEqual(before, after, places=4)
+
+    def test_lm_head_remains_tied_after_load(self):
+        cfg = _tiny_cfg()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / &quot;stub.safetensors&quot;
+            make_stub_safetensors(path, cfg, seed=1)
+            model = GPTModel(cfg)
+            load_safetensors(model, path, verbose=False)
+            self.assertEqual(
+                model.lm_head.weight.data_ptr(),
+                model.tok_embed.weight.data_ptr(),
+            )
+
+    def test_shape_mismatch_is_recorded_not_assigned(self):
+        cfg = _tiny_cfg()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / &quot;stub.safetensors&quot;
+            make_stub_safetensors(path, cfg, seed=1)
+            with safe_open(str(path), framework=&quot;pt&quot;) as reader:
+                tensors = {name: reader.get_tensor(name) for name in reader.keys()}
+            tensors[&quot;wte.weight&quot;] = torch.randn(cfg.vocab_size, cfg.d_model + 1)
+            bad = Path(tmp) / &quot;bad.safetensors&quot;
+            save_file(tensors, str(bad))
+
+            model = GPTModel(cfg)
+            original = model.tok_embed.weight.clone()
+            report = load_safetensors(model, bad, verbose=False)
+            self.assertGreater(len(report.shape_mismatch), 0)
+            self.assertTrue(torch.allclose(model.tok_embed.weight, original))
+
+    def test_unknown_tensor_goes_to_unexpected(self):
+        cfg = _tiny_cfg()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / &quot;stub.safetensors&quot;
+            make_stub_safetensors(path, cfg, seed=1)
+            with safe_open(str(path), framework=&quot;pt&quot;) as reader:
+                tensors = {name: reader.get_tensor(name) for name in reader.keys()}
+            tensors[&quot;something.unknown.weight&quot;] = torch.zeros(8)
+            polluted = Path(tmp) / &quot;polluted.safetensors&quot;
+            save_file(tensors, str(polluted))
+
+            model = GPTModel(cfg)
+            report = load_safetensors(model, polluted, verbose=False)
+            self.assertIn(&quot;something.unknown.weight&quot;, report.unexpected)
+
+    def test_missing_file_raises(self):
+        cfg = _tiny_cfg()
+        model = GPTModel(cfg)
+        with self.assertRaises(FileNotFoundError):
+            load_safetensors(model, Path(&quot;/nonexistent/path.safetensors&quot;), verbose=False)
+
+
+class StubFixtureTests(unittest.TestCase):
+    def test_stub_writes_expected_tensor_count(self):
+        cfg = _tiny_cfg(num_layers=3)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / &quot;stub.safetensors&quot;
+            make_stub_safetensors(path, cfg, seed=1)
+            with safe_open(str(path), framework=&quot;pt&quot;) as reader:
+                names = list(reader.keys())
+        per_layer = 12
+        expected = 4 + per_layer * cfg.num_layers
+        self.assertEqual(len(names), expected)
+
+
+class GenerationConsistencyTests(unittest.TestCase):
+    def test_loaded_model_generates_different_tokens_from_random_init(self):
+        cfg = _tiny_cfg()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / &quot;stub.safetensors&quot;
+            make_stub_safetensors(path, cfg, seed=7)
+            model = GPTModel(cfg)
+            prompt = torch.tensor([[1, 2, 3]], dtype=torch.long)
+            before = quick_generate(model, prompt, n=5, seed=0)
+            load_safetensors(model, path, verbose=False)
+            after = quick_generate(model, prompt, n=5, seed=0)
+            self.assertNotEqual(before, after)
+
+
+if __name__ == &quot;__main__&quot;:
+    unittest.main()
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. Why does the loader need a name map?</legend><label class="option"><input type="radio" name="q0" value="0"> Published GPT-2 weights use names like wte, wpe, h.N.attn.c_attn; the local model uses tok_embed, pos_embed, blocks.N.attn.qkv; the loader translates one onto the other</label><label class="option"><input type="radio" name="q0" value="1"> Safetensors files are encrypted</label><label class="option"><input type="radio" name="q0" value="2"> Pretrained tensors and local parameters share the same name</label><label class="option"><input type="radio" name="q0" value="3"> Torch requires it</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. What is the conv1d transpose, and which tensors need it?</legend><label class="option"><input type="radio" name="q1" value="0"> All weight tensors</label><label class="option"><input type="radio" name="q1" value="1"> Published GPT-2 stores c_attn, c_proj, and c_fc weights in tensorflow conv1d layout, which is the transpose of what nn.Linear.weight expects; the loader calls .t() on those during assignment</label><label class="option"><input type="radio" name="q1" value="2"> Only the embedding</label><label class="option"><input type="radio" name="q1" value="3"> Only the LayerNorm scales</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. Why is the LM head not in the safetensors file?</legend><label class="option"><input type="radio" name="q2" value="0"> It is too large</label><label class="option"><input type="radio" name="q2" value="1"> It is loaded from a separate file</label><label class="option"><input type="radio" name="q2" value="2"> It is computed at runtime from logits</label><label class="option"><input type="radio" name="q2" value="3"> Weight tying: the LM head shares storage with the token embedding (wte), so loading wte and aliasing lm_head.weight = tok_embed.weight after the load reconstructs the head</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. What does the loader do on a shape mismatch?</legend><label class="option"><input type="radio" name="q3" value="0"> Pads the smaller tensor</label><label class="option"><input type="radio" name="q3" value="1"> Crashes the process</label><label class="option"><input type="radio" name="q3" value="2"> Records the mismatch in LoadReport.shape_mismatch and refuses to assign, leaving the local parameter untouched</label><label class="option"><input type="radio" name="q3" value="3"> Truncates the larger tensor</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. Why is the demo&#39;s stub fixture not a real GPT-2 download?</legend><label class="option"><input type="radio" name="q4" value="0"> Real files are not in safetensors format</label><label class="option"><input type="radio" name="q4" value="1"> Real weights are encrypted</label><label class="option"><input type="radio" name="q4" value="2"> The demo must run offline and quickly; the stub uses the exact pretrained naming convention so the loader code path is identical, and swapping in a real file changes nothing about the loader</label><label class="option"><input type="radio" name="q4" value="3"> Safetensors cannot store large tensors</label><p data-feedback="4"></p></fieldset><fieldset><legend>6. Why generate a sample before and after the load?</legend><label class="option"><input type="radio" name="q5" value="0"> To measure inference speed</label><label class="option"><input type="radio" name="q5" value="1"> To set the random seed</label><label class="option"><input type="radio" name="q5" value="2"> If the post-load samples are identical to the pre-load samples, the load did not change the model, which means the mapping silently missed every tensor</label><label class="option"><input type="radio" name="q5" value="3"> To warm up the GPU cache</label><p data-feedback="5"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/19-capstone-projects/36-training-loop-eval/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/19-capstone-projects/38-classifier-finetuning/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/19-capstone-projects/37-loading-pretrained-weights/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

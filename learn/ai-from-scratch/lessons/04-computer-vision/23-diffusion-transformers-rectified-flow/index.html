@@ -1,0 +1,1040 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>散变压器和调整流量 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-04-computer-vision" data-lesson="04-computer-vision/23-diffusion-transformers-rectified-flow" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/04-computer-vision/">计算机视觉</a> / LESSON 23</p><h1 class="lesson-title">散变压器和调整流量</h1><p>Diffusion Transformers &amp; Rectified Flow</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>散变压器和调整流量</h1>
+<blockquote>
+<p>转换一个变压器,换一个直线流量,突然间你就有了SD3,FLUX,以及每一个2026年的文字到图像模型.</p>
+</blockquote>
+<p><strong>Type:</strong> Learn + Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 4 Lesson 10 (Diffusion DDPM), Phase 4 Lesson 14 (ViT), Phase 7 Lesson 02 (Self-Attention)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>追踪从U-Net DDPM (课程10) 发展到散变压器 (DiT),MMDiT (SD3),单+双流DiT (FLUX)</li>
+<li>解释调整流量:为什么噪音和数据之间的直线轨迹允许模型在20个步骤中采样而不是1000个步骤</li>
+<li>实现一个小的DIT块和一个正流训练循环,两者都在100条以下</li>
+<li>根据架构,参数数数和许可证来区分模型变量 (SD3,FLUX.1-dev,FLUX.1-schnell,Z-Image,Qwen-Image)</li>
+</ul>
+<h2>问题</h2>
+<p>第10课构建了DDPM与U-Net指标.该配方主导于2020-2023年:U-Net +beta时间表 +噪音预测损失.它产生了稳定扩散1.5和2.1和DALL-E 2.</p>
+<p>每个2026年最先进的文本到图像模型都已经过去了它.稳定射3,FLUX,SD4,Z-图像,Qwen-图像,Hunyuan-图像 都没有使用U-网.它们使用射变换器 (DiT).SD3和FLUX也替换了DDPM噪声时间表,以进行修复流程,这使得从噪声到数据的路径更为直线,并允许在一致性或蒸变异的情况下推断1-4步.</p>
+<p>转变是重要的,因为它是基于扩散的图像生成成为可控制,快速准确的原因 (SD3/SD4解决文本染),以及生产快速的原因.理解DIT+修改流程是理解2026年生成图像堆.</p>
+<h2>概念</h2>
+<h3>从U-Net到变压器</h3>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-19eb619e706dcc481799.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><ul>
+<li><strong>DiT</strong>在隐藏的补丁上用一种类似VIT的变压器取代U-Net.通过适应性层标准 (AdaLN) 调 conditioning.</li>
+<li><strong>MMDiT</strong>两个流,对共享关注的文本和图像代币有不同的权重.</li>
+<li><strong>FLUX</strong>(黑森林实验室, 2024) 最初的N块像SD3一样双流,后来的块连接并共享重量 (单流) 以提高高深度的效率.</li>
+<li><strong>Z-Image</strong>在6B参数上有效的单流DT,挑战&quot;无论如何的规模&quot;.</li>
+</ul>
+<h3>一段时间内调整的流量</h3>
+<p>未来的过程是杂的SDE,<code>x_t</code>学习的反向是第二个SDE,通过1000个小步骤解决.</p>
+<p>调整流量定义了<strong>straight-line</strong>清洁数据与清洁噪音之间的插射:</p>
+<pre><code>x_t = (1 - t) * x_0 + t * epsilon,     t in [0, 1]
+</code></pre>
+<p>训练一个网络来预测速度<code>v_theta(x_t, t) = epsilon - x_0</code>从清洁数据到噪音的直线路沿向方向 (<code>dx_t/dt</code>) 在采样过程中,你将这种速度整合到后面,从噪音向数据迈进.</p>
+<p>SD3叫这么说<strong>Rectified Flow Matching</strong>,Z-图像和大多数2026模型都使用相同的目标.典型的推断:旧的DDPM模式中20-30个欧勒步骤 (确定性) 与50多个DDIM步骤.蒸/轮/快速/LCM变体将其降至1-4个步骤.</p>
+<h3>适应性调节</h3>
+<p>通过 时间步骤和课程/文本的DIT条件<strong>adaptive layer norm</strong>预测<code>scale</code>其他<code>shift</code>它们比U-Nets中的FiLM式调节更清洁,而且是每个现代的DIT中默认的.</p>
+<pre><code>cond -&gt; MLP -&gt; (scale, shift, gate)
+norm(x) * (1 + scale) + shift, then residual add * gate
+</code></pre>
+<h3>在SD3和FLUX中编码文字</h3>
+<ul>
+<li><strong>SD3</strong>使用三个文本编码器:两个CLIP模型+T5-XXL.嵌入式连接并作为文本调节输入到图像流中.</li>
+<li><strong>FLUX</strong>使用一个Clip-L + T5-XXL.</li>
+<li><strong>Qwen-Image / Z-Image</strong>变体使用自己的内部文本编码器,与其基本的LLM一致.</li>
+</ul>
+<p>文字编码器是 SD3/FLUX为什么比 SD1.5更好地解释提示的重要原因.</p>
+<h3>无分类指导仍然有效</h3>
+<p>修改流量改变了样本,而不是条件化.无分类指导 (训练期间的10%概率,在推断时混合有条件和无条件的预测) 与修改流量相同.大多数2026型号使用了比SD1.5的7.5低的指导尺度3.5-5,因为修改流量模型默认更紧密地遵循提示.</p>
+<h3>连贯性,土波,施内尔,LCM</h3>
+<p>为了一个想法,我们要将慢慢的多步模型成快速的几步模型.</p>
+<ul>
+<li>**LCM (Latent Consistency Model)**培训一个预测最终的学生<code>x_0</code>任何中间体<code>x_t</code>在一个步骤.</li>
+<li><strong>SDXL Turbo / FLUX schnell</strong> 1-4 阶段模型,采用反向扩散蒸.</li>
+<li><strong>SD Turbo</strong>适应隐藏传播的OpenAI式一致性模型.</li>
+</ul>
+<p>任何新型船的生产服务都具有&quot;完整质量&quot;检查点和&quot;轮机/快速&quot;变体.Schnell (&quot;快速&quot;在德语,黑森林实验室的会议) 在1-4步骤中运行,并适用于实时管道.</p>
+<h3>2026年样式景观</h3>
+<table>
+<thead>
+<tr>
+<th>Model</th>
+<th>Size</th>
+<th>Architecture</th>
+<th>License</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Stable Diffusion 3 Medium</td>
+<td>2B</td>
+<td>MMDiT</td>
+<td>SAI Community</td>
+</tr>
+<tr>
+<td>Stable Diffusion 3.5 Large</td>
+<td>8B</td>
+<td>MMDiT</td>
+<td>SAI Community</td>
+</tr>
+<tr>
+<td>FLUX.1-dev</td>
+<td>12B</td>
+<td>Double + Single Stream DiT</td>
+<td>non-commercial</td>
+</tr>
+<tr>
+<td>FLUX.1-schnell</td>
+<td>12B</td>
+<td>same, distilled</td>
+<td>Apache 2.0</td>
+</tr>
+<tr>
+<td>FLUX.2</td>
+<td>—</td>
+<td>iterated FLUX.1</td>
+<td>mixed</td>
+</tr>
+<tr>
+<td>Z-Image</td>
+<td>6B</td>
+<td>S3-DiT (Scalable Single-Stream)</td>
+<td>permissive</td>
+</tr>
+<tr>
+<td>Qwen-Image</td>
+<td>~20B</td>
+<td>DiT + Qwen text tower</td>
+<td>Apache 2.0</td>
+</tr>
+<tr>
+<td>Hunyuan-Image-3.0</td>
+<td>~80B</td>
+<td>DiT</td>
+<td>research</td>
+</tr>
+<tr>
+<td>SD4 Turbo</td>
+<td>3B</td>
+<td>DiT + distillation</td>
+<td>SAI Commercial</td>
+</tr>
+</tbody>
+</table>
+<p>果版是2026年开源默认版本.Z-Image是效率领先者.FLUX.2和SD4是当前的质量提示.</p>
+<h3>为什么这个阶段转变是重要的</h3>
+<p>化系统+U-Net工作了.<strong>better, faster, and scales more cleanly</strong>转型与从RNN到NLP中的转换器相似:两种架构都解决了相同的问题,但转换器扩大了规模,现在占据主导地位. 2026年每篇关于图像,视频或3D生成的论文都使用了DT形状的指标,通常是修改的流量目标.U-Net DDPM现在主要是教学性 (课 10).</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-c86613f7554539f836ba.png" alt="cv3-rectified-flow 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<h3>步骤1:使用AdaLN进行DiT阻塞</h3>
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+
+class AdaLNZero(nn.Module):
+    &quot;&quot;&quot;
+    Adaptive LayerNorm with a gate. Predicts (scale, shift, gate) from the conditioning.
+    Init such that the whole block starts as identity (&quot;zero init&quot;).
+    &quot;&quot;&quot;
+
+    def __init__(self, dim, cond_dim):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim, elementwise_affine=False)
+        self.mlp = nn.Linear(cond_dim, dim * 3)
+        nn.init.zeros_(self.mlp.weight)
+        nn.init.zeros_(self.mlp.bias)
+
+    def forward(self, x, cond):
+        scale, shift, gate = self.mlp(cond).chunk(3, dim=-1)
+        h = self.norm(x) * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+        return h, gate.unsqueeze(1)
+
+
+class DiTBlock(nn.Module):
+    def __init__(self, dim=192, heads=3, mlp_ratio=4, cond_dim=192):
+        super().__init__()
+        self.adaln1 = AdaLNZero(dim, cond_dim)
+        self.attn = nn.MultiheadAttention(dim, heads, batch_first=True)
+        self.adaln2 = AdaLNZero(dim, cond_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, dim * mlp_ratio),
+            nn.GELU(),
+            nn.Linear(dim * mlp_ratio, dim),
+        )
+
+    def forward(self, x, cond):
+        h, gate1 = self.adaln1(x, cond)
+        a, _ = self.attn(h, h, h, need_weights=False)
+        x = x + gate1 * a
+        h, gate2 = self.adaln2(x, cond)
+        x = x + gate2 * self.mlp(h)
+        return x
+</code></pre>
+<p><code>AdaLNZero</code>训练将区块远离身份,这将显著稳定深度变压器扩散模型.</p>
+<h3>步骤2:一个小的DIT</h3>
+<pre><code class="language-python">def timestep_embedding(t, dim):
+    import math
+    half = dim // 2
+    freqs = torch.exp(-math.log(10000) * torch.arange(half, device=t.device) / half)
+    args = t[:, None].float() * freqs[None]
+    return torch.cat([args.sin(), args.cos()], dim=-1)
+
+
+class TinyDiT(nn.Module):
+    def __init__(self, image_size=16, patch_size=2, in_channels=3, dim=96, depth=4, heads=3):
+        super().__init__()
+        self.patch_size = patch_size
+        self.num_patches = (image_size // patch_size) ** 2
+        self.patch = nn.Conv2d(in_channels, dim, kernel_size=patch_size, stride=patch_size)
+        self.pos = nn.Parameter(torch.zeros(1, self.num_patches, dim))
+        self.time_mlp = nn.Sequential(
+            nn.Linear(dim, dim * 2),
+            nn.SiLU(),
+            nn.Linear(dim * 2, dim),
+        )
+        self.blocks = nn.ModuleList([DiTBlock(dim, heads, cond_dim=dim) for _ in range(depth)])
+        self.norm_out = nn.LayerNorm(dim, elementwise_affine=False)
+        self.head = nn.Linear(dim, patch_size * patch_size * in_channels)
+
+    def forward(self, x, t):
+        n = x.size(0)
+        x = self.patch(x)
+        x = x.flatten(2).transpose(1, 2) + self.pos
+        t_emb = self.time_mlp(timestep_embedding(t, self.pos.size(-1)))
+        for blk in self.blocks:
+            x = blk(x, t_emb)
+        x = self.norm_out(x)
+        x = self.head(x)
+        return self._unpatchify(x, n)
+
+    def _unpatchify(self, x, n):
+        p = self.patch_size
+        h = w = int(self.num_patches ** 0.5)
+        x = x.view(n, h, w, p, p, -1).permute(0, 5, 1, 3, 2, 4).reshape(n, -1, h * p, w * p)
+        return x
+</code></pre>
+<h3>步骤3:修改流程训练</h3>
+<pre><code class="language-python">import torch.nn.functional as F
+
+def rectified_flow_train_step(model, x0, optimizer, device):
+    model.train()
+    x0 = x0.to(device)
+    n = x0.size(0)
+    t = torch.rand(n, device=device)
+    epsilon = torch.randn_like(x0)
+    x_t = (1 - t[:, None, None, None]) * x0 + t[:, None, None, None] * epsilon
+
+    target_velocity = epsilon - x0
+    pred_velocity = model(x_t, t)
+
+    loss = F.mse_loss(pred_velocity, target_velocity)
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+    return loss.item()
+</code></pre>
+<p>与DDPM的噪音预测损失 (课10) 相比:相同的结构,不同的目标.<code>epsilon</code>我们预测<strong>velocity</strong> <code>epsilon - x_0</code>通过直线插射,从数据到噪音.</p>
+<h3>步骤4: 艾勒样本</h3>
+<p>修改流程是ODE. 艾勒的方法是最简单的,并且对于训练有素的修改流程模型,几乎与高级解决器一样精确,在20+步骤.</p>
+<pre><code class="language-python">@torch.no_grad()
+def rectified_flow_sample(model, shape, steps=20, device=&quot;cpu&quot;):
+    model.eval()
+    x = torch.randn(shape, device=device)
+    dt = 1.0 / steps
+    t = torch.ones(shape[0], device=device)
+    for _ in range(steps):
+        v = model(x, t)
+        x = x - dt * v
+        t = t - dt
+    return x
+</code></pre>
+<p>在训练有素的模型上,它可以与1000步DDPM相比较的样本产生.</p>
+<h3>步骤5:端到端烟雾测试</h3>
+<pre><code class="language-python">import numpy as np
+
+def synthetic_blobs(num=200, size=16, seed=0):
+    rng = np.random.default_rng(seed)
+    out = np.zeros((num, 3, size, size), dtype=np.float32)
+    yy, xx = np.meshgrid(np.arange(size), np.arange(size), indexing=&quot;ij&quot;)
+    for i in range(num):
+        cx, cy = rng.uniform(4, size - 4, size=2)
+        r = rng.uniform(2, 4)
+        mask = (xx - cx) ** 2 + (yy - cy) ** 2 &lt; r ** 2
+        colour = rng.uniform(-1, 1, size=3)
+        for c in range(3):
+            out[i, c][mask] = colour[c]
+    return torch.from_numpy(out)
+</code></pre>
+<p>列车<code>TinyDiT</code>在500步后,样本输出应该看起来像薄的色彩.</p>
+<h2>用它</h2>
+<p>对于使用 FLUX / SD3 / Z-Image的真实图像生成, <code>diffusers</code>每个船只都具有统一的API:</p>
+<pre><code class="language-python">from diffusers import FluxPipeline, StableDiffusion3Pipeline
+import torch
+
+pipe = FluxPipeline.from_pretrained(
+    &quot;black-forest-labs/FLUX.1-schnell&quot;,
+    torch_dtype=torch.bfloat16,
+).to(&quot;cuda&quot;)
+
+out = pipe(
+    prompt=&quot;a golden retriever surfing a tsunami, hyperrealistic, studio lighting&quot;,
+    guidance_scale=0.0,           # schnell was trained without CFG
+    num_inference_steps=4,
+    max_sequence_length=256,
+).images[0]
+out.save(&quot;surf.png&quot;)
+</code></pre>
+<p>三个行.<code>FLUX.1-schnell</code>换取模型身份证<code>black-forest-labs/FLUX.1-dev</code>对于更高质量的20-30步骤,使用CFG.</p>
+<p>对于SD3:</p>
+<pre><code class="language-python">pipe = StableDiffusion3Pipeline.from_pretrained(
+    &quot;stabilityai/stable-diffusion-3.5-large&quot;,
+    torch_dtype=torch.bfloat16,
+).to(&quot;cuda&quot;)
+out = pipe(prompt, guidance_scale=3.5, num_inference_steps=28).images[0]
+</code></pre>
+<h2>运送它</h2>
+<p>这一课产生了:</p>
+<ul>
+<li><code>outputs/prompt-dit-model-picker.md</code>选择SD3,FLUX.1-dev,FLUX.1-schnell,Z-Image,SD4 Turbo 鉴于质量,延迟和许可限制.</li>
+<li><code>outputs/skill-rectified-flow-trainer.md</code>通过AdaLN DiT和Euler样本采集编写了完整的调整流程训练循环.</li>
+</ul>
+<h2>运动</h2>
+<ol>
+<li>**(Easy)**按上述合成块数据集进行500步的训练. 进行 10, 20 和 50 个欧勒步骤的样本比较.</li>
+<li>**(Medium)**通过将学习类嵌入式连接到嵌入式时间 (10 个&quot;类&quot;按颜色的斑点) 添加文本调节.</li>
+<li>**(Hard)**计算从 rectified-flow和 DDPM版本生成的样本之间的Fréchet距离 (FID代理) 基于相同数据训练的相同规模网络. 报告更快的收缩.</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>DiT</td>
+<td>&quot;Diffusion transformer&quot;</td>
+<td>Transformer that replaces the U-Net as the diffusion denoiser; operates on patchified latents</td>
+</tr>
+<tr>
+<td>AdaLN</td>
+<td>&quot;Adaptive layer norm&quot;</td>
+<td>Timestep/text conditioning via learned scale, shift, gate applied after LayerNorm; standard in every modern DiT</td>
+</tr>
+<tr>
+<td>MMDiT</td>
+<td>&quot;Multi-modal DiT (SD3)&quot;</td>
+<td>Separate weight streams for text and image tokens that share a joint self-attention</td>
+</tr>
+<tr>
+<td>Single-stream / double-stream</td>
+<td>&quot;FLUX trick&quot;</td>
+<td>First N blocks double-stream (separate weights per modality), later blocks single-stream (concat + shared weights) for efficiency</td>
+</tr>
+<tr>
+<td>Rectified flow</td>
+<td>&quot;Straight-line noise-to-data&quot;</td>
+<td>Linear interpolation between data and noise; network predicts velocity; fewer ODE steps needed at inference</td>
+</tr>
+<tr>
+<td>Velocity target</td>
+<td>&quot;epsilon - x_0&quot;</td>
+<td>The regression target in rectified flow; points from clean data to noise</td>
+</tr>
+<tr>
+<td>CFG guidance</td>
+<td>&quot;classifier-free guidance&quot;</td>
+<td>Mix conditional and unconditional predictions; still used in rectified-flow models</td>
+</tr>
+<tr>
+<td>Schnell / turbo / LCM</td>
+<td>&quot;1-4 step distillation&quot;</td>
+<td>Small-step variants distilled from full-quality models; production real-time</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2212.09748" rel="noreferrer" data-network="true">Scalable Diffusion Models with Transformers (Peebles &amp; Xie, 2023) <small>↗ 需要联网</small></a></li>
+<li><a href="https://arxiv.org/abs/2403.03206" rel="noreferrer" data-network="true">Scaling Rectified Flow Transformers (Esser et al., SD3 paper) <small>↗ 需要联网</small></a> MMDiT和直流量</li>
+<li><a href="https://huggingface.co/black-forest-labs/FLUX.1-dev" rel="noreferrer" data-network="true">FLUX.1 model card and technical report (Black Forest Labs) <small>↗ 需要联网</small></a>双式+单流细节</li>
+<li><a href="https://arxiv.org/html/2511.22699v1" rel="noreferrer" data-network="true">Z-Image: Efficient Image Generation Foundation Model (2025) <small>↗ 需要联网</small></a>单流在6B</li>
+<li><a href="https://arxiv.org/abs/2206.00364" rel="noreferrer" data-network="true">Elucidating the Design Space of Diffusion (Karras et al., 2022) <small>↗ 需要联网</small></a>每一个扩散设计交易的参考</li>
+<li><a href="https://arxiv.org/abs/2310.04378" rel="noreferrer" data-network="true">Latent Consistency Models (Luo et al., 2023) <small>↗ 需要联网</small></a>如何LCM- LoRA给你提供4步推断</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Diffusion Transformers &amp; Rectified Flow</h1>
+<blockquote>
+<p>The U-Net is not the secret of diffusion. Replace it with a transformer, swap the noise schedule for a straight-line flow, and suddenly you have SD3, FLUX, and every 2026 text-to-image model.</p>
+</blockquote>
+<p><strong>Type:</strong> Learn + Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 4 Lesson 10 (Diffusion DDPM), Phase 4 Lesson 14 (ViT), Phase 7 Lesson 02 (Self-Attention)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Trace the evolution from U-Net DDPM (Lesson 10) to Diffusion Transformer (DiT), MMDiT (SD3), and single+double-stream DiT (FLUX)</li>
+<li>Explain rectified flow: why a straight-line trajectory between noise and data lets models sample in 20 steps instead of 1000</li>
+<li>Implement a tiny DiT block and a rectified-flow training loop, both under 100 lines</li>
+<li>Distinguish model variants (SD3, FLUX.1-dev, FLUX.1-schnell, Z-Image, Qwen-Image) by architecture, parameter count, and licensing</li>
+</ul>
+<h2>The Problem</h2>
+<p>Lesson 10 built a DDPM with a U-Net denoiser. That recipe dominated 2020-2023: U-Net + beta schedule + noise-prediction loss. It produced Stable Diffusion 1.5 and 2.1 and DALL-E 2.</p>
+<p>Every 2026 state-of-the-art text-to-image model has moved past it. Stable Diffusion 3, FLUX, SD4, Z-Image, Qwen-Image, Hunyuan-Image — none use a U-Net. They use Diffusion Transformers (DiT). SD3 and FLUX also swap the DDPM noise schedule for rectified flow, which straightens the path from noise to data and enables 1-4 step inference with consistency or distilled variants.</p>
+<p>The shift matters because it is the reason diffusion-based image generation became controllable, prompt-accurate (SD3/SD4 solved text rendering), and production-fast. Understanding DiT + rectified flow is understanding the 2026 generative-image stack.</p>
+<h2>The Concept</h2>
+<h3>From U-Net to transformer</h3>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-19eb619e706dcc481799.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><ul>
+<li><strong>DiT</strong> (Peebles &amp; Xie, 2023) — replace the U-Net with a ViT-like transformer on latent patches. Conditioning via adaptive layer norm (AdaLN).</li>
+<li><strong>MMDiT</strong> (SD3, Esser et al., 2024) — two streams with separate weights for text and image tokens that share a joint attention.</li>
+<li><strong>FLUX</strong> (Black Forest Labs, 2024) — first N blocks double-stream like SD3, later blocks concatenate and share weights (single-stream) for efficiency at higher depth.</li>
+<li><strong>Z-Image</strong> (2025) — an efficient single-stream DiT at 6B parameters that challenges &quot;scale at all costs&quot;.</li>
+</ul>
+<h3>Rectified flow in one paragraph</h3>
+<p>DDPM defines the forward process as a noisy SDE where <code>x_t</code> is increasingly corrupted. The learned reverse is a second SDE, solved by 1000 small steps.</p>
+<p>Rectified flow defines a <strong>straight-line</strong> interpolation between clean data and pure noise:</p>
+<pre><code>x_t = (1 - t) * x_0 + t * epsilon,     t in [0, 1]
+</code></pre>
+<p>Train a network to predict the velocity <code>v_theta(x_t, t) = epsilon - x_0</code> — the forward direction along the straight-line path from clean data to noise (<code>dx_t/dt</code>). During sampling, you integrate this velocity backward to step from noise toward data. The resulting ODE is much closer to a straight line, so far fewer integration steps are needed to sample.</p>
+<p>SD3 calls this <strong>Rectified Flow Matching</strong>. FLUX, Z-Image, and most 2026 models use the same objective. Typical inference: 20-30 Euler steps (deterministic) vs 50+ DDIM steps in the old DDPM regime. Distilled / turbo / schnell / LCM variants take it down to 1-4 steps.</p>
+<h3>AdaLN conditioning</h3>
+<p>DiTs condition on timestep and class/text via <strong>adaptive layer norm</strong>: predict <code>scale</code> and <code>shift</code> from the conditioning vector and apply them after LayerNorm. Much cleaner than FiLM-style modulation in U-Nets and the default in every modern DiT.</p>
+<pre><code>cond -&gt; MLP -&gt; (scale, shift, gate)
+norm(x) * (1 + scale) + shift, then residual add * gate
+</code></pre>
+<h3>Text encoders in SD3 and FLUX</h3>
+<ul>
+<li><strong>SD3</strong> uses three text encoders: two CLIP models + T5-XXL. Embeddings concatenated and fed to the image stream as text conditioning.</li>
+<li><strong>FLUX</strong> uses one CLIP-L + T5-XXL.</li>
+<li><strong>Qwen-Image / Z-Image</strong> variants use their own in-house text encoders aligned with their base LLMs.</li>
+</ul>
+<p>The text encoder is a big part of why SD3/FLUX reason about prompts so much better than SD1.5. T5-XXL alone is 4.7B params.</p>
+<h3>Classifier-free guidance still holds</h3>
+<p>Rectified flow changes the sampler, not the conditioning. Classifier-free guidance (drop text with 10% probability during training, mix conditional and unconditional predictions at inference) works identically with rectified flow. Most 2026 models use guidance scale 3.5-5 — lower than SD1.5's 7.5 because rectified-flow models follow prompts more tightly by default.</p>
+<h3>Consistency, Turbo, Schnell, LCM</h3>
+<p>Four names for the same idea: distil a slow many-step model into a fast few-step model.</p>
+<ul>
+<li><strong>LCM (Latent Consistency Model)</strong> — train a student that predicts the final <code>x_0</code> from any intermediate <code>x_t</code> in one step.</li>
+<li><strong>SDXL Turbo / FLUX schnell</strong> — 1-4 step models trained with adversarial diffusion distillation.</li>
+<li><strong>SD Turbo</strong> — OpenAI-style Consistency Models adapted to latent diffusion.</li>
+</ul>
+<p>Production serving of any new model ships both a &quot;full quality&quot; checkpoint and a &quot;turbo / schnell&quot; variant. Schnell (&quot;fast&quot; in German, Black Forest Labs' convention) runs in 1-4 steps and fits real-time pipelines.</p>
+<h3>Model landscape in 2026</h3>
+<table>
+<thead>
+<tr>
+<th>Model</th>
+<th>Size</th>
+<th>Architecture</th>
+<th>License</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Stable Diffusion 3 Medium</td>
+<td>2B</td>
+<td>MMDiT</td>
+<td>SAI Community</td>
+</tr>
+<tr>
+<td>Stable Diffusion 3.5 Large</td>
+<td>8B</td>
+<td>MMDiT</td>
+<td>SAI Community</td>
+</tr>
+<tr>
+<td>FLUX.1-dev</td>
+<td>12B</td>
+<td>Double + Single Stream DiT</td>
+<td>non-commercial</td>
+</tr>
+<tr>
+<td>FLUX.1-schnell</td>
+<td>12B</td>
+<td>same, distilled</td>
+<td>Apache 2.0</td>
+</tr>
+<tr>
+<td>FLUX.2</td>
+<td>—</td>
+<td>iterated FLUX.1</td>
+<td>mixed</td>
+</tr>
+<tr>
+<td>Z-Image</td>
+<td>6B</td>
+<td>S3-DiT (Scalable Single-Stream)</td>
+<td>permissive</td>
+</tr>
+<tr>
+<td>Qwen-Image</td>
+<td>~20B</td>
+<td>DiT + Qwen text tower</td>
+<td>Apache 2.0</td>
+</tr>
+<tr>
+<td>Hunyuan-Image-3.0</td>
+<td>~80B</td>
+<td>DiT</td>
+<td>research</td>
+</tr>
+<tr>
+<td>SD4 Turbo</td>
+<td>3B</td>
+<td>DiT + distillation</td>
+<td>SAI Commercial</td>
+</tr>
+</tbody>
+</table>
+<p>FLUX.1-schnell is the 2026 open-source default. Z-Image is the efficiency leader. FLUX.2 and SD4 are the current quality tips.</p>
+<h3>Why this phase shift matters</h3>
+<p>DDPM + U-Net worked. DiT + rectified flow works <strong>better, faster, and scales more cleanly</strong>. The transition parallels the one from RNNs to transformers in NLP: both architectures solved the same problem, but transformers scaled and now dominate. Every 2026 paper on image, video, or 3D generation uses a DiT-shaped denoiser and usually a rectified flow objective. U-Net DDPM is now primarily pedagogical (Lesson 10).</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-c86613f7554539f836ba.png" alt="cv3-rectified-flow 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<h3>Step 1: A DiT block with AdaLN</h3>
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+
+class AdaLNZero(nn.Module):
+    &quot;&quot;&quot;
+    Adaptive LayerNorm with a gate. Predicts (scale, shift, gate) from the conditioning.
+    Init such that the whole block starts as identity (&quot;zero init&quot;).
+    &quot;&quot;&quot;
+
+    def __init__(self, dim, cond_dim):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim, elementwise_affine=False)
+        self.mlp = nn.Linear(cond_dim, dim * 3)
+        nn.init.zeros_(self.mlp.weight)
+        nn.init.zeros_(self.mlp.bias)
+
+    def forward(self, x, cond):
+        scale, shift, gate = self.mlp(cond).chunk(3, dim=-1)
+        h = self.norm(x) * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+        return h, gate.unsqueeze(1)
+
+
+class DiTBlock(nn.Module):
+    def __init__(self, dim=192, heads=3, mlp_ratio=4, cond_dim=192):
+        super().__init__()
+        self.adaln1 = AdaLNZero(dim, cond_dim)
+        self.attn = nn.MultiheadAttention(dim, heads, batch_first=True)
+        self.adaln2 = AdaLNZero(dim, cond_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, dim * mlp_ratio),
+            nn.GELU(),
+            nn.Linear(dim * mlp_ratio, dim),
+        )
+
+    def forward(self, x, cond):
+        h, gate1 = self.adaln1(x, cond)
+        a, _ = self.attn(h, h, h, need_weights=False)
+        x = x + gate1 * a
+        h, gate2 = self.adaln2(x, cond)
+        x = x + gate2 * self.mlp(h)
+        return x
+</code></pre>
+<p><code>AdaLNZero</code> starts as an identity mapping because its MLP weights are initialised to zero. Training nudges the block away from identity; this stabilises deep transformer diffusion models dramatically.</p>
+<h3>Step 2: A tiny DiT</h3>
+<pre><code class="language-python">def timestep_embedding(t, dim):
+    import math
+    half = dim // 2
+    freqs = torch.exp(-math.log(10000) * torch.arange(half, device=t.device) / half)
+    args = t[:, None].float() * freqs[None]
+    return torch.cat([args.sin(), args.cos()], dim=-1)
+
+
+class TinyDiT(nn.Module):
+    def __init__(self, image_size=16, patch_size=2, in_channels=3, dim=96, depth=4, heads=3):
+        super().__init__()
+        self.patch_size = patch_size
+        self.num_patches = (image_size // patch_size) ** 2
+        self.patch = nn.Conv2d(in_channels, dim, kernel_size=patch_size, stride=patch_size)
+        self.pos = nn.Parameter(torch.zeros(1, self.num_patches, dim))
+        self.time_mlp = nn.Sequential(
+            nn.Linear(dim, dim * 2),
+            nn.SiLU(),
+            nn.Linear(dim * 2, dim),
+        )
+        self.blocks = nn.ModuleList([DiTBlock(dim, heads, cond_dim=dim) for _ in range(depth)])
+        self.norm_out = nn.LayerNorm(dim, elementwise_affine=False)
+        self.head = nn.Linear(dim, patch_size * patch_size * in_channels)
+
+    def forward(self, x, t):
+        n = x.size(0)
+        x = self.patch(x)
+        x = x.flatten(2).transpose(1, 2) + self.pos
+        t_emb = self.time_mlp(timestep_embedding(t, self.pos.size(-1)))
+        for blk in self.blocks:
+            x = blk(x, t_emb)
+        x = self.norm_out(x)
+        x = self.head(x)
+        return self._unpatchify(x, n)
+
+    def _unpatchify(self, x, n):
+        p = self.patch_size
+        h = w = int(self.num_patches ** 0.5)
+        x = x.view(n, h, w, p, p, -1).permute(0, 5, 1, 3, 2, 4).reshape(n, -1, h * p, w * p)
+        return x
+</code></pre>
+<h3>Step 3: Rectified flow training</h3>
+<pre><code class="language-python">import torch.nn.functional as F
+
+def rectified_flow_train_step(model, x0, optimizer, device):
+    model.train()
+    x0 = x0.to(device)
+    n = x0.size(0)
+    t = torch.rand(n, device=device)
+    epsilon = torch.randn_like(x0)
+    x_t = (1 - t[:, None, None, None]) * x0 + t[:, None, None, None] * epsilon
+
+    target_velocity = epsilon - x0
+    pred_velocity = model(x_t, t)
+
+    loss = F.mse_loss(pred_velocity, target_velocity)
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+    return loss.item()
+</code></pre>
+<p>Compare with DDPM's noise-prediction loss (Lesson 10): same structure, different target. Instead of predicting the noise <code>epsilon</code>, we predict the <strong>velocity</strong> <code>epsilon - x_0</code>, which points from data to noise along the straight-line interpolation.</p>
+<h3>Step 4: Euler sampler</h3>
+<p>Rectified flow is an ODE. Euler's method is the simplest and, for a well-trained rectified-flow model, nearly as accurate as higher-order solvers at 20+ steps.</p>
+<pre><code class="language-python">@torch.no_grad()
+def rectified_flow_sample(model, shape, steps=20, device=&quot;cpu&quot;):
+    model.eval()
+    x = torch.randn(shape, device=device)
+    dt = 1.0 / steps
+    t = torch.ones(shape[0], device=device)
+    for _ in range(steps):
+        v = model(x, t)
+        x = x - dt * v
+        t = t - dt
+    return x
+</code></pre>
+<p>20 steps. On a trained model this produces samples comparable to 1000-step DDPM.</p>
+<h3>Step 5: End-to-end smoke test</h3>
+<pre><code class="language-python">import numpy as np
+
+def synthetic_blobs(num=200, size=16, seed=0):
+    rng = np.random.default_rng(seed)
+    out = np.zeros((num, 3, size, size), dtype=np.float32)
+    yy, xx = np.meshgrid(np.arange(size), np.arange(size), indexing=&quot;ij&quot;)
+    for i in range(num):
+        cx, cy = rng.uniform(4, size - 4, size=2)
+        r = rng.uniform(2, 4)
+        mask = (xx - cx) ** 2 + (yy - cy) ** 2 &lt; r ** 2
+        colour = rng.uniform(-1, 1, size=3)
+        for c in range(3):
+            out[i, c][mask] = colour[c]
+    return torch.from_numpy(out)
+</code></pre>
+<p>Train a <code>TinyDiT</code> on this with rectified flow. After 500 steps, sampled outputs should look like faint blobs of colour.</p>
+<h2>Use It</h2>
+<p>For real image generation with FLUX / SD3 / Z-Image, <code>diffusers</code> ships every one with a unified API:</p>
+<pre><code class="language-python">from diffusers import FluxPipeline, StableDiffusion3Pipeline
+import torch
+
+pipe = FluxPipeline.from_pretrained(
+    &quot;black-forest-labs/FLUX.1-schnell&quot;,
+    torch_dtype=torch.bfloat16,
+).to(&quot;cuda&quot;)
+
+out = pipe(
+    prompt=&quot;a golden retriever surfing a tsunami, hyperrealistic, studio lighting&quot;,
+    guidance_scale=0.0,           # schnell was trained without CFG
+    num_inference_steps=4,
+    max_sequence_length=256,
+).images[0]
+out.save(&quot;surf.png&quot;)
+</code></pre>
+<p>Three lines. <code>FLUX.1-schnell</code> in four steps. Swap the model id for <code>black-forest-labs/FLUX.1-dev</code> for higher quality at 20-30 steps with CFG.</p>
+<p>For SD3:</p>
+<pre><code class="language-python">pipe = StableDiffusion3Pipeline.from_pretrained(
+    &quot;stabilityai/stable-diffusion-3.5-large&quot;,
+    torch_dtype=torch.bfloat16,
+).to(&quot;cuda&quot;)
+out = pipe(prompt, guidance_scale=3.5, num_inference_steps=28).images[0]
+</code></pre>
+<h2>Ship It</h2>
+<p>This lesson produces:</p>
+<ul>
+<li><code>outputs/prompt-dit-model-picker.md</code> — picks between SD3, FLUX.1-dev, FLUX.1-schnell, Z-Image, SD4 Turbo given quality, latency, and license constraints.</li>
+<li><code>outputs/skill-rectified-flow-trainer.md</code> — writes a complete training loop for rectified flow with AdaLN DiT and Euler sampling.</li>
+</ul>
+<h2>Exercises</h2>
+<ol>
+<li><strong>(Easy)</strong> Train the TinyDiT above on the synthetic blob dataset for 500 steps. Compare samples produced with 10, 20, and 50 Euler steps.</li>
+<li><strong>(Medium)</strong> Add text conditioning by concatenating a learned class embedding to the time embedding (10 blob &quot;classes&quot; by colour). Sample with class 0, 5, and 9 and verify colours match.</li>
+<li><strong>(Hard)</strong> Compute the Fréchet distance (FID proxy) between generated samples from rectified-flow and DDPM versions of the same-size network trained on the same data for the same number of steps. Report which converges faster.</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>DiT</td>
+<td>&quot;Diffusion transformer&quot;</td>
+<td>Transformer that replaces the U-Net as the diffusion denoiser; operates on patchified latents</td>
+</tr>
+<tr>
+<td>AdaLN</td>
+<td>&quot;Adaptive layer norm&quot;</td>
+<td>Timestep/text conditioning via learned scale, shift, gate applied after LayerNorm; standard in every modern DiT</td>
+</tr>
+<tr>
+<td>MMDiT</td>
+<td>&quot;Multi-modal DiT (SD3)&quot;</td>
+<td>Separate weight streams for text and image tokens that share a joint self-attention</td>
+</tr>
+<tr>
+<td>Single-stream / double-stream</td>
+<td>&quot;FLUX trick&quot;</td>
+<td>First N blocks double-stream (separate weights per modality), later blocks single-stream (concat + shared weights) for efficiency</td>
+</tr>
+<tr>
+<td>Rectified flow</td>
+<td>&quot;Straight-line noise-to-data&quot;</td>
+<td>Linear interpolation between data and noise; network predicts velocity; fewer ODE steps needed at inference</td>
+</tr>
+<tr>
+<td>Velocity target</td>
+<td>&quot;epsilon - x_0&quot;</td>
+<td>The regression target in rectified flow; points from clean data to noise</td>
+</tr>
+<tr>
+<td>CFG guidance</td>
+<td>&quot;classifier-free guidance&quot;</td>
+<td>Mix conditional and unconditional predictions; still used in rectified-flow models</td>
+</tr>
+<tr>
+<td>Schnell / turbo / LCM</td>
+<td>&quot;1-4 step distillation&quot;</td>
+<td>Small-step variants distilled from full-quality models; production real-time</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2212.09748" rel="noreferrer" data-network="true">Scalable Diffusion Models with Transformers (Peebles &amp; Xie, 2023) <small>↗ 需要联网</small></a> — the DiT paper</li>
+<li><a href="https://arxiv.org/abs/2403.03206" rel="noreferrer" data-network="true">Scaling Rectified Flow Transformers (Esser et al., SD3 paper) <small>↗ 需要联网</small></a> — MMDiT and rectified-flow at scale</li>
+<li><a href="https://huggingface.co/black-forest-labs/FLUX.1-dev" rel="noreferrer" data-network="true">FLUX.1 model card and technical report (Black Forest Labs) <small>↗ 需要联网</small></a> — double + single-stream details</li>
+<li><a href="https://arxiv.org/html/2511.22699v1" rel="noreferrer" data-network="true">Z-Image: Efficient Image Generation Foundation Model (2025) <small>↗ 需要联网</small></a> — single-stream DiT at 6B</li>
+<li><a href="https://arxiv.org/abs/2206.00364" rel="noreferrer" data-network="true">Elucidating the Design Space of Diffusion (Karras et al., 2022) <small>↗ 需要联网</small></a> — the reference for every diffusion design trade-off</li>
+<li><a href="https://arxiv.org/abs/2310.04378" rel="noreferrer" data-network="true">Latent Consistency Models (Luo et al., 2023) <small>↗ 需要联网</small></a> — how LCM-LoRA gives you 4-step inference</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-04-computer-vision--23-diffusion-transformers-rectified-flow.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-04-computer-vision--23-diffusion-transformers-rectified-flow.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/04-computer-vision/23-diffusion-transformers-rectified-flow/code/main.py">phases/04-computer-vision/23-diffusion-transformers-rectified-flow/code/main.py</a><details><summary>查看原始文本</summary><pre><code>import math
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+def timestep_embedding(t, dim):
+    half = dim // 2
+    freqs = torch.exp(-math.log(10000) * torch.arange(half, device=t.device) / half)
+    args = t[:, None].float() * freqs[None]
+    return torch.cat([args.sin(), args.cos()], dim=-1)
+
+
+class AdaLNZero(nn.Module):
+    def __init__(self, dim, cond_dim):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim, elementwise_affine=False)
+        self.mlp = nn.Linear(cond_dim, dim * 3)
+        nn.init.zeros_(self.mlp.weight)
+        nn.init.zeros_(self.mlp.bias)
+
+    def forward(self, x, cond):
+        scale, shift, gate = self.mlp(cond).chunk(3, dim=-1)
+        h = self.norm(x) * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+        return h, gate.unsqueeze(1)
+
+
+class DiTBlock(nn.Module):
+    def __init__(self, dim=96, heads=3, mlp_ratio=4, cond_dim=96):
+        super().__init__()
+        self.adaln1 = AdaLNZero(dim, cond_dim)
+        self.attn = nn.MultiheadAttention(dim, heads, batch_first=True)
+        self.adaln2 = AdaLNZero(dim, cond_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, dim * mlp_ratio),
+            nn.GELU(),
+            nn.Linear(dim * mlp_ratio, dim),
+        )
+
+    def forward(self, x, cond):
+        h, gate1 = self.adaln1(x, cond)
+        a, _ = self.attn(h, h, h, need_weights=False)
+        x = x + gate1 * a
+        h, gate2 = self.adaln2(x, cond)
+        x = x + gate2 * self.mlp(h)
+        return x
+
+
+class TinyDiT(nn.Module):
+    def __init__(self, image_size=16, patch_size=2, in_channels=3, dim=96, depth=4, heads=3):
+        super().__init__()
+        self.patch_size = patch_size
+        self.image_size = image_size
+        self.num_patches = (image_size // patch_size) ** 2
+        self.in_channels = in_channels
+        self.patch = nn.Conv2d(in_channels, dim, kernel_size=patch_size, stride=patch_size)
+        self.pos = nn.Parameter(torch.zeros(1, self.num_patches, dim))
+        self.time_mlp = nn.Sequential(
+            nn.Linear(dim, dim * 2),
+            nn.SiLU(),
+            nn.Linear(dim * 2, dim),
+        )
+        self.blocks = nn.ModuleList([DiTBlock(dim, heads, cond_dim=dim) for _ in range(depth)])
+        self.norm_out = nn.LayerNorm(dim, elementwise_affine=False)
+        self.head = nn.Linear(dim, patch_size * patch_size * in_channels)
+        nn.init.trunc_normal_(self.pos, std=0.02)
+
+    def forward(self, x, t):
+        n = x.size(0)
+        x = self.patch(x)
+        x = x.flatten(2).transpose(1, 2) + self.pos
+        t_emb = self.time_mlp(timestep_embedding(t, self.pos.size(-1)))
+        for blk in self.blocks:
+            x = blk(x, t_emb)
+        x = self.norm_out(x)
+        x = self.head(x)
+        return self._unpatchify(x, n)
+
+    def _unpatchify(self, x, n):
+        p = self.patch_size
+        h = w = int(self.num_patches ** 0.5)
+        x = x.view(n, h, w, p, p, self.in_channels).permute(0, 5, 1, 3, 2, 4)
+        x = x.reshape(n, self.in_channels, h * p, w * p)
+        return x
+
+
+def rectified_flow_train_step(model, x0, optimizer, device):
+    model.train()
+    x0 = x0.to(device)
+    n = x0.size(0)
+    t = torch.rand(n, device=device)
+    epsilon = torch.randn_like(x0)
+    x_t = (1 - t[:, None, None, None]) * x0 + t[:, None, None, None] * epsilon
+    target_v = epsilon - x0
+    pred_v = model(x_t, t)
+    loss = F.mse_loss(pred_v, target_v)
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+    return loss.item()
+
+
+@torch.no_grad()
+def rectified_flow_sample(model, shape, steps=20, device=&quot;cpu&quot;):
+    model.eval()
+    x = torch.randn(shape, device=device)
+    dt = 1.0 / steps
+    t = torch.ones(shape[0], device=device)
+    for _ in range(steps):
+        v = model(x, t)
+        x = x - dt * v
+        t = t - dt
+    return x
+
+
+def synthetic_blobs(num=200, size=16, seed=0):
+    rng = np.random.default_rng(seed)
+    out = np.zeros((num, 3, size, size), dtype=np.float32)
+    yy, xx = np.meshgrid(np.arange(size), np.arange(size), indexing=&quot;ij&quot;)
+    for i in range(num):
+        cx, cy = rng.uniform(4, size - 4, size=2)
+        r = rng.uniform(2, 4)
+        mask = (xx - cx) ** 2 + (yy - cy) ** 2 &lt; r ** 2
+        colour = rng.uniform(-1, 1, size=3)
+        for c in range(3):
+            out[i, c][mask] = colour[c]
+    return torch.from_numpy(out)
+
+
+def main():
+    torch.manual_seed(0)
+    device = &quot;cpu&quot;
+    data = synthetic_blobs(num=128, size=16)
+    print(f&quot;data shape: {tuple(data.shape)}&quot;)
+
+    model = TinyDiT(image_size=16, patch_size=2, in_channels=3, dim=96, depth=4, heads=3).to(device)
+    print(f&quot;params: {sum(p.numel() for p in model.parameters()):,}&quot;)
+
+    opt = torch.optim.Adam(model.parameters(), lr=3e-4)
+
+    batch = 32
+    for step in range(300):
+        idx = np.random.choice(len(data), batch)
+        x0 = data[idx]
+        loss = rectified_flow_train_step(model, x0, opt, device)
+        if step % 50 == 0:
+            print(f&quot;step {step:3d}  rf_mse {loss:.4f}&quot;)
+
+    print(&quot;\n[sample] steps=20&quot;)
+    s20 = rectified_flow_sample(model, (4, 3, 16, 16), steps=20, device=device)
+    print(f&quot;  samples range [{s20.min():.2f}, {s20.max():.2f}]  shape {tuple(s20.shape)}&quot;)
+    print(&quot;[sample] steps=4 (schnell-like)&quot;)
+    s4 = rectified_flow_sample(model, (4, 3, 16, 16), steps=4, device=device)
+    print(f&quot;  samples range [{s4.min():.2f}, {s4.max():.2f}]  shape {tuple(s4.shape)}&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/04-computer-vision/23-diffusion-transformers-rectified-flow/outputs/prompt-dit-model-picker.md">phases/04-computer-vision/23-diffusion-transformers-rectified-flow/outputs/prompt-dit-model-picker.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: prompt-dit-model-picker
+description: Pick between SD3, SD3.5, FLUX.1-dev, FLUX.1-schnell, Z-Image, SD4 Turbo given quality, latency, and license
+phase: 4
+lesson: 23
+---
+
+You are a DiT model selector for text-to-image generation.
+
+## Inputs
+
+- `quality_target`: prototype | production | premium
+- `latency_target_s`: per image on target GPU
+- `license_need`: permissive | commercial_ok | research_ok
+- `gpu_memory_gb`: 8 | 12 | 16 | 24 | 48+
+- `resolution`: 512 | 768 | 1024 | 2048
+
+## Decision
+
+1. `latency_target_s &lt;= 0.5` and `license_need == permissive` -&gt; **FLUX.1-schnell** (Apache 2.0, 4 steps).
+2. `latency_target_s &lt;= 1.0` and `quality_target &gt;= production` -&gt; **SD4 Turbo** or **SDXL-Turbo** with LCM-LoRA.
+3. `quality_target == premium` and `license_need == research_ok` -&gt; **FLUX.1-dev** (non-commercial) at 20-30 steps.
+4. `quality_target == premium` and `license_need == commercial_ok` -&gt; **Stable Diffusion 3.5 Large** (SAI Community) or **FLUX.2**.
+5. `gpu_memory_gb &lt;= 12` and `quality_target == production` -&gt; **Z-Image** (6B params, efficient).
+6. `quality_target == prototype` -&gt; **SD3 Medium** (2B) or **FLUX.1-schnell**.
+7. `resolution == 2048` -&gt; **SDXL + LCM-LoRA** or **FLUX.1-dev** with tiled inference; most DiTs hit quality ceilings above 1024 native.
+
+## Output
+
+```
+[model pick]
+  id:           &lt;HuggingFace repo id&gt;
+  params:       &lt;N&gt;
+  precision:    float16 | bfloat16
+  license:      &lt;full name&gt;
+
+[inference recipe]
+  scheduler:    FlowMatchEuler | DPM-Solver++ | LCM
+  steps:        &lt;int&gt;
+  guidance:     &lt;float, 0 for schnell&gt;
+  resolution:   &lt;H x W&gt;
+
+[expected latency]
+  &lt;s per image on target GPU&gt;
+
+[caveats]
+  - any license restrictions
+  - any resolution / aspect ratio gotchas
+  - quality gaps vs the premium tier
+```
+
+## Rules
+
+- For `license_need == permissive`, restrict to FLUX.1-schnell (Apache 2.0) and Qwen-Image (Apache 2.0).
+- For `license_need == commercial_ok`, SD3.5 is the safest mainstream choice; FLUX.1-dev is not.
+- Never recommend SD1.5 or SDXL as the primary for new 2026 projects unless there is a specific ecosystem reason (LoRAs, ControlNets) — quality ceilings are below the DiT tier.
+- If `gpu_memory_gb &lt; 8`, recommend offloading CPU / sequential encoder loading in diffusers rather than switching model; the base model still needs to live somewhere.
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/04-computer-vision/23-diffusion-transformers-rectified-flow/outputs/skill-rectified-flow-trainer.md">phases/04-computer-vision/23-diffusion-transformers-rectified-flow/outputs/skill-rectified-flow-trainer.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: skill-rectified-flow-trainer
+description: Write a complete rectified-flow training loop with AdaLN DiT and Euler sampling
+version: 1.0.0
+phase: 4
+lesson: 23
+tags: [diffusion, rectified-flow, DiT, training]
+---
+
+# Rectified Flow Trainer
+
+Produce a clean, minimal training loop that would successfully train a small DiT with rectified flow on any image tensor dataset.
+
+## When to use
+
+- Reproducing the SD3 / FLUX training objective at small scale.
+- Benchmarking rectified flow vs DDPM on the same data.
+- Building a custom rectified-flow model for a non-standard domain (medical, satellite).
+
+## Inputs
+
+- `model`: an `nn.Module` taking `(x, t)` and returning a predicted velocity.
+- `dataset`: an iterable of clean images in the model&#39;s domain.
+- `optimizer`: AdamW with `lr=1e-4`, `weight_decay=0.01`, `betas=(0.9, 0.99)`.
+- `scheduler`: cosine with warmup, default 1000 warmup steps.
+
+## Training step
+
+```python
+def rectified_flow_train_step(model, x0, optimizer, device):
+    model.train()
+    x0 = x0.to(device)
+    n = x0.size(0)
+    t = torch.rand(n, device=device)                     # uniform in [0, 1]
+    epsilon = torch.randn_like(x0)
+    x_t = (1 - t[:, None, None, None]) * x0 + t[:, None, None, None] * epsilon
+    target_v = epsilon - x0                              # velocity target
+    pred_v = model(x_t, t)
+    loss = F.mse_loss(pred_v, target_v)
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+    return loss.item()
+```
+
+## Sampling (Euler)
+
+```python
+@torch.no_grad()
+def sample(model, shape, steps=20, device=&quot;cpu&quot;):
+    model.eval()
+    x = torch.randn(shape, device=device)
+    dt = 1.0 / steps
+    t = torch.ones(shape[0], device=device)
+    for _ in range(steps):
+        v = model(x, t)
+        x = x - dt * v
+        t = t - dt
+    return x
+```
+
+## Tips
+
+- Use `torch.rand` uniform `t`; logit-normal or Sd3-style weighted sampling of `t` helps slightly but is not required to get started.
+- EMA of model weights is standard practice; maintain `ema_model` with decay 0.9999.
+- Classifier-free guidance for conditional models: with 10% probability replace the conditioning with an empty/null embedding during training; at inference mix `v_uncond + w * (v_cond - v_uncond)` with `w` around 3-5.
+- For LDM-style training (FLUX, SD3), the whole loop runs in a VAE latent space; the clean `x0` above is actually `VAE.encode(image)`.
+- Typical convergence on a 32x32 toy dataset: 2000-5000 steps. On real latent SD3 training: hundreds of thousands.
+
+## Report
+
+```
+[rectified flow training]
+  steps:        &lt;int&gt;
+  final loss:   &lt;float&gt;
+  ema decay:    &lt;float&gt;
+  vae?:         yes | no
+  cfg dropout:  &lt;fraction&gt;
+
+[sampling]
+  default steps: 20
+  schnell / turbo target: 4
+  full quality reference: 50+ (for comparison only)
+```
+
+## Rules
+
+- Never train rectified flow with an image-space velocity target on RGB `uint8` data; normalise to zero mean, unit variance first.
+- Always log training loss per timestep-bucket; if early timesteps (near 0) have higher loss than late ones (near 1) the velocity parameterisation is probably miswired.
+- Do not mix rectified-flow velocity target with DDPM noise target in the same training loop; pick one.
+- Use bfloat16 training on Ampere+ GPUs; float16 sometimes produces NaN grads in rectified flow due to the velocity magnitude.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. Why did 2024+ SOTA text-to-image models (SD3, FLUX, Z-Image) replace the U-Net denoiser with a Diffusion Transformer (DiT)?</legend><label class="option"><input type="radio" name="q0" value="0"> U-Net is not supported on GPUs anymore</label><label class="option"><input type="radio" name="q0" value="1"> DiT scales more predictably than U-Net (same scaling-law regime as LLMs), handles long-range spatial dependencies better for prompt-accurate generation, and pairs naturally with text encoders via cross or joint attention</label><label class="option"><input type="radio" name="q0" value="2"> Transformers are easier to write</label><label class="option"><input type="radio" name="q0" value="3"> DiT has fewer parameters</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. Rectified flow trains the model to predict velocity `v = epsilon - x_0` along a straight-line interpolation between data and noise. Why does this enable 20-step sampling instead of 1000?</legend><label class="option"><input type="radio" name="q1" value="0"> It requires a bigger model</label><label class="option"><input type="radio" name="q1" value="1"> The learned ODE is closer to a straight line than DDPM&#39;s curved SDE, so few-step Euler integration produces accurate samples; combined with distillation you get 1-4 step variants like FLUX schnell</label><label class="option"><input type="radio" name="q1" value="2"> Euler is strictly better than DDIM</label><label class="option"><input type="radio" name="q1" value="3"> It does not; rectified flow also needs 1000 steps</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. MMDiT (SD3) uses two sets of weights, one for text tokens and one for image tokens, that share a single joint attention layer. Why?</legend><label class="option"><input type="radio" name="q2" value="0"> To save memory</label><label class="option"><input type="radio" name="q2" value="1"> Text and image embeddings are conceptually different distributions; separate weights let each modality process its own representation while the joint attention lets them interact; the result is better text-image alignment and prompt following than a single shared stream</label><label class="option"><input type="radio" name="q2" value="2"> It is a legacy design</label><label class="option"><input type="radio" name="q2" value="3"> Only image tokens actually go through the attention</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. What does AdaLN-Zero mean in a DiT block, and why does it help?</legend><label class="option"><input type="radio" name="q3" value="0"> A LayerNorm that is only applied 50% of the time</label><label class="option"><input type="radio" name="q3" value="1"> Adaptive LayerNorm whose modulation MLP is initialised to zero so the block starts as identity; training then learns the scale/shift/gate, which stabilises very deep diffusion transformers</label><label class="option"><input type="radio" name="q3" value="2"> A layer norm with zero epsilon</label><label class="option"><input type="radio" name="q3" value="3"> A LayerNorm with zero mean</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. FLUX.1-schnell can produce an image in 4 steps. Which technique lets it do that?</legend><label class="option"><input type="radio" name="q4" value="0"> Lower precision weights</label><label class="option"><input type="radio" name="q4" value="1"> Smaller parameter count</label><label class="option"><input type="radio" name="q4" value="2"> Distillation — schnell is trained from a slow many-step teacher using adversarial / consistency-style objectives so that 1-4 denoising steps match the teacher&#39;s 20-30 step output</label><label class="option"><input type="radio" name="q4" value="3"> A different base architecture than FLUX.1-dev</label><p data-feedback="4"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/04-computer-vision/22-3d-gaussian-splatting/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/04-computer-vision/24-sam3-open-vocab-segmentation/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/04-computer-vision/23-diffusion-transformers-rectified-flow/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

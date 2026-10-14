@@ -1,0 +1,1053 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>视频理解管道 (场景,问答,搜索) · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-19-capstone-projects" data-lesson="19-capstone-projects/12-video-understanding-pipeline" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/19-capstone-projects/">综合项目</a> / LESSON 12</p><h1 class="lesson-title">视频理解管道 (场景,问答,搜索)</h1><p>Capstone 12 — Video Understanding Pipeline (Scene, QA, Search)</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>视频理解管道 (场景,问答,搜索)</h1>
+<blockquote>
+<p>十二个实验室生产了马伦戈+佩加索. 视频DB发送了CRUD为视频API. 艾尔2的Molmo2公布了开放的VLM检查站. 双胞胎长文本处理数小时的视频. 时间镜头-100K定义了时间定位. 2026年管道已经解决了:场景分区,每场景标题+嵌入,转录对齐,多向量索引,以及一个用 (开始,结束) 时间标签和框架预览来回答的问题. 终点石正在摄入100小时, 达到公共标准,</p>
+</blockquote>
+<p><strong>Type:</strong> Capstone
+<strong>Languages:</strong> Python (pipeline), TypeScript (UI)
+<strong>Prerequisites:</strong> Phase 4 (CV), Phase 6 (speech), Phase 7 (transformers), Phase 11 (LLM engineering), Phase 12 (multimodal), Phase 17 (infrastructure)
+**Phases exercised:**子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子
+<strong>Time:</strong> 30 hours</p>
+<h2>问题</h2>
+<p>长频视频QA是2026年规模最需要带宽的多模式问题. 双子球 2.5 Pro 可以本地读取2小时的视频, 但在可查询的体内摄入100小时的视频仍然需要一个场景级索引. 制作形状结合了场景细分 (TransNetV2或PySceneDetect),每场景标题与VLM (Gemini 2.5,Qwen3-VL-Max或Molmo 2),转录对齐 (Whisper-v3-turbo与词时刻标签),以及多向量索引,存储标题,框架嵌入和转录一边. 查询管道的答案是 (开始,结束) 时间标签以及框架预览.</p>
+<p>测量标准是公开的 (ActivityNet-QA,NeXT-GQA) 加上你自己的100个查询定制集.计算和行动类型的问题上的幻觉是已知的硬失败类;终点石显然测量它.</p>
+<h2>概念</h2>
+<p>入时,三个管道并行.<strong>Scene segmentation</strong>剪辑视频成场景.<strong>VLM captioning</strong>通过键盘生成一个字幕,<strong>ASR alignment</strong>制作字面级时间标签.三个流由 (scene_id,时间范围) 连接.每个场景在多向量索引 (Qdrant) 中得到三个向量类型:标题嵌入,键盘嵌入,转录嵌入.</p>
+<p>在查询时,自然语言问题针对三个向量;结果与RRF合并;一个时间定位适配器 (TimeLens式) 精炼了顶部场景内的 (开始,结束) 窗口.VLM合成器 (Gemini 2.5 Pro或Qwen3-VL-Max) 采用引用的时间标签和框架预览来查询+顶部场景+截截图框架和答案.</p>
+<p>测量幻觉是重要的.计算 (&quot;房间里有多少人进来?&quot;) 和行动类型 (&quot;厨师在之前倒水吗?&quot;) 的问题是不值得信赖的.</p>
+<h2>建筑</h2>
+<pre><code>video file / URL
+      |
+      v
+PySceneDetect / TransNetV2  (scene segmentation)
+      |
+      +--- per-scene keyframe --- VLM caption + frame embedding
+      |                            (Gemini 2.5 Pro / Qwen3-VL-Max / Molmo 2)
+      |
+      +--- audio channel --- Whisper-v3-turbo ASR + word timestamps
+      |
+      v
+multi-vector Qdrant: {caption_emb, keyframe_emb, transcript_emb}
+      |
+query:
+  dense queries against all three -&gt; RRF merge -&gt; top-k scenes
+      |
+      v
+TimeLens / VideoITG temporal grounding (refine start/end within scene)
+      |
+      v
+VLM synth: query + top scenes + frame previews
+      |
+      v
+answer + (start, end) timestamps + frame thumbs + citations
+</code></pre>
+<h2>堆</h2>
+<ul>
+<li>场景细分:TransNetV2 (最先进的2024-26) 或PySceneDetect</li>
+<li>通过快速的语,使用词语时刻标签.</li>
+<li>维LM子+答案机:双子 2.5 专业或Qwen3-VL-Max或Molmo 2</li>
+<li>时间定位:TimeLens-100K训练式适配器或视频ITG</li>
+<li>索引:多向量支持的Qdrant (标题/框架/转录)</li>
+<li>接口:下一个.js 15 带HTML5视频播放器和场景缩影</li>
+<li>标准:ActivityNet-QA,NeXT-GQA,定制100个问题手动标记的套件</li>
+<li>幻觉基准:手标的计数和行动类型子组</li>
+</ul>
+<figure><img src="/learn/ai-from-scratch/figures/figure-8453fcb1a1365fcad56b.png" alt="cf-scene-index 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<ol>
+<li>
+<p>**Ingest walker.**接受YouTubeURL或本地MP4文件. 如果需要,下调到720p.坚持<code>{video_id, file_path}</code>现在,我们要去.</p>
+</li>
+<li>
+<p>**Scene segmentation.**运行TransNetV2或PySceneDetect以生成<code>[{scene_id, start_ms, end_ms, keyframe_path}]</code>目标100小时: ~6K-8K场景.</p>
+</li>
+<li>
+<p>**ASR pass.**运行Whisper-v3turbo在音频上; 导出文字级别的时间; 分成每场景的转录片.</p>
+</li>
+<li>
+<p>**VLM captioning.**每场景,用键盘和短标题模板拨打双子座2.5 Pro (或Qwen3-VL-Max).生成标题+框架嵌入.</p>
+</li>
+<li>
+<p>**Multi-vector index.**源集有三个命名的向量.<code>{video_id, scene_id, start_ms, end_ms, keyframe_url}</code>现在,我们要去.</p>
+</li>
+<li>
+<p>**Query.**自然语言问题引发了三个密集的查询;与相互的排列融合融合融合;顶级k=5场景.</p>
+</li>
+<li>
+<p>**Temporal grounding.**在上方场景上运行TimeLens式适配器,以精细化场景内的 (开始,结束) 窗口.</p>
+</li>
+<li>
+<p>**VLM synth.**通过查询+前三场景剪辑 (作为图像或短片) +转录来调用双子 2.5 Pro. 要求 <code>(video_id, start_ms, end_ms)</code>引用.</p>
+</li>
+<li>
+<p>**Eval.**运行 ActivityNet-QA 和 NeXT-GQA. 建立一个100个查询的自定义集. 报告总体准确性+每个类的分类 (计数,操作,描述).</p>
+</li>
+</ol>
+<h2>用它</h2>
+<pre><code>$ video-qa ask --url=https://youtube.com/watch?v=X &quot;how many cars pass the intersection in the first minute?&quot;
+[scene]    23 scenes detected
+[asr]      transcript complete, 4m12s
+[index]    69 vectors written (23 scenes x 3)
+[query]    top scene: scene 3 [01:32-01:54], confidence 0.84
+[ground]   refined window: [00:12-00:58]
+[synth]    gemini 2.5 pro, 1.4s
+answer:    5 cars pass the intersection between 00:12 and 00:58.
+citations: [scene 3: 00:12-00:58]
+          [frame preview at 00:14, 00:27, 00:44, 00:51, 00:57]
+</code></pre>
+<h2>运送它</h2>
+<p><code>outputs/skill-video-qa.md</code>提供YouTubeURL或上传的视频,该管道将场景索引,并以时间标记引用来回答问题.</p>
+<table>
+<thead>
+<tr>
+<th style="text-align:center">Weight</th>
+<th>Criterion</th>
+<th>How it is measured</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align:center">25</td>
+<td>Temporal grounding IoU</td>
+<td>Intersection-over-union on held-out grounding set</td>
+</tr>
+<tr>
+<td style="text-align:center">20</td>
+<td>QA accuracy</td>
+<td>NeXT-GQA and custom 100-query</td>
+</tr>
+<tr>
+<td style="text-align:center">20</td>
+<td>Ingest throughput</td>
+<td>Hours of video per dollar spent</td>
+</tr>
+<tr>
+<td style="text-align:center">20</td>
+<td>UI and citation UX</td>
+<td>Timestamp links, thumbnail strip, jump-to-frame</td>
+</tr>
+<tr>
+<td style="text-align:center">15</td>
+<td>Hallucination rate</td>
+<td>Counting and action-type accuracy separately</td>
+</tr>
+<tr>
+<td style="text-align:center"><strong>100</strong></td>
+<td></td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<h2>运动</h2>
+<ol>
+<li>
+<p>报道标题质量达尔塔在人类评级的50场景样本上.</p>
+</li>
+<li>
+<p>减少每场景的框架嵌入到一个聚合向量而不是多向量.</p>
+</li>
+<li>
+<p>建立&quot;严格计数&quot;模式:合成器将每次计数的实例都以时间印取出来,用户点击验证. 测量用户验证是否减少幻觉.</p>
+</li>
+<li>
+<p>根据标准摄入成本:每美元的视频时间,在三个VLM选择中.</p>
+</li>
+<li>
+<p>添加扬声器日记转录:在音频中运行pyannote扬声器日记转录,并嵌入每个扬声器的转录. 展示&quot;爱丽丝对X说什么?&quot;的查询.</p>
+</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Scene segmentation</td>
+<td>&quot;Shot detection&quot;</td>
+<td>Cutting video into scenes at shot boundaries</td>
+</tr>
+<tr>
+<td>Multi-vector index</td>
+<td>&quot;Caption + frame + transcript&quot;</td>
+<td>Qdrant collection with named vectors per representation</td>
+</tr>
+<tr>
+<td>Temporal grounding</td>
+<td>&quot;When exactly did it happen&quot;</td>
+<td>Refining the (start, end) window for a query answer</td>
+</tr>
+<tr>
+<td>Frame embedding</td>
+<td>&quot;Visual representation&quot;</td>
+<td>A vector embedding of a keyframe; used for scene-visual similarity</td>
+</tr>
+<tr>
+<td>RRF fusion</td>
+<td>&quot;Reciprocal rank fusion&quot;</td>
+<td>Merge strategy across multiple ranked lists; a classic hybrid-retrieval trick</td>
+</tr>
+<tr>
+<td>Counting hallucination</td>
+<td>&quot;Miscount&quot;</td>
+<td>Known failure mode of VLMs on &quot;how many X&quot; questions</td>
+</tr>
+<tr>
+<td>ActivityNet-QA</td>
+<td>&quot;Video-QA benchmark&quot;</td>
+<td>Long-form video QA accuracy benchmark</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://allenai.org/blog/molmo2" rel="noreferrer" data-network="true">AI2 Molmo 2 <small>↗ 需要联网</small></a>开放VLM检查站</li>
+<li><a href="https://github.com/TencentARC/TimeLens" rel="noreferrer" data-network="true">TimeLens (CVPR 2026) <small>↗ 需要联网</small></a>时间定位</li>
+<li><a href="https://deepmind.google/technologies/gemini" rel="noreferrer" data-network="true">Gemini Video long-context <small>↗ 需要联网</small></a> 托管的参考</li>
+<li><a href="https://videodb.io" rel="noreferrer" data-network="true">VideoDB <small>↗ 需要联网</small></a>CRUD为视频API参考</li>
+<li><a href="https://www.twelvelabs.io" rel="noreferrer" data-network="true">Twelve Labs Marengo + Pegasus <small>↗ 需要联网</small></a>商业参考</li>
+<li><a href="https://github.com/soCzech/TransNetV2" rel="noreferrer" data-network="true">TransNetV2 <small>↗ 需要联网</small></a>场景分区模型</li>
+<li><a href="https://github.com/Breakthrough/PySceneDetect" rel="noreferrer" data-network="true">PySceneDetect <small>↗ 需要联网</small></a>经典的开放替代品</li>
+<li><a href="https://arxiv.org/abs/1906.02467" rel="noreferrer" data-network="true">ActivityNet-QA <small>↗ 需要联网</small></a>参考评价基准</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Capstone 12 — Video Understanding Pipeline (Scene, QA, Search)</h1>
+<blockquote>
+<p>Twelve Labs productized Marengo + Pegasus. VideoDB shipped the CRUD-for-video API. AI2's Molmo 2 published open VLM checkpoints. Gemini long-context handles hours of video natively. TimeLens-100K defined temporal grounding at scale. The 2026 pipeline is settled: scene segmentation, per-scene caption + embedding, transcript alignment, multi-vector index, and a query that answers with (start, end) timestamps plus frame previews. The capstone is ingesting 100 hours, hitting public benchmarks, and measuring hallucination on counting and action questions.</p>
+</blockquote>
+<p><strong>Type:</strong> Capstone
+<strong>Languages:</strong> Python (pipeline), TypeScript (UI)
+<strong>Prerequisites:</strong> Phase 4 (CV), Phase 6 (speech), Phase 7 (transformers), Phase 11 (LLM engineering), Phase 12 (multimodal), Phase 17 (infrastructure)
+<strong>Phases exercised:</strong> P4 · P6 · P7 · P11 · P12 · P17
+<strong>Time:</strong> 30 hours</p>
+<h2>Problem</h2>
+<p>Long-form video QA is the most bandwidth-hungry multimodal problem at 2026 scale. Gemini 2.5 Pro can read a 2-hour video natively, but ingesting 100 hours of video into a queryable corpus still requires a scene-level index. The production shape combines scene segmentation (TransNetV2 or PySceneDetect), per-scene captioning with a VLM (Gemini 2.5, Qwen3-VL-Max, or Molmo 2), transcript alignment (Whisper-v3-turbo with word timestamps), and a multi-vector index that stores caption, frame embedding, and transcript side by side. The query pipeline answers with (start, end) timestamps plus frame previews.</p>
+<p>Benchmarks are public (ActivityNet-QA, NeXT-GQA) plus your own 100-query custom set. Hallucination on counting and action-type questions is the known-hard failure class; the capstone explicitly measures it.</p>
+<h2>Concept</h2>
+<p>Three pipelines run in parallel at ingest. <strong>Scene segmentation</strong> cuts the video into scenes. <strong>VLM captioning</strong> generates a caption per scene and a frame embedding from a keyframe. <strong>ASR alignment</strong> produces word-level timestamps. The three streams are joined by (scene_id, time range). Each scene gets three vector types in a multi-vector index (Qdrant): caption embedding, keyframe embedding, transcript embedding.</p>
+<p>At query time, the natural-language question fires against all three vectors; results merge with RRF; a temporal-grounding adapter (TimeLens-style) refines the (start, end) window within the top scene. The VLM synthesizer (Gemini 2.5 Pro or Qwen3-VL-Max) takes query + top scenes + cropped frames and answers with cited timestamps and a frame preview.</p>
+<p>The hallucination measurement matters. Counting (&quot;how many people enter the room?&quot;) and action-type (&quot;does the chef pour before stirring?&quot;) questions are notoriously unreliable. Report accuracy separately from descriptive questions.</p>
+<h2>Architecture</h2>
+<pre><code>video file / URL
+      |
+      v
+PySceneDetect / TransNetV2  (scene segmentation)
+      |
+      +--- per-scene keyframe --- VLM caption + frame embedding
+      |                            (Gemini 2.5 Pro / Qwen3-VL-Max / Molmo 2)
+      |
+      +--- audio channel --- Whisper-v3-turbo ASR + word timestamps
+      |
+      v
+multi-vector Qdrant: {caption_emb, keyframe_emb, transcript_emb}
+      |
+query:
+  dense queries against all three -&gt; RRF merge -&gt; top-k scenes
+      |
+      v
+TimeLens / VideoITG temporal grounding (refine start/end within scene)
+      |
+      v
+VLM synth: query + top scenes + frame previews
+      |
+      v
+answer + (start, end) timestamps + frame thumbs + citations
+</code></pre>
+<h2>Stack</h2>
+<ul>
+<li>Scene segmentation: TransNetV2 (state-of-the-art 2024-26) or PySceneDetect</li>
+<li>ASR: Whisper-v3-turbo via faster-whisper with word timestamps</li>
+<li>VLM captioner + answerer: Gemini 2.5 Pro or Qwen3-VL-Max or Molmo 2</li>
+<li>Temporal grounding: TimeLens-100K-trained adapter or VideoITG</li>
+<li>Index: Qdrant with multi-vector support (caption / frame / transcript)</li>
+<li>UI: Next.js 15 with HTML5 video player and scene thumbnails</li>
+<li>Eval: ActivityNet-QA, NeXT-GQA, custom 100-question hand-labeled set</li>
+<li>Hallucination benchmark: counting and action-type subsets with hand labels</li>
+</ul>
+<figure><img src="/learn/ai-from-scratch/figures/figure-8453fcb1a1365fcad56b.png" alt="cf-scene-index 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<ol>
+<li>
+<p><strong>Ingest walker.</strong> Accept YouTube URLs or local MP4s. Downscale to 720p if needed. Persist <code>{video_id, file_path}</code>.</p>
+</li>
+<li>
+<p><strong>Scene segmentation.</strong> Run TransNetV2 or PySceneDetect to produce <code>[{scene_id, start_ms, end_ms, keyframe_path}]</code>. Target 100 hours: ~6k-8k scenes.</p>
+</li>
+<li>
+<p><strong>ASR pass.</strong> Run Whisper-v3-turbo on audio; export word-level timestamps; split into per-scene transcript slices.</p>
+</li>
+<li>
+<p><strong>VLM captioning.</strong> Per scene, call Gemini 2.5 Pro (or Qwen3-VL-Max) with the keyframe and a short caption template. Produce caption + frame embedding.</p>
+</li>
+<li>
+<p><strong>Multi-vector index.</strong> Qdrant collection with three named vectors. Payload: <code>{video_id, scene_id, start_ms, end_ms, keyframe_url}</code>.</p>
+</li>
+<li>
+<p><strong>Query.</strong> Natural-language question fires three dense queries; merge with reciprocal rank fusion; top-k=5 scenes.</p>
+</li>
+<li>
+<p><strong>Temporal grounding.</strong> Run TimeLens-style adapter on the top scene to refine the (start, end) window within the scene.</p>
+</li>
+<li>
+<p><strong>VLM synth.</strong> Call Gemini 2.5 Pro with query + top-3 scene clips (as images or short clips) + transcripts. Require <code>(video_id, start_ms, end_ms)</code> citations.</p>
+</li>
+<li>
+<p><strong>Eval.</strong> Run ActivityNet-QA and NeXT-GQA. Build a 100-query custom set. Report overall accuracy + per-class breakdown (counting, action, descriptive).</p>
+</li>
+</ol>
+<h2>Use It</h2>
+<pre><code>$ video-qa ask --url=https://youtube.com/watch?v=X &quot;how many cars pass the intersection in the first minute?&quot;
+[scene]    23 scenes detected
+[asr]      transcript complete, 4m12s
+[index]    69 vectors written (23 scenes x 3)
+[query]    top scene: scene 3 [01:32-01:54], confidence 0.84
+[ground]   refined window: [00:12-00:58]
+[synth]    gemini 2.5 pro, 1.4s
+answer:    5 cars pass the intersection between 00:12 and 00:58.
+citations: [scene 3: 00:12-00:58]
+          [frame preview at 00:14, 00:27, 00:44, 00:51, 00:57]
+</code></pre>
+<h2>Ship It</h2>
+<p><code>outputs/skill-video-qa.md</code> is the deliverable. Given a YouTube URL or uploaded video, the pipeline indexes scenes and answers questions with timestamped citations.</p>
+<table>
+<thead>
+<tr>
+<th style="text-align:center">Weight</th>
+<th>Criterion</th>
+<th>How it is measured</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align:center">25</td>
+<td>Temporal grounding IoU</td>
+<td>Intersection-over-union on held-out grounding set</td>
+</tr>
+<tr>
+<td style="text-align:center">20</td>
+<td>QA accuracy</td>
+<td>NeXT-GQA and custom 100-query</td>
+</tr>
+<tr>
+<td style="text-align:center">20</td>
+<td>Ingest throughput</td>
+<td>Hours of video per dollar spent</td>
+</tr>
+<tr>
+<td style="text-align:center">20</td>
+<td>UI and citation UX</td>
+<td>Timestamp links, thumbnail strip, jump-to-frame</td>
+</tr>
+<tr>
+<td style="text-align:center">15</td>
+<td>Hallucination rate</td>
+<td>Counting and action-type accuracy separately</td>
+</tr>
+<tr>
+<td style="text-align:center"><strong>100</strong></td>
+<td></td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<h2>Exercises</h2>
+<ol>
+<li>
+<p>Swap Gemini 2.5 Pro for Qwen3-VL-Max on the captioning pass. Report caption quality delta on a human-rated 50-scene sample.</p>
+</li>
+<li>
+<p>Reduce per-scene frame embedding to one pooled vector instead of multi-vector. Measure the retrieval regression.</p>
+</li>
+<li>
+<p>Build a &quot;counting strict&quot; mode: the synthesizer extracts each counted instance with a timestamp and the user clicks to verify. Measure whether user-verification reduces hallucination.</p>
+</li>
+<li>
+<p>Benchmark ingest cost: hours-of-video-per-dollar across three VLM choices. Pick the sweet spot.</p>
+</li>
+<li>
+<p>Add speaker-diarized transcript: run pyannote speaker diarization on the audio and embed per-speaker transcripts. Demonstrate &quot;what did Alice say about X?&quot; queries.</p>
+</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Scene segmentation</td>
+<td>&quot;Shot detection&quot;</td>
+<td>Cutting video into scenes at shot boundaries</td>
+</tr>
+<tr>
+<td>Multi-vector index</td>
+<td>&quot;Caption + frame + transcript&quot;</td>
+<td>Qdrant collection with named vectors per representation</td>
+</tr>
+<tr>
+<td>Temporal grounding</td>
+<td>&quot;When exactly did it happen&quot;</td>
+<td>Refining the (start, end) window for a query answer</td>
+</tr>
+<tr>
+<td>Frame embedding</td>
+<td>&quot;Visual representation&quot;</td>
+<td>A vector embedding of a keyframe; used for scene-visual similarity</td>
+</tr>
+<tr>
+<td>RRF fusion</td>
+<td>&quot;Reciprocal rank fusion&quot;</td>
+<td>Merge strategy across multiple ranked lists; a classic hybrid-retrieval trick</td>
+</tr>
+<tr>
+<td>Counting hallucination</td>
+<td>&quot;Miscount&quot;</td>
+<td>Known failure mode of VLMs on &quot;how many X&quot; questions</td>
+</tr>
+<tr>
+<td>ActivityNet-QA</td>
+<td>&quot;Video-QA benchmark&quot;</td>
+<td>Long-form video QA accuracy benchmark</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://allenai.org/blog/molmo2" rel="noreferrer" data-network="true">AI2 Molmo 2 <small>↗ 需要联网</small></a> — open VLM checkpoints</li>
+<li><a href="https://github.com/TencentARC/TimeLens" rel="noreferrer" data-network="true">TimeLens (CVPR 2026) <small>↗ 需要联网</small></a> — temporal grounding at scale</li>
+<li><a href="https://deepmind.google/technologies/gemini" rel="noreferrer" data-network="true">Gemini Video long-context <small>↗ 需要联网</small></a> — the hosted reference</li>
+<li><a href="https://videodb.io" rel="noreferrer" data-network="true">VideoDB <small>↗ 需要联网</small></a> — CRUD-for-video API reference</li>
+<li><a href="https://www.twelvelabs.io" rel="noreferrer" data-network="true">Twelve Labs Marengo + Pegasus <small>↗ 需要联网</small></a> — commercial reference</li>
+<li><a href="https://github.com/soCzech/TransNetV2" rel="noreferrer" data-network="true">TransNetV2 <small>↗ 需要联网</small></a> — scene segmentation model</li>
+<li><a href="https://github.com/Breakthrough/PySceneDetect" rel="noreferrer" data-network="true">PySceneDetect <small>↗ 需要联网</small></a> — classic open alternative</li>
+<li><a href="https://arxiv.org/abs/1906.02467" rel="noreferrer" data-network="true">ActivityNet-QA <small>↗ 需要联网</small></a> — reference eval benchmark</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-19-capstone-projects--12-video-understanding-pipeline.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-19-capstone-projects--12-video-understanding-pipeline.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/12-video-understanding-pipeline/code/main.py">phases/19-capstone-projects/12-video-understanding-pipeline/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Video understanding pipeline — multi-vector scene index scaffold.
+
+The hard architectural primitive is a multi-vector-per-scene index with
+three representations (caption, frame, transcript), queried in parallel and
+merged with reciprocal rank fusion, then refined by a temporal-grounding
+step that picks a sub-window inside the best scene. This scaffold implements
+the index shape, the triple-query fusion, and the sub-window grounding.
+
+Run:  python main.py
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import math
+import random
+import re
+from collections import defaultdict
+from dataclasses import dataclass, field
+
+
+EMB_DIM = 24
+
+
+def tokenize(s: str) -&gt; list[str]:
+    return re.findall(r&quot;\w+&quot;, s.lower())
+
+
+def fake_embed(text: str) -&gt; list[float]:
+    v = [0.0] * EMB_DIM
+    for tok in tokenize(text):
+        h = hash(tok)
+        v[h % EMB_DIM] += 1.0
+        v[(h &gt;&gt; 8) % EMB_DIM] += 0.5
+    n = math.sqrt(sum(x * x for x in v)) or 1.0
+    return [x / n for x in v]
+
+
+def cosine(a: list[float], b: list[float]) -&gt; float:
+    return sum(x * y for x, y in zip(a, b))
+
+
+# ---------------------------------------------------------------------------
+# scene record  --  multi-vector: caption / frame / transcript
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Scene:
+    video_id: str
+    scene_id: int
+    start_ms: int
+    end_ms: int
+    caption: str
+    transcript: str
+    frame_tags: str              # stand-in for frame embedding features
+    caption_emb: list[float] = field(default_factory=list)
+    frame_emb: list[float] = field(default_factory=list)
+    transcript_emb: list[float] = field(default_factory=list)
+
+    def embed(self) -&gt; None:
+        self.caption_emb = fake_embed(self.caption)
+        self.frame_emb = fake_embed(self.frame_tags)
+        self.transcript_emb = fake_embed(self.transcript)
+
+
+SAMPLE = [
+    Scene(&quot;vid_001&quot;, 0,       0,  32_000, &quot;sunrise over skyline, drone footage&quot;,
+          &quot;we start here in tokyo&quot;,
+          &quot;skyline buildings dawn orange sky haze&quot;),
+    Scene(&quot;vid_001&quot;, 1,  32_000,  68_000, &quot;busy intersection with pedestrians&quot;,
+          &quot;shibuya crossing after sunrise&quot;,
+          &quot;street people walking cars traffic signal&quot;),
+    Scene(&quot;vid_001&quot;, 2,  68_000, 132_000, &quot;cars stopped at a red light&quot;,
+          &quot;let me count the vehicles approaching&quot;,
+          &quot;cars red light queue crossing lanes&quot;),
+    Scene(&quot;vid_001&quot;, 3, 132_000, 170_000, &quot;kitchen scene chef pouring then stirring&quot;,
+          &quot;first we pour then we stir it slowly&quot;,
+          &quot;chef pan stove pour stir ingredient&quot;),
+    Scene(&quot;vid_001&quot;, 4, 170_000, 210_000, &quot;chef plating the finished dish&quot;,
+          &quot;plated presentation of the dish&quot;,
+          &quot;plate garnish spoon finishing dish&quot;),
+    Scene(&quot;vid_002&quot;, 0,       0,  40_000, &quot;ocean waves at sunset&quot;,
+          &quot;beautiful evening at the shore&quot;,
+          &quot;ocean waves sunset sky shore&quot;),
+]
+
+
+# ---------------------------------------------------------------------------
+# triple-vector query + RRF merge
+# ---------------------------------------------------------------------------
+
+def multi_vector_search(query: str, scenes: list[Scene], k: int = 5) -&gt; list[tuple[Scene, float]]:
+    qv = fake_embed(query)
+    scored_caption = sorted(scenes, key=lambda s: -cosine(qv, s.caption_emb))
+    scored_frame = sorted(scenes, key=lambda s: -cosine(qv, s.frame_emb))
+    scored_transcript = sorted(scenes, key=lambda s: -cosine(qv, s.transcript_emb))
+
+    fused: dict[tuple[str, int], float] = defaultdict(float)
+    index: dict[tuple[str, int], Scene] = {}
+    for ranks, stream in ((scored_caption, &quot;cap&quot;),
+                          (scored_frame, &quot;frm&quot;),
+                          (scored_transcript, &quot;trn&quot;)):
+        for rank, sc in enumerate(ranks):
+            key = (sc.video_id, sc.scene_id)
+            fused[key] += 1.0 / (60 + rank + 1)
+            index[key] = sc
+
+    ranked = sorted(fused.items(), key=lambda x: -x[1])
+    return [(index[k_], s) for k_, s in ranked[:k]]
+
+
+# ---------------------------------------------------------------------------
+# temporal grounding stub  --  refine start/end within the best scene
+# ---------------------------------------------------------------------------
+
+def ground_window(query: str, scene: Scene) -&gt; tuple[int, int]:
+    &quot;&quot;&quot;Stand-in: pick a sub-window of the scene based on query keyword position.&quot;&quot;&quot;
+    q = set(tokenize(query))
+    t_tokens = tokenize(scene.transcript)
+    if not q or not t_tokens:
+        return scene.start_ms, scene.end_ms
+    positions = [i for i, w in enumerate(t_tokens) if w in q]
+    if not positions:
+        return scene.start_ms, scene.end_ms
+    span = scene.end_ms - scene.start_ms
+    start_frac = min(positions) / max(1, len(t_tokens))
+    end_frac = (max(positions) + 1) / max(1, len(t_tokens))
+    start = int(scene.start_ms + span * max(0.0, start_frac - 0.05))
+    end = int(scene.start_ms + span * min(1.0, end_frac + 0.05))
+    return start, end
+
+
+# ---------------------------------------------------------------------------
+# demo
+# ---------------------------------------------------------------------------
+
+def fmt_ms(ms: int) -&gt; str:
+    s = ms // 1000
+    return f&quot;{s // 60:02d}:{s % 60:02d}&quot;
+
+
+def main() -&gt; None:
+    scenes = SAMPLE
+    for s in scenes:
+        s.embed()
+
+    queries = [
+        (&quot;how many cars pass through the intersection&quot;, False),
+        (&quot;what happened first pour or stir&quot;, False),
+        (&quot;plating of the dish&quot;, True),
+        (&quot;ocean at sunset&quot;, True),
+    ]
+
+    for q, descriptive in queries:
+        print(f&quot;\nQ: {q}  (descriptive={descriptive})&quot;)
+        hits = multi_vector_search(q, scenes, k=3)
+        for sc, score in hits:
+            print(f&quot;  scene {sc.video_id}/{sc.scene_id} @ [{fmt_ms(sc.start_ms)}-{fmt_ms(sc.end_ms)}] &quot;
+                  f&quot;score={score:.4f}  cap=&#39;{sc.caption[:40]}&#39;&quot;)
+        top = hits[0][0]
+        start, end = ground_window(q, top)
+        print(f&quot;  grounded window: [{fmt_ms(start)}-{fmt_ms(end)}] &quot;
+              f&quot;(narrowed from {fmt_ms(top.start_ms)}-{fmt_ms(top.end_ms)})&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/12-video-understanding-pipeline/code/ts/README.md">phases/19-capstone-projects/12-video-understanding-pipeline/code/ts/README.md</a><details><summary>查看原始文本</summary><pre><code># Lesson 12 - Video Understanding Pipeline (TypeScript UI)
+
+TypeScript half of the capstone. The Python side (`code/main.py`) owns the
+multi-vector index and temporal grounding. This project ships the dashboard
+half: a Hono app over the four pipeline stages (chunk, embed, index, qa).
+
+## Layout
+
+```text
+src/
+  index.ts     entry: demo (default) or HTTP server (--serve)
+  server.ts    Hono routes (/, /jobs, /job/:id) + HTML index
+  jobs.ts     JobStore + fixture seeder
+  stages.ts    stage advance + overall status
+  types.ts     Stage, StageState, Job
+tests/
+  stages.test.ts  job state transitions + store
+```
+
+## Run
+
+```bash
+npm install
+npm run typecheck
+npm test
+npm start              # self-terminating demo
+npm run serve          # HTTP server on :8123
+```
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/12-video-understanding-pipeline/code/ts/package.json">phases/19-capstone-projects/12-video-understanding-pipeline/code/ts/package.json</a><details><summary>查看原始文本</summary><pre><code>{
+  &quot;name&quot;: &quot;lesson-12-video-pipeline-ui&quot;,
+  &quot;version&quot;: &quot;1.0.0&quot;,
+  &quot;private&quot;: true,
+  &quot;type&quot;: &quot;module&quot;,
+  &quot;scripts&quot;: {
+    &quot;start&quot;: &quot;tsx src/index.ts&quot;,
+    &quot;demo&quot;: &quot;tsx src/index.ts&quot;,
+    &quot;serve&quot;: &quot;tsx src/index.ts --serve&quot;,
+    &quot;typecheck&quot;: &quot;tsc --noEmit&quot;,
+    &quot;test&quot;: &quot;tsx --test tests/*.test.ts&quot;
+  },
+  &quot;dependencies&quot;: {
+    &quot;hono&quot;: &quot;^4.6.0&quot;,
+    &quot;zod&quot;: &quot;^3.23.0&quot;
+  },
+  &quot;devDependencies&quot;: {
+    &quot;@types/node&quot;: &quot;^20.14.0&quot;,
+    &quot;tsx&quot;: &quot;^4.19.0&quot;,
+    &quot;typescript&quot;: &quot;^5.7.0&quot;
+  }
+}
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/12-video-understanding-pipeline/code/ts/src/index.ts">phases/19-capstone-projects/12-video-understanding-pipeline/code/ts/src/index.ts</a><details><summary>查看原始文本</summary><pre><code>// Video understanding pipeline: TypeScript UI half of the lesson stack.
+// Python side ships the multi-vector index + temporal grounding; this TS
+// project exposes /jobs and /job/:id over the four pipeline stages.
+// Refs: docs/en.md (this lesson),
+//   VideoDB CRUD-for-video API: https://videodb.io
+//   TransNetV2 scene segmentation: https://github.com/soCzech/TransNetV2
+
+import { createServer, IncomingMessage, ServerResponse } from &quot;node:http&quot;;
+import { buildApp } from &quot;./server.js&quot;;
+import { JobStore, seedFixture } from &quot;./jobs.js&quot;;
+
+function runDemo(): void {
+  const store = new JobStore();
+  seedFixture(store);
+
+  process.stdout.write(&quot;=&quot;.repeat(72) + &quot;\n&quot;);
+  process.stdout.write(&quot;PHASE 19 LESSON 12 - video pipeline UI (TypeScript)\n&quot;);
+  process.stdout.write(&quot;=&quot;.repeat(72) + &quot;\n&quot;);
+
+  process.stdout.write(&quot;\nGET /jobs\n&quot;);
+  process.stdout.write(JSON.stringify({ jobs: store.summaries() }, null, 2) + &quot;\n&quot;);
+
+  for (const id of [&quot;job-001&quot;, &quot;job-002&quot;, &quot;job-003&quot;, &quot;job-404&quot;]) {
+    process.stdout.write(`\nGET /job/${id}\n`);
+    const body = store.detail(id);
+    if (!body) {
+      process.stdout.write(JSON.stringify({ error: &quot;not found&quot;, id }) + &quot;\n&quot;);
+      continue;
+    }
+    process.stdout.write(JSON.stringify(body, null, 2) + &quot;\n&quot;);
+  }
+}
+
+function nodeAdapter(app: ReturnType&lt;typeof buildApp&gt;) {
+  return async (req: IncomingMessage, res: ServerResponse): Promise&lt;void&gt; =&gt; {
+    const host = req.headers.host ?? &quot;localhost&quot;;
+    const url = new URL(req.url ?? &quot;/&quot;, `http://${host}`);
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(chunk as Buffer);
+    const body = chunks.length &gt; 0 ? Buffer.concat(chunks) : undefined;
+    const headers = new Headers();
+    for (const [key, value] of Object.entries(req.headers)) {
+      if (typeof value === &quot;string&quot;) headers.set(key, value);
+      else if (Array.isArray(value)) headers.set(key, value.join(&quot;, &quot;));
+    }
+    const init: RequestInit = {
+      method: req.method ?? &quot;GET&quot;,
+      headers,
+    };
+    if (body &amp;&amp; req.method !== &quot;GET&quot; &amp;&amp; req.method !== &quot;HEAD&quot;) init.body = body;
+    const fetchRes = await app.fetch(new Request(url.toString(), init));
+    res.writeHead(fetchRes.status, Object.fromEntries(fetchRes.headers));
+    res.end(Buffer.from(await fetchRes.arrayBuffer()));
+  };
+}
+
+function runServer(port: number): void {
+  const store = new JobStore();
+  seedFixture(store);
+  const app = buildApp(store);
+  const handler = nodeAdapter(app);
+  const server = createServer((req, res) =&gt; {
+    handler(req, res).catch((err) =&gt; {
+      res.writeHead(500, { &quot;content-type&quot;: &quot;application/json&quot; });
+      res.end(JSON.stringify({ error: String(err) }));
+    });
+  });
+  server.listen(port, () =&gt; {
+    process.stdout.write(`listening on http://localhost:${port}\n`);
+  });
+}
+
+const DEFAULT_PORT = 8123;
+
+function parsePort(argv: string[], defaultPort: number): number {
+  const portFlag = argv.indexOf(&quot;--port&quot;);
+  if (portFlag &lt; 0) return defaultPort;
+  const raw = argv[portFlag + 1];
+  if (raw === undefined) {
+    process.stderr.write(&quot;--port requires a value\n&quot;);
+    process.exit(2);
+  }
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n &lt; 1 || n &gt; 65535) {
+    process.stderr.write(`invalid --port ${raw}: must be integer in 1..65535\n`);
+    process.exit(2);
+  }
+  return n;
+}
+
+function main(): void {
+  const argv = process.argv.slice(2);
+  if (argv.includes(&quot;--serve&quot;)) {
+    const port = parsePort(argv, DEFAULT_PORT);
+    runServer(port);
+    return;
+  }
+  runDemo();
+}
+
+main();
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/12-video-understanding-pipeline/code/ts/src/jobs.ts">phases/19-capstone-projects/12-video-understanding-pipeline/code/ts/src/jobs.ts</a><details><summary>查看原始文本</summary><pre><code>import type { Job, StageState } from &quot;./types.js&quot;;
+import { STAGES } from &quot;./types.js&quot;;
+import { advanceJob, overallStatus } from &quot;./stages.js&quot;;
+
+export class JobStore {
+  private jobs = new Map&lt;string, Job&gt;();
+
+  create(id: string, video_url: string, question: string, createdAt?: number): Job {
+    const job: Job = {
+      id,
+      video_url,
+      question,
+      created_at: createdAt ?? Date.now(),
+      stages: STAGES.map((stage): StageState =&gt; ({ stage, status: &quot;pending&quot; })),
+    };
+    this.jobs.set(id, job);
+    return job;
+  }
+
+  get(id: string): Job | undefined {
+    const j = this.jobs.get(id);
+    if (j) advanceJob(j);
+    return j;
+  }
+
+  list(now: number = Date.now()): Job[] {
+    for (const j of this.jobs.values()) advanceJob(j, now);
+    return [...this.jobs.values()].sort((a, b) =&gt; b.created_at - a.created_at);
+  }
+
+  summaries(): Array&lt;{
+    id: string;
+    video_url: string;
+    question: string;
+    created_at: number;
+    overall: ReturnType&lt;typeof overallStatus&gt;;
+  }&gt; {
+    return this.list().map((j) =&gt; ({
+      id: j.id,
+      video_url: j.video_url,
+      question: j.question,
+      created_at: j.created_at,
+      overall: overallStatus(j),
+    }));
+  }
+
+  detail(id: string): {
+    id: string;
+    video_url: string;
+    question: string;
+    overall: ReturnType&lt;typeof overallStatus&gt;;
+    timeline: Array&lt;{
+      stage: StageState[&quot;stage&quot;];
+      status: StageState[&quot;status&quot;];
+      started_at: number | null;
+      finished_at: number | null;
+      detail: string | null;
+    }&gt;;
+  } | null {
+    const job = this.get(id);
+    if (!job) return null;
+    return {
+      id: job.id,
+      video_url: job.video_url,
+      question: job.question,
+      overall: overallStatus(job),
+      timeline: job.stages.map((s) =&gt; ({
+        stage: s.stage,
+        status: s.status,
+        started_at: s.started_at ?? null,
+        finished_at: s.finished_at ?? null,
+        detail: s.detail ?? null,
+      })),
+    };
+  }
+}
+
+export function seedFixture(store: JobStore): void {
+  const j1 = store.create(
+    &quot;job-001&quot;,
+    &quot;vid_001&quot;,
+    &quot;how many cars pass through the intersection&quot;,
+    Date.now() - 8000,
+  );
+  advanceJob(j1);
+
+  const j2 = store.create(&quot;job-002&quot;, &quot;vid_001&quot;, &quot;plating of the dish&quot;, Date.now() - 3500);
+  advanceJob(j2);
+
+  store.create(&quot;job-003&quot;, &quot;vid_002&quot;, &quot;ocean at sunset&quot;);
+}
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/12-video-understanding-pipeline/code/ts/src/server.ts">phases/19-capstone-projects/12-video-understanding-pipeline/code/ts/src/server.ts</a><details><summary>查看原始文本</summary><pre><code>import { Hono } from &quot;hono&quot;;
+import type { JobStore } from &quot;./jobs.js&quot;;
+import { advanceJob, overallStatus } from &quot;./stages.js&quot;;
+
+export function renderIndexHtml(store: JobStore): string {
+  const rows = store
+    .list()
+    .map((j) =&gt; {
+      advanceJob(j);
+      return `&lt;tr&gt;&lt;td&gt;${j.id}&lt;/td&gt;&lt;td&gt;${j.video_url}&lt;/td&gt;&lt;td&gt;${j.question}&lt;/td&gt;&lt;td&gt;${overallStatus(j)}&lt;/td&gt;&lt;/tr&gt;`;
+    })
+    .join(&quot;&quot;);
+  return `&lt;!doctype html&gt;&lt;meta charset=&quot;utf-8&quot;&gt;&lt;title&gt;video jobs&lt;/title&gt;
+&lt;style&gt;body{font-family:system-ui;margin:2rem}table{border-collapse:collapse;width:100%}td,th{border:1px solid #ccc;padding:.4rem .6rem;text-align:left}&lt;/style&gt;
+&lt;h1&gt;video understanding jobs&lt;/h1&gt;
+&lt;table&gt;&lt;thead&gt;&lt;tr&gt;&lt;th&gt;id&lt;/th&gt;&lt;th&gt;video&lt;/th&gt;&lt;th&gt;question&lt;/th&gt;&lt;th&gt;status&lt;/th&gt;&lt;/tr&gt;&lt;/thead&gt;
+&lt;tbody&gt;${rows}&lt;/tbody&gt;&lt;/table&gt;
+&lt;p&gt;JSON: &lt;a href=&quot;/jobs&quot;&gt;/jobs&lt;/a&gt;, single job: &lt;code&gt;/job/&amp;lt;id&amp;gt;&lt;/code&gt;&lt;/p&gt;`;
+}
+
+export function buildApp(store: JobStore): Hono {
+  const app = new Hono();
+
+  app.get(&quot;/&quot;, (c) =&gt; c.html(renderIndexHtml(store)));
+
+  app.get(&quot;/jobs&quot;, (c) =&gt; c.json({ jobs: store.summaries() }));
+
+  app.get(&quot;/job/:id&quot;, (c) =&gt; {
+    const id = c.req.param(&quot;id&quot;);
+    const body = store.detail(id);
+    if (!body) return c.json({ error: &quot;job not found&quot;, id }, 404);
+    return c.json(body);
+  });
+
+  return app;
+}
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/12-video-understanding-pipeline/code/ts/src/stages.ts">phases/19-capstone-projects/12-video-understanding-pipeline/code/ts/src/stages.ts</a><details><summary>查看原始文本</summary><pre><code>import type { Job, StageStatus } from &quot;./types.js&quot;;
+import { STAGE_DURATIONS_MS } from &quot;./types.js&quot;;
+
+export function advanceJob(job: Job, nowOverride?: number): void {
+  const now = nowOverride ?? Date.now();
+  let elapsed = now - job.created_at;
+  let priorOffset = 0;
+  for (const slot of job.stages) {
+    const dur = STAGE_DURATIONS_MS[slot.stage];
+    if (elapsed &lt;= 0) {
+      slot.status = &quot;pending&quot;;
+      continue;
+    }
+    if (elapsed &lt; dur) {
+      slot.status = &quot;running&quot;;
+      slot.started_at = job.created_at + priorOffset;
+      slot.detail = `${Math.round((elapsed / dur) * 100)}% through ${slot.stage}`;
+      break;
+    }
+    slot.status = &quot;done&quot;;
+    slot.started_at = job.created_at + priorOffset;
+    slot.finished_at = slot.started_at + dur;
+    slot.detail = `${slot.stage} complete in ${dur}ms`;
+    priorOffset += dur;
+    elapsed -= dur;
+  }
+}
+
+export function overallStatus(job: Job): StageStatus {
+  if (job.stages.some((s) =&gt; s.status === &quot;error&quot;)) return &quot;error&quot;;
+  if (job.stages.every((s) =&gt; s.status === &quot;done&quot;)) return &quot;done&quot;;
+  if (job.stages.some((s) =&gt; s.status === &quot;running&quot;)) return &quot;running&quot;;
+  return &quot;pending&quot;;
+}
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/12-video-understanding-pipeline/code/ts/src/types.ts">phases/19-capstone-projects/12-video-understanding-pipeline/code/ts/src/types.ts</a><details><summary>查看原始文本</summary><pre><code>export type Stage = &quot;chunk&quot; | &quot;embed&quot; | &quot;index&quot; | &quot;qa&quot;;
+
+export type StageStatus = &quot;pending&quot; | &quot;running&quot; | &quot;done&quot; | &quot;error&quot;;
+
+export type StageState = {
+  stage: Stage;
+  status: StageStatus;
+  started_at?: number;
+  finished_at?: number;
+  detail?: string;
+};
+
+export type Job = {
+  id: string;
+  video_url: string;
+  question: string;
+  created_at: number;
+  stages: StageState[];
+};
+
+export const STAGES: Stage[] = [&quot;chunk&quot;, &quot;embed&quot;, &quot;index&quot;, &quot;qa&quot;];
+
+export const STAGE_DURATIONS_MS: Record&lt;Stage, number&gt; = {
+  chunk: 1200,
+  embed: 2400,
+  index: 800,
+  qa: 1600,
+};
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/12-video-understanding-pipeline/code/ts/tests/stages.test.ts">phases/19-capstone-projects/12-video-understanding-pipeline/code/ts/tests/stages.test.ts</a><details><summary>查看原始文本</summary><pre><code>import { test } from &quot;node:test&quot;;
+import { strict as assert } from &quot;node:assert&quot;;
+import { JobStore, seedFixture } from &quot;../src/jobs.js&quot;;
+import { advanceJob, overallStatus } from &quot;../src/stages.js&quot;;
+import type { Job } from &quot;../src/types.js&quot;;
+import { STAGE_DURATIONS_MS, STAGES } from &quot;../src/types.js&quot;;
+
+function freshJob(createdAt: number): Job {
+  const store = new JobStore();
+  return store.create(&quot;t-1&quot;, &quot;vid&quot;, &quot;q&quot;, createdAt);
+}
+
+test(&quot;pending right after creation&quot;, () =&gt; {
+  const created = 1_000_000_000_000;
+  const job = freshJob(created);
+  advanceJob(job, created);
+  assert.equal(overallStatus(job), &quot;pending&quot;);
+  assert.ok(job.stages.every((s) =&gt; s.status === &quot;pending&quot;));
+});
+
+test(&quot;running while first stage in progress&quot;, () =&gt; {
+  const created = 1_000_000_000_000;
+  const job = freshJob(created);
+  advanceJob(job, created + 600);
+  const first = job.stages[0];
+  assert.ok(first);
+  assert.equal(first.status, &quot;running&quot;);
+  assert.equal(overallStatus(job), &quot;running&quot;);
+});
+
+test(&quot;done once total elapsed exceeds sum of durations&quot;, () =&gt; {
+  const created = 1_000_000_000_000;
+  const job = freshJob(created);
+  const total = STAGES.reduce((acc, s) =&gt; acc + STAGE_DURATIONS_MS[s], 0);
+  advanceJob(job, created + total + 1);
+  assert.equal(overallStatus(job), &quot;done&quot;);
+  assert.ok(job.stages.every((s) =&gt; s.status === &quot;done&quot;));
+});
+
+test(&quot;seedFixture populates store with three jobs&quot;, () =&gt; {
+  const store = new JobStore();
+  seedFixture(store);
+  assert.equal(store.list().length, 3);
+  const detail = store.detail(&quot;job-001&quot;);
+  assert.ok(detail);
+  assert.equal(detail.id, &quot;job-001&quot;);
+});
+
+test(&quot;detail returns null for unknown id&quot;, () =&gt; {
+  const store = new JobStore();
+  seedFixture(store);
+  assert.equal(store.detail(&quot;missing&quot;), null);
+});
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/12-video-understanding-pipeline/code/ts/tsconfig.json">phases/19-capstone-projects/12-video-understanding-pipeline/code/ts/tsconfig.json</a><details><summary>查看原始文本</summary><pre><code>{
+  &quot;compilerOptions&quot;: {
+    &quot;target&quot;: &quot;ES2022&quot;,
+    &quot;module&quot;: &quot;ESNext&quot;,
+    &quot;moduleResolution&quot;: &quot;Bundler&quot;,
+    &quot;lib&quot;: [&quot;ES2022&quot;],
+    &quot;types&quot;: [&quot;node&quot;],
+    &quot;strict&quot;: true,
+    &quot;noUncheckedIndexedAccess&quot;: true,
+    &quot;esModuleInterop&quot;: true,
+    &quot;skipLibCheck&quot;: true,
+    &quot;noEmit&quot;: true,
+    &quot;allowImportingTsExtensions&quot;: false,
+    &quot;resolveJsonModule&quot;: true,
+    &quot;forceConsistentCasingInFileNames&quot;: true
+  },
+  &quot;include&quot;: [&quot;src/**/*.ts&quot;, &quot;tests/**/*.ts&quot;]
+}
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/12-video-understanding-pipeline/outputs/skill-video-qa.md">phases/19-capstone-projects/12-video-understanding-pipeline/outputs/skill-video-qa.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: video-qa
+description: Build a video understanding pipeline with scene segmentation, multi-vector indexing, temporal grounding, and timestamped citations.
+version: 1.0.0
+phase: 19
+lesson: 12
+tags: [capstone, video, multimodal, gemini, qwen-vl, molmo, transnet, qdrant]
+---
+
+Given 100 hours of video, build an ingestion pipeline and a query system that answers natural-language questions with (start, end) timestamps plus frame previews.
+
+Build plan:
+
+1. Ingest videos (YouTube URLs or MP4); downscale to 720p if needed.
+2. Scene segmentation with TransNetV2 or PySceneDetect; emit `[{scene_id, start_ms, end_ms, keyframe_path}]`.
+3. ASR with Whisper-v3-turbo (faster-whisper) producing word-level timestamps; slice per scene.
+4. VLM captioning with Gemini 2.5 Pro or Qwen3-VL-Max or Molmo 2; emit caption + frame embedding.
+5. Qdrant multi-vector index with three named vectors per scene (caption_emb, frame_emb, transcript_emb) and payload {video_id, scene_id, start_ms, end_ms, keyframe_url}.
+6. Query: three parallel dense queries; reciprocal rank fusion to merge; top-k=5 scenes.
+7. Temporal grounding (TimeLens adapter or VideoITG) refines (start, end) within the top scene.
+8. VLM synthesis (Gemini 2.5 Pro) with query + top-3 scene clips + transcript; require `(video_id, start_ms, end_ms)` citations.
+9. Eval on ActivityNet-QA, NeXT-GQA, plus a 100-query hand-labeled custom set. Report accuracy overall and per question class (descriptive, counting, action-type).
+
+Assessment rubric:
+
+| Weight | Criterion | Measurement |
+|:-:|---|---|
+| 25 | Temporal grounding IoU | IoU on held-out grounding set |
+| 20 | QA accuracy | NeXT-GQA and 100-query custom set |
+| 20 | Ingest throughput | Hours of video indexed per dollar |
+| 20 | UI and citation UX | Timestamp links, thumbnail strip, jump-to-frame |
+| 15 | Hallucination rate | Counting and action-type accuracy reported separately |
+
+Hard rejects:
+
+- Pipelines that pool a single vector per scene. Multi-vector is required for the class distinctions to show.
+- Answers without (start, end) citations.
+- Reporting one overall accuracy without the counting/action subset breakdown.
+- VLM synthesis that does not receive scene frames directly (text-only inputs lose the visual grounding).
+
+Refusal rules:
+
+- Refuse to serve videos with unclear license provenance; require a license tag on every video_id.
+- Refuse to claim &quot;real-time&quot; response at ingest rates above the measured throughput.
+- Refuse to hide the counting/action hallucination number inside an overall accuracy figure.
+
+Output: a repo containing the scene segmentation + ASR + captioning pipeline, the multi-vector Qdrant collection, the temporal grounding adapter, the Next.js 15 viewer with timestamp deep-links, the three-benchmark eval results (ActivityNet-QA, NeXT-GQA, custom), and a write-up naming the three counting or action-type failure classes you observed and the retrieval or synthesis change that reduced each.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. Why is a scene-level index still needed even when a long-context VLM can read a 2-hour video natively?</legend><label class="option"><input type="radio" name="q0" value="0"> Scene cuts are the only thing a VLM understands</label><label class="option"><input type="radio" name="q0" value="1"> Vector indexes do not support video files</label><label class="option"><input type="radio" name="q0" value="2"> Long-context VLMs cannot stream output</label><label class="option"><input type="radio" name="q0" value="3"> Ingesting 100 hours of video into a queryable corpus needs scene-level retrieval, even when individual videos can be read whole</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. Which three vector types does each scene get in the multi-vector index?</legend><label class="option"><input type="radio" name="q1" value="0"> Audio waveform, mel-spectrogram, and MFCCs</label><label class="option"><input type="radio" name="q1" value="1"> Pose, depth, and optical flow</label><label class="option"><input type="radio" name="q1" value="2"> Hash, gzip, and CRC</label><label class="option"><input type="radio" name="q1" value="3"> Caption embedding, keyframe embedding, and transcript embedding</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. How are results from the three retrieval streams merged at query time?</legend><label class="option"><input type="radio" name="q2" value="0"> Via reciprocal rank fusion across the three ranked lists</label><label class="option"><input type="radio" name="q2" value="1"> By averaging cosine similarities</label><label class="option"><input type="radio" name="q2" value="2"> By picking the caption hit only</label><label class="option"><input type="radio" name="q2" value="3"> By taking the union without scoring</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. What does the temporal grounding step refine inside the top scene?</legend><label class="option"><input type="radio" name="q3" value="0"> The (start, end) timestamp window that contains the answer</label><label class="option"><input type="radio" name="q3" value="1"> The keyframe embedding dimensionality</label><label class="option"><input type="radio" name="q3" value="2"> The transcript word timestamps from Whisper</label><label class="option"><input type="radio" name="q3" value="3"> The number of vectors stored in Qdrant</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. Which question class is reported separately because it is a known hallucination hotspot?</legend><label class="option"><input type="radio" name="q4" value="0"> Translation questions</label><label class="option"><input type="radio" name="q4" value="1"> Speaker identification questions</label><label class="option"><input type="radio" name="q4" value="2"> Counting and action-type questions, where VLMs miscount or mis-order events</label><label class="option"><input type="radio" name="q4" value="3"> Descriptive questions about scenery</label><p data-feedback="4"></p></fieldset><fieldset><legend>6. Which grounding metric does the rubric measure on a held-out set?</legend><label class="option"><input type="radio" name="q5" value="0"> Perplexity</label><label class="option"><input type="radio" name="q5" value="1"> Temporal-grounding intersection-over-union (IoU)</label><label class="option"><input type="radio" name="q5" value="2"> Acceptance rate</label><label class="option"><input type="radio" name="q5" value="3"> MRR@10</label><p data-feedback="5"></p></fieldset><fieldset><legend>7. Why does the pipeline require cited timestamps in answers?</legend><label class="option"><input type="radio" name="q6" value="0"> Timestamps are required by Whisper output</label><label class="option"><input type="radio" name="q6" value="1"> Timestamps are required by Qdrant payloads</label><label class="option"><input type="radio" name="q6" value="2"> They reduce the embedding dimension</label><label class="option"><input type="radio" name="q6" value="3"> They let the viewer jump to the exact (video_id, start, end) so users can verify the claim</label><p data-feedback="6"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/19-capstone-projects/11-llm-observability-dashboard/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/19-capstone-projects/13-mcp-server-with-registry/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/19-capstone-projects/12-video-understanding-pipeline/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

@@ -1,0 +1,798 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>渐进检查和激活重计算 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-10-llms-from-scratch" data-lesson="10-llms-from-scratch/34-gradient-checkpointing" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/10-llms-from-scratch/">从零构建大语言模型</a> / LESSON 34</p><h1 class="lesson-title">渐进检查和激活重计算</h1><p>Gradient Checkpointing and Activation Recomputation</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>渐进检查和激活重计算</h1>
+<blockquote>
+<p>后置保持每次中间激活.在70B参数和128K背景,每级为3TB的激活.检查点交易FLOPs的内存:重新计算而不是保存.问题是哪些段落要放下,答案不是&quot;所有&quot;.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python (with numpy, optional torch)
+<strong>Prerequisites:</strong> Phase 10 Lesson 04 (Pre-Training Mini-GPT), Phase 10 Lesson 05 (Scaling &amp; Distributed)
+<strong>Time:</strong> ~70 minutes</p>
+<h2>问题</h2>
+<p>培训变压器存储每个层次的每个操作的输入,分为后向:注意力输入,Q/K/V投影,软max输出,FFN输入,标准输出和残留流.<code>d</code>序列长度<code>L</code>批量<code>B</code>现在,这是为了<code>12 * B * L * d</code>的,的,的,的,的,的,的,的,的,的,的,的,的,的,的,的,的,的,的,的,的,的,的,的,的,的,的,的,的,的,的,,的,,的,,,的,,,,,的,,,,,,的,,,,,的,,,</p>
+<p>为了<code>d=8192, L=8192, B=1</code>在BF16中,这相当于800MB/层. 64-层模型是51GB的激活,然后再乘以微量级,然后再添加注意力-软max中间体 (<code>L^2</code>在你考虑之前,</p>
+<p>双面账单:BF16重量加上优化器状态可能适合80GB,但激活会推你过去.渐进检查点 (也称为激活重新计算) 是标准的解决方案.放弃大多数激活;在向后重复前进以获得它们.成本:额外的FLOP. 益处:记忆量减少了检查点段与总层的比例.</p>
+<p>通过&quot;智能选择&quot;的Korthikanti等. 您可以节省5倍的内存,而FP8的上费用不到5%. 并且,FP8的,FSDP的脱载,和专家平行的MOE,这真的很重要:您无法负担任何内存或浪费的计算.</p>
+<h2>概念</h2>
+<h3>那些落后的人真正需要什么</h3>
+<p><code>output = layer(input)</code>后退的愿望<code>grad_input</code>其他<code>grad_params</code>为了计算它们,需要:</p>
+<ul>
+<li><code>input</code>(计算<code>grad_params = input.T @ grad_output</code>对于线性层)</li>
+<li>某些激活衍生品中间体 (ReLU/GELU/softmax的衍生品取决于激活值)</li>
+</ul>
+<p>进口通行器将这些自动存储在自动格式图中.<code>tensor.retain_grad()</code>每个需要输入的操作都保留了参考.</p>
+<h3>无明的全面检查</h3>
+<p>分开网络<code>N</code>在前进过程中,只存储每个段子的 <em>输入</em>.当后退需要中间件时,再运行段子的前进通过来实现它们,然后区分.</p>
+<p>举个例子:32层变压器分为32个分段,每个分别为1层.</p>
+<ul>
+<li>存储器:32层输入 (小) 与32 * (每个层的激活量) (巨大).</li>
+<li>额外计算:每段额外的前进1个,即前进FLOP总数增加了 ~33% (由于向后是前进2倍,完整步骤将成为1 + 1 + 2 = 4个单位而不是1 + 2 = 3).</li>
+</ul>
+<p>这就是陈等人2016年的原始食谱:每一个检查点<code>sqrt(L)</code>对于L=64,那就是8个检查点.</p>
+<h3>选择性检查 (科尔蒂坎蒂 2022)</h3>
+<p>没有所有激活成本相同.<code>B*L*L*heads</code>随着序列长度的 * 方形化 * 增长.<code>B*L*4d</code>长序列中,软max 主导.</p>
+<p>选择性检查点将廉价的存储激活 (线性投影,残余) 保持,只会重新计算昂贵的激活 (注意).</p>
+<p>梅加特龙-核心将其作为&quot;选择性&quot;激活重计算.</p>
+<h3>放电</h3>
+<p>替代式:在前后和后后后之间将CPU RAM激活.需要PCIe带宽;在空置带宽超过重建成本时是有益的.混合策略是常见的:检查某些层,卸载其他层.</p>
+<p>FSDP2 作为一流的选择,在 GPU 处于内存瓶状态时, 卸载光线闪耀, 但 CPU-GPU 转移则有空间.</p>
+<h3>计算成本模型</h3>
+<p>逐步的FLOP,每次都会进行无明的检查.<code>k</code>层<code>L</code>其他:</p>
+<pre><code>flops_fwd_normal = L * f_layer
+flops_bwd_normal = 2 * L * f_layer
+flops_total_normal = 3 * L * f_layer
+
+flops_fwd_ckpt = L * f_layer
+flops_recompute = L * f_layer  # one extra forward per layer in the segment
+flops_bwd_ckpt = 2 * L * f_layer
+flops_total_ckpt = 4 * L * f_layer
+overhead = 4 / 3 - 1 = 0.33 = 33%
+</code></pre>
+<p>通过选择性检查点,你只重新计算注意力内核,而不是整个层:</p>
+<pre><code>flops_recompute_selective = L * f_attention ~= L * f_layer * 0.15
+overhead_selective = (3 + 0.15) / 3 - 1 = 0.05 = 5%
+</code></pre>
+<h3>存储记忆模型</h3>
+<p>每层激活量: <code>A</code>为了<code>L</code>层,总激活内存: <code>L * A</code>现在,我们要去.</p>
+<p>完整检查点 (区块大小1): 仅存储<code>L * input_volume</code>,我知道.<code>L * 1/10 A</code>对于标准变压器).<code>9 * L * A * 1/10</code>现在,我们要去.</p>
+<p>每次都会有检查点<code>k</code>层:存储<code>L/k * A</code>另外<code>k-1</code>在活跃部分内的层值.</p>
+<p>在<code>k = sqrt(L)</code>存储和重新计算成本<code>sqrt(L)</code>对均成本层进行最佳交易.</p>
+<h3>什么时候不能到检查点</h3>
+<ul>
+<li>管道的最深层层已经在飞行中,他们必须要完成.</li>
+<li>如果它们占据了舞台的计算 (在变压器中罕见) 的第一和最后层.</li>
+<li>Flash 已经重新计算了软max速度,因此额外的层级检查点点增加了很少.</li>
+</ul>
+<h3>实施模式</h3>
+<ol>
+<li>
+<p>**Function wrapper:**包裹一个段子<code>torch.utils.checkpoint.checkpoint(fn, input)</code>只有Pytorch商店<code>input</code>现在,我们可以重新计算一切.</p>
+</li>
+<li>
+<p>**Decorator-based:**标签层作为可检查的;培训员在配置时决定哪些段子被包装.</p>
+</li>
+<li>
+<p>**Manual explicit recompute:**写回后的传票,叫做习惯.<code>recompute_forward</code>转换的输入</p>
+</li>
+</ol>
+<p>包装是标准的语法.</p>
+<h3>与TP/PP/FP8相互作用</h3>
+<ul>
+<li>**Tensor parallel:**检查点输入必须在重新计算上收集或重新分配;应承担通信成本.</li>
+<li>**Pipeline parallel:**典型的模式是检查每个管道阶段的前进点,以便反向序列的微洗手机可以重复使用激活内存.</li>
+<li>**FP8 recompute:**在重新计算过程中更新的 amax 历史必须与原始前进的,或FP8 尺度漂移相匹配.大多数框架快速拍摄尺度.</li>
+</ul>
+<figure><img src="/learn/ai-from-scratch/figures/figure-ed6771a475b884fe8d78.png" alt="activation-recompute 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<h3>第一个步骤:玩具模型</h3>
+<pre><code class="language-python">import numpy as np
+
+
+def linear_forward(x, w, b):
+    return x @ w + b
+
+
+def relu(x):
+    return np.maximum(x, 0)
+
+
+def layer_forward(x, w1, b1, w2, b2):
+    h = relu(linear_forward(x, w1, b1))
+    return linear_forward(h, w2, b2)
+
+
+def model_forward(x, params):
+    activations = [x]
+    h = x
+    for w1, b1, w2, b2 in params:
+        h = layer_forward(h, w1, b1, w2, b2)
+        activations.append(h)
+    return h, activations
+</code></pre>
+<h3>第二步: 需要所有活动的天真回落</h3>
+<pre><code class="language-python">def model_backward(grad_output, activations, params):
+    grads = [None] * len(params)
+    g = grad_output
+    for i in range(len(params) - 1, -1, -1):
+        w1, b1, w2, b2 = params[i]
+        x_in = activations[i]
+        h_pre = linear_forward(x_in, w1, b1)
+        h = relu(h_pre)
+        gh = g @ w2.T
+        gw2 = h.T @ g
+        gb2 = g.sum(axis=0)
+        g_pre = gh * (h_pre &gt; 0)
+        gx = g_pre @ w1.T
+        gw1 = x_in.T @ g_pre
+        gb1 = g_pre.sum(axis=0)
+        grads[i] = (gw1, gb1, gw2, gb2)
+        g = gx
+    return g, grads
+</code></pre>
+<h3>步骤3:检查点-每一个k 记忆</h3>
+<pre><code class="language-python">def model_forward_checkpointed(x, params, k=4):
+    saved_inputs = [x]
+    h = x
+    for i, (w1, b1, w2, b2) in enumerate(params):
+        h = layer_forward(h, w1, b1, w2, b2)
+        if (i + 1) % k == 0:
+            saved_inputs.append(h)
+    return h, saved_inputs
+
+
+def model_backward_checkpointed(grad_output, saved_inputs, params, k=4):
+    grads = [None] * len(params)
+    g = grad_output
+    segments = [(j * k, min((j + 1) * k, len(params))) for j in range(len(saved_inputs))]
+    for seg_idx in range(len(saved_inputs) - 1, -1, -1):
+        start, end = segments[seg_idx]
+        if start &gt;= end:
+            continue
+        x_in = saved_inputs[seg_idx]
+        _, seg_acts = model_forward(x_in, params[start:end])
+        g, seg_grads = model_backward(g, seg_acts, params[start:end])
+        for j, gr in enumerate(seg_grads):
+            grads[start + j] = gr
+    return g, grads
+</code></pre>
+<h3>步骤4:成本模型</h3>
+<pre><code class="language-python">def checkpoint_cost(n_layers, segment_size, flops_per_layer=1.0):
+    fwd = n_layers * flops_per_layer
+    recompute = n_layers * flops_per_layer
+    bwd = 2 * n_layers * flops_per_layer
+    return {
+        &quot;fwd&quot;: fwd,
+        &quot;recompute&quot;: recompute,
+        &quot;bwd&quot;: bwd,
+        &quot;total&quot;: fwd + recompute + bwd,
+        &quot;overhead_vs_no_ckpt&quot;: (fwd + recompute + bwd) / (fwd + bwd) - 1.0,
+    }
+
+
+def selective_checkpoint_cost(n_layers, attention_fraction=0.15,
+                              flops_per_layer=1.0):
+    fwd = n_layers * flops_per_layer
+    recompute = n_layers * attention_fraction * flops_per_layer
+    bwd = 2 * n_layers * flops_per_layer
+    return {
+        &quot;fwd&quot;: fwd,
+        &quot;recompute&quot;: recompute,
+        &quot;bwd&quot;: bwd,
+        &quot;total&quot;: fwd + recompute + bwd,
+        &quot;overhead_vs_no_ckpt&quot;: (fwd + recompute + bwd) / (fwd + bwd) - 1.0,
+    }
+</code></pre>
+<h3>步骤5:记忆估计器</h3>
+<pre><code class="language-python">def activation_memory_mb(n_layers, hidden=8192, seq=8192,
+                        batch=1, bytes_per_value=2):
+    per_layer = 12 * batch * seq * hidden * bytes_per_value
+    return n_layers * per_layer / 1e6
+
+
+def memory_after_checkpoint(n_layers, segment_size, hidden=8192,
+                           seq=8192, batch=1, bytes_per_value=2):
+    n_seg = max(1, n_layers // segment_size)
+    saved = (n_seg + segment_size) * 1 * batch * seq * hidden * bytes_per_value
+    return saved / 1e6
+</code></pre>
+<h3>步骤 6:最佳细分尺寸</h3>
+<pre><code class="language-python">def optimal_segment(n_layers):
+    return int(round(np.sqrt(n_layers)))
+</code></pre>
+<h3>七步:选择性检查站决定</h3>
+<pre><code class="language-python">def should_recompute(layer_type, activation_bytes, recompute_flops_ratio):
+    if layer_type == &quot;attention&quot; and activation_bytes &gt; 100 * 1e6:
+        return True
+    if layer_type == &quot;ffn&quot; and activation_bytes &gt; 500 * 1e6:
+        return recompute_flops_ratio &lt; 0.1
+    return False
+</code></pre>
+<h2>用它</h2>
+<ul>
+<li><strong>torch.utils.checkpoint</strong>其他<code>from torch.utils.checkpoint import checkpoint</code> PyTorch 中的可行包装. 包裹一个函数; 仅存储输入,重新计算后退.</li>
+<li><strong>Megatron-Core activation recomputation</strong>支持<code>selective</code>现在<code>full</code>其他<code>block</code>标准在2024+边境培训.</li>
+<li><strong>FSDP2 offload</strong>其他<code>module.to_empty(device=&quot;cpu&quot;)</code>随着<code>offload_policy</code>在FSDP2中,切断激活到CPU而不是重新计算.</li>
+<li><strong>DeepSpeed ZeRO-Offload</strong>: 优化状态和激活的CPU脱载,补充检查点.</li>
+</ul>
+<h2>运送它</h2>
+<p>这一课产生了<code>outputs/prompt-activation-recompute-policy.md</code>一个提示,将您的模型配置 (层,隐藏, seq,批量) 和可用的GPU内存取,并发出每层重计算政策 (无 / 选择性 / 完全 / 卸载).</p>
+<h2>运动</h2>
+<ol>
+<li>
+<p>检查正确性.<code>model_forward</code>其他<code>model_backward</code>(完全激活)<code>model_forward_checkpointed</code>其他<code>model_backward_checkpointed</code>参数梯度必须与机器精度相同.</p>
+</li>
+<li>
+<p>扫描部分大小<code>k</code>从1到<code>L</code>图片,记忆,找到曲线的膝盖.</p>
+</li>
+<li>
+<p>执行选择性检查点:存储注意力模块输入,但不是其中间件. 测量FLOP上层与全层检查点为32层模型的seq=8192.</p>
+</li>
+<li>
+<p>添加脱载.将段输入保存到模拟的&quot;CPU缓冲器&quot; (单独列表).以字节/时间测量&quot;PCIe带宽&quot;,并找到脱载和重新计算之间的分离点.</p>
+</li>
+<li>
+<p>根据标准,一个真正的 PyTorch 变压器,有或没有<code>torch.utils.checkpoint</code>测量记忆 (通过<code>torch.cuda.max_memory_allocated</code>) 和步骤时间.</p>
+</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Gradient checkpointing</td>
+<td>&quot;Save memory by redoing forward&quot;</td>
+<td>Store segment inputs only; recompute intermediates during backward to get gradient-support tensors</td>
+</tr>
+<tr>
+<td>Activation recomputation</td>
+<td>&quot;Same as checkpointing&quot;</td>
+<td>The HPC-flavored name for the same technique</td>
+</tr>
+<tr>
+<td>Segment size (k)</td>
+<td>&quot;How many layers per checkpoint&quot;</td>
+<td>Number of layers whose intermediates are dropped and rematerialized together</td>
+</tr>
+<tr>
+<td>Selective checkpointing</td>
+<td>&quot;Korthikanti's trick&quot;</td>
+<td>Recompute only expensive-to-store activations (attention softmax); keep cheap ones</td>
+</tr>
+<tr>
+<td>Full checkpointing</td>
+<td>&quot;The naive version&quot;</td>
+<td>Recompute every layer's intermediates in every segment</td>
+</tr>
+<tr>
+<td>Block checkpointing</td>
+<td>&quot;Coarse-grained&quot;</td>
+<td>Checkpoint whole transformer blocks; largest granularity</td>
+</tr>
+<tr>
+<td>FLOP overhead</td>
+<td>&quot;The compute tax&quot;</td>
+<td>Extra FLOPs per step = (recompute FLOPs) / (fwd + bwd FLOPs); 33% naive, 5% selective</td>
+</tr>
+<tr>
+<td>Activation offload</td>
+<td>&quot;Ship to CPU&quot;</td>
+<td>Move activations to CPU RAM across forward-&gt;backward; alternative to recompute</td>
+</tr>
+<tr>
+<td>sqrt-L rule</td>
+<td>&quot;The classical optimum&quot;</td>
+<td>For uniform-cost layers, optimal checkpoint spacing is sqrt(L) layers</td>
+</tr>
+<tr>
+<td>Attention-softmax volume</td>
+<td>&quot;The O(L^2) problem&quot;</td>
+<td>L^2 * heads * batch floats; dominates activation memory at long contexts</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/1604.06174" rel="noreferrer" data-network="true">Chen et al., 2016 -- &quot;Training Deep Nets with Sublinear Memory Cost&quot; <small>↗ 需要联网</small></a>根据原始文件,</li>
+<li><a href="https://arxiv.org/abs/2205.05198" rel="noreferrer" data-network="true">Korthikanti et al., 2022 -- &quot;Reducing Activation Recomputation in Large Transformer Models&quot; <small>↗ 需要联网</small></a>-- 选择性激活再计算和正式成本分析</li>
+<li><a href="https://arxiv.org/abs/2002.05645" rel="noreferrer" data-network="true">Pudipeddi et al., 2020 -- &quot;Training Large Neural Networks with Constant Memory using a New Execution Algorithm&quot; <small>↗ 需要联网</small></a>--通过反向模式重现物质化来替代常设存储方法</li>
+<li><a href="https://arxiv.org/abs/2101.06840" rel="noreferrer" data-network="true">Ren et al., 2021 -- &quot;ZeRO-Offload: Democratizing Billion-Scale Model Training&quot; <small>↗ 需要联网</small></a>-- 激活放电量</li>
+<li><a href="https://pytorch.org/docs/stable/checkpoint.html" rel="noreferrer" data-network="true">PyTorch torch.utils.checkpoint docs <small>↗ 需要联网</small></a>--标准的API</li>
+<li><a href="https://docs.nvidia.com/nemo/megatron-bridge/latest/training/activation-recomputation.html" rel="noreferrer" data-network="true">Megatron Bridge activation recomputation documentation <small>↗ 需要联网</small></a>--选择性,完整和区块模式</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Gradient Checkpointing and Activation Recomputation</h1>
+<blockquote>
+<p>Backprop keeps every intermediate activation. At 70B parameters and 128K context that is 3 TB of activations per rank. Checkpointing trades FLOPs for memory: recompute instead of save. The question is which segments to drop, and the answer is not &quot;all of them.&quot;</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python (with numpy, optional torch)
+<strong>Prerequisites:</strong> Phase 10 Lesson 04 (Pre-Training Mini-GPT), Phase 10 Lesson 05 (Scaling &amp; Distributed)
+<strong>Time:</strong> ~70 minutes</p>
+<h2>The Problem</h2>
+<p>Training a transformer stores, for each layer, the inputs to every op that is differentiated in backward: the attention inputs, the Q/K/V projections, the softmax output, the FFN inputs, the norm outputs, and the residual stream. For a layer with hidden size <code>d</code>, sequence length <code>L</code>, batch <code>B</code>, this is on the order of <code>12 * B * L * d</code> floats per layer.</p>
+<p>For <code>d=8192, L=8192, B=1</code>, that's 800 MB/layer in BF16. A 64-layer model is 51 GB of activations — and that's before you multiply by microbatch size, before you add attention-softmax intermediates (<code>L^2</code> per head), and before you factor tensor-parallel partial copies.</p>
+<p>The two-sided bill: BF16 weights plus optimizer state might fit in 80GB, but activations push you past. Gradient checkpointing (aka activation recomputation) is the standard fix. Drop most activations; redo the forward during backward to get them back. Cost: extra FLOPs. Benefit: memory drops by the ratio of checkpoint segments to total layers.</p>
+<p>Done naively, checkpointing costs roughly 33% more forward-pass FLOPs per step. Done well — selective checkpointing per the &quot;smart selection&quot; of Korthikanti et al. — you save 5x memory for under 5% FLOP overhead. And with FP8 matmuls, FSDP offload, and expert-parallel MoE this really matters: you can't afford either the memory or the wasted compute.</p>
+<h2>The Concept</h2>
+<h3>What Backward Actually Needs</h3>
+<p><code>output = layer(input)</code>. Backward wants <code>grad_input</code> and <code>grad_params</code>. To compute them it needs:</p>
+<ul>
+<li><code>input</code> (to compute <code>grad_params = input.T @ grad_output</code> for linear layers)</li>
+<li>some activation derivative intermediates (the derivative of ReLU/GELU/softmax depends on the activation value)</li>
+</ul>
+<p>The forward pass stores these automatically in the autograd graph. Every <code>tensor.retain_grad()</code> and every op that needs its input retains a reference.</p>
+<h3>Naive Full Checkpointing</h3>
+<p>Split the network into <code>N</code> segments. During forward, store only the <em>input</em> to each segment. When backward needs intermediates, rerun the segment's forward pass to materialize them, then differentiate.</p>
+<p>Example: 32-layer transformer split into 32 segments of 1 layer each.</p>
+<ul>
+<li>Memory: 32 layer-inputs (small) vs 32 * (activation volume per layer) (huge).</li>
+<li>Extra compute: 1 extra forward per segment, i.e., ~33% more forward FLOPs total (since backward is 2x forward, full step becomes 1 + 1 + 2 = 4 units instead of 1 + 2 = 3).</li>
+</ul>
+<p>This is the original Chen et al. 2016 recipe: one checkpoint every <code>sqrt(L)</code> layers to balance memory and compute. For L=64, that's 8 checkpoints.</p>
+<h3>Selective Checkpointing (Korthikanti 2022)</h3>
+<p>Not all activations cost the same. The attention softmax output is <code>B*L*L*heads</code> and grows <em>quadratically</em> with sequence length. The FFN hidden activation is <code>B*L*4d</code> and grows linearly. For long sequences the softmax dominates.</p>
+<p>Selective checkpointing keeps the cheap-to-store activations (linear projections, residuals) and recomputes only the expensive ones (attention). You pay minimal FLOPs to recompute but save the O(L^2) memory.</p>
+<p>Megatron-Core implements this as &quot;selective&quot; activation recomputation. Used in most 2024+ frontier training runs.</p>
+<h3>Offload</h3>
+<p>Alternative to recompute: ship activations to CPU RAM between forward and backward. Requires PCIe bandwidth; beneficial when idle bandwidth exceeds the cost of rematerialization. Mixed strategies are common: checkpoint some layers, offload others.</p>
+<p>FSDP2 ships offload as a first-class option. Offload shines when GPU is bottlenecked on memory but CPU-GPU transfer has headroom.</p>
+<h3>Recompute Cost Model</h3>
+<p>Per-step FLOPs with naive checkpointing every <code>k</code> layers out of <code>L</code>:</p>
+<pre><code>flops_fwd_normal = L * f_layer
+flops_bwd_normal = 2 * L * f_layer
+flops_total_normal = 3 * L * f_layer
+
+flops_fwd_ckpt = L * f_layer
+flops_recompute = L * f_layer  # one extra forward per layer in the segment
+flops_bwd_ckpt = 2 * L * f_layer
+flops_total_ckpt = 4 * L * f_layer
+overhead = 4 / 3 - 1 = 0.33 = 33%
+</code></pre>
+<p>With selective checkpointing you recompute only the attention kernel, not the whole layer:</p>
+<pre><code>flops_recompute_selective = L * f_attention ~= L * f_layer * 0.15
+overhead_selective = (3 + 0.15) / 3 - 1 = 0.05 = 5%
+</code></pre>
+<h3>Memory Savings Model</h3>
+<p>Activation volume per layer: <code>A</code>. For <code>L</code> layers, total activation memory: <code>L * A</code>.</p>
+<p>Full checkpoint (segment size 1): store only <code>L * input_volume</code> (~<code>L * 1/10 A</code> for a standard transformer). Saves ~<code>9 * L * A * 1/10</code>.</p>
+<p>Checkpoint every <code>k</code> layers: store <code>L/k * A</code> plus <code>k-1</code> layers' worth within the active segment.</p>
+<p>At <code>k = sqrt(L)</code>, memory and recompute cost both scale with <code>sqrt(L)</code> — the optimal tradeoff for uniform-cost layers.</p>
+<h3>When Not to Checkpoint</h3>
+<ul>
+<li>The innermost layers of a pipeline stage already in-flight. They have to finish anyway.</li>
+<li>The first and last layers if they dominate the stage's compute (rare in transformers).</li>
+<li>Attention kernels already using FlashAttention — Flash already recomputes the softmax fast, so additional layer-level checkpointing adds little on top.</li>
+</ul>
+<h3>Implementation Patterns</h3>
+<ol>
+<li>
+<p><strong>Function wrapper:</strong> wrap a segment in <code>torch.utils.checkpoint.checkpoint(fn, input)</code>. PyTorch stores only <code>input</code>, recomputes everything else on backward.</p>
+</li>
+<li>
+<p><strong>Decorator-based:</strong> label layers as checkpointable; the trainer decides at config time which segments get wrapped.</p>
+</li>
+<li>
+<p><strong>Manual explicit recompute:</strong> write the backward pass yourself, calling a custom <code>recompute_forward</code> that duplicates the forward with the stored input.</p>
+</li>
+</ol>
+<p>All three give the same functional result. Wrappers are the standard idiom.</p>
+<h3>Interaction with TP / PP / FP8</h3>
+<ul>
+<li><strong>Tensor parallel:</strong> checkpoint inputs must be gathered or rescattered on recompute; handle the communication cost.</li>
+<li><strong>Pipeline parallel:</strong> typical pattern is to checkpoint each pipeline-stage's forward so reverse-order microbatches can reuse activation memory.</li>
+<li><strong>FP8 recompute:</strong> amax histories updated during recompute must match the original forward's, or the FP8 scale drifts. Most frameworks snapshot the scale.</li>
+</ul>
+<figure><img src="/learn/ai-from-scratch/figures/figure-ed6771a475b884fe8d78.png" alt="activation-recompute 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<h3>Step 1: A Toy Model With Segments</h3>
+<pre><code class="language-python">import numpy as np
+
+
+def linear_forward(x, w, b):
+    return x @ w + b
+
+
+def relu(x):
+    return np.maximum(x, 0)
+
+
+def layer_forward(x, w1, b1, w2, b2):
+    h = relu(linear_forward(x, w1, b1))
+    return linear_forward(h, w2, b2)
+
+
+def model_forward(x, params):
+    activations = [x]
+    h = x
+    for w1, b1, w2, b2 in params:
+        h = layer_forward(h, w1, b1, w2, b2)
+        activations.append(h)
+    return h, activations
+</code></pre>
+<h3>Step 2: Naive Backward Needing All Activations</h3>
+<pre><code class="language-python">def model_backward(grad_output, activations, params):
+    grads = [None] * len(params)
+    g = grad_output
+    for i in range(len(params) - 1, -1, -1):
+        w1, b1, w2, b2 = params[i]
+        x_in = activations[i]
+        h_pre = linear_forward(x_in, w1, b1)
+        h = relu(h_pre)
+        gh = g @ w2.T
+        gw2 = h.T @ g
+        gb2 = g.sum(axis=0)
+        g_pre = gh * (h_pre &gt; 0)
+        gx = g_pre @ w1.T
+        gw1 = x_in.T @ g_pre
+        gb1 = g_pre.sum(axis=0)
+        grads[i] = (gw1, gb1, gw2, gb2)
+        g = gx
+    return g, grads
+</code></pre>
+<h3>Step 3: Checkpoint-Every-k Memory</h3>
+<pre><code class="language-python">def model_forward_checkpointed(x, params, k=4):
+    saved_inputs = [x]
+    h = x
+    for i, (w1, b1, w2, b2) in enumerate(params):
+        h = layer_forward(h, w1, b1, w2, b2)
+        if (i + 1) % k == 0:
+            saved_inputs.append(h)
+    return h, saved_inputs
+
+
+def model_backward_checkpointed(grad_output, saved_inputs, params, k=4):
+    grads = [None] * len(params)
+    g = grad_output
+    segments = [(j * k, min((j + 1) * k, len(params))) for j in range(len(saved_inputs))]
+    for seg_idx in range(len(saved_inputs) - 1, -1, -1):
+        start, end = segments[seg_idx]
+        if start &gt;= end:
+            continue
+        x_in = saved_inputs[seg_idx]
+        _, seg_acts = model_forward(x_in, params[start:end])
+        g, seg_grads = model_backward(g, seg_acts, params[start:end])
+        for j, gr in enumerate(seg_grads):
+            grads[start + j] = gr
+    return g, grads
+</code></pre>
+<h3>Step 4: Cost Model</h3>
+<pre><code class="language-python">def checkpoint_cost(n_layers, segment_size, flops_per_layer=1.0):
+    fwd = n_layers * flops_per_layer
+    recompute = n_layers * flops_per_layer
+    bwd = 2 * n_layers * flops_per_layer
+    return {
+        &quot;fwd&quot;: fwd,
+        &quot;recompute&quot;: recompute,
+        &quot;bwd&quot;: bwd,
+        &quot;total&quot;: fwd + recompute + bwd,
+        &quot;overhead_vs_no_ckpt&quot;: (fwd + recompute + bwd) / (fwd + bwd) - 1.0,
+    }
+
+
+def selective_checkpoint_cost(n_layers, attention_fraction=0.15,
+                              flops_per_layer=1.0):
+    fwd = n_layers * flops_per_layer
+    recompute = n_layers * attention_fraction * flops_per_layer
+    bwd = 2 * n_layers * flops_per_layer
+    return {
+        &quot;fwd&quot;: fwd,
+        &quot;recompute&quot;: recompute,
+        &quot;bwd&quot;: bwd,
+        &quot;total&quot;: fwd + recompute + bwd,
+        &quot;overhead_vs_no_ckpt&quot;: (fwd + recompute + bwd) / (fwd + bwd) - 1.0,
+    }
+</code></pre>
+<h3>Step 5: Memory Estimator</h3>
+<pre><code class="language-python">def activation_memory_mb(n_layers, hidden=8192, seq=8192,
+                        batch=1, bytes_per_value=2):
+    per_layer = 12 * batch * seq * hidden * bytes_per_value
+    return n_layers * per_layer / 1e6
+
+
+def memory_after_checkpoint(n_layers, segment_size, hidden=8192,
+                           seq=8192, batch=1, bytes_per_value=2):
+    n_seg = max(1, n_layers // segment_size)
+    saved = (n_seg + segment_size) * 1 * batch * seq * hidden * bytes_per_value
+    return saved / 1e6
+</code></pre>
+<h3>Step 6: Optimal Segment Size</h3>
+<pre><code class="language-python">def optimal_segment(n_layers):
+    return int(round(np.sqrt(n_layers)))
+</code></pre>
+<h3>Step 7: Selective Checkpoint Decision</h3>
+<pre><code class="language-python">def should_recompute(layer_type, activation_bytes, recompute_flops_ratio):
+    if layer_type == &quot;attention&quot; and activation_bytes &gt; 100 * 1e6:
+        return True
+    if layer_type == &quot;ffn&quot; and activation_bytes &gt; 500 * 1e6:
+        return recompute_flops_ratio &lt; 0.1
+    return False
+</code></pre>
+<h2>Use It</h2>
+<ul>
+<li><strong>torch.utils.checkpoint</strong>: <code>from torch.utils.checkpoint import checkpoint</code> — the canonical wrapper in PyTorch. Wraps a function; stores only inputs, recomputes on backward.</li>
+<li><strong>Megatron-Core activation recomputation</strong>: supports <code>selective</code>, <code>full</code>, and <code>block</code> modes. Standard in 2024+ frontier training.</li>
+<li><strong>FSDP2 offload</strong>: <code>module.to_empty(device=&quot;cpu&quot;)</code> with <code>offload_policy</code> in FSDP2 shards activations to CPU instead of recomputing.</li>
+<li><strong>DeepSpeed ZeRO-Offload</strong>: CPU offload for optimizer states and activations, complementing checkpointing.</li>
+</ul>
+<h2>Ship It</h2>
+<p>This lesson produces <code>outputs/prompt-activation-recompute-policy.md</code> — a prompt that takes your model config (layers, hidden, seq, batch) and available GPU memory and emits a per-layer recompute policy (none / selective / full / offload).</p>
+<h2>Exercises</h2>
+<ol>
+<li>
+<p>Verify correctness. Run <code>model_forward</code> + <code>model_backward</code> (full activations) vs <code>model_forward_checkpointed</code> + <code>model_backward_checkpointed</code> (segments). Parameter gradients must be identical to machine precision.</p>
+</li>
+<li>
+<p>Sweep segment size <code>k</code> from 1 to <code>L</code>. Plot FLOP overhead and memory. Find the knee of the curve.</p>
+</li>
+<li>
+<p>Implement selective checkpointing: store the attention-module input but not its intermediates. Measure the FLOP overhead vs full-layer checkpointing for a 32-layer model at seq=8192.</p>
+</li>
+<li>
+<p>Add offload. Save segment inputs to a simulated &quot;CPU buffer&quot; (a separate list). Measure &quot;PCIe bandwidth&quot; as bytes/time and find the breakeven point between offload and recompute.</p>
+</li>
+<li>
+<p>Benchmark a real PyTorch transformer with and without <code>torch.utils.checkpoint</code>. Measure memory (via <code>torch.cuda.max_memory_allocated</code>) and step time.</p>
+</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Gradient checkpointing</td>
+<td>&quot;Save memory by redoing forward&quot;</td>
+<td>Store segment inputs only; recompute intermediates during backward to get gradient-support tensors</td>
+</tr>
+<tr>
+<td>Activation recomputation</td>
+<td>&quot;Same as checkpointing&quot;</td>
+<td>The HPC-flavored name for the same technique</td>
+</tr>
+<tr>
+<td>Segment size (k)</td>
+<td>&quot;How many layers per checkpoint&quot;</td>
+<td>Number of layers whose intermediates are dropped and rematerialized together</td>
+</tr>
+<tr>
+<td>Selective checkpointing</td>
+<td>&quot;Korthikanti's trick&quot;</td>
+<td>Recompute only expensive-to-store activations (attention softmax); keep cheap ones</td>
+</tr>
+<tr>
+<td>Full checkpointing</td>
+<td>&quot;The naive version&quot;</td>
+<td>Recompute every layer's intermediates in every segment</td>
+</tr>
+<tr>
+<td>Block checkpointing</td>
+<td>&quot;Coarse-grained&quot;</td>
+<td>Checkpoint whole transformer blocks; largest granularity</td>
+</tr>
+<tr>
+<td>FLOP overhead</td>
+<td>&quot;The compute tax&quot;</td>
+<td>Extra FLOPs per step = (recompute FLOPs) / (fwd + bwd FLOPs); 33% naive, 5% selective</td>
+</tr>
+<tr>
+<td>Activation offload</td>
+<td>&quot;Ship to CPU&quot;</td>
+<td>Move activations to CPU RAM across forward-&gt;backward; alternative to recompute</td>
+</tr>
+<tr>
+<td>sqrt-L rule</td>
+<td>&quot;The classical optimum&quot;</td>
+<td>For uniform-cost layers, optimal checkpoint spacing is sqrt(L) layers</td>
+</tr>
+<tr>
+<td>Attention-softmax volume</td>
+<td>&quot;The O(L^2) problem&quot;</td>
+<td>L^2 * heads * batch floats; dominates activation memory at long contexts</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/1604.06174" rel="noreferrer" data-network="true">Chen et al., 2016 -- &quot;Training Deep Nets with Sublinear Memory Cost&quot; <small>↗ 需要联网</small></a> -- the original paper that formalized gradient checkpointing</li>
+<li><a href="https://arxiv.org/abs/2205.05198" rel="noreferrer" data-network="true">Korthikanti et al., 2022 -- &quot;Reducing Activation Recomputation in Large Transformer Models&quot; <small>↗ 需要联网</small></a> -- selective activation recomputation and the formal cost analysis</li>
+<li><a href="https://arxiv.org/abs/2002.05645" rel="noreferrer" data-network="true">Pudipeddi et al., 2020 -- &quot;Training Large Neural Networks with Constant Memory using a New Execution Algorithm&quot; <small>↗ 需要联网</small></a> -- alternative constant-memory approach via reverse-mode rematerialization</li>
+<li><a href="https://arxiv.org/abs/2101.06840" rel="noreferrer" data-network="true">Ren et al., 2021 -- &quot;ZeRO-Offload: Democratizing Billion-Scale Model Training&quot; <small>↗ 需要联网</small></a> -- activation offload at scale</li>
+<li><a href="https://pytorch.org/docs/stable/checkpoint.html" rel="noreferrer" data-network="true">PyTorch torch.utils.checkpoint docs <small>↗ 需要联网</small></a> -- the standard API</li>
+<li><a href="https://docs.nvidia.com/nemo/megatron-bridge/latest/training/activation-recomputation.html" rel="noreferrer" data-network="true">Megatron Bridge activation recomputation documentation <small>↗ 需要联网</small></a> -- selective, full, and block modes</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-10-llms-from-scratch--34-gradient-checkpointing.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-10-llms-from-scratch--34-gradient-checkpointing.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/10-llms-from-scratch/34-gradient-checkpointing/code/main.py">phases/10-llms-from-scratch/34-gradient-checkpointing/code/main.py</a><details><summary>查看原始文本</summary><pre><code>import numpy as np
+
+
+def linear_forward(x, w, b):
+    return x @ w + b
+
+
+def relu(x):
+    return np.maximum(x, 0.0)
+
+
+def layer_forward(x, w1, b1, w2, b2):
+    h = relu(linear_forward(x, w1, b1))
+    return linear_forward(h, w2, b2)
+
+
+def model_forward(x, params):
+    activations = [x]
+    h = x
+    for w1, b1, w2, b2 in params:
+        h = layer_forward(h, w1, b1, w2, b2)
+        activations.append(h)
+    return h, activations
+
+
+def layer_backward(g, x_in, w1, b1, w2, b2):
+    h_pre = linear_forward(x_in, w1, b1)
+    h = relu(h_pre)
+    gw2 = h.T @ g
+    gb2 = g.sum(axis=0)
+    gh = g @ w2.T
+    g_pre = gh * (h_pre &gt; 0)
+    gw1 = x_in.T @ g_pre
+    gb1 = g_pre.sum(axis=0)
+    gx = g_pre @ w1.T
+    return gx, (gw1, gb1, gw2, gb2)
+
+
+def model_backward(grad_output, activations, params):
+    grads = [None] * len(params)
+    g = grad_output
+    for i in range(len(params) - 1, -1, -1):
+        w1, b1, w2, b2 = params[i]
+        x_in = activations[i]
+        g, grads[i] = layer_backward(g, x_in, w1, b1, w2, b2)
+    return g, grads
+
+
+def model_forward_checkpointed(x, params, k=4):
+    saved_inputs = [x]
+    h = x
+    for i, (w1, b1, w2, b2) in enumerate(params):
+        h = layer_forward(h, w1, b1, w2, b2)
+        if (i + 1) % k == 0 and (i + 1) &lt; len(params):
+            saved_inputs.append(h)
+    saved_inputs.append(h)
+    return h, saved_inputs
+
+
+def model_backward_checkpointed(grad_output, saved_inputs, params, k=4):
+    grads = [None] * len(params)
+    g = grad_output
+    n_seg = (len(params) + k - 1) // k
+    for seg_idx in range(n_seg - 1, -1, -1):
+        start = seg_idx * k
+        end = min(start + k, len(params))
+        x_in = saved_inputs[seg_idx]
+        _, seg_acts = model_forward(x_in, params[start:end])
+        g, seg_grads = model_backward(g, seg_acts, params[start:end])
+        for j, gr in enumerate(seg_grads):
+            grads[start + j] = gr
+    return g, grads
+
+
+def checkpoint_cost(n_layers, segment_size=1, flops_per_layer=1.0,
+                    attention_fraction=0.15, selective=False):
+    fwd = n_layers * flops_per_layer
+    if selective:
+        recompute = n_layers * attention_fraction * flops_per_layer
+    else:
+        recompute = n_layers * flops_per_layer * (
+            (segment_size - 1) / max(segment_size, 1)
+        )
+    bwd = 2 * n_layers * flops_per_layer
+    total = fwd + recompute + bwd
+    baseline = fwd + bwd
+    return {
+        &quot;fwd&quot;: fwd,
+        &quot;recompute&quot;: recompute,
+        &quot;bwd&quot;: bwd,
+        &quot;total&quot;: total,
+        &quot;overhead_vs_no_ckpt&quot;: total / baseline - 1.0,
+    }
+
+
+def activation_memory_mb(n_layers, hidden=8192, seq=8192, batch=1,
+                         bytes_per_value=2):
+    per_layer = 12 * batch * seq * hidden * bytes_per_value
+    return n_layers * per_layer / 1e6
+
+
+def memory_after_checkpoint(n_layers, segment_size, hidden=8192,
+                            seq=8192, batch=1, bytes_per_value=2):
+    n_seg = (n_layers + segment_size - 1) // segment_size
+    saved = (n_seg + segment_size) * batch * seq * hidden * bytes_per_value
+    return saved / 1e6
+
+
+def optimal_segment(n_layers):
+    return max(1, int(round(np.sqrt(n_layers))))
+
+
+def should_recompute(layer_type, activation_bytes_mb, recompute_flops_ratio):
+    if layer_type == &quot;attention&quot; and activation_bytes_mb &gt; 100:
+        return True
+    if layer_type == &quot;ffn&quot; and activation_bytes_mb &gt; 500:
+        return recompute_flops_ratio &lt; 0.1
+    return False
+
+
+def make_params(n_layers, hidden, inner, seed=0):
+    rng = np.random.default_rng(seed)
+    params = []
+    for _ in range(n_layers):
+        w1 = rng.standard_normal((hidden, inner)).astype(np.float32) * (1.0 / np.sqrt(hidden))
+        b1 = np.zeros(inner, dtype=np.float32)
+        w2 = rng.standard_normal((inner, hidden)).astype(np.float32) * (1.0 / np.sqrt(inner))
+        b2 = np.zeros(hidden, dtype=np.float32)
+        params.append((w1, b1, w2, b2))
+    return params
+
+
+def verify_equivalence(n_layers=6, hidden=16, inner=32, batch=4, k=2):
+    rng = np.random.default_rng(1)
+    x = rng.standard_normal((batch, hidden)).astype(np.float32)
+    params = make_params(n_layers, hidden, inner)
+    out_full, acts_full = model_forward(x, params)
+    grad_out = rng.standard_normal(out_full.shape).astype(np.float32)
+    _, grads_full = model_backward(grad_out, acts_full, params)
+    out_ck, saved = model_forward_checkpointed(x, params, k=k)
+    _, grads_ck = model_backward_checkpointed(grad_out, saved, params, k=k)
+    max_diff = 0.0
+    for gf, gc in zip(grads_full, grads_ck):
+        for a, b in zip(gf, gc):
+            max_diff = max(max_diff, float(np.max(np.abs(a - b))))
+    return {
+        &quot;output_match&quot;: bool(np.allclose(out_full, out_ck, atol=1e-5)),
+        &quot;max_grad_diff&quot;: max_diff,
+    }
+
+
+if __name__ == &quot;__main__&quot;:
+    print(&quot;equivalence:&quot;, verify_equivalence())
+    for seg in [1, 2, 4, 8, 16, 32, 64]:
+        cost = checkpoint_cost(64, segment_size=seg)
+        print(f&quot;k={seg:3d}  overhead={cost[&#39;overhead_vs_no_ckpt&#39;]:.1%}&quot;)
+    print(&quot;selective overhead:&quot;, f&quot;{checkpoint_cost(64, selective=True)[&#39;overhead_vs_no_ckpt&#39;]:.1%}&quot;)
+    print(&quot;optimal segment for L=64:&quot;, optimal_segment(64))
+    print(&quot;activation memory (no ckpt), L=64, d=8192, seq=8192, batch=1:&quot;,
+          f&quot;{activation_memory_mb(64):.1f} MB&quot;)
+    for seg in [1, 4, 8, 16, 32]:
+        print(f&quot;  checkpoint k={seg:3d}: {memory_after_checkpoint(64, seg):.1f} MB&quot;)
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/10-llms-from-scratch/34-gradient-checkpointing/outputs/skill-checkpointing-planner.md">phases/10-llms-from-scratch/34-gradient-checkpointing/outputs/skill-checkpointing-planner.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: checkpointing-planner
+description: Choose an activation recomputation policy per layer (none / selective / full / offload) given a training config and HBM budget.
+version: 1.0.0
+phase: 10
+lesson: 34
+tags: [gradient-checkpointing, activation-recomputation, selective-checkpoint, fsdp-offload, training-memory]
+---
+
+Given the training config (layer count L, hidden size d, sequence length S, microbatch B, dtype bytes per value, attention kernel, tensor-parallel degree TP, pipeline-parallel degree PP, expert-parallel degree EP if MoE) and the per-rank HBM budget after weights and optimizer state, output:
+
+1. Per-layer policy. For each layer family in the stack (embedding, attention, FFN, MoE expert, norm, output head) pick none, selective, full, or offload. Default to selective for attention when S exceeds 4_096; default to none on residual streams and norms; default to offload on FFN only when the measured PCIe transfer time for that layer&#39;s activations is less than its measured recompute time.
+2. Segment size k. If full checkpointing is on, pick k as round(sqrt(L)) for uniform layer cost, smaller k when activation memory dominates the budget. Report extra FLOP percentage as (1/k) of forward FLOPs.
+3. FlashAttention interaction. Confirm whether the attention kernel already recomputes softmax. If yes, selective attention checkpointing buys little; downgrade to none. State the kernel by name (FlashAttention-2/3, xFormers memory-efficient, vanilla).
+4. TP / PP plan. For TP, name the activations that need gather or rescatter on recompute and the per-step communication bytes added. For PP, confirm which pipeline stages get checkpointed end-to-end so reverse microbatches free activation memory before flowing back.
+5. Budget math. Predict activation memory before and after the policy (in MB per rank). Predict FLOP overhead as percent of fwd+bwd. Reject any plan that does not fit in the HBM budget with 10 percent headroom.
+
+Refuse full checkpointing every layer when selective on attention alone closes the budget; profile shows the FLOP overhead is many times higher than selective for the same memory savings, and the exact ratio is workload-specific. Refuse offload when the layer&#39;s measured activation transfer time on the target PCIe link exceeds its measured recompute time; recompute wins. Refuse &quot;checkpoint everywhere&quot; for FP8 training when the chosen framework does not snapshot amax history; the recompute will drift the scale and silently corrupt gradients.
+
+Example input: &quot;L=64, d=8192, S=8192, B=1, bf16, FlashAttention-3, TP=8, PP=4, HBM budget per rank 32 GB after weights, MoE with 8 experts and EP=8.&quot;
+
+Example output:
+- Per-layer policy: attention selective, FFN none, MoE expert full, embedding none, output head offload.
+- Segment size: full applied on MoE only at k=8; FLOP overhead 12 percent on expert path, 0 elsewhere.
+- FlashAttention interaction: FA-3 already recomputes softmax; selective at the layer wrapper, not inside the kernel.
+- TP / PP plan: TP gather of the attention input on recompute, 0.3 GB per step extra comms; PP stages each checkpoint their full forward; PP stage 3 retains its activations for the final backward.
+- Budget math: activations 38 GB without policy, 11 GB with policy. Total FLOP overhead 7.5 percent fwd+bwd.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原课程未提供测验。</p></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/10-llms-from-scratch/25-speculative-decoding/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/11-llm-engineering/01-prompt-engineering/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/10-llms-from-scratch/34-gradient-checkpointing/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

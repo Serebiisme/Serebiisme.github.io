@@ -1,0 +1,602 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>代理国机器 图表,节点,检查站 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-11-llm-engineering" data-lesson="11-llm-engineering/16-langgraph-state-machines" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/11-llm-engineering/">大语言模型工程</a> / LESSON 16</p><h1 class="lesson-title">代理国机器 图表,节点,检查站</h1><p>Agent State Machines — Graphs, Nodes, Checkpoints</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>代理国机器 图表,节点,检查站</h1>
+<blockquote>
+<p>通过手写的 ReAct 循环是<code>while True</code>作为一个明确的图表,写的循环是你可以检查点,打断,分支,时间旅行. 代理没有改变. 环绕它有.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 11 · 09 (Function Calling), Phase 11 · 14 (Model Context Protocol)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>问题</h2>
+<p>运输一个调用函数的代理.它工作了三次,然后发生了一些问题:模型尝试一个返回500的工具,用户在任务中改变了想法,或者代理决定退还一个订单,没有人签署.<code>while True:</code>没有子. 你不能暂停它,你不能转它,你不能分分成&quot;如果模型选择了另一种工具&quot;.</p>
+<p>接下来的步骤是显而易见的. 代理已经是一个状态机 系统提示加上消息历史加上等待工具调用加上下一步行动. 让状态机明确:节点为&quot;模型认为&quot;,&quot;工具运行&quot;,&quot;人批准&quot;,和边缘为它们之间的条件过渡. 一旦图表明确,该带将获得四件事免费:检查点 (节省步骤之间的状态),中断 (人类的暂停),流 (流代币和中间事件),以及时间旅行 (回返以前的状态并尝试不同的分支).</p>
+<p>这种抽象的参考实现是LangGraph.它不是一个代理框架,在LangChain意义上 (&quot;这里有一个代理执行者,好运&quot;).它是一个图表运行时间,具有一流状态,一流的持久性和一流的中断.代理循环是你绘制的东西,而不是你手写的东西.</p>
+<h2>概念</h2>
+<p><img src="/learn/ai-from-scratch/files/phases/11-llm-engineering/16-langgraph-state-machines/assets/langgraph-stategraph.svg" alt="LangGraph StateGraph: nodes, edges, and the checkpointer" loading="lazy"></p>
+<p><code>StateGraph</code>有三个东西.</p>
+<ol>
+<li>**State.**输入式命令 (TypedDict或Pydantic模型) 通过图表流动.每个节点都收到完整状态并返回部分更新,LangGraph将其通过每个字段的 <em>reducer</em> 合并<code>operator.add</code>对于应该积累的列表,默认上重写.</li>
+<li><strong>Nodes.</strong> Python 函数<code>state -&gt; partial_state</code>每一步都是一个分别的步骤: &quot;调用模型&quot;, &quot;运行工具&quot;, &quot;总结&quot;.</li>
+<li>**Edges.**节点之间的过渡.静态边缘将移动到一个地方. 条件边缘将接收路由器函数<code>state -&gt; next_node_name</code>图表可以分为模型输出.</li>
+</ol>
+<p>编译将拓链接,附加一个检查点 (可选但对于生产至关重要),并返回一个可运行的.您使用一个初始状态和一个<code>thread_id</code>每一步执行都会有一个关键的检查点<code>(thread_id, checkpoint_id)</code>现在,我们要去.</p>
+<h3>它们是四大超级大国.</h3>
+<p>**Checkpointing.**每个节点过渡都会将新状态写入一个存储器 (在内存中进行测试,Postgres/Redis/SQLite为 prod).再重复,再用相同的方式调用图表.<code>thread_id</code>图表从停留的地方恢复.</p>
+<p>**Interrupts.**标记一个节点<code>interrupt_before=[&quot;human_review&quot;]</code>您的API会以&quot;等待批准&quot;回复用户. 随后请求相同的<code>thread_id</code>随着<code>Command(resume=...)</code>恢复执行.</p>
+<p><strong>Streaming.</strong> <code>graph.stream(state, mode=&quot;updates&quot;)</code>随着这些事件,<code>mode=&quot;messages&quot;</code>通过模特节点中流动LLM代币. <code>mode=&quot;values&quot;</code>您可以选择在用户界面中出现什么.</p>
+<p><strong>Time-travel.</strong> <code>graph.get_state_history(thread_id)</code>返回检查站的全部日志.<code>checkpoint_id</code>为了<code>graph.invoke</code>对于调试 (&quot;如果模型选择了工具B?&quot;) 和重播生产痕迹的回归测试来说,</p>
+<h3>减少者是个问题</h3>
+<p>每个状态字段都有减小器.大多数默认值都很好一个新的值覆盖了旧值.但消息列表需要<code>operator.add</code>通过减速器将其更新合并.如果两个节点都更新<code>messages</code>你忘了了这个<code>Annotated[list, add_messages]</code>减速器是图书馆唯一的微妙东西;把它做得好,剩下的都是编曲.</p>
+<h3>通过4个节点的 ReAct图</h3>
+<p>生产 ReAct 代理是四个节点和两个边缘:</p>
+<ol>
+<li><code>agent</code>将当前消息历史记录传递给LLM. 返回助理消息 (可能包含工具_调用).</li>
+<li><code>tools</code>执行最后一个助理消息中的任何工具_调用,将工具结果添加为工具消息.</li>
+<li>一个条件边缘<code>agent</code>航线到<code>tools</code>如果最后一个消息有工具_调用,否则<code>END</code>现在,我们要去.</li>
+<li>一个静态边缘<code>tools</code>回到<code>agent</code>现在,我们要去.</li>
+</ol>
+<p>您可以在约40行代码中获得全 ReAct循环 (思维 → 行动 → 观察 → 思考 → ...) 通过检查点,中断和流.</p>
+<h3>状态图与发送 (预测)</h3>
+<p><code>Send(node_name, state)</code>让节点发送平行子图. 举个例子:代理决定同时查询三个检索器. 每个<code>Send</code>通过状态减小器,它们的输出融合. 这就是LangGraph在没有线程原始的情况下表达了乐队员-工作者模式.</p>
+<h3>字幕</h3>
+<p>编译图可以是另一个图中的节点. 外面图看到单个节点;内部图有自己的状态和检查点.这就是团队构建监督员工代理的方式:监督员工图将用户意图导向每个域名的员工子图.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-a10e1f870d9f14ab38d9.png" alt="l5-state-graph-ledger 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<h3>步骤1:状态和节点</h3>
+<pre><code class="language-python">from typing import Annotated, TypedDict
+from langchain_core.messages import AnyMessage, HumanMessage, AIMessage
+from langgraph.graph import StateGraph, END
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode
+from langgraph.checkpoint.memory import MemorySaver
+
+class State(TypedDict):
+    messages: Annotated[list[AnyMessage], add_messages]
+
+def agent_node(state: State) -&gt; dict:
+    response = llm.invoke(state[&quot;messages&quot;])
+    return {&quot;messages&quot;: [response]}
+
+def should_continue(state: State) -&gt; str:
+    last = state[&quot;messages&quot;][-1]
+    return &quot;tools&quot; if getattr(last, &quot;tool_calls&quot;, None) else END
+
+tool_node = ToolNode(tools=[search_web, read_file])
+
+graph = StateGraph(State)
+graph.add_node(&quot;agent&quot;, agent_node)
+graph.add_node(&quot;tools&quot;, tool_node)
+graph.set_entry_point(&quot;agent&quot;)
+graph.add_conditional_edges(&quot;agent&quot;, should_continue, {&quot;tools&quot;: &quot;tools&quot;, END: END})
+graph.add_edge(&quot;tools&quot;, &quot;agent&quot;)
+
+app = graph.compile(checkpointer=MemorySaver())
+</code></pre>
+<p><code>add_messages</code>错误的原因是,它是最常见的LangGraph错误.</p>
+<h3>步骤2:用线程运行</h3>
+<pre><code class="language-python">config = {&quot;configurable&quot;: {&quot;thread_id&quot;: &quot;user-42&quot;}}
+for event in app.stream(
+    {&quot;messages&quot;: [HumanMessage(&quot;find the Anthropic headquarters address&quot;)]},
+    config,
+    stream_mode=&quot;updates&quot;,
+):
+    print(event)
+</code></pre>
+<p>每次更新都是一个命令<code>{node_name: state_delta}</code>你的前端可以向用户界面传输这些,以便用户看到&quot;代理正在考虑...打电话搜索_网...得到结果...回复&quot;.</p>
+<h3>步骤3:添加一个人-在循环中中断</h3>
+<p>标记一个节点,以便执行停止运行之前.</p>
+<pre><code class="language-python">app = graph.compile(
+    checkpointer=MemorySaver(),
+    interrupt_before=[&quot;tools&quot;],  # pause before every tool call
+)
+
+state = app.invoke({&quot;messages&quot;: [HumanMessage(&quot;delete the production database&quot;)]}, config)
+# state[&quot;__interrupt__&quot;] is set. Inspect proposed tool calls.
+# If approved:
+from langgraph.types import Command
+app.invoke(Command(resume=True), config)
+# If denied: write a rejection message and resume
+app.update_state(config, {&quot;messages&quot;: [AIMessage(&quot;Blocked by human reviewer.&quot;)]})
+</code></pre>
+<p>状态,检查点和线程都在中断期间持续存在. 除了执行时,没有任何东西被记住.</p>
+<h3>步骤4:调试时间旅行</h3>
+<pre><code class="language-python">history = list(app.get_state_history(config))
+for snapshot in history:
+    print(snapshot.values[&quot;messages&quot;][-1].content[:80], snapshot.config)
+
+# Fork from a prior checkpoint
+target = history[3].config  # three steps back
+for event in app.stream(None, target, stream_mode=&quot;values&quot;):
+    pass  # replay from that point forward
+</code></pre>
+<p>通过<code>None</code>通过一个值,在恢复之前将其添加到该点状态的更新中. 这就是你在没有重新运行整个对话的情况下重复一个坏代理运行的方式.</p>
+<h3>步骤5:换取检查点进行生产</h3>
+<pre><code class="language-python">from langgraph.checkpoint.postgres import PostgresSaver
+
+with PostgresSaver.from_conn_string(&quot;postgresql://...&quot;) as checkpointer:
+    checkpointer.setup()
+    app = graph.compile(checkpointer=checkpointer)
+</code></pre>
+<p>石,雷迪斯和后生已经出货了.<code>MemorySaver</code>任何持续在重启过程中都需要真正的商店.</p>
+<h2>技能</h2>
+<blockquote>
+<p>你把代理作为图形,而不是作为图形.<code>while True</code>子,子.</p>
+</blockquote>
+<p>在你拿到兰格拉夫之前,做一个60秒的设计:</p>
+<ol>
+<li>**Name the nodes.**任何单独的决定或副作用都是节点. &quot;代理认为&quot;, &quot;工具运行&quot;, &quot;评论员批准&quot;, &quot;响应流&quot;.如果你不能列出它们,任务还没有代理形状.</li>
+<li>**Declare the state.**单词单词,每一个单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词单词<code>messages</code>提升任务特定领域 (一个工作<code>plan</code>其他<code>budget</code>计数器<code>retrieved_docs</code>列表) 到最高水平.</li>
+<li>**Draw the edges.**只有下一步取决于模型输出.每个条件边缘需要一个具有命名分支的路由器函数.</li>
+<li><strong>Choose a checkpointer up front.</strong> <code>MemorySaver</code>对于测试, Postgres/Redis/SQLite. 没有一个 没有检查点意味着没有简历,没有中断,没有时间旅行.</li>
+<li>**Decide interrupts before tools run, not after.**通过将边缘进入一个副作用节点,以便您可以在损害之前取消;验证将在模型边缘取消,</li>
+<li><strong>Stream by default.</strong> <code>mode=&quot;updates&quot;</code>对于UI,<code>mode=&quot;messages&quot;</code>对于模型节点内部的代币级流,<code>mode=&quot;values&quot;</code>在评估期间,</li>
+</ol>
+<p>拒绝运送没有检查点的LangGraph代理.拒绝运送中断后的代理.拒绝运送一个<code>messages</code>没有字段<code>add_messages</code>作为其减小剂.</p>
+<h2>运动</h2>
+<ol>
+<li>**Easy.**通过计算器工具和网页搜索工具实现上述四节点 ReAct 图.<code>list(app.get_state_history(config))</code>返回至少四个检查站,进行两轮对话.</li>
+<li>**Medium.**添加一个<code>planner</code>之前运行的节点<code>agent</code>编写一个结构化<code>plan: list[str]</code>现在,我在美国.<code>agent</code>测试中失败,如果<code>plan</code>检查点简历 (错误减小器) 上丢失.</li>
+<li>**Hard.**建立一个监督图,该图将三个子图之间的路线 (<code>researcher</code>现在<code>writer</code>现在<code>reviewer</code>) 使用<code>Send</code>每个子图都有自己的状态和检查点.<code>interrupt_before=[&quot;writer&quot;]</code>确认从前一个检查点的时间旅行只运行了叉子分支.</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>StateGraph</td>
+<td>&quot;The LangGraph graph&quot;</td>
+<td>The builder object you add nodes and edges to before compile.</td>
+</tr>
+<tr>
+<td>Reducer</td>
+<td>&quot;How the field merges&quot;</td>
+<td>A function <code>(old, new) -&gt; merged</code> applied when a node returns an update for that field; default is overwrite, <code>add_messages</code> appends.</td>
+</tr>
+<tr>
+<td>Thread</td>
+<td>&quot;A conversation ID&quot;</td>
+<td>A <code>thread_id</code> string that scopes all checkpoints for one session.</td>
+</tr>
+<tr>
+<td>Checkpoint</td>
+<td>&quot;A paused state&quot;</td>
+<td>A persisted snapshot of the full graph state after a node transition, keyed on <code>(thread_id, checkpoint_id)</code>.</td>
+</tr>
+<tr>
+<td>Interrupt</td>
+<td>&quot;Pause for a human&quot;</td>
+<td><code>interrupt_before</code> / <code>interrupt_after</code> stop execution at a node boundary; resume with <code>Command(resume=...)</code>.</td>
+</tr>
+<tr>
+<td>Time-travel</td>
+<td>&quot;Fork from a prior step&quot;</td>
+<td><code>graph.invoke(None, config_with_old_checkpoint_id)</code> replays from that checkpoint forward.</td>
+</tr>
+<tr>
+<td>Send</td>
+<td>&quot;Parallel subgraph dispatch&quot;</td>
+<td>A constructor a node can return to spawn N parallel executions of a target node.</td>
+</tr>
+<tr>
+<td>Subgraph</td>
+<td>&quot;A compiled graph as a node&quot;</td>
+<td>A compiled StateGraph used as a node in another graph; preserves its own state scope.</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://langchain-ai.github.io/langgraph/" rel="noreferrer" data-network="true">LangGraph documentation <small>↗ 需要联网</small></a>对国家图表,减小器,检查点和中断的常规参考.</li>
+<li><a href="https://langchain-ai.github.io/langgraph/concepts/low_level/" rel="noreferrer" data-network="true">LangGraph concepts: state, reducers, checkpointers <small>↗ 需要联网</small></a>本课中使用的心理模型,直接从源头.</li>
+<li><a href="https://langchain-ai.github.io/langgraph/concepts/persistence/" rel="noreferrer" data-network="true">LangGraph Persistence and Checkpoints <small>↗ 需要联网</small></a> Postgres/SQLite/Redis 商店,检查点名字空间和线程ID的细节.</li>
+<li><a href="https://langchain-ai.github.io/langgraph/concepts/human_in_the_loop/" rel="noreferrer" data-network="true">LangGraph Human-in-the-loop <small>↗ 需要联网</small></a> <code>interrupt_before</code>现在<code>interrupt_after</code>现在<code>Command(resume=...)</code>它们是&quot;化&quot;的.</li>
+<li><a href="https://arxiv.org/abs/2210.03629" rel="noreferrer" data-network="true">Yao et al., &quot;ReAct: Synergizing Reasoning and Acting in Language Models&quot; (ICLR 2023) <small>↗ 需要联网</small></a>每一个LangGraph代理所实施的模式;阅读它,以推理后果理性.</li>
+<li><a href="https://www.anthropic.com/research/building-effective-agents" rel="noreferrer" data-network="true">Anthropic — Building effective agents (Dec 2024) <small>↗ 需要联网</small></a> 什么图形 (链,路由器,管弦工作者,评价者优化器) 首选,何时.</li>
+<li>阶段11 · 09 (函数调用) 每一个LangGraph代理节点重复使用工具调用原始.</li>
+<li>11 · 14阶段 (模式文本协议) 外部工具发现,将其插入到一个LangGraph<code>ToolNode</code>通过MCP适配器.</li>
+<li>阶段11 · 17 (代理框架交易) 什么时候选择LangGraph而不是CrewAI,AutoGen或Agno.</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Agent State Machines — Graphs, Nodes, Checkpoints</h1>
+<blockquote>
+<p>A ReAct loop written by hand is a <code>while True</code>. The same loop written as an explicit graph is something you can checkpoint, interrupt, branch, and time-travel through. The agent hasn't changed. The harness around it has.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 11 · 09 (Function Calling), Phase 11 · 14 (Model Context Protocol)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>The Problem</h2>
+<p>You ship a function-calling agent. It works for three turns, then something goes wrong: the model tries a tool that returns 500, the user changes their mind mid-task, or the agent decides to refund an order without a human signing off. The <code>while True:</code> loop has no hooks. You can't pause it, you can't rewind it, and you can't branch off into &quot;what if the model had picked the other tool.&quot; The moment you ship this past a demo, the agent becomes a black box that either worked or didn't.</p>
+<p>The next step is obvious once you see it. The agent is already a state machine — system prompt plus message history plus pending tool calls plus the next action. Make the state machine explicit: nodes for &quot;the model thinks,&quot; &quot;a tool runs,&quot; &quot;a human approves,&quot; and edges for the conditional transitions between them. Once the graph is explicit, the harness gets four things for free: checkpointing (save state between steps), interrupts (pause for a human), streaming (stream tokens and intermediate events), and time-travel (rewind to a prior state and try a different branch).</p>
+<p>The reference implementation of this abstraction is LangGraph. It is not an agent framework in the LangChain sense (&quot;here is an AgentExecutor, good luck&quot;). It is a graph runtime with first-class state, first-class persistence, and first-class interrupts. The agent loop is something you draw, not something you hand-write.</p>
+<h2>The Concept</h2>
+<p><img src="/learn/ai-from-scratch/files/phases/11-llm-engineering/16-langgraph-state-machines/assets/langgraph-stategraph.svg" alt="LangGraph StateGraph: nodes, edges, and the checkpointer" loading="lazy"></p>
+<p>A <code>StateGraph</code> has three things.</p>
+<ol>
+<li><strong>State.</strong> A typed dict (TypedDict or Pydantic model) that flows through the graph. Every node receives the full state and returns a partial update, which LangGraph merges using a <em>reducer</em> per field — <code>operator.add</code> for lists that should accumulate, overwrite by default.</li>
+<li><strong>Nodes.</strong> Python functions <code>state -&gt; partial_state</code>. Each is a discrete step: &quot;call the model,&quot; &quot;run tools,&quot; &quot;summarize.&quot;</li>
+<li><strong>Edges.</strong> Transitions between nodes. Static edges go one place. Conditional edges take a router function <code>state -&gt; next_node_name</code> so the graph can branch on model output.</li>
+</ol>
+<p>You compile the graph. Compile binds the topology, attaches a checkpointer (optional but essential for production), and returns a runnable. You invoke it with an initial state and a <code>thread_id</code>. Every step of execution persists a checkpoint keyed on <code>(thread_id, checkpoint_id)</code>.</p>
+<h3>The four superpowers</h3>
+<p><strong>Checkpointing.</strong> Every node transition writes the new state to a store (in-memory for tests, Postgres/Redis/SQLite for prod). Resume by calling the graph again with the same <code>thread_id</code>. The graph picks up where it paused.</p>
+<p><strong>Interrupts.</strong> Mark a node with <code>interrupt_before=[&quot;human_review&quot;]</code> and execution stops before that node runs. The state persists. Your API responds to the user with &quot;awaiting approval.&quot; A later request to the same <code>thread_id</code> with <code>Command(resume=...)</code> resumes execution.</p>
+<p><strong>Streaming.</strong> <code>graph.stream(state, mode=&quot;updates&quot;)</code> yields state deltas as they happen. <code>mode=&quot;messages&quot;</code> streams the LLM tokens inside model nodes. <code>mode=&quot;values&quot;</code> yields full snapshots. You pick what to surface in your UI.</p>
+<p><strong>Time-travel.</strong> <code>graph.get_state_history(thread_id)</code> returns the full checkpoint log. Pass any prior <code>checkpoint_id</code> to <code>graph.invoke</code> and you fork from that point. Great for debugging (&quot;what if the model had picked tool B instead?&quot;) and for regression tests that replay production traces.</p>
+<h3>Reducers are the point</h3>
+<p>Every state field has a reducer. Most defaults are fine — a new value overwrites the old. But message lists need <code>operator.add</code> so new messages append instead of replacing. Parallel edges merge their updates through the reducer. If two nodes both update <code>messages</code> and you forgot the <code>Annotated[list, add_messages]</code>, the second wins silently and you lose half the turn. The reducer is the only subtle thing in the library; get it right and the rest composes.</p>
+<h3>The ReAct graph in four nodes</h3>
+<p>A production ReAct agent is four nodes and two edges:</p>
+<ol>
+<li><code>agent</code> — calls the LLM with the current message history. Returns the assistant message (which may contain tool_calls).</li>
+<li><code>tools</code> — executes any tool_calls in the last assistant message, appends the tool results as tool messages.</li>
+<li>A conditional edge from <code>agent</code> that routes to <code>tools</code> if the last message has tool_calls, else to <code>END</code>.</li>
+<li>A static edge from <code>tools</code> back to <code>agent</code>.</li>
+</ol>
+<p>That is it. You get the full ReAct loop (Thought → Action → Observation → Thought → …) with checkpointing, interrupts, and streaming, in roughly 40 lines of code.</p>
+<h3>StateGraph vs Send (fanout)</h3>
+<p><code>Send(node_name, state)</code> lets a node dispatch parallel subgraphs. Example: the agent decides to query three retrievers at once. Each <code>Send</code> spawns a parallel execution of the target node; their outputs merge through the state reducer. This is how LangGraph expresses the orchestrator-workers pattern without threading primitives.</p>
+<h3>Subgraphs</h3>
+<p>A compiled graph can be a node in another graph. The outer graph sees a single node; the inner graph has its own state and its own checkpoints. This is how teams build supervisor-worker agents: the supervisor graph routes user intent to a per-domain worker subgraph.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-a10e1f870d9f14ab38d9.png" alt="l5-state-graph-ledger 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<h3>Step 1: state and nodes</h3>
+<pre><code class="language-python">from typing import Annotated, TypedDict
+from langchain_core.messages import AnyMessage, HumanMessage, AIMessage
+from langgraph.graph import StateGraph, END
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode
+from langgraph.checkpoint.memory import MemorySaver
+
+class State(TypedDict):
+    messages: Annotated[list[AnyMessage], add_messages]
+
+def agent_node(state: State) -&gt; dict:
+    response = llm.invoke(state[&quot;messages&quot;])
+    return {&quot;messages&quot;: [response]}
+
+def should_continue(state: State) -&gt; str:
+    last = state[&quot;messages&quot;][-1]
+    return &quot;tools&quot; if getattr(last, &quot;tool_calls&quot;, None) else END
+
+tool_node = ToolNode(tools=[search_web, read_file])
+
+graph = StateGraph(State)
+graph.add_node(&quot;agent&quot;, agent_node)
+graph.add_node(&quot;tools&quot;, tool_node)
+graph.set_entry_point(&quot;agent&quot;)
+graph.add_conditional_edges(&quot;agent&quot;, should_continue, {&quot;tools&quot;: &quot;tools&quot;, END: END})
+graph.add_edge(&quot;tools&quot;, &quot;agent&quot;)
+
+app = graph.compile(checkpointer=MemorySaver())
+</code></pre>
+<p><code>add_messages</code> is the reducer that makes the message list accumulate instead of overwrite. Forgetting it is the most common LangGraph bug.</p>
+<h3>Step 2: run with a thread</h3>
+<pre><code class="language-python">config = {&quot;configurable&quot;: {&quot;thread_id&quot;: &quot;user-42&quot;}}
+for event in app.stream(
+    {&quot;messages&quot;: [HumanMessage(&quot;find the Anthropic headquarters address&quot;)]},
+    config,
+    stream_mode=&quot;updates&quot;,
+):
+    print(event)
+</code></pre>
+<p>Every update is a dict <code>{node_name: state_delta}</code>. Your frontend can stream these to the UI so users see &quot;agent is thinking… calling search_web… got result… answering.&quot;</p>
+<h3>Step 3: add a human-in-the-loop interrupt</h3>
+<p>Mark a node so execution pauses before it runs.</p>
+<pre><code class="language-python">app = graph.compile(
+    checkpointer=MemorySaver(),
+    interrupt_before=[&quot;tools&quot;],  # pause before every tool call
+)
+
+state = app.invoke({&quot;messages&quot;: [HumanMessage(&quot;delete the production database&quot;)]}, config)
+# state[&quot;__interrupt__&quot;] is set. Inspect proposed tool calls.
+# If approved:
+from langgraph.types import Command
+app.invoke(Command(resume=True), config)
+# If denied: write a rejection message and resume
+app.update_state(config, {&quot;messages&quot;: [AIMessage(&quot;Blocked by human reviewer.&quot;)]})
+</code></pre>
+<p>The state, the checkpoint, and the thread all persist across the interrupt. Nothing is in memory except during execution.</p>
+<h3>Step 4: time-travel for debugging</h3>
+<pre><code class="language-python">history = list(app.get_state_history(config))
+for snapshot in history:
+    print(snapshot.values[&quot;messages&quot;][-1].content[:80], snapshot.config)
+
+# Fork from a prior checkpoint
+target = history[3].config  # three steps back
+for event in app.stream(None, target, stream_mode=&quot;values&quot;):
+    pass  # replay from that point forward
+</code></pre>
+<p>Passing <code>None</code> as the input replays from the given checkpoint; passing a value appends it as an update to that checkpoint's state before resuming. This is how you reproduce a bad agent run without re-running the whole conversation.</p>
+<h3>Step 5: swap the checkpointer for production</h3>
+<pre><code class="language-python">from langgraph.checkpoint.postgres import PostgresSaver
+
+with PostgresSaver.from_conn_string(&quot;postgresql://...&quot;) as checkpointer:
+    checkpointer.setup()
+    app = graph.compile(checkpointer=checkpointer)
+</code></pre>
+<p>SQLite, Redis, and Postgres are shipped. <code>MemorySaver</code> is for tests. Anything that persists across restarts wants a real store.</p>
+<h2>The Skill</h2>
+<blockquote>
+<p>You build agents as graphs, not as <code>while True</code> loops.</p>
+</blockquote>
+<p>Before you reach for LangGraph, do a 60-second design:</p>
+<ol>
+<li><strong>Name the nodes.</strong> Every discrete decision or side-effecting action is a node. &quot;Agent thinks,&quot; &quot;tool runs,&quot; &quot;reviewer approves,&quot; &quot;response streams.&quot; If you can't list them, the task is not agent-shaped yet.</li>
+<li><strong>Declare the state.</strong> Minimal TypedDict with a reducer for every list field. Do not stuff everything into <code>messages</code>; hoist task-specific fields (a working <code>plan</code>, a <code>budget</code> counter, a <code>retrieved_docs</code> list) to the top level.</li>
+<li><strong>Draw the edges.</strong> Static unless the next step depends on model output. Every conditional edge needs a router function with named branches.</li>
+<li><strong>Choose a checkpointer up front.</strong> <code>MemorySaver</code> for tests, Postgres/Redis/SQLite for anything else. Do not ship without one — no checkpointer means no resume, no interrupt, no time-travel.</li>
+<li><strong>Decide interrupts before tools run, not after.</strong> Approvals go on the edge into a side-effecting node so you can cancel before harm; validation goes on the edge out of the model so you can reject bad calls cheaply.</li>
+<li><strong>Stream by default.</strong> <code>mode=&quot;updates&quot;</code> for the UI, <code>mode=&quot;messages&quot;</code> for token-level streaming inside model nodes, <code>mode=&quot;values&quot;</code> for full snapshots during eval.</li>
+</ol>
+<p>Refuse to ship a LangGraph agent that has no checkpointer. Refuse to ship one that interrupts <em>after</em> the side effect. Refuse to ship a <code>messages</code> field without <code>add_messages</code> as its reducer.</p>
+<h2>Exercises</h2>
+<ol>
+<li><strong>Easy.</strong> Implement the four-node ReAct graph above with a calculator tool and a web-search tool. Verify that <code>list(app.get_state_history(config))</code> returns at least four checkpoints for a two-turn conversation.</li>
+<li><strong>Medium.</strong> Add a <code>planner</code> node that runs before <code>agent</code> and writes a structured <code>plan: list[str]</code> into state. Have <code>agent</code> mark plan steps as done. Fail the test if <code>plan</code> is lost across a checkpoint resume (wrong reducer).</li>
+<li><strong>Hard.</strong> Build a supervisor graph that routes between three subgraphs (<code>researcher</code>, <code>writer</code>, <code>reviewer</code>) using <code>Send</code>. Each subgraph has its own state and checkpointer. Add an <code>interrupt_before=[&quot;writer&quot;]</code> on the outer graph so a human can approve the research brief. Confirm that time-travel from a prior checkpoint re-runs only the forked branch.</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>StateGraph</td>
+<td>&quot;The LangGraph graph&quot;</td>
+<td>The builder object you add nodes and edges to before compile.</td>
+</tr>
+<tr>
+<td>Reducer</td>
+<td>&quot;How the field merges&quot;</td>
+<td>A function <code>(old, new) -&gt; merged</code> applied when a node returns an update for that field; default is overwrite, <code>add_messages</code> appends.</td>
+</tr>
+<tr>
+<td>Thread</td>
+<td>&quot;A conversation ID&quot;</td>
+<td>A <code>thread_id</code> string that scopes all checkpoints for one session.</td>
+</tr>
+<tr>
+<td>Checkpoint</td>
+<td>&quot;A paused state&quot;</td>
+<td>A persisted snapshot of the full graph state after a node transition, keyed on <code>(thread_id, checkpoint_id)</code>.</td>
+</tr>
+<tr>
+<td>Interrupt</td>
+<td>&quot;Pause for a human&quot;</td>
+<td><code>interrupt_before</code> / <code>interrupt_after</code> stop execution at a node boundary; resume with <code>Command(resume=...)</code>.</td>
+</tr>
+<tr>
+<td>Time-travel</td>
+<td>&quot;Fork from a prior step&quot;</td>
+<td><code>graph.invoke(None, config_with_old_checkpoint_id)</code> replays from that checkpoint forward.</td>
+</tr>
+<tr>
+<td>Send</td>
+<td>&quot;Parallel subgraph dispatch&quot;</td>
+<td>A constructor a node can return to spawn N parallel executions of a target node.</td>
+</tr>
+<tr>
+<td>Subgraph</td>
+<td>&quot;A compiled graph as a node&quot;</td>
+<td>A compiled StateGraph used as a node in another graph; preserves its own state scope.</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://langchain-ai.github.io/langgraph/" rel="noreferrer" data-network="true">LangGraph documentation <small>↗ 需要联网</small></a> — canonical reference for StateGraph, reducers, checkpointers, and interrupts.</li>
+<li><a href="https://langchain-ai.github.io/langgraph/concepts/low_level/" rel="noreferrer" data-network="true">LangGraph concepts: state, reducers, checkpointers <small>↗ 需要联网</small></a> — the mental model this lesson uses, straight from the source.</li>
+<li><a href="https://langchain-ai.github.io/langgraph/concepts/persistence/" rel="noreferrer" data-network="true">LangGraph Persistence and Checkpoints <small>↗ 需要联网</small></a> — the detail on Postgres/SQLite/Redis stores, checkpoint namespaces, and thread IDs.</li>
+<li><a href="https://langchain-ai.github.io/langgraph/concepts/human_in_the_loop/" rel="noreferrer" data-network="true">LangGraph Human-in-the-loop <small>↗ 需要联网</small></a> — <code>interrupt_before</code>, <code>interrupt_after</code>, <code>Command(resume=...)</code>, and the edit-state pattern.</li>
+<li><a href="https://arxiv.org/abs/2210.03629" rel="noreferrer" data-network="true">Yao et al., &quot;ReAct: Synergizing Reasoning and Acting in Language Models&quot; (ICLR 2023) <small>↗ 需要联网</small></a> — the pattern every LangGraph agent implements; read it for the reasoning trace rationale.</li>
+<li><a href="https://www.anthropic.com/research/building-effective-agents" rel="noreferrer" data-network="true">Anthropic — Building effective agents (Dec 2024) <small>↗ 需要联网</small></a> — which graph shapes (chain, router, orchestrator-workers, evaluator-optimizer) to prefer and when.</li>
+<li>Phase 11 · 09 (Function Calling) — the tool-call primitive every LangGraph agent node reuses.</li>
+<li>Phase 11 · 14 (Model Context Protocol) — external tool discovery that plugs into a LangGraph <code>ToolNode</code> via the MCP adapter.</li>
+<li>Phase 11 · 17 (Agent framework tradeoffs) — when to pick LangGraph over CrewAI, AutoGen, or Agno.</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-11-llm-engineering--16-langgraph-state-machines.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-11-llm-engineering--16-langgraph-state-machines.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/11-llm-engineering/16-langgraph-state-machines/code/main.py">phases/11-llm-engineering/16-langgraph-state-machines/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Minimal LangGraph ReAct agent with a checkpointer, an interrupt, and time-travel.
+
+Runs with an Anthropic API key (`ANTHROPIC_API_KEY`). The agent has two toy
+tools (calculator, web_lookup). It:
+
+1. Builds a four-node StateGraph (agent -&gt; tools -&gt; agent) with `add_messages`
+   as the reducer for the message list.
+2. Compiles with a `MemorySaver` checkpointer and an `interrupt_before` on the
+   `tools` node so we pause before any side effect.
+3. Runs a two-turn conversation, streaming update events.
+4. Pauses before the first tool call, inspects the pending tool_calls, then
+   resumes with `Command(resume=True)`.
+5. Prints the checkpoint history and demonstrates time-travel by forking from
+   an earlier checkpoint.
+
+Install:
+    pip install &quot;langgraph&gt;=0.2.50&quot; &quot;langchain-anthropic&gt;=0.3.0&quot;
+
+Run:
+    python main.py
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import os
+from typing import Annotated, TypedDict
+
+from langchain_anthropic import ChatAnthropic
+from langchain_core.messages import AnyMessage, HumanMessage
+from langchain_core.tools import tool
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import END, StateGraph
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode
+from langgraph.types import Command
+
+
+# State ----------------------------------------------------------------------
+
+
+class State(TypedDict):
+    messages: Annotated[list[AnyMessage], add_messages]
+
+
+# Tools ----------------------------------------------------------------------
+
+
+@tool
+def calculator(expression: str) -&gt; str:
+    &quot;&quot;&quot;Evaluate a Python arithmetic expression like &#39;2 + 2 * 3&#39;. Returns the
+    result as a string.&quot;&quot;&quot;
+    allowed = set(&quot;0123456789+-*/(). &quot;)
+    if not set(expression) &lt;= allowed:
+        return &quot;ERROR: only digits and + - * / ( ) are allowed&quot;
+    try:
+        return str(eval(expression, {&quot;__builtins__&quot;: {}}, {}))
+    except Exception as exc:
+        return f&quot;ERROR: {exc!r}&quot;
+
+
+@tool
+def web_lookup(query: str) -&gt; str:
+    &quot;&quot;&quot;Fake web search. Returns canned facts for known queries and &#39;unknown&#39;
+    otherwise. Stand-in for a real retrieval tool.&quot;&quot;&quot;
+    facts = {
+        &quot;anthropic headquarters&quot;: &quot;Anthropic is headquartered in San Francisco, California.&quot;,
+        &quot;python release year&quot;: &quot;Python was first released in 1991.&quot;,
+    }
+    return facts.get(query.strip().lower(), &quot;unknown&quot;)
+
+
+TOOLS = [calculator, web_lookup]
+
+
+# Graph ----------------------------------------------------------------------
+
+
+def build_app() -&gt; tuple:
+    &quot;&quot;&quot;Wire the four-node ReAct graph and return (compiled_app, llm_with_tools).&quot;&quot;&quot;
+    llm = ChatAnthropic(model=os.environ.get(&quot;LLM_MODEL&quot;, &quot;claude-sonnet-4-5&quot;), temperature=0).bind_tools(TOOLS)
+
+    def agent_node(state: State) -&gt; dict:
+        response = llm.invoke(state[&quot;messages&quot;])
+        return {&quot;messages&quot;: [response]}
+
+    def should_continue(state: State) -&gt; str:
+        last = state[&quot;messages&quot;][-1]
+        return &quot;tools&quot; if getattr(last, &quot;tool_calls&quot;, None) else END
+
+    tool_node = ToolNode(TOOLS)
+
+    graph = StateGraph(State)
+    graph.add_node(&quot;agent&quot;, agent_node)
+    graph.add_node(&quot;tools&quot;, tool_node)
+    graph.set_entry_point(&quot;agent&quot;)
+    graph.add_conditional_edges(&quot;agent&quot;, should_continue, {&quot;tools&quot;: &quot;tools&quot;, END: END})
+    graph.add_edge(&quot;tools&quot;, &quot;agent&quot;)
+
+    app = graph.compile(
+        checkpointer=MemorySaver(),
+        interrupt_before=[&quot;tools&quot;],
+    )
+    return app, llm
+
+
+# Driver ---------------------------------------------------------------------
+
+
+def pretty(msg: AnyMessage) -&gt; str:
+    kind = msg.__class__.__name__
+    content = msg.content if isinstance(msg.content, str) else str(msg.content)[:200]
+    tool_calls = getattr(msg, &quot;tool_calls&quot;, None) or []
+    tcs = &quot; | &quot;.join(f&quot;{t[&#39;name&#39;]}({t[&#39;args&#39;]})&quot; for t in tool_calls)
+    return f&quot;[{kind}] {content} {(&#39;-&gt; &#39; + tcs) if tcs else &#39;&#39;}&quot;.strip()
+
+
+def run() -&gt; None:
+    app, _llm = build_app()
+    config = {&quot;configurable&quot;: {&quot;thread_id&quot;: &quot;demo-42&quot;}}
+
+    # Turn 1: ask a question that should hit web_lookup.
+    user = HumanMessage(&quot;Where is Anthropic headquartered?&quot;)
+    for event in app.stream({&quot;messages&quot;: [user]}, config, stream_mode=&quot;updates&quot;):
+        for node, update in event.items():
+            print(f&quot;&lt;&lt;{node}&gt;&gt;&quot;)
+            for m in update.get(&quot;messages&quot;, []):
+                print(&quot;   &quot;, pretty(m))
+
+    # We are now paused at interrupt_before=[&#39;tools&#39;].
+    pending = app.get_state(config)
+    print(&quot;\nPAUSED. Pending tool calls:&quot;)
+    for m in pending.values[&quot;messages&quot;][-1:]:
+        for tc in getattr(m, &quot;tool_calls&quot;, []) or []:
+            print(f&quot;  - {tc[&#39;name&#39;]}({tc[&#39;args&#39;]})&quot;)
+
+    # Approve and resume.
+    for event in app.stream(Command(resume=True), config, stream_mode=&quot;updates&quot;):
+        for node, update in event.items():
+            print(f&quot;&lt;&lt;{node}&gt;&gt;&quot;)
+            for m in update.get(&quot;messages&quot;, []):
+                print(&quot;   &quot;, pretty(m))
+
+    # Checkpoint history.
+    history = list(app.get_state_history(config))
+    print(f&quot;\nCheckpoint history: {len(history)} snapshots&quot;)
+    for i, snap in enumerate(history):
+        last = snap.values[&quot;messages&quot;][-1] if snap.values.get(&quot;messages&quot;) else None
+        tag = last.__class__.__name__ if last else &quot;?&quot;
+        print(f&quot;  {i:&gt;2}  {tag:&lt;15}  next={snap.next}&quot;)
+
+    # Time-travel: fork from the earliest snapshot and ask a different question.
+    if len(history) &gt;= 3:
+        earliest = history[-1].config
+        print(&quot;\nTime-travel: forking from earliest checkpoint and asking a math question.&quot;)
+        fork = {&quot;messages&quot;: [HumanMessage(&quot;What is 17 * 23?&quot;)]}
+        for event in app.stream(fork, earliest, stream_mode=&quot;updates&quot;):
+            for node, update in event.items():
+                print(f&quot;&lt;&lt;{node}&gt;&gt;&quot;)
+                for m in update.get(&quot;messages&quot;, []):
+                    print(&quot;   &quot;, pretty(m))
+        # Resume past the interrupt for the math tool.
+        for event in app.stream(Command(resume=True), earliest, stream_mode=&quot;updates&quot;):
+            for node, update in event.items():
+                print(f&quot;&lt;&lt;{node}&gt;&gt;&quot;)
+                for m in update.get(&quot;messages&quot;, []):
+                    print(&quot;   &quot;, pretty(m))
+
+
+if __name__ == &quot;__main__&quot;:
+    run()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/11-llm-engineering/16-langgraph-state-machines/outputs/skill-stategraph-designer.md">phases/11-llm-engineering/16-langgraph-state-machines/outputs/skill-stategraph-designer.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: stategraph-designer
+description: Turn an agent task into a LangGraph StateGraph with named nodes, typed state, reducers, checkpointer, and human interrupts.
+version: 1.0.0
+phase: 11
+lesson: 16
+tags: [langgraph, stategraph, checkpointer, interrupt, time-travel, react-agent, human-in-the-loop]
+---
+
+Given the agent task (user-facing goal, available tools, expected turn count, side effects with safety blast radius, durability requirements, target latency budget), output:
+
+1. Node list. Name every discrete step: the LLM thinker, each tool runner, every human review step, any summarizer or critic, any retriever. Reject the design if any node touches more than one concern; split it.
+2. State schema. TypedDict (or Pydantic) fields with a reducer for every list. Always Annotated[list, add_messages] on the message log. Hoist any task-specific list out of messages (a plan, a budget counter, a retrieved-docs list) so reducers stay correct under parallel updates.
+3. Edge map. Static edges where the next step is deterministic. Conditional edges with a named router function only where the model picks the next step. Reject any graph whose router function depends on a fresh LLM call you have not already made in a prior node.
+4. Interrupt placement. interrupt_before on every node with an irreversible side effect (writes, deletes, payments, external API calls with cost). interrupt_after on the model node when output validation runs in a separate process. Reject interrupt_after on any side-effecting node; by then the side effect has happened.
+5. Checkpointer. MemorySaver for tests only. Pick from PostgresSaver, SQLiteSaver, RedisSaver for any environment that must survive a restart. Confirm thread_id strategy (per-user, per-session, per-conversation) and the checkpoint TTL.
+
+Refuse to ship a LangGraph without a checkpointer. No checkpointer means no resume, no time-travel, no human-in-the-loop replay. Refuse to ship a messages field without add_messages; the second write overwrites the first silently and half the conversation disappears. Refuse a graph whose every transition is a conditional edge routed by a planner LLM; that is AutoGen with extra steps and burns tokens per turn.
+
+Example input: &quot;Refund-handling agent over Anthropic Claude with three tools (lookup_order, issue_refund, send_email), must pause for a human before any refund over 100 dollars, must resume after server restart, p95 latency budget 8 seconds.&quot;
+
+Example output:
+- Nodes: agent (LLM call), lookup_tool, refund_tool, email_tool, human_review.
+- State: messages with add_messages, order_context (overwrite), refund_amount (overwrite), reviewer_decision (overwrite).
+- Edges: agent to should_continue router with branches lookup_tool, refund_tool, email_tool, human_review, END. Tool nodes go back to agent.
+- Interrupts: interrupt_before on refund_tool when refund_amount &gt; 100. No interrupt on lookup_tool or email_tool.
+- Checkpointer: PostgresSaver with thread_id &quot;user:{user_id}:case:{case_id}&quot; and 30-day TTL.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. Why does the `messages` field in a LangGraph State TypedDict need `Annotated[list, add_messages]`?</legend><label class="option"><input type="radio" name="q0" value="0"> It compresses the message list when checkpoints are written to disk.</label><label class="option"><input type="radio" name="q0" value="1"> It enables streaming of token deltas from the model.</label><label class="option"><input type="radio" name="q0" value="2"> It converts plain dicts into LangChain message objects at runtime.</label><label class="option"><input type="radio" name="q0" value="3"> Without the reducer, node updates overwrite the list instead of appending, so every turn loses the prior history.</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. What is the difference between `interrupt_before=[&#39;tools&#39;]` and `interrupt_after=[&#39;tools&#39;]`?</legend><label class="option"><input type="radio" name="q1" value="0"> `interrupt_before` pauses after the model emits tool_calls but before the tools execute; `interrupt_after` pauses after the tools have already run.</label><label class="option"><input type="radio" name="q1" value="1"> `interrupt_before` runs the tool in a sandbox first; `interrupt_after` runs it in production.</label><label class="option"><input type="radio" name="q1" value="2"> No difference; they are aliases.</label><label class="option"><input type="radio" name="q1" value="3"> `interrupt_before` is for unit tests; `interrupt_after` is for production.</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. Given a thread&#39;s checkpoint history, how do you time-travel to a prior state and explore a different branch?</legend><label class="option"><input type="radio" name="q2" value="0"> Set `graph.rewind = True` and reinvoke.</label><label class="option"><input type="radio" name="q2" value="1"> Call `graph.reset(thread_id)` then `graph.invoke(new_input, config)`.</label><label class="option"><input type="radio" name="q2" value="2"> Delete the checkpoint directory and reinvoke with the same thread_id.</label><label class="option"><input type="radio" name="q2" value="3"> Invoke the graph with the desired prior `checkpoint_id` in the config; passing `None` as input replays from that checkpoint, passing a new value appends to it before resuming.</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. In a four-node ReAct graph (agent, tools, conditional edge, static edge back to agent), where does the conditional edge live?</legend><label class="option"><input type="radio" name="q3" value="0"> From `START`, routing to either `agent` or `END` based on input length.</label><label class="option"><input type="radio" name="q3" value="1"> From `tools` back to `agent`, routing on whether tool output was empty.</label><label class="option"><input type="radio" name="q3" value="2"> There is no conditional edge; both are static.</label><label class="option"><input type="radio" name="q3" value="3"> From `agent`, routing to `tools` if the last message has tool_calls and to `END` otherwise.</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. When should you use `Send(node_name, state)` instead of a plain edge?</legend><label class="option"><input type="radio" name="q4" value="0"> To invoke a node in a different process for isolation.</label><label class="option"><input type="radio" name="q4" value="1"> To defer a node until a timer expires.</label><label class="option"><input type="radio" name="q4" value="2"> To retry a node after a failure.</label><label class="option"><input type="radio" name="q4" value="3"> To dispatch N parallel executions of a target node whose outputs merge back through the state reducer.</label><p data-feedback="4"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/11-llm-engineering/15-prompt-caching/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/11-llm-engineering/17-agent-framework-tradeoffs/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/11-llm-engineering/16-langgraph-state-machines/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

@@ -1,0 +1,1326 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>规范化 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-03-deep-learning-core" data-lesson="03-deep-learning-core/07-regularization" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/03-deep-learning-core/">深度学习核心</a> / LESSON 07</p><h1 class="lesson-title">规范化</h1><p>Regularization</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>规范化</h1>
+<blockquote>
+<p>你的模型得到了99%的训练数据和60%的测试数据. 它记得而不是学习.规范化是你对复杂性征收的税收,</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Lesson 03.06 (Optimizers)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>实现倒置缩放,L2体重衰减,批量正常化,层正常化和从零开始的RMSNorm</li>
+<li>测量火车测试精度差距,并通过规范化实验诊断过度适应</li>
+<li>解释为什么变压器使用LayerNorm而不是BatchNorm,以及为什么现代LLM更喜欢RMSNorm</li>
+<li>根据过度适应的严重性,应对正确的规范技术组合</li>
+</ul>
+<h2>问题</h2>
+<p>网络具有足够的参数可以记住任何数据集.这不是假设的 - 张等人 (2017) 通过在图像网上训练标准网络随机标签证明了这一点.网络在完全随机标签任务上达到接近零的训练损失.他们记住了百万个随机输入输出对,没有学习的模式.训练损失是完美的.测试精度是零.</p>
+<p>由于这种情况,GPT-3的训练组具有约500亿个代币. 随着这么多的参数,模型具有足够的能力来文字记住大量的训练数据. 如果没有规范化,它只会重新生成训练示例,而不是学习可通用模式.</p>
+<p>训练性能和测试性能之间的差距是过度适应的差距. 每个技术都从不同的角度攻击了这个差距. 由于失效,网络不依赖任何一个神经元. 减肥可以防止任何体重变得过大. 批量正常化使损失景观平滑,使优化器发现更平坦,更可通用的最小值. 层正常化也会做同样的事情,但在批量正常化失败的情况下就能工作 (小批量,变长序列). 通过降低平均计算,RMSNorm可以更快10%. 每个技术都是简单的. 它们是记忆模型和概括模型之间的区别.</p>
+<h2>概念</h2>
+<h3>过度适应的频谱</h3>
+<p>每个模型都在某个频谱上坐落,从不适合 (太简单无法捕捉模式) 到超适合 (太复杂以捕捉噪音).</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-d86cb909169931bae5f7.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>放弃</h3>
+<p>在训练中,随机设置每个神经元的输出到零,概率为p.</p>
+<pre><code>output = activation(z) * mask    where mask[i] ~ Bernoulli(1 - p)
+</code></pre>
+<p>网络必须学习冗余的表达,因为它无法预测哪些神经元将会有. 这阻止了共适应 - - 神经元学习依赖其他特定的神经元存在.</p>
+<p>综合解释:一个网络中N神经元和中断产生2^N可能的子网络 (每个神经元的组合都开放或关闭). 训练与中断约同时训练2^N子网络,每个分类在不同的小批量. 在测试时,你使用所有神经元 (没有放弃) 并将输出量量达 (1 - p) 来匹配训练期间预期的值. 这相当于平均2^N子网络的预测 - - 一个单个模型的巨大组.</p>
+<p>实际上,在训练期间使用扩展而不是测试 (反转放弃):</p>
+<pre><code>During training:  output = activation(z) * mask / (1 - p)
+During testing:   output = activation(z)   (no change needed)
+</code></pre>
+<p>这更干净,因为测试代码根本不需要知道退学.</p>
+<p>默认故障率:变压器的p = 0.1,MLP的p = 0.5 ,CNN的p = 0.2-0.3.</p>
+<h3>体重减退 (L2规律化)</h3>
+<p>增加所有权重的平方大小:</p>
+<pre><code>total_loss = task_loss + (lambda / 2) * sum(w_i^2)
+</code></pre>
+<p>规律化术语的梯度是lambda * w. 这意味着每一步,每个重量都缩小到零的比例.大重量受到更多的惩罚.模型被推向没有单个重量主导的解决方案.</p>
+<p>为什么这有助于通用化:超级适应型号往往具有大重量,这会在训练数据中放大噪音.体重衰减使重量保持小,从而限制了模型的有效能力,迫使其依赖于强,可通用的特性而不是记忆的奇怪.</p>
+<p>果超值控制强度.</p>
+<ul>
+<li>转变器的 AdamW 0.01</li>
+<li>对于CNN电视台的SGD,</li>
+<li>0.1 适合重量超级型号</li>
+</ul>
+<p>根据第06课中所述,体重减轻和L2规则化在SGD中相当,但在亚当中不是.</p>
+<h3>批量正常化</h3>
+<p>在将其传递到下一个层之前,将每个层的输出正常化在迷你批量中.</p>
+<p>对于某个层中的小型激活:</p>
+<pre><code>mu = (1/B) * sum(x_i)           (batch mean)
+sigma^2 = (1/B) * sum((x_i - mu)^2)   (batch variance)
+x_hat = (x_i - mu) / sqrt(sigma^2 + eps)   (normalize)
+y = gamma * x_hat + beta        (scale and shift)
+</code></pre>
+<p>没有它们,你将迫使每个层的输出变化为零平均单位变化,这可能不是网络想要的.</p>
+<p>**Training vs inference split:**在训练期间,mu和sigma来自当前的迷你批量.在推断过程中,你使用训练期间积累的运行平均值 (动力率为0.1的指数,即90%旧 +10%新).</p>
+<p>现在还有人讨论 BatchNorm 为什么工作. 原文声称它减少了&quot;内部变量转移&quot; (随着早期层更新而变化的层输入分布). 桑图尔卡等 (2018) 显示了这种解释是错误的. 实际原因是,BatchNorm使损失景观更加平滑. 梯度更具预测性,利普斯奇特常数更小,优化器可以安全地采取更大的步骤. 这就是为什么BatchNorm允许你使用更高的学习率,</p>
+<p>批量规则有一个基本的局限性:它取决于批量统计.在批量大小1时,平均和差异是无意义的.在小批量 (&lt;32),统计数据是噪音和损伤性能.这对于对象检测 (记忆限制批量大小) 和语言建模 (测序长度不同的地方) 等任务来说很重要.</p>
+<h3>层正常化</h3>
+<p>标准化在各个特征上,而不是在整个批量上.</p>
+<pre><code>mu = (1/D) * sum(x_j)           (feature mean)
+sigma^2 = (1/D) * sum((x_j - mu)^2)   (feature variance)
+x_hat = (x_j - mu) / sqrt(sigma^2 + eps)
+y = gamma * x_hat + beta
+</code></pre>
+<p>变压器使用LayerNorm而不是 BatchNorm.序列的长度可变,批量大小通常很小 (或在生成过程中是1),训练和推断之间的计算是相同的.</p>
+<p>在变压器中,LayerNorm应在每一个自我注意区块和每一个输送前进区块 (后LN) 后或之前 (前LN,更稳定于训练).</p>
+<h3>标准</h3>
+<p>没有平均减小的LayerNorm. 张和森尼里希 (2019) 提出.</p>
+<pre><code>rms = sqrt((1/D) * sum(x_j^2))
+y = gamma * x / rms
+</code></pre>
+<p>没有平均计算,没有beta参数.观察:LayerNorm中重中心化 (平均减小) 对模型的性能贡献很少,但成本计算.删除它会带来同样的精度,大约10%的总成本.</p>
+<p>,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,</p>
+<h3>规范化比较</h3>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-168588827044c347c7e6.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>数据增长作为规范化</h3>
+<p>转换训练输入,同时保留标签:</p>
+<ul>
+<li>图像:随机收获,翻转,旋转,颜色动,切割</li>
+<li>文字:代名词的替代,回译,随机删除</li>
+<li>音频:时间延伸,音调转移,噪音增加</li>
+</ul>
+<p>效果与规律化相同:它增加了训练集的实际尺寸,使得模型更难记住特定的例子.只能在原始形式中看到每个图像的模型只能记住它.看到每个图像的50个增强版本的模型被迫学习不变结构.</p>
+<h3>早期停止</h3>
+<p>最简单的调节剂:在验证损失开始增加时停止训练.模型尚未过度适应.实际上,您每一个时代都会跟踪验证损失,保存最好的模型,并继续训练,以实现&quot;耐心&quot;窗口 (通常5-20个时代).如果验证损失在耐心窗口内没有改善,您就会停止和加载最好的保存模型.</p>
+<h3>什么时候应用</h3>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-8ab85af8c050b5f79720.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><figure><img src="/learn/ai-from-scratch/figures/figure-fe197820928a722b104f.png" alt="l2-regularization 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<h3>步骤1:放弃 (列车和Eval模式)</h3>
+<pre><code class="language-python">import random
+import math
+
+
+class Dropout:
+    def __init__(self, p=0.5):
+        self.p = p
+        self.training = True
+        self.mask = None
+
+    def forward(self, x):
+        if not self.training:
+            return list(x)
+        self.mask = []
+        output = []
+        for val in x:
+            if random.random() &lt; self.p:
+                self.mask.append(0)
+                output.append(0.0)
+            else:
+                self.mask.append(1)
+                output.append(val / (1 - self.p))
+        return output
+
+    def backward(self, grad_output):
+        grads = []
+        for g, m in zip(grad_output, self.mask):
+            if m == 0:
+                grads.append(0.0)
+            else:
+                grads.append(g / (1 - self.p))
+        return grads
+</code></pre>
+<h3>步骤2:L2体重衰减</h3>
+<pre><code class="language-python">def l2_regularization(weights, lambda_reg):
+    penalty = 0.0
+    for w in weights:
+        penalty += w * w
+    return lambda_reg * 0.5 * penalty
+
+def l2_gradient(weights, lambda_reg):
+    return [lambda_reg * w for w in weights]
+</code></pre>
+<h3>步骤3:批量正常化</h3>
+<pre><code class="language-python">class BatchNorm:
+    def __init__(self, num_features, momentum=0.1, eps=1e-5):
+        self.gamma = [1.0] * num_features
+        self.beta = [0.0] * num_features
+        self.eps = eps
+        self.momentum = momentum
+        self.running_mean = [0.0] * num_features
+        self.running_var = [1.0] * num_features
+        self.training = True
+        self.num_features = num_features
+
+    def forward(self, batch):
+        batch_size = len(batch)
+        if self.training:
+            mean = [0.0] * self.num_features
+            for sample in batch:
+                for j in range(self.num_features):
+                    mean[j] += sample[j]
+            mean = [m / batch_size for m in mean]
+
+            var = [0.0] * self.num_features
+            for sample in batch:
+                for j in range(self.num_features):
+                    var[j] += (sample[j] - mean[j]) ** 2
+            var = [v / batch_size for v in var]
+
+            for j in range(self.num_features):
+                self.running_mean[j] = (1 - self.momentum) * self.running_mean[j] + self.momentum * mean[j]
+                self.running_var[j] = (1 - self.momentum) * self.running_var[j] + self.momentum * var[j]
+        else:
+            mean = list(self.running_mean)
+            var = list(self.running_var)
+
+        self.x_hat = []
+        output = []
+        for sample in batch:
+            normalized = []
+            out_sample = []
+            for j in range(self.num_features):
+                x_h = (sample[j] - mean[j]) / math.sqrt(var[j] + self.eps)
+                normalized.append(x_h)
+                out_sample.append(self.gamma[j] * x_h + self.beta[j])
+            self.x_hat.append(normalized)
+            output.append(out_sample)
+        return output
+</code></pre>
+<h3>步骤4: 层正常化</h3>
+<pre><code class="language-python">class LayerNorm:
+    def __init__(self, num_features, eps=1e-5):
+        self.gamma = [1.0] * num_features
+        self.beta = [0.0] * num_features
+        self.eps = eps
+        self.num_features = num_features
+
+    def forward(self, x):
+        mean = sum(x) / len(x)
+        var = sum((xi - mean) ** 2 for xi in x) / len(x)
+
+        self.x_hat = []
+        output = []
+        for j in range(self.num_features):
+            x_h = (x[j] - mean) / math.sqrt(var + self.eps)
+            self.x_hat.append(x_h)
+            output.append(self.gamma[j] * x_h + self.beta[j])
+        return output
+</code></pre>
+<h3>步骤5:RMSNorm</h3>
+<pre><code class="language-python">class RMSNorm:
+    def __init__(self, num_features, eps=1e-6):
+        self.gamma = [1.0] * num_features
+        self.eps = eps
+        self.num_features = num_features
+
+    def forward(self, x):
+        rms = math.sqrt(sum(xi * xi for xi in x) / len(x) + self.eps)
+        output = []
+        for j in range(self.num_features):
+            output.append(self.gamma[j] * x[j] / rms)
+        return output
+</code></pre>
+<h3>第六步: 训练,不定期训练</h3>
+<pre><code class="language-python">def sigmoid(x):
+    x = max(-500, min(500, x))
+    return 1.0 / (1.0 + math.exp(-x))
+
+
+def make_circle_data(n=200, seed=42):
+    random.seed(seed)
+    data = []
+    for _ in range(n):
+        x = random.uniform(-2, 2)
+        y = random.uniform(-2, 2)
+        label = 1.0 if x * x + y * y &lt; 1.5 else 0.0
+        data.append(([x, y], label))
+    return data
+
+
+class RegularizedNetwork:
+    def __init__(self, hidden_size=16, lr=0.05, dropout_p=0.0, weight_decay=0.0):
+        random.seed(0)
+        self.hidden_size = hidden_size
+        self.lr = lr
+        self.dropout_p = dropout_p
+        self.weight_decay = weight_decay
+        self.dropout = Dropout(p=dropout_p) if dropout_p &gt; 0 else None
+
+        self.w1 = [[random.gauss(0, 0.5) for _ in range(2)] for _ in range(hidden_size)]
+        self.b1 = [0.0] * hidden_size
+        self.w2 = [random.gauss(0, 0.5) for _ in range(hidden_size)]
+        self.b2 = 0.0
+
+    def forward(self, x, training=True):
+        self.x = x
+        self.z1 = []
+        self.h = []
+        for i in range(self.hidden_size):
+            z = self.w1[i][0] * x[0] + self.w1[i][1] * x[1] + self.b1[i]
+            self.z1.append(z)
+            self.h.append(max(0.0, z))
+
+        if self.dropout and training:
+            self.dropout.training = True
+            self.h = self.dropout.forward(self.h)
+        elif self.dropout:
+            self.dropout.training = False
+            self.h = self.dropout.forward(self.h)
+
+        self.z2 = sum(self.w2[i] * self.h[i] for i in range(self.hidden_size)) + self.b2
+        self.out = sigmoid(self.z2)
+        return self.out
+
+    def backward(self, target):
+        eps = 1e-15
+        p = max(eps, min(1 - eps, self.out))
+        d_loss = -(target / p) + (1 - target) / (1 - p)
+        d_sigmoid = self.out * (1 - self.out)
+        d_out = d_loss * d_sigmoid
+
+        for i in range(self.hidden_size):
+            d_relu = 1.0 if self.z1[i] &gt; 0 else 0.0
+            d_h = d_out * self.w2[i] * d_relu
+            self.w2[i] -= self.lr * (d_out * self.h[i] + self.weight_decay * self.w2[i])
+            for j in range(2):
+                self.w1[i][j] -= self.lr * (d_h * self.x[j] + self.weight_decay * self.w1[i][j])
+            self.b1[i] -= self.lr * d_h
+        self.b2 -= self.lr * d_out
+
+    def evaluate(self, data):
+        correct = 0
+        total_loss = 0.0
+        for x, y in data:
+            pred = self.forward(x, training=False)
+            eps = 1e-15
+            p = max(eps, min(1 - eps, pred))
+            total_loss += -(y * math.log(p) + (1 - y) * math.log(1 - p))
+            if (pred &gt;= 0.5) == (y &gt;= 0.5):
+                correct += 1
+        return total_loss / len(data), correct / len(data) * 100
+
+    def train_model(self, train_data, test_data, epochs=300):
+        history = []
+        for epoch in range(epochs):
+            total_loss = 0.0
+            correct = 0
+            for x, y in train_data:
+                pred = self.forward(x, training=True)
+                self.backward(y)
+                eps = 1e-15
+                p = max(eps, min(1 - eps, pred))
+                total_loss += -(y * math.log(p) + (1 - y) * math.log(1 - p))
+                if (pred &gt;= 0.5) == (y &gt;= 0.5):
+                    correct += 1
+            train_loss = total_loss / len(train_data)
+            train_acc = correct / len(train_data) * 100
+            test_loss, test_acc = self.evaluate(test_data)
+            history.append((train_loss, train_acc, test_loss, test_acc))
+            if epoch % 75 == 0 or epoch == epochs - 1:
+                gap = train_acc - test_acc
+                print(f&quot;    Epoch {epoch:3d}: train_acc={train_acc:.1f}%, test_acc={test_acc:.1f}%, gap={gap:.1f}%&quot;)
+        return history
+</code></pre>
+<h2>用它</h2>
+<p>PyTorch提供了所有正常化和规律化的模块:</p>
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+model = nn.Sequential(
+    nn.Linear(784, 256),
+    nn.BatchNorm1d(256),
+    nn.ReLU(),
+    nn.Dropout(0.3),
+    nn.Linear(256, 128),
+    nn.BatchNorm1d(128),
+    nn.ReLU(),
+    nn.Dropout(0.3),
+    nn.Linear(128, 10),
+)
+
+model.train()
+out_train = model(torch.randn(32, 784))
+
+model.eval()
+out_test = model(torch.randn(1, 784))
+</code></pre>
+<p>其他<code>model.train()</code>现在,<code>model.eval()</code>切换关键. 它将停机关关闭/关闭开关,并告诉BatchNorm使用批量统计与运行统计. 忘记<code>model.eval()</code>测试精度会随机波动,因为中断仍然活跃,而BatchNorm正在使用迷你批量统计数据.</p>
+<p>对于变压器来说,模式不同:</p>
+<pre><code class="language-python">class TransformerBlock(nn.Module):
+    def __init__(self, d_model=512, nhead=8, dropout=0.1):
+        super().__init__()
+        self.attention = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, d_model * 4),
+            nn.GELU(),
+            nn.Linear(d_model * 4, d_model),
+            nn.Dropout(dropout),
+        )
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        attended, _ = self.attention(x, x, x)
+        x = self.norm1(x + self.dropout(attended))
+        x = self.norm2(x + self.ff(x))
+        return x
+</code></pre>
+<p>没有什么变压器,没有什么变压器.</p>
+<h2>运送它</h2>
+<p>这一课产生了:</p>
+<ul>
+<li><code>outputs/prompt-regularization-advisor.md</code>-- 提示诊断过度适应,并建议正确的规范化策略</li>
+</ul>
+<h2>运动</h2>
+<ol>
+<li>
+<p>实现2D数据的空间放弃:而不是放弃单个神经元,放弃整个功能道.通过将连续特征的组作为道和放弃整个组来模拟这一点.将火车测试差距与圆数据集中的标准放弃相比较,以 hidden_size=32.</p>
+</li>
+<li>
+<p>执行从05课开始的标签滑滑,并与从本课结束的排行. 训练有四个配置:没有,只放弃,只放标. 测量每个列车测试的最终精度差距.哪个组合给出最小的差距?</p>
+</li>
+<li>
+<p>在隐藏层和您的圆数据集网络中的激活之间添加一个BatchNorm层. 在学习率0.01,0.05和0.1的情况下与 BatchNorm一起和没有 BatchNorm一起训练.</p>
+</li>
+<li>
+<p>执行早期停止:每个时代追踪测试损失,节省最佳权重,并在20个时代内测试损失未改善时停止.运行规律化网络1000个时代.报告哪个时代具有最佳测试精度,以及您节省了多少个计算时代.</p>
+</li>
+<li>
+<p>根据4层网络 (不仅是2) 的LayerNorm与RMSNorm比较. 启动两者均重量. 训练200个时代,并对比最后的精度,训练速度 (时间每时代),和梯度大小在第一层. 检查RMSNorm是更快的与相同的精度.</p>
+</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Overfitting</td>
+<td>&quot;Model memorized the data&quot;</td>
+<td>When a model's training performance significantly exceeds its test performance, indicating it learned noise rather than signal</td>
+</tr>
+<tr>
+<td>Regularization</td>
+<td>&quot;Preventing overfitting&quot;</td>
+<td>Any technique that constrains model complexity to improve generalization: dropout, weight decay, normalization, augmentation</td>
+</tr>
+<tr>
+<td>Dropout</td>
+<td>&quot;Random neuron deletion&quot;</td>
+<td>Zeroing random neurons during training with probability p, forcing redundant representations; equivalent to training an ensemble</td>
+</tr>
+<tr>
+<td>Weight decay</td>
+<td>&quot;L2 penalty&quot;</td>
+<td>Shrinking all weights toward zero by subtracting lambda * w at each step; penalizes complexity through weight magnitude</td>
+</tr>
+<tr>
+<td>Batch normalization</td>
+<td>&quot;Normalize per batch&quot;</td>
+<td>Normalizing layer outputs across the batch dimension using batch statistics during training and running averages during inference</td>
+</tr>
+<tr>
+<td>Layer normalization</td>
+<td>&quot;Normalize per sample&quot;</td>
+<td>Normalizing across features within each sample; batch-independent, used in transformers where batch size varies</td>
+</tr>
+<tr>
+<td>RMSNorm</td>
+<td>&quot;LayerNorm without the mean&quot;</td>
+<td>Root mean square normalization; drops the mean subtraction from LayerNorm for 10% speedup with equal accuracy</td>
+</tr>
+<tr>
+<td>Early stopping</td>
+<td>&quot;Stop before overfit&quot;</td>
+<td>Halting training when validation loss stops improving; the simplest regularizer, often used alongside others</td>
+</tr>
+<tr>
+<td>Data augmentation</td>
+<td>&quot;More data from less&quot;</td>
+<td>Transforming training inputs (flip, crop, noise) to increase effective dataset size and force invariance learning</td>
+</tr>
+<tr>
+<td>Generalization gap</td>
+<td>&quot;Train-test split&quot;</td>
+<td>The difference between training and test performance; regularization aims to minimize this gap</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li>斯里瓦斯塔瓦等人&quot;,脱离:防止神经网络过度适应的简单方法&quot; (2014) - - 带有组合解释和广泛的实验的原始脱离论文</li>
+<li>伊夫夫和谢杰迪, &quot;批量正常化:通过减少内部变量转移加速深度网络培训&quot; (2015) -- 介绍了BatchNorm及其培训程序,这是最受引用的深度学习论文之一</li>
+<li>张和森里希,&quot;根中方层正常化&quot; (2019) -- 显示RMSNorm与LayerNorm的准确性相匹配,计算量减少; LLaMA和Mistral采用</li>
+<li>张等人&quot;,理解深度学习需要重新思考通用化&quot; (2017) -- 展示神经网络能够记住随机标签的具有里程碑意义的论文,挑战了传统的通用化观点</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Regularization</h1>
+<blockquote>
+<p>Your model gets 99% on training data and 60% on test data. It memorized instead of learning. Regularization is the tax you impose on complexity to force generalization.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Lesson 03.06 (Optimizers)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Implement dropout with inverted scaling, L2 weight decay, batch normalization, layer normalization, and RMSNorm from scratch</li>
+<li>Measure the train-test accuracy gap and diagnose overfitting using regularization experiments</li>
+<li>Explain why transformers use LayerNorm instead of BatchNorm and why modern LLMs prefer RMSNorm</li>
+<li>Apply the correct combination of regularization techniques based on the severity of overfitting</li>
+</ul>
+<h2>The Problem</h2>
+<p>A neural network with enough parameters can memorize any dataset. This is not a hypothetical -- Zhang et al. (2017) proved it by training standard networks on ImageNet with random labels. The networks reached near-zero training loss on completely random label assignments. They memorized a million random input-output pairs with no pattern to learn. Training loss was perfect. Test accuracy was zero.</p>
+<p>This is the overfitting problem, and it gets worse as models get larger. GPT-3 has 175 billion parameters. The training set has about 500 billion tokens. With that many parameters, the model has enough capacity to memorize significant chunks of the training data verbatim. Without regularization, it would just regurgitate training examples instead of learning generalizable patterns.</p>
+<p>The gap between training performance and test performance is the overfitting gap. Every technique in this lesson attacks that gap from a different angle. Dropout forces the network to not rely on any single neuron. Weight decay prevents any single weight from growing too large. Batch normalization smooths the loss landscape so the optimizer finds flatter, more generalizable minima. Layer normalization does the same thing but works where batch normalization fails (small batches, variable-length sequences). RMSNorm does it 10% faster by dropping the mean calculation. Each technique is simple. Together, they're the difference between a model that memorizes and one that generalizes.</p>
+<h2>The Concept</h2>
+<h3>The Overfitting Spectrum</h3>
+<p>Every model sits somewhere on a spectrum from underfitting (too simple to capture the pattern) to overfitting (so complex it captures noise). The sweet spot is in between, and regularization pushes models toward it from the overfit side.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-d86cb909169931bae5f7.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>Dropout</h3>
+<p>The simplest regularization technique with the most elegant interpretation. During training, randomly set each neuron's output to zero with probability p.</p>
+<pre><code>output = activation(z) * mask    where mask[i] ~ Bernoulli(1 - p)
+</code></pre>
+<p>With p = 0.5, half the neurons are zeroed on every forward pass. The network must learn redundant representations because it can't predict which neurons will be available. This prevents co-adaptation -- neurons learning to rely on specific other neurons being present.</p>
+<p>The ensemble interpretation: a network with N neurons and dropout creates 2^N possible subnetworks (every combination of which neurons are on or off). Training with dropout approximately trains all 2^N subnetworks simultaneously, each on different mini-batches. At test time, you use all neurons (no dropout) and scale outputs by (1 - p) to match the expected value during training. This is equivalent to averaging the predictions of 2^N subnetworks -- a massive ensemble from a single model.</p>
+<p>In practice, the scaling is applied during training instead of testing (inverted dropout):</p>
+<pre><code>During training:  output = activation(z) * mask / (1 - p)
+During testing:   output = activation(z)   (no change needed)
+</code></pre>
+<p>This is cleaner because test code doesn't need to know about dropout at all.</p>
+<p>Default rates: p = 0.1 for transformers, p = 0.5 for MLPs, p = 0.2-0.3 for CNNs. Higher dropout = stronger regularization = more underfitting risk.</p>
+<h3>Weight Decay (L2 Regularization)</h3>
+<p>Add the squared magnitude of all weights to the loss:</p>
+<pre><code>total_loss = task_loss + (lambda / 2) * sum(w_i^2)
+</code></pre>
+<p>The gradient of the regularization term is lambda * w. This means at every step, each weight is shrunk toward zero by a fraction proportional to its magnitude. Large weights get penalized more. The model is pushed toward solutions where no single weight dominates.</p>
+<p>Why this helps generalization: overfit models tend to have large weights that amplify noise in the training data. Weight decay keeps weights small, which limits the model's effective capacity and forces it to rely on robust, generalizable features rather than memorized quirks.</p>
+<p>The lambda hyperparameter controls the strength. Typical values:</p>
+<ul>
+<li>0.01 for AdamW on transformers</li>
+<li>1e-4 for SGD on CNNs</li>
+<li>0.1 for heavily overfit models</li>
+</ul>
+<p>As discussed in lesson 06: weight decay and L2 regularization are equivalent in SGD but not in Adam. Always use AdamW (decoupled weight decay) when training with Adam.</p>
+<h3>Batch Normalization</h3>
+<p>Normalize the output of each layer across the mini-batch before passing it to the next layer.</p>
+<p>For a mini-batch of activations at some layer:</p>
+<pre><code>mu = (1/B) * sum(x_i)           (batch mean)
+sigma^2 = (1/B) * sum((x_i - mu)^2)   (batch variance)
+x_hat = (x_i - mu) / sqrt(sigma^2 + eps)   (normalize)
+y = gamma * x_hat + beta        (scale and shift)
+</code></pre>
+<p>Gamma and beta are learnable parameters that let the network undo the normalization if that's optimal. Without them, you'd be forcing every layer's output to be zero-mean unit-variance, which might not be what the network wants.</p>
+<p><strong>Training vs inference split:</strong> During training, mu and sigma come from the current mini-batch. During inference, you use running averages accumulated during training (exponential moving average with momentum = 0.1, meaning 90% old + 10% new).</p>
+<p>Why BatchNorm works is still debated. The original paper claimed it reduces &quot;internal covariate shift&quot; (the distribution of layer inputs changing as earlier layers update). Santurkar et al. (2018) showed this explanation is wrong. The actual reason: BatchNorm makes the loss landscape smoother. The gradients are more predictive, the Lipschitz constants are smaller, and the optimizer can take larger steps safely. This is why BatchNorm lets you use higher learning rates and converge faster.</p>
+<p>BatchNorm has a fundamental limitation: it depends on batch statistics. With batch size 1, the mean and variance are meaningless. With small batches (&lt; 32), the statistics are noisy and hurt performance. This matters for tasks like object detection (where memory limits batch size) and language modeling (where sequence lengths vary).</p>
+<h3>Layer Normalization</h3>
+<p>Normalize across features instead of across the batch. For a single sample:</p>
+<pre><code>mu = (1/D) * sum(x_j)           (feature mean)
+sigma^2 = (1/D) * sum((x_j - mu)^2)   (feature variance)
+x_hat = (x_j - mu) / sqrt(sigma^2 + eps)
+y = gamma * x_hat + beta
+</code></pre>
+<p>D is the feature dimension. Each sample is normalized independently -- no dependence on batch size. This is why transformers use LayerNorm instead of BatchNorm. Sequences have variable lengths, batch sizes are often small (or 1 during generation), and the computation is identical between training and inference.</p>
+<p>LayerNorm in transformers is applied after each self-attention block and each feed-forward block (Post-LN), or before them (Pre-LN, which is more stable for training).</p>
+<h3>RMSNorm</h3>
+<p>LayerNorm without the mean subtraction. Proposed by Zhang &amp; Sennrich (2019).</p>
+<pre><code>rms = sqrt((1/D) * sum(x_j^2))
+y = gamma * x / rms
+</code></pre>
+<p>That's it. No mean computation, no beta parameter. The observation: the re-centering (mean subtraction) in LayerNorm contributes very little to the model's performance, but costs computation. Removing it gives the same accuracy with about 10% less overhead.</p>
+<p>LLaMA, LLaMA 2, LLaMA 3, Mistral, and most modern LLMs use RMSNorm instead of LayerNorm. At the scale of billions of parameters and trillions of tokens, that 10% savings is significant.</p>
+<h3>Normalization Comparison</h3>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-168588827044c347c7e6.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>Data Augmentation as Regularization</h3>
+<p>Not a model modification but a data modification. Transform training inputs while preserving labels:</p>
+<ul>
+<li>Images: random crop, flip, rotation, color jitter, cutout</li>
+<li>Text: synonym replacement, back-translation, random deletion</li>
+<li>Audio: time stretch, pitch shift, noise addition</li>
+</ul>
+<p>The effect is identical to regularization: it increases the effective size of the training set, making it harder for the model to memorize specific examples. A model that only sees each image once in its original form can memorize it. A model that sees 50 augmented versions of each image is forced to learn the invariant structure.</p>
+<h3>Early Stopping</h3>
+<p>The simplest regularizer: stop training when validation loss starts increasing. The model hasn't overfit yet at that point. In practice, you track validation loss every epoch, save the best model, and continue training for a &quot;patience&quot; window (typically 5-20 epochs). If validation loss doesn't improve within the patience window, you stop and load the best saved model.</p>
+<h3>When to Apply What</h3>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-8ab85af8c050b5f79720.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><figure><img src="/learn/ai-from-scratch/figures/figure-fe197820928a722b104f.png" alt="l2-regularization 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<h3>Step 1: Dropout (Train and Eval Mode)</h3>
+<pre><code class="language-python">import random
+import math
+
+
+class Dropout:
+    def __init__(self, p=0.5):
+        self.p = p
+        self.training = True
+        self.mask = None
+
+    def forward(self, x):
+        if not self.training:
+            return list(x)
+        self.mask = []
+        output = []
+        for val in x:
+            if random.random() &lt; self.p:
+                self.mask.append(0)
+                output.append(0.0)
+            else:
+                self.mask.append(1)
+                output.append(val / (1 - self.p))
+        return output
+
+    def backward(self, grad_output):
+        grads = []
+        for g, m in zip(grad_output, self.mask):
+            if m == 0:
+                grads.append(0.0)
+            else:
+                grads.append(g / (1 - self.p))
+        return grads
+</code></pre>
+<h3>Step 2: L2 Weight Decay</h3>
+<pre><code class="language-python">def l2_regularization(weights, lambda_reg):
+    penalty = 0.0
+    for w in weights:
+        penalty += w * w
+    return lambda_reg * 0.5 * penalty
+
+def l2_gradient(weights, lambda_reg):
+    return [lambda_reg * w for w in weights]
+</code></pre>
+<h3>Step 3: Batch Normalization</h3>
+<pre><code class="language-python">class BatchNorm:
+    def __init__(self, num_features, momentum=0.1, eps=1e-5):
+        self.gamma = [1.0] * num_features
+        self.beta = [0.0] * num_features
+        self.eps = eps
+        self.momentum = momentum
+        self.running_mean = [0.0] * num_features
+        self.running_var = [1.0] * num_features
+        self.training = True
+        self.num_features = num_features
+
+    def forward(self, batch):
+        batch_size = len(batch)
+        if self.training:
+            mean = [0.0] * self.num_features
+            for sample in batch:
+                for j in range(self.num_features):
+                    mean[j] += sample[j]
+            mean = [m / batch_size for m in mean]
+
+            var = [0.0] * self.num_features
+            for sample in batch:
+                for j in range(self.num_features):
+                    var[j] += (sample[j] - mean[j]) ** 2
+            var = [v / batch_size for v in var]
+
+            for j in range(self.num_features):
+                self.running_mean[j] = (1 - self.momentum) * self.running_mean[j] + self.momentum * mean[j]
+                self.running_var[j] = (1 - self.momentum) * self.running_var[j] + self.momentum * var[j]
+        else:
+            mean = list(self.running_mean)
+            var = list(self.running_var)
+
+        self.x_hat = []
+        output = []
+        for sample in batch:
+            normalized = []
+            out_sample = []
+            for j in range(self.num_features):
+                x_h = (sample[j] - mean[j]) / math.sqrt(var[j] + self.eps)
+                normalized.append(x_h)
+                out_sample.append(self.gamma[j] * x_h + self.beta[j])
+            self.x_hat.append(normalized)
+            output.append(out_sample)
+        return output
+</code></pre>
+<h3>Step 4: Layer Normalization</h3>
+<pre><code class="language-python">class LayerNorm:
+    def __init__(self, num_features, eps=1e-5):
+        self.gamma = [1.0] * num_features
+        self.beta = [0.0] * num_features
+        self.eps = eps
+        self.num_features = num_features
+
+    def forward(self, x):
+        mean = sum(x) / len(x)
+        var = sum((xi - mean) ** 2 for xi in x) / len(x)
+
+        self.x_hat = []
+        output = []
+        for j in range(self.num_features):
+            x_h = (x[j] - mean) / math.sqrt(var + self.eps)
+            self.x_hat.append(x_h)
+            output.append(self.gamma[j] * x_h + self.beta[j])
+        return output
+</code></pre>
+<h3>Step 5: RMSNorm</h3>
+<pre><code class="language-python">class RMSNorm:
+    def __init__(self, num_features, eps=1e-6):
+        self.gamma = [1.0] * num_features
+        self.eps = eps
+        self.num_features = num_features
+
+    def forward(self, x):
+        rms = math.sqrt(sum(xi * xi for xi in x) / len(x) + self.eps)
+        output = []
+        for j in range(self.num_features):
+            output.append(self.gamma[j] * x[j] / rms)
+        return output
+</code></pre>
+<h3>Step 6: Training With and Without Regularization</h3>
+<pre><code class="language-python">def sigmoid(x):
+    x = max(-500, min(500, x))
+    return 1.0 / (1.0 + math.exp(-x))
+
+
+def make_circle_data(n=200, seed=42):
+    random.seed(seed)
+    data = []
+    for _ in range(n):
+        x = random.uniform(-2, 2)
+        y = random.uniform(-2, 2)
+        label = 1.0 if x * x + y * y &lt; 1.5 else 0.0
+        data.append(([x, y], label))
+    return data
+
+
+class RegularizedNetwork:
+    def __init__(self, hidden_size=16, lr=0.05, dropout_p=0.0, weight_decay=0.0):
+        random.seed(0)
+        self.hidden_size = hidden_size
+        self.lr = lr
+        self.dropout_p = dropout_p
+        self.weight_decay = weight_decay
+        self.dropout = Dropout(p=dropout_p) if dropout_p &gt; 0 else None
+
+        self.w1 = [[random.gauss(0, 0.5) for _ in range(2)] for _ in range(hidden_size)]
+        self.b1 = [0.0] * hidden_size
+        self.w2 = [random.gauss(0, 0.5) for _ in range(hidden_size)]
+        self.b2 = 0.0
+
+    def forward(self, x, training=True):
+        self.x = x
+        self.z1 = []
+        self.h = []
+        for i in range(self.hidden_size):
+            z = self.w1[i][0] * x[0] + self.w1[i][1] * x[1] + self.b1[i]
+            self.z1.append(z)
+            self.h.append(max(0.0, z))
+
+        if self.dropout and training:
+            self.dropout.training = True
+            self.h = self.dropout.forward(self.h)
+        elif self.dropout:
+            self.dropout.training = False
+            self.h = self.dropout.forward(self.h)
+
+        self.z2 = sum(self.w2[i] * self.h[i] for i in range(self.hidden_size)) + self.b2
+        self.out = sigmoid(self.z2)
+        return self.out
+
+    def backward(self, target):
+        eps = 1e-15
+        p = max(eps, min(1 - eps, self.out))
+        d_loss = -(target / p) + (1 - target) / (1 - p)
+        d_sigmoid = self.out * (1 - self.out)
+        d_out = d_loss * d_sigmoid
+
+        for i in range(self.hidden_size):
+            d_relu = 1.0 if self.z1[i] &gt; 0 else 0.0
+            d_h = d_out * self.w2[i] * d_relu
+            self.w2[i] -= self.lr * (d_out * self.h[i] + self.weight_decay * self.w2[i])
+            for j in range(2):
+                self.w1[i][j] -= self.lr * (d_h * self.x[j] + self.weight_decay * self.w1[i][j])
+            self.b1[i] -= self.lr * d_h
+        self.b2 -= self.lr * d_out
+
+    def evaluate(self, data):
+        correct = 0
+        total_loss = 0.0
+        for x, y in data:
+            pred = self.forward(x, training=False)
+            eps = 1e-15
+            p = max(eps, min(1 - eps, pred))
+            total_loss += -(y * math.log(p) + (1 - y) * math.log(1 - p))
+            if (pred &gt;= 0.5) == (y &gt;= 0.5):
+                correct += 1
+        return total_loss / len(data), correct / len(data) * 100
+
+    def train_model(self, train_data, test_data, epochs=300):
+        history = []
+        for epoch in range(epochs):
+            total_loss = 0.0
+            correct = 0
+            for x, y in train_data:
+                pred = self.forward(x, training=True)
+                self.backward(y)
+                eps = 1e-15
+                p = max(eps, min(1 - eps, pred))
+                total_loss += -(y * math.log(p) + (1 - y) * math.log(1 - p))
+                if (pred &gt;= 0.5) == (y &gt;= 0.5):
+                    correct += 1
+            train_loss = total_loss / len(train_data)
+            train_acc = correct / len(train_data) * 100
+            test_loss, test_acc = self.evaluate(test_data)
+            history.append((train_loss, train_acc, test_loss, test_acc))
+            if epoch % 75 == 0 or epoch == epochs - 1:
+                gap = train_acc - test_acc
+                print(f&quot;    Epoch {epoch:3d}: train_acc={train_acc:.1f}%, test_acc={test_acc:.1f}%, gap={gap:.1f}%&quot;)
+        return history
+</code></pre>
+<h2>Use It</h2>
+<p>PyTorch provides all normalization and regularization as modules:</p>
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+model = nn.Sequential(
+    nn.Linear(784, 256),
+    nn.BatchNorm1d(256),
+    nn.ReLU(),
+    nn.Dropout(0.3),
+    nn.Linear(256, 128),
+    nn.BatchNorm1d(128),
+    nn.ReLU(),
+    nn.Dropout(0.3),
+    nn.Linear(128, 10),
+)
+
+model.train()
+out_train = model(torch.randn(32, 784))
+
+model.eval()
+out_test = model(torch.randn(1, 784))
+</code></pre>
+<p>The <code>model.train()</code> / <code>model.eval()</code> toggle is critical. It switches dropout on/off and tells BatchNorm to use batch statistics vs running statistics. Forgetting <code>model.eval()</code> before inference is one of the most common bugs in deep learning. Your test accuracy will fluctuate randomly because dropout is still active and BatchNorm is using mini-batch statistics.</p>
+<p>For transformers, the pattern is different:</p>
+<pre><code class="language-python">class TransformerBlock(nn.Module):
+    def __init__(self, d_model=512, nhead=8, dropout=0.1):
+        super().__init__()
+        self.attention = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, d_model * 4),
+            nn.GELU(),
+            nn.Linear(d_model * 4, d_model),
+            nn.Dropout(dropout),
+        )
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        attended, _ = self.attention(x, x, x)
+        x = self.norm1(x + self.dropout(attended))
+        x = self.norm2(x + self.ff(x))
+        return x
+</code></pre>
+<p>LayerNorm, not BatchNorm. Dropout p=0.1, not p=0.5. These are the transformer defaults.</p>
+<h2>Ship It</h2>
+<p>This lesson produces:</p>
+<ul>
+<li><code>outputs/prompt-regularization-advisor.md</code> -- a prompt that diagnoses overfitting and recommends the right regularization strategy</li>
+</ul>
+<h2>Exercises</h2>
+<ol>
+<li>
+<p>Implement spatial dropout for 2D data: instead of dropping individual neurons, drop entire feature channels. Simulate this by treating groups of consecutive features as channels and dropping whole groups. Compare the train-test gap to standard dropout on the circle dataset with hidden_size=32.</p>
+</li>
+<li>
+<p>Implement label smoothing from lesson 05 combined with dropout from this lesson. Train with four configurations: neither, dropout only, label smoothing only, both. Measure the final train-test accuracy gap for each. Which combination gives the smallest gap?</p>
+</li>
+<li>
+<p>Add a BatchNorm layer between the hidden layer and the activation in your circle-dataset network. Train with and without BatchNorm at learning rates 0.01, 0.05, and 0.1. BatchNorm should allow stable training at higher learning rates where the vanilla network diverges.</p>
+</li>
+<li>
+<p>Implement early stopping: track test loss each epoch, save the best weights, and stop if test loss hasn't improved for 20 epochs. Run the regularized network for 1000 epochs. Report which epoch had the best test accuracy and how many epochs of computation you saved.</p>
+</li>
+<li>
+<p>Compare LayerNorm vs RMSNorm on a 4-layer network (not just 2). Initialize both with the same weights. Train for 200 epochs and compare final accuracy, training speed (time per epoch), and gradient magnitudes at the first layer. Verify that RMSNorm is faster with the same accuracy.</p>
+</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Overfitting</td>
+<td>&quot;Model memorized the data&quot;</td>
+<td>When a model's training performance significantly exceeds its test performance, indicating it learned noise rather than signal</td>
+</tr>
+<tr>
+<td>Regularization</td>
+<td>&quot;Preventing overfitting&quot;</td>
+<td>Any technique that constrains model complexity to improve generalization: dropout, weight decay, normalization, augmentation</td>
+</tr>
+<tr>
+<td>Dropout</td>
+<td>&quot;Random neuron deletion&quot;</td>
+<td>Zeroing random neurons during training with probability p, forcing redundant representations; equivalent to training an ensemble</td>
+</tr>
+<tr>
+<td>Weight decay</td>
+<td>&quot;L2 penalty&quot;</td>
+<td>Shrinking all weights toward zero by subtracting lambda * w at each step; penalizes complexity through weight magnitude</td>
+</tr>
+<tr>
+<td>Batch normalization</td>
+<td>&quot;Normalize per batch&quot;</td>
+<td>Normalizing layer outputs across the batch dimension using batch statistics during training and running averages during inference</td>
+</tr>
+<tr>
+<td>Layer normalization</td>
+<td>&quot;Normalize per sample&quot;</td>
+<td>Normalizing across features within each sample; batch-independent, used in transformers where batch size varies</td>
+</tr>
+<tr>
+<td>RMSNorm</td>
+<td>&quot;LayerNorm without the mean&quot;</td>
+<td>Root mean square normalization; drops the mean subtraction from LayerNorm for 10% speedup with equal accuracy</td>
+</tr>
+<tr>
+<td>Early stopping</td>
+<td>&quot;Stop before overfit&quot;</td>
+<td>Halting training when validation loss stops improving; the simplest regularizer, often used alongside others</td>
+</tr>
+<tr>
+<td>Data augmentation</td>
+<td>&quot;More data from less&quot;</td>
+<td>Transforming training inputs (flip, crop, noise) to increase effective dataset size and force invariance learning</td>
+</tr>
+<tr>
+<td>Generalization gap</td>
+<td>&quot;Train-test split&quot;</td>
+<td>The difference between training and test performance; regularization aims to minimize this gap</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li>Srivastava et al., &quot;Dropout: A Simple Way to Prevent Neural Networks from Overfitting&quot; (2014) -- the original dropout paper with the ensemble interpretation and extensive experiments</li>
+<li>Ioffe &amp; Szegedy, &quot;Batch Normalization: Accelerating Deep Network Training by Reducing Internal Covariate Shift&quot; (2015) -- introduced BatchNorm and its training procedure, one of the most cited deep learning papers</li>
+<li>Zhang &amp; Sennrich, &quot;Root Mean Square Layer Normalization&quot; (2019) -- showed RMSNorm matches LayerNorm accuracy with reduced computation; adopted by LLaMA and Mistral</li>
+<li>Zhang et al., &quot;Understanding Deep Learning Requires Rethinking Generalization&quot; (2017) -- the landmark paper showing neural networks can memorize random labels, challenging traditional views of generalization</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-03-deep-learning-core--07-regularization.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-03-deep-learning-core--07-regularization.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/03-deep-learning-core/07-regularization/code/main.py">phases/03-deep-learning-core/07-regularization/code/main.py</a><details><summary>查看原始文本</summary><pre><code>import math
+import random
+
+
+class Dropout:
+    def __init__(self, p=0.5):
+        self.p = p
+        self.training = True
+        self.mask = None
+
+    def forward(self, x):
+        if not self.training:
+            return list(x)
+        self.mask = []
+        output = []
+        for val in x:
+            if random.random() &lt; self.p:
+                self.mask.append(0)
+                output.append(0.0)
+            else:
+                self.mask.append(1)
+                output.append(val / (1 - self.p))
+        return output
+
+    def backward(self, grad_output):
+        grads = []
+        for g, m in zip(grad_output, self.mask):
+            if m == 0:
+                grads.append(0.0)
+            else:
+                grads.append(g / (1 - self.p))
+        return grads
+
+
+def l2_regularization(weights, lambda_reg):
+    penalty = 0.0
+    for w in weights:
+        penalty += w * w
+    return lambda_reg * 0.5 * penalty
+
+
+def l2_gradient(weights, lambda_reg):
+    return [lambda_reg * w for w in weights]
+
+
+class BatchNorm:
+    def __init__(self, num_features, momentum=0.1, eps=1e-5):
+        self.gamma = [1.0] * num_features
+        self.beta = [0.0] * num_features
+        self.eps = eps
+        self.momentum = momentum
+        self.running_mean = [0.0] * num_features
+        self.running_var = [1.0] * num_features
+        self.training = True
+        self.num_features = num_features
+
+    def forward(self, batch):
+        batch_size = len(batch)
+        if self.training:
+            mean = [0.0] * self.num_features
+            for sample in batch:
+                for j in range(self.num_features):
+                    mean[j] += sample[j]
+            mean = [m / batch_size for m in mean]
+
+            var = [0.0] * self.num_features
+            for sample in batch:
+                for j in range(self.num_features):
+                    var[j] += (sample[j] - mean[j]) ** 2
+            var = [v / batch_size for v in var]
+
+            for j in range(self.num_features):
+                self.running_mean[j] = (1 - self.momentum) * self.running_mean[j] + self.momentum * mean[j]
+                self.running_var[j] = (1 - self.momentum) * self.running_var[j] + self.momentum * var[j]
+        else:
+            mean = list(self.running_mean)
+            var = list(self.running_var)
+
+        self.x_hat = []
+        output = []
+        for sample in batch:
+            normalized = []
+            out_sample = []
+            for j in range(self.num_features):
+                x_h = (sample[j] - mean[j]) / math.sqrt(var[j] + self.eps)
+                normalized.append(x_h)
+                out_sample.append(self.gamma[j] * x_h + self.beta[j])
+            self.x_hat.append(normalized)
+            output.append(out_sample)
+        return output
+
+
+class LayerNorm:
+    def __init__(self, num_features, eps=1e-5):
+        self.gamma = [1.0] * num_features
+        self.beta = [0.0] * num_features
+        self.eps = eps
+        self.num_features = num_features
+
+    def forward(self, x):
+        mean = sum(x) / len(x)
+        var = sum((xi - mean) ** 2 for xi in x) / len(x)
+
+        self.x_hat = []
+        output = []
+        for j in range(self.num_features):
+            x_h = (x[j] - mean) / math.sqrt(var + self.eps)
+            self.x_hat.append(x_h)
+            output.append(self.gamma[j] * x_h + self.beta[j])
+        return output
+
+
+class RMSNorm:
+    def __init__(self, num_features, eps=1e-6):
+        self.gamma = [1.0] * num_features
+        self.eps = eps
+        self.num_features = num_features
+
+    def forward(self, x):
+        rms = math.sqrt(sum(xi * xi for xi in x) / len(x) + self.eps)
+        output = []
+        for j in range(self.num_features):
+            output.append(self.gamma[j] * x[j] / rms)
+        return output
+
+
+def sigmoid(x):
+    x = max(-500, min(500, x))
+    return 1.0 / (1.0 + math.exp(-x))
+
+
+def make_circle_data(n=200, seed=42):
+    random.seed(seed)
+    data = []
+    for _ in range(n):
+        x = random.uniform(-2, 2)
+        y = random.uniform(-2, 2)
+        label = 1.0 if x * x + y * y &lt; 1.5 else 0.0
+        data.append(([x, y], label))
+    return data
+
+
+class RegularizedNetwork:
+    def __init__(self, hidden_size=16, lr=0.05, dropout_p=0.0, weight_decay=0.0):
+        random.seed(0)
+        self.hidden_size = hidden_size
+        self.lr = lr
+        self.dropout_p = dropout_p
+        self.weight_decay = weight_decay
+        self.dropout = Dropout(p=dropout_p) if dropout_p &gt; 0 else None
+
+        self.w1 = [[random.gauss(0, 0.5) for _ in range(2)] for _ in range(hidden_size)]
+        self.b1 = [0.0] * hidden_size
+        self.w2 = [random.gauss(0, 0.5) for _ in range(hidden_size)]
+        self.b2 = 0.0
+
+    def forward(self, x, training=True):
+        self.x = x
+        self.z1 = []
+        self.h = []
+        for i in range(self.hidden_size):
+            z = self.w1[i][0] * x[0] + self.w1[i][1] * x[1] + self.b1[i]
+            self.z1.append(z)
+            self.h.append(max(0.0, z))
+
+        if self.dropout and training:
+            self.dropout.training = True
+            self.h = self.dropout.forward(self.h)
+        elif self.dropout:
+            self.dropout.training = False
+            self.h = self.dropout.forward(self.h)
+
+        self.z2 = sum(self.w2[i] * self.h[i] for i in range(self.hidden_size)) + self.b2
+        self.out = sigmoid(self.z2)
+        return self.out
+
+    def backward(self, target):
+        eps = 1e-15
+        p = max(eps, min(1 - eps, self.out))
+        d_loss = -(target / p) + (1 - target) / (1 - p)
+        d_sigmoid = self.out * (1 - self.out)
+        d_out = d_loss * d_sigmoid
+
+        d_h_dropout = [d_out * self.w2[i] for i in range(self.hidden_size)]
+        if self.dropout and self.dropout.mask is not None:
+            d_h_dropout = [g * m / (1 - self.dropout.p) if m else 0.0
+                           for g, m in zip(d_h_dropout, self.dropout.mask)]
+
+        for i in range(self.hidden_size):
+            d_relu = 1.0 if self.z1[i] &gt; 0 else 0.0
+            d_h = d_h_dropout[i] * d_relu
+            self.w2[i] -= self.lr * (d_out * self.h[i] + self.weight_decay * self.w2[i])
+            for j in range(2):
+                self.w1[i][j] -= self.lr * (d_h * self.x[j] + self.weight_decay * self.w1[i][j])
+            self.b1[i] -= self.lr * d_h
+        self.b2 -= self.lr * d_out
+
+    def evaluate(self, data):
+        correct = 0
+        total_loss = 0.0
+        for x, y in data:
+            pred = self.forward(x, training=False)
+            eps = 1e-15
+            p = max(eps, min(1 - eps, pred))
+            total_loss += -(y * math.log(p) + (1 - y) * math.log(1 - p))
+            if (pred &gt;= 0.5) == (y &gt;= 0.5):
+                correct += 1
+        return total_loss / len(data), correct / len(data) * 100
+
+    def train_model(self, train_data, test_data, epochs=300):
+        history = []
+        for epoch in range(epochs):
+            total_loss = 0.0
+            correct = 0
+            for x, y in train_data:
+                pred = self.forward(x, training=True)
+                self.backward(y)
+                eps = 1e-15
+                p = max(eps, min(1 - eps, pred))
+                total_loss += -(y * math.log(p) + (1 - y) * math.log(1 - p))
+                if (pred &gt;= 0.5) == (y &gt;= 0.5):
+                    correct += 1
+            train_loss = total_loss / len(train_data)
+            train_acc = correct / len(train_data) * 100
+            test_loss, test_acc = self.evaluate(test_data)
+            history.append((train_loss, train_acc, test_loss, test_acc))
+            if epoch % 75 == 0 or epoch == epochs - 1:
+                gap = train_acc - test_acc
+                print(f&quot;    Epoch {epoch:3d}: train_acc={train_acc:.1f}%, test_acc={test_acc:.1f}%, gap={gap:.1f}%&quot;)
+        return history
+
+
+if __name__ == &quot;__main__&quot;:
+    print(&quot;=&quot; * 60)
+    print(&quot;STEP 1: Dropout Demonstration&quot;)
+    print(&quot;=&quot; * 60)
+    drop = Dropout(p=0.5)
+    test_input = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+    random.seed(42)
+
+    drop.training = True
+    print(f&quot;  Input:          {test_input}&quot;)
+    for trial in range(3):
+        output = drop.forward(test_input)
+        active = sum(1 for v in output if v &gt; 0)
+        print(f&quot;  Train pass {trial+1}:   {[f&#39;{v:.1f}&#39; for v in output]}  ({active}/{len(test_input)} active)&quot;)
+
+    drop.training = False
+    output = drop.forward(test_input)
+    print(f&quot;  Eval pass:      {[f&#39;{v:.1f}&#39; for v in output]}&quot;)
+    print(f&quot;  Train mean: ~{sum(test_input)/len(test_input):.1f} (scaled by 1/(1-p))&quot;)
+    print(f&quot;  Eval mean:   {sum(output)/len(output):.1f} (no scaling needed)&quot;)
+
+    print(&quot;\n&quot; + &quot;=&quot; * 60)
+    print(&quot;STEP 2: L2 Regularization&quot;)
+    print(&quot;=&quot; * 60)
+    weights = [0.5, -1.2, 3.0, 0.1, -2.5]
+    lambda_val = 0.01
+    penalty = l2_regularization(weights, lambda_val)
+    grads = l2_gradient(weights, lambda_val)
+    print(f&quot;  Weights: {weights}&quot;)
+    print(f&quot;  Lambda:  {lambda_val}&quot;)
+    print(f&quot;  L2 penalty: {penalty:.6f}&quot;)
+    print(f&quot;  L2 grads:   {[f&#39;{g:.4f}&#39; for g in grads]}&quot;)
+    print(f&quot;  Largest weight (3.0) gets largest gradient ({grads[2]:.4f})&quot;)
+
+    print(&quot;\n&quot; + &quot;=&quot; * 60)
+    print(&quot;STEP 3: BatchNorm vs LayerNorm vs RMSNorm&quot;)
+    print(&quot;=&quot; * 60)
+    random.seed(42)
+    batch = [[random.gauss(5, 2) for _ in range(4)] for _ in range(8)]
+    sample = batch[0]
+
+    bn = BatchNorm(4)
+    bn_out = bn.forward(batch)
+
+    ln = LayerNorm(4)
+    ln_out = ln.forward(sample)
+
+    rn = RMSNorm(4)
+    rn_out = rn.forward(sample)
+
+    print(f&quot;  Raw sample: {[f&#39;{v:.2f}&#39; for v in sample]}&quot;)
+    print(f&quot;  BatchNorm:  {[f&#39;{v:.2f}&#39; for v in bn_out[0]]}&quot;)
+    print(f&quot;  LayerNorm:  {[f&#39;{v:.2f}&#39; for v in ln_out]}&quot;)
+    print(f&quot;  RMSNorm:    {[f&#39;{v:.2f}&#39; for v in rn_out]}&quot;)
+
+    ln_mean = sum(ln_out) / len(ln_out)
+    ln_std = math.sqrt(sum((v - ln_mean) ** 2 for v in ln_out) / len(ln_out))
+    rn_mean = sum(rn_out) / len(rn_out)
+    rn_rms = math.sqrt(sum(v * v for v in rn_out) / len(rn_out))
+    print(f&quot;\n  LayerNorm output: mean={ln_mean:.4f}, std={ln_std:.4f}&quot;)
+    print(f&quot;  RMSNorm output:   mean={rn_mean:.4f}, rms={rn_rms:.4f}&quot;)
+    print(f&quot;  LayerNorm centers to mean=0. RMSNorm normalizes scale only.&quot;)
+
+    print(&quot;\n&quot; + &quot;=&quot; * 60)
+    print(&quot;STEP 4: BatchNorm Training vs Eval Mode&quot;)
+    print(&quot;=&quot; * 60)
+    bn2 = BatchNorm(4)
+    bn2.training = True
+    for step in range(10):
+        batch = [[random.gauss(3 + step * 0.1, 1) for _ in range(4)] for _ in range(16)]
+        bn2.forward(batch)
+
+    print(f&quot;  Running mean after 10 batches: {[f&#39;{v:.3f}&#39; for v in bn2.running_mean]}&quot;)
+    print(f&quot;  Running var  after 10 batches: {[f&#39;{v:.3f}&#39; for v in bn2.running_var]}&quot;)
+
+    bn2.training = False
+    test_sample = [[5.0, 5.0, 5.0, 5.0]]
+    eval_out = bn2.forward(test_sample)
+    print(f&quot;  Eval mode uses running stats, not batch stats&quot;)
+    print(f&quot;  Input [5,5,5,5] -&gt; {[f&#39;{v:.3f}&#39; for v in eval_out[0]]}&quot;)
+
+    print(&quot;\n&quot; + &quot;=&quot; * 60)
+    print(&quot;STEP 5: Training With vs Without Regularization&quot;)
+    print(&quot;=&quot; * 60)
+    all_data = make_circle_data(n=300, seed=42)
+    train_data = all_data[:150]
+    test_data = all_data[150:]
+
+    configs = [
+        (&quot;No regularization&quot;, 0.0, 0.0),
+        (&quot;Dropout p=0.3&quot;, 0.3, 0.0),
+        (&quot;Weight decay 0.01&quot;, 0.0, 0.01),
+        (&quot;Dropout + weight decay&quot;, 0.3, 0.01),
+    ]
+
+    results = {}
+    for name, drop_p, wd in configs:
+        print(f&quot;\n--- {name} ---&quot;)
+        net = RegularizedNetwork(hidden_size=16, lr=0.05, dropout_p=drop_p, weight_decay=wd)
+        history = net.train_model(train_data, test_data, epochs=300)
+        results[name] = history
+
+    print(&quot;\n&quot; + &quot;=&quot; * 60)
+    print(&quot;FINAL COMPARISON&quot;)
+    print(&quot;=&quot; * 60)
+    print(f&quot;  {&#39;Config&#39;:30s} {&#39;Train Acc&#39;:&gt;10s} {&#39;Test Acc&#39;:&gt;10s} {&#39;Gap&#39;:&gt;8s}&quot;)
+    print(&quot;  &quot; + &quot;-&quot; * 60)
+    for name, history in results.items():
+        train_loss, train_acc, test_loss, test_acc = history[-1]
+        gap = train_acc - test_acc
+        print(f&quot;  {name:30s} {train_acc:&gt;9.1f}% {test_acc:&gt;9.1f}% {gap:&gt;7.1f}%&quot;)
+
+    print(&quot;\n  Key insight: regularization reduces the train-test gap.&quot;)
+    print(&quot;  The model with dropout + weight decay generalizes best,&quot;)
+    print(&quot;  even if its training accuracy is lower.&quot;)
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/03-deep-learning-core/07-regularization/outputs/prompt-regularization-advisor.md">phases/03-deep-learning-core/07-regularization/outputs/prompt-regularization-advisor.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: prompt-regularization-advisor
+description: A diagnostic prompt for choosing regularization strategies based on overfitting symptoms
+phase: 03
+lesson: 07
+---
+
+You are an expert ML engineer specializing in model generalization. Given training metrics and model details, diagnose overfitting and recommend a regularization strategy.
+
+Analyze these inputs:
+
+1. **Training accuracy** vs **test/validation accuracy** (the gap)
+2. **Model size**: Number of parameters relative to dataset size
+3. **Architecture**: Transformer, CNN, MLP, or other
+4. **Current regularization**: What&#39;s already applied
+5. **Training duration**: How many epochs, has validation loss started increasing
+
+Apply these diagnostic rules:
+
+**Gap &lt; 3%: No significant overfitting**
+- Continue training, model may still be underfitting
+- Consider increasing model capacity if test accuracy is low
+
+**Gap 3-10%: Mild overfitting**
+- Add dropout (p=0.1 for transformers, p=0.2-0.3 for MLPs/CNNs)
+- Add weight decay (0.01 for AdamW, 1e-4 for SGD)
+- Add normalization if not present (LayerNorm for transformers, BatchNorm for CNNs)
+
+**Gap 10-20%: Moderate overfitting**
+- All of the above, plus:
+- Data augmentation (random crop, flip, color jitter for images)
+- Label smoothing (alpha=0.1)
+- Early stopping (patience=10-20 epochs)
+- Reduce model capacity (fewer layers or smaller hidden dim)
+
+**Gap &gt; 20%: Severe overfitting**
+- All of the above, plus:
+- Increase dropout to p=0.3-0.5
+- Increase weight decay to 0.1
+- Aggressive data augmentation (mixup, cutmix, randaugment)
+- Consider getting more training data
+- Consider simpler model architecture
+
+**Architecture-specific defaults:**
+
+Transformers:
+- LayerNorm (or RMSNorm) after attention and FFN blocks
+- Dropout p=0.1 on attention weights and residual connections
+- Weight decay 0.01-0.1 via AdamW
+- Label smoothing 0.1
+
+CNNs:
+- BatchNorm after convolutions
+- Dropout p=0.2-0.5 before final linear layers (not between conv layers)
+- Weight decay 1e-4
+- Data augmentation (critical for CNNs)
+
+MLPs:
+- Dropout p=0.3-0.5 between hidden layers
+- BatchNorm or LayerNorm between layers
+- Weight decay 0.01
+- Careful: MLPs overfit easily, regularization is essential
+
+**Common mistakes:**
+- Applying BatchNorm with batch size &lt; 16 (use LayerNorm instead)
+- Forgetting model.eval() during inference (dropout stays active, BatchNorm uses batch stats)
+- Using the same dropout rate everywhere (attention needs less than FFN)
+- Weight decay on bias and normalization parameters (exclude them)
+
+For each recommendation:
+- State the technique and its hyperparameters
+- Explain why it addresses the specific overfitting pattern
+- Specify the expected impact on the train-test gap
+- Warn about any side effects (e.g., dropout slows convergence)
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. What is overfitting in neural networks?</legend><label class="option"><input type="radio" name="q0" value="0"> The model is too small to learn the data</label><label class="option"><input type="radio" name="q0" value="1"> The model trains too slowly</label><label class="option"><input type="radio" name="q0" value="2"> The model memorizes training data instead of learning generalizable patterns, showing a large gap between train and test accuracy</label><label class="option"><input type="radio" name="q0" value="3"> The loss function is wrong</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. How does dropout regularize a neural network?</legend><label class="option"><input type="radio" name="q1" value="0"> It removes the worst-performing neurons permanently</label><label class="option"><input type="radio" name="q1" value="1"> It reduces the learning rate</label><label class="option"><input type="radio" name="q1" value="2"> It randomly zeroes neurons during training, forcing the network to learn redundant representations</label><label class="option"><input type="radio" name="q1" value="3"> It removes outliers from the training data</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. Why do transformers use LayerNorm instead of BatchNorm?</legend><label class="option"><input type="radio" name="q2" value="0"> BatchNorm causes gradient explosion</label><label class="option"><input type="radio" name="q2" value="1"> LayerNorm was invented more recently</label><label class="option"><input type="radio" name="q2" value="2"> LayerNorm is faster to compute</label><label class="option"><input type="radio" name="q2" value="3"> LayerNorm normalizes across features per sample (batch-independent), which works with variable sequence lengths and small batch sizes</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. What is the key difference between RMSNorm and LayerNorm?</legend><label class="option"><input type="radio" name="q3" value="0"> RMSNorm uses batch statistics</label><label class="option"><input type="radio" name="q3" value="1"> RMSNorm only works on CNNs</label><label class="option"><input type="radio" name="q3" value="2"> RMSNorm skips the mean subtraction, only dividing by the root mean square, giving ~10% speedup with equal accuracy</label><label class="option"><input type="radio" name="q3" value="3"> RMSNorm adds learnable parameters</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. Why is it critical to call model.eval() before running inference in PyTorch?</legend><label class="option"><input type="radio" name="q4" value="0"> It speeds up computation</label><label class="option"><input type="radio" name="q4" value="1"> It enables gradient computation</label><label class="option"><input type="radio" name="q4" value="2"> It disables dropout and switches BatchNorm to use running statistics instead of batch statistics, giving deterministic outputs</label><label class="option"><input type="radio" name="q4" value="3"> It frees GPU memory</label><p data-feedback="4"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/03-deep-learning-core/06-optimizers/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/03-deep-learning-core/08-weight-initialization/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/03-deep-learning-core/07-regularization/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

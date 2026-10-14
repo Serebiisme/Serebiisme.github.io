@@ -1,0 +1,585 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>混合型内存:向量+图表+KV · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-14-agent-engineering" data-lesson="14-agent-engineering/09-hybrid-memory-mem0" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/14-agent-engineering/">Agent 工程</a> / LESSON 09</p><h1 class="lesson-title">混合型内存:向量+图表+KV</h1><p>Hybrid Memory: Vector + Graph + KV</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>混合型内存:向量+图表+KV</h1>
+<blockquote>
+<p>混合存储器在并行中运行三个存储器 向量用于语义相似性,KV用于快速的事实搜索,图为实体关系推理,并具有在检索时合并它们的分数层.这是外部存储器的广泛使用的生产模式;Mem0 (Chhikara等,2025) 是一个参考实现.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python (stdlib)
+<strong>Prerequisites:</strong> Phase 14 · 07 (MemGPT), Phase 14 · 08 (Letta Blocks)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>解释为什么单个存储器 (仅为向量,仅为图,仅为KV) 为代理记忆不够.</li>
+<li>给Mem0的三个平行商店一个名称,每个商店都为什么优化.</li>
+<li>描述Mem0的融合评分 相关性,重要性,近期性 以及为什么它是一个权重的数量,而不是一个层次.</li>
+<li>通过一个   应用一个玩具三层内存在 stdlib<code>add()</code>这写给三个和一个<code>search()</code>这会导致结.</li>
+</ul>
+<h2>问题</h2>
+<p>对于三个查询类别之一,一个商店是错误的:</p>
+<ul>
+<li><strong>Semantic similarity</strong>&quot;我们上周讨论了什么关于代理漂移?&quot; 矢量获胜;KV和图表失败.</li>
+<li><strong>Fact lookup</strong>&quot;用户的电话号码是什么?&quot;KV获胜;向量是浪费的,图表是过度的.</li>
+<li><strong>Relationship reasoning</strong> &quot;哪些客户共享相同的发票实体?&quot;图表获胜;向量和KV无法回答.</li>
+</ul>
+<p>制作代理人在一次会议中发布了所有三个. 一个单店内存总是对两个错误的. Mem0的贡献是将所有三个连接到一个单个内存.<code>add</code>现在,我们要去.<code>search</code>表面具有分数函数,将它们合并.</p>
+<h2>概念</h2>
+<h3>连续三家商店</h3>
+<p>关于&quot;联合国&quot;的决议<code>add(text, user_id, metadata)</code>其他:</p>
+<ol>
+<li>从文本中提取候选事实 (基于LLM的步骤).</li>
+<li>写每一个事实到向量存储 (嵌入) 中进行语义搜索.</li>
+<li>写出每个事实到按键 (user_id, fact_type, entity) 键入的 KV存储中,用于O(1) 搜索.</li>
+<li>写每一个事实到图库 (Mem0g) 作为键入边缘关系查询.</li>
+</ol>
+<p>现在<code>search(query, user_id)</code>其他:</p>
+<ol>
+<li>通过嵌入 cosine,向量商店返回 top-k.</li>
+<li>查询来源 (user_id,类型,实体) 上键入的直接击中返回.</li>
+<li>图库返回从查询实体可访问的子图.</li>
+<li>结合了三种.</li>
+</ol>
+<h3>聚合分数</h3>
+<pre><code>score = w_relevance * relevance(q, record)
+      + w_importance * importance(record)
+      + w_recency * recency(record)
+</code></pre>
+<ul>
+<li><strong>Relevance</strong>向量共数,KV的确切匹配,图路径重量.</li>
+<li><strong>Importance</strong>标记在写作时间或学习 (一些事实更重要:名称,身份证,政策).</li>
+<li><strong>Recency</strong>自上一次写或阅读以来,随时间的推移而呈指数级衰退.</li>
+</ul>
+<p>按产品调整的重量.<code>w_recency</code>对于聊天代理人;更高<code>w_importance</code>对于合规代理人;<code>w_relevance</code>为了检索人员.</p>
+<h3>记忆和时间推理</h3>
+<p>Mem0g添加了冲突探测器.当一个新的事实与现有边缘相矛盾时,现有边缘被标记为无效但不会被删除.时间查询 (&quot;3月用户的城市是什么?&quot;) 穿越了有效时代子图.</p>
+<p>这就是Letta的无效模式一般化的合规性行为.</p>
+<h3>基准号码</h3>
+<p>报告 (2025):</p>
+<ul>
+<li><strong>LoCoMo</strong>(长时间对话记忆): 91.6</li>
+<li><strong>LongMemEval</strong>长视野事件记忆:93.4</li>
+<li><strong>BEAM 1M</strong>(M-代币内存基准值): 64.1</li>
+</ul>
+<p>比较基线 (全文 128k LLM,平面向量存储,平面KV) 都损失了10+分.仅仅的基准不证明选择的操作形状是,但数字显示融合设计不是圆形错误.</p>
+<h3>范围分类</h3>
+<p>Mem0 分开记忆范围:</p>
+<ul>
+<li><strong>User memory</strong>持续在整个会议中,按键开.<code>user_id</code>现在,我们要去.</li>
+<li><strong>Session memory</strong>在一个线程内持续.</li>
+<li><strong>Agent memory</strong>每代理实例状态.</li>
+</ul>
+<p>每个写作都会选择一个范围. 检索可以通过每个范围的权重进行查询. 混合范围是如何得到&quot;助理告诉爱丽丝关于勃的项目&quot;事件.</p>
+<h3>在这个模式出现错误的地方</h3>
+<ul>
+<li>**Embedding drift.**随着体积的增长,向量结果在第一百个查询中会降低.</li>
+<li><strong>KV schema creep.</strong> <code>(user_id, type, entity)</code>看起来很简单,直到每个团队都加入了自己的团队.<code>type</code>季度检查类型.</li>
+<li>**Graph explosion.**一个噪音的提取器每条消息增加了50个边缘.<code>add</code>让人们放弃低信心的边缘.</li>
+</ul>
+<figure><img src="/learn/ai-from-scratch/figures/figure-13e0b8affa3c58e47c7c.png" alt="ae-memory-fusion 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<p><code>code/main.py</code>在 stdlib 中实现了三层格式:</p>
+<ul>
+<li><code>VectorStore</code>作为嵌入式替代品的无明的代币重叠相似性.</li>
+<li><code>KVStore</code> 按键键键<code>(user_id, fact_type, entity)</code>现在,我们要去.</li>
+<li><code>GraphStore</code>打字边缘 (主体,关系,对象,有效).</li>
+<li><code>Mem0</code>顶层面面<code>add()</code>现在<code>search()</code>合分数,以及意识到范围的检索.</li>
+<li>通过多个用户进行的对话,</li>
+</ul>
+<p>运行它:</p>
+<pre><code>python3 code/main.py
+</code></pre>
+<p>输出显示了三个独立的召回路径加上合并的顶-k.<code>main()</code>看到排名变化.</p>
+<h2>用它</h2>
+<ul>
+<li><strong>Mem0 (Apache 2.0)</strong> 准备生产.自主主持人使用Postgres + Qdrant + Neo4j,或使用管理云.</li>
+<li><strong>Letta</strong>三层核心/回忆/档案;带你自己的向量和图形后端.</li>
+<li><strong>Zep</strong>商业替代品,即时间KG和事实提取.</li>
+<li><strong>Custom builds</strong>需要对取器 (合规性) 或合权重 (声源主导的声源) 的确控制.</li>
+</ul>
+<h2>运送它</h2>
+<p><code>outputs/skill-hybrid-memory.md</code>产生一个三层内存架子, 配有合分数, 范围分类和时间无效的电缆.</p>
+<h2>运动</h2>
+<ol>
+<li>取代玩具向量相似性用一个真正的嵌入模型 (句子变换器,Ollama,OpenAI嵌入).在合成长对话中测量回忆@10.排名漂移超过1000写?</li>
+<li>添加时间查询:<code>search(query, as_of=timestamp)</code>返回只有在那个时间或之前有效的记录.哪家商店需要最多的工作?</li>
+<li>实现冲突检测器:如果一个传入的事实与图表边缘相矛盾,请无效取消旧边缘并记录两者.</li>
+<li>移植合分数器,包括一个<code>user_feedback</code>如何防止游戏 (代理只返回已喜欢的记录)?</li>
+<li>阅读 Mem0文件 (<code>docs.mem0.ai</code>把玩具带到<code>mem0</code>根据相同的20个测试查询,</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Hybrid memory</td>
+<td>&quot;Vector plus graph plus KV&quot;</td>
+<td>Three stores written in parallel, fused on retrieval</td>
+</tr>
+<tr>
+<td>Fact extraction</td>
+<td>&quot;Memory ingestion&quot;</td>
+<td>LLM step that breaks text into (entity, relation, fact) tuples</td>
+</tr>
+<tr>
+<td>Fusion scoring</td>
+<td>&quot;Relevance ranking&quot;</td>
+<td>Weighted sum of relevance, importance, recency</td>
+</tr>
+<tr>
+<td>Scope</td>
+<td>&quot;Memory namespace&quot;</td>
+<td>user / session / agent — determines who sees what</td>
+</tr>
+<tr>
+<td>Mem0g</td>
+<td>&quot;Memory graph&quot;</td>
+<td>Typed edges with temporal validity for relationship queries</td>
+</tr>
+<tr>
+<td>Temporal invalidation</td>
+<td>&quot;Soft delete&quot;</td>
+<td>Mark contradicted edges invalid; never delete</td>
+</tr>
+<tr>
+<td>Embedding drift</td>
+<td>&quot;Retrieval rot&quot;</td>
+<td>Vector quality degrades as corpus grows; re-embed periodically</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2504.19413" rel="noreferrer" data-network="true">Chhikara et al., Mem0 (arXiv:2504.19413) <small>↗ 需要联网</small></a>原始纸</li>
+<li><a href="https://docs.mem0.ai/platform/overview" rel="noreferrer" data-network="true">Mem0 docs <small>↗ 需要联网</small></a>生产API,SDK,管理云</li>
+<li><a href="https://arxiv.org/abs/2310.08560" rel="noreferrer" data-network="true">Packer et al., MemGPT (arXiv:2310.08560) <small>↗ 需要联网</small></a>虚拟文本前身</li>
+<li><a href="https://www.letta.com/blog/memory-blocks" rel="noreferrer" data-network="true">Letta, Memory Blocks blog <small>↗ 需要联网</small></a>三层式的兄弟设计</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Hybrid Memory: Vector + Graph + KV</h1>
+<blockquote>
+<p>Hybrid memory runs three stores in parallel — vector for semantic similarity, KV for fast fact lookup, graph for entity-relationship reasoning — with a scoring layer that fuses them on retrieval. This is a widely used production pattern for external memory; Mem0 (Chhikara et al., 2025) is one reference implementation.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python (stdlib)
+<strong>Prerequisites:</strong> Phase 14 · 07 (MemGPT), Phase 14 · 08 (Letta Blocks)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Explain why a single store (vector only, graph only, KV only) is insufficient for agent memory.</li>
+<li>Name Mem0's three parallel stores and what each one optimizes for.</li>
+<li>Describe Mem0's fusion scoring — relevance, importance, recency — and why it is a weighted sum, not a hierarchy.</li>
+<li>Implement a toy three-store memory in stdlib with an <code>add()</code> that writes to all three and a <code>search()</code> that fuses results.</li>
+</ul>
+<h2>The Problem</h2>
+<p>One store is wrong for one of three query classes:</p>
+<ul>
+<li><strong>Semantic similarity</strong> — &quot;what did we discuss about agent drift last week?&quot; Vector wins; KV and graph miss.</li>
+<li><strong>Fact lookup</strong> — &quot;what is the user's phone number?&quot; KV wins; vector is wasteful, graph is overkill.</li>
+<li><strong>Relationship reasoning</strong> — &quot;which customers share the same billing entity?&quot; Graph wins; vector and KV cannot answer.</li>
+</ul>
+<p>Production agents issue all three in one session. A single-store memory is always wrong for two of them. Mem0's contribution is wiring all three behind a single <code>add</code>/<code>search</code> surface with a scoring function that fuses them.</p>
+<h2>The Concept</h2>
+<h3>Three stores in parallel</h3>
+<p>Mem0 (arXiv:2504.19413, April 2025) on <code>add(text, user_id, metadata)</code>:</p>
+<ol>
+<li>Extract candidate facts from the text (an LLM-driven step).</li>
+<li>Write each fact to the vector store (embedding) for semantic search.</li>
+<li>Write each fact to the KV store keyed on (user_id, fact_type, entity) for O(1) lookup.</li>
+<li>Write each fact to the graph store (Mem0g) as typed edges for relationship queries.</li>
+</ol>
+<p>On <code>search(query, user_id)</code>:</p>
+<ol>
+<li>Vector store returns top-k by embedding cosine.</li>
+<li>KV store returns direct hits keyed on query-derived (user_id, type, entity).</li>
+<li>Graph store returns subgraph reachable from query entities.</li>
+<li>A scoring layer fuses the three.</li>
+</ol>
+<h3>Fusion scoring</h3>
+<pre><code>score = w_relevance * relevance(q, record)
+      + w_importance * importance(record)
+      + w_recency * recency(record)
+</code></pre>
+<ul>
+<li><strong>Relevance</strong> — vector cosine, KV exact match, graph path weight.</li>
+<li><strong>Importance</strong> — tagged at write time or learned (some facts matter more: names, IDs, policies).</li>
+<li><strong>Recency</strong> — exponential decay over time since last write or read.</li>
+</ul>
+<p>Weights are tuned per product. Higher <code>w_recency</code> for chat agents; higher <code>w_importance</code> for compliance agents; higher <code>w_relevance</code> for retrieval agents.</p>
+<h3>Mem0g and temporal reasoning</h3>
+<p>Mem0g adds a conflict detector. When a new fact contradicts an existing edge, the existing edge is marked invalid but not deleted. Temporal queries (&quot;what was the user's city in March?&quot;) traverse the valid-at-time subgraph.</p>
+<p>This is the compliance-grade behavior Letta's invalidation pattern generalizes.</p>
+<h3>Benchmark numbers</h3>
+<p>The Mem0 paper reports (2025):</p>
+<ul>
+<li><strong>LoCoMo</strong> (long-form conversation memory): 91.6</li>
+<li><strong>LongMemEval</strong> (long-horizon episodic memory): 93.4</li>
+<li><strong>BEAM 1M</strong> (1M-token memory benchmark): 64.1</li>
+</ul>
+<p>Comparison baselines (full-context 128k LLM, flat vector store, flat KV) all lose by 10+ points. Benchmarks alone don't justify choice — operational shape does — but the numbers show the fusion design is not a rounding error.</p>
+<h3>Scope taxonomy</h3>
+<p>Mem0 splits memory by scope:</p>
+<ul>
+<li><strong>User memory</strong> — persists across sessions, keyed on <code>user_id</code>.</li>
+<li><strong>Session memory</strong> — persists within one thread.</li>
+<li><strong>Agent memory</strong> — per-agent instance state.</li>
+</ul>
+<p>Every write picks one scope. Retrieval can query across scopes with per-scope weights. Mixing scopes without thought is how you get &quot;the assistant told Alice about Bob's project&quot; incidents.</p>
+<h3>Where this pattern goes wrong</h3>
+<ul>
+<li><strong>Embedding drift.</strong> Vector results that look right on the first hundred queries degrade as the corpus grows. Add periodic re-embedding of the top-N-used records.</li>
+<li><strong>KV schema creep.</strong> <code>(user_id, type, entity)</code> looks simple until every team adds their own <code>type</code>. Audit the type set quarterly.</li>
+<li><strong>Graph explosion.</strong> One noisy extractor adds 50 edges per message. Cap graph writes per <code>add</code> call; drop low-confidence edges.</li>
+</ul>
+<figure><img src="/learn/ai-from-scratch/figures/figure-13e0b8affa3c58e47c7c.png" alt="ae-memory-fusion 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<p><code>code/main.py</code> implements the three-store pattern in stdlib:</p>
+<ul>
+<li><code>VectorStore</code> — naive token-overlap similarity as an embedding stand-in.</li>
+<li><code>KVStore</code> — dict keyed on <code>(user_id, fact_type, entity)</code>.</li>
+<li><code>GraphStore</code> — typed edges (subject, relation, object, valid).</li>
+<li><code>Mem0</code> — top-level facade with <code>add()</code>, <code>search()</code>, fusion scoring, and scope-aware retrieval.</li>
+<li>A worked trace on a multi-user, multi-session conversation.</li>
+</ul>
+<p>Run it:</p>
+<pre><code>python3 code/main.py
+</code></pre>
+<p>The output shows three separate recall paths plus the fused top-k. Flip the scoring weights at the top of <code>main()</code> and watch the ranking change.</p>
+<h2>Use It</h2>
+<ul>
+<li><strong>Mem0 (Apache 2.0)</strong> — production-ready. Self-host with Postgres + Qdrant + Neo4j, or use the managed cloud.</li>
+<li><strong>Letta</strong> — three-tier core/recall/archival; bring your own vector and graph backends.</li>
+<li><strong>Zep</strong> — commercial alternative with temporal KG and fact extraction.</li>
+<li><strong>Custom builds</strong> — when you need exact control over the extractor (compliance) or fusion weights (voice agents where recency dominates).</li>
+</ul>
+<h2>Ship It</h2>
+<p><code>outputs/skill-hybrid-memory.md</code> generates a three-store memory scaffold with a fusion scorer, scope taxonomy, and temporal invalidation wired in.</p>
+<h2>Exercises</h2>
+<ol>
+<li>Replace the toy vector similarity with a real embedding model (sentence-transformers, Ollama, OpenAI embeddings). Measure recall@10 on a synthetic long conversation. Does the ranking drift over 1000 writes?</li>
+<li>Add a temporal query: <code>search(query, as_of=timestamp)</code>. Return only records valid at or before that time. Which store needs the most work?</li>
+<li>Implement a conflict detector: if an incoming fact contradicts a graph edge, invalidate the old edge and log both. Test on &quot;user lives in Berlin&quot; -&gt; &quot;user lives in Lisbon.&quot;</li>
+<li>Port the fusion scorer to include a <code>user_feedback</code> dimension (thumbs-up on retrieved records). How do you prevent gaming (the agent only returns records it already liked)?</li>
+<li>Read the Mem0 docs (<code>docs.mem0.ai</code>). Port the toy to <code>mem0</code> client calls. Compare retrieval quality on the same 20 test queries.</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Hybrid memory</td>
+<td>&quot;Vector plus graph plus KV&quot;</td>
+<td>Three stores written in parallel, fused on retrieval</td>
+</tr>
+<tr>
+<td>Fact extraction</td>
+<td>&quot;Memory ingestion&quot;</td>
+<td>LLM step that breaks text into (entity, relation, fact) tuples</td>
+</tr>
+<tr>
+<td>Fusion scoring</td>
+<td>&quot;Relevance ranking&quot;</td>
+<td>Weighted sum of relevance, importance, recency</td>
+</tr>
+<tr>
+<td>Scope</td>
+<td>&quot;Memory namespace&quot;</td>
+<td>user / session / agent — determines who sees what</td>
+</tr>
+<tr>
+<td>Mem0g</td>
+<td>&quot;Memory graph&quot;</td>
+<td>Typed edges with temporal validity for relationship queries</td>
+</tr>
+<tr>
+<td>Temporal invalidation</td>
+<td>&quot;Soft delete&quot;</td>
+<td>Mark contradicted edges invalid; never delete</td>
+</tr>
+<tr>
+<td>Embedding drift</td>
+<td>&quot;Retrieval rot&quot;</td>
+<td>Vector quality degrades as corpus grows; re-embed periodically</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2504.19413" rel="noreferrer" data-network="true">Chhikara et al., Mem0 (arXiv:2504.19413) <small>↗ 需要联网</small></a> — the original paper</li>
+<li><a href="https://docs.mem0.ai/platform/overview" rel="noreferrer" data-network="true">Mem0 docs <small>↗ 需要联网</small></a> — production API, SDKs, managed cloud</li>
+<li><a href="https://arxiv.org/abs/2310.08560" rel="noreferrer" data-network="true">Packer et al., MemGPT (arXiv:2310.08560) <small>↗ 需要联网</small></a> — the virtual-context predecessor</li>
+<li><a href="https://www.letta.com/blog/memory-blocks" rel="noreferrer" data-network="true">Letta, Memory Blocks blog <small>↗ 需要联网</small></a> — the three-tier sibling design</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-14-agent-engineering--09-hybrid-memory-mem0.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-14-agent-engineering--09-hybrid-memory-mem0.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/14-agent-engineering/09-hybrid-memory-mem0/code/main.py">phases/14-agent-engineering/09-hybrid-memory-mem0/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Mem0-shaped hybrid memory: vector + KV + graph with fusion scoring.
+
+Stdlib only. Vector store uses token-overlap as an embedding stand-in.
+Scope taxonomy: user / session / agent. Fusion: relevance + importance + recency.
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass, field
+from typing import Any
+
+
+@dataclass
+class Record:
+    rid: str
+    text: str
+    scope: str
+    user_id: str
+    session_id: str
+    importance: float = 0.5
+    ts: float = field(default_factory=time.time)
+    tags: tuple[str, ...] = ()
+
+
+class VectorStore:
+    def __init__(self) -&gt; None:
+        self._records: dict[str, Record] = {}
+
+    def add(self, record: Record) -&gt; None:
+        self._records[record.rid] = record
+
+    def search(self, query: str, top_k: int = 5) -&gt; list[tuple[float, Record]]:
+        q_tokens = set(query.lower().split())
+        scored: list[tuple[float, Record]] = []
+        for record in self._records.values():
+            r_tokens = set(record.text.lower().split())
+            if not r_tokens:
+                continue
+            overlap = len(q_tokens &amp; r_tokens)
+            if overlap == 0:
+                continue
+            score = overlap / (len(q_tokens | r_tokens))
+            scored.append((score, record))
+        scored.sort(key=lambda x: -x[0])
+        return scored[:top_k]
+
+
+@dataclass(frozen=True)
+class KVKey:
+    user_id: str
+    fact_type: str
+    entity: str
+
+
+class KVStore:
+    def __init__(self) -&gt; None:
+        self._map: dict[KVKey, Record] = {}
+
+    def put(self, key: KVKey, record: Record) -&gt; None:
+        self._map[key] = record
+
+    def get(self, key: KVKey) -&gt; Record | None:
+        return self._map.get(key)
+
+    def by_user(self, user_id: str) -&gt; list[Record]:
+        return [r for k, r in self._map.items() if k.user_id == user_id]
+
+
+@dataclass
+class Edge:
+    subject: str
+    relation: str
+    obj: str
+    valid: bool = True
+    ts: float = field(default_factory=time.time)
+
+
+class GraphStore:
+    def __init__(self) -&gt; None:
+        self._edges: list[Edge] = []
+
+    def add_edge(self, subject: str, relation: str, obj: str) -&gt; None:
+        for edge in self._edges:
+            if edge.valid and edge.subject == subject and edge.relation == relation:
+                edge.valid = False
+        self._edges.append(Edge(subject=subject, relation=relation, obj=obj))
+
+    def neighbors(self, subject: str, valid_only: bool = True) -&gt; list[Edge]:
+        return [e for e in self._edges
+                if e.subject == subject and (e.valid or not valid_only)]
+
+    def all_edges(self) -&gt; list[Edge]:
+        return list(self._edges)
+
+
+@dataclass
+class Mem0Config:
+    w_relevance: float = 0.6
+    w_importance: float = 0.2
+    w_recency: float = 0.2
+    recency_halflife_s: float = 86400.0
+
+
+class Mem0:
+    def __init__(self, config: Mem0Config | None = None) -&gt; None:
+        self.vector = VectorStore()
+        self.kv = KVStore()
+        self.graph = GraphStore()
+        self.config = config or Mem0Config()
+        self._counter = 0
+
+    def add(self, text: str, *, user_id: str, session_id: str = &quot;s0&quot;,
+            scope: str = &quot;user&quot;, importance: float = 0.5,
+            tags: tuple[str, ...] = (),
+            kv_triples: tuple[tuple[str, str], ...] = (),
+            graph_triples: tuple[tuple[str, str, str], ...] = ()) -&gt; str:
+        self._counter += 1
+        rid = f&quot;m{self._counter:03d}&quot;
+        record = Record(rid=rid, text=text, scope=scope, user_id=user_id,
+                        session_id=session_id, importance=importance, tags=tags)
+        self.vector.add(record)
+        for fact_type, entity in kv_triples:
+            self.kv.put(KVKey(user_id=user_id, fact_type=fact_type, entity=entity), record)
+        for subject, relation, obj in graph_triples:
+            self.graph.add_edge(subject, relation, obj)
+        return rid
+
+    def _recency_score(self, record: Record, now: float) -&gt; float:
+        elapsed = max(0.0, now - record.ts)
+        half = self.config.recency_halflife_s
+        return 0.5 ** (elapsed / half) if half &gt; 0 else 1.0
+
+    def search(self, query: str, *, user_id: str,
+               scope: str | None = None, top_k: int = 5) -&gt; list[tuple[float, Record]]:
+        now = time.time()
+        vector_hits = self.vector.search(query, top_k=top_k * 3)
+        fused: dict[str, tuple[float, Record]] = {}
+        for rel, record in vector_hits:
+            if scope is not None and record.scope != scope:
+                continue
+            if record.user_id != user_id and record.scope == &quot;user&quot;:
+                continue
+            recency = self._recency_score(record, now)
+            score = (self.config.w_relevance * rel
+                     + self.config.w_importance * record.importance
+                     + self.config.w_recency * recency)
+            fused[record.rid] = (score, record)
+        for record in self.kv.by_user(user_id):
+            if record.rid in fused:
+                continue
+            recency = self._recency_score(record, now)
+            score = (self.config.w_relevance * 0.4
+                     + self.config.w_importance * record.importance
+                     + self.config.w_recency * recency)
+            fused[record.rid] = (score, record)
+        ordered = sorted(fused.values(), key=lambda x: -x[0])
+        return ordered[:top_k]
+
+
+def main() -&gt; None:
+    print(&quot;=&quot; * 70)
+    print(&quot;MEM0 HYBRID MEMORY — Phase 14, Lesson 09&quot;)
+    print(&quot;=&quot; * 70)
+
+    mem = Mem0()
+
+    mem.add(
+        &quot;ava prefers citation-heavy, terse writing over tutorial style&quot;,
+        user_id=&quot;ava&quot;, session_id=&quot;s001&quot;,
+        importance=0.7, tags=(&quot;preference&quot;, &quot;writing&quot;),
+        kv_triples=((&quot;writing_style&quot;, &quot;terse_citation_heavy&quot;),),
+    )
+    mem.add(
+        &quot;ava is building a 30-lesson curriculum on agent engineering&quot;,
+        user_id=&quot;ava&quot;, session_id=&quot;s001&quot;,
+        importance=0.9, tags=(&quot;project&quot;,),
+        kv_triples=((&quot;project&quot;, &quot;agent_curriculum&quot;),),
+        graph_triples=((&quot;ava&quot;, &quot;owns_project&quot;, &quot;agent_curriculum&quot;),),
+    )
+    mem.add(
+        &quot;ava lives in Berlin&quot;,
+        user_id=&quot;ava&quot;, session_id=&quot;s001&quot;,
+        importance=0.6, tags=(&quot;profile&quot;,),
+        kv_triples=((&quot;city&quot;, &quot;Berlin&quot;),),
+        graph_triples=((&quot;ava&quot;, &quot;lives_in&quot;, &quot;Berlin&quot;),),
+    )
+    mem.add(
+        &quot;ava moved to Lisbon last month&quot;,
+        user_id=&quot;ava&quot;, session_id=&quot;s002&quot;,
+        importance=0.8, tags=(&quot;profile&quot;, &quot;update&quot;),
+        kv_triples=((&quot;city&quot;, &quot;Lisbon&quot;),),
+        graph_triples=((&quot;ava&quot;, &quot;lives_in&quot;, &quot;Lisbon&quot;),),
+    )
+    mem.add(
+        &quot;bob requested a refund for invoice 4711&quot;,
+        user_id=&quot;bob&quot;, session_id=&quot;s010&quot;,
+        importance=0.9, tags=(&quot;billing&quot;,),
+        kv_triples=((&quot;refund_request&quot;, &quot;4711&quot;),),
+    )
+
+    print(&quot;\nvector-only recall for &#39;writing style preferences&#39;&quot;)
+    for score, record in mem.vector.search(&quot;writing style preferences&quot;, top_k=3):
+        print(f&quot;  {score:.3f}  {record.rid}  {record.text}&quot;)
+
+    print(&quot;\ngraph recall for entities linked to &#39;ava&#39;&quot;)
+    for edge in mem.graph.neighbors(&quot;ava&quot;, valid_only=False):
+        status = &quot;VALID  &quot; if edge.valid else &quot;INVALID&quot;
+        print(f&quot;  [{status}] {edge.subject} --{edge.relation}--&gt; {edge.obj}&quot;)
+
+    print(&quot;\nKV recall for ava all facts&quot;)
+    for record in mem.kv.by_user(&quot;ava&quot;):
+        print(f&quot;  {record.rid}  {record.text}&quot;)
+
+    print(&quot;\nfused top-3 for ava, query &#39;where does ava live&#39;&quot;)
+    for score, record in mem.search(&quot;where does ava live&quot;, user_id=&quot;ava&quot;, top_k=3):
+        print(f&quot;  {score:.3f}  {record.rid}  {record.text}&quot;)
+
+    print(&quot;\nfused top-3 for ava, query &#39;what is she building&#39;&quot;)
+    for score, record in mem.search(&quot;what is ava building&quot;, user_id=&quot;ava&quot;, top_k=3):
+        print(f&quot;  {score:.3f}  {record.rid}  {record.text}&quot;)
+
+    print(&quot;\nscope isolation: bob&#39;s refund does not leak to ava&#39;s search&quot;)
+    hits = mem.search(&quot;refund invoice&quot;, user_id=&quot;ava&quot;, top_k=5)
+    print(f&quot;  ava results: {len(hits)}  (expect 0 user-scoped hits from bob)&quot;)
+    for score, record in hits:
+        print(f&quot;    {score:.3f}  {record.user_id}  {record.text}&quot;)
+
+    print()
+    print(&quot;fusion: relevance + importance + recency. per-product weight tuning.&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/14-agent-engineering/09-hybrid-memory-mem0/outputs/skill-hybrid-memory.md">phases/14-agent-engineering/09-hybrid-memory-mem0/outputs/skill-hybrid-memory.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: hybrid-memory
+description: Generate a Mem0-shaped three-store memory system (vector + KV + graph) with a fusion scorer, scope taxonomy, and temporal invalidation.
+version: 1.0.0
+phase: 14
+lesson: 09
+tags: [memory, mem0, vector, graph, kv, fusion, scope]
+---
+
+Given a target runtime, a vector backend (Qdrant, pgvector, Chroma, sqlite-vec), a KV backend (Postgres, Redis, dict), and a graph backend (Neo4j, in-memory edges), produce a fused memory system.
+
+Produce:
+
+1. Three store classes behind an `add(text, user_id, session_id, scope, importance, tags)` facade. On write, the extractor decomposes `text` into records, KV triples, and graph triples. No store is optional.
+2. A fusion scorer `score = w_rel * relevance + w_imp * importance + w_rec * recency`. Expose all three weights as config. Tune per product, not per call.
+3. Scope taxonomy: `user`, `session`, `agent`. Retrieval MUST respect scope. A user query must never leak another user&#39;s records.
+4. Temporal invalidation. Contradictions mark old edges/records invalid; never delete. Expose `search(query, as_of=timestamp)` for historical queries.
+5. An extractor interface. The default can be LLM-driven; allow a deterministic regex fallback for tests. Cap graph edges per `add()` to prevent explosion.
+
+Hard rejects:
+
+- Single-store memory described as &quot;Mem0-shaped.&quot; Vector-only, KV-only, graph-only products are fine but are not hybrid memory. Do not misname them.
+- Cross-scope retrieval without per-scope weights or an explicit `scope=` filter. Scope leak is a compliance and privacy incident.
+- Deleting on contradiction. Invalidate and time-stamp. Deletion hides bugs and breaks audits.
+
+Refusal rules:
+
+- If the user asks for &quot;no importance weighting,&quot; refuse. Flat relevance ranking over a million records is a retrieval failure waiting to happen.
+- If the graph backend has no conflict detector, refuse to call the resulting system &quot;Mem0-shaped.&quot; Downgrade the name.
+- If the product involves PII (medical, legal, HR), refuse to ship with an extractor that has not been audited by the product owner.
+
+Output: one file per store plus `memory.py` (facade), `config.py` (weights), `README.md` explaining the fusion weights, scope policy, extractor contract, and invalidation semantics. End with &quot;what to read next&quot; pointing to Lesson 10 if the agent needs to learn new skills, Lesson 23 if OTel spans are required on memory ops, or Lesson 27 for untrusted-input handling on retrieval.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. Which query class does a KV store handle best?</legend><label class="option"><input type="radio" name="q0" value="0"> Reachability across customers sharing a billing entity</label><label class="option"><input type="radio" name="q0" value="1"> Direct fact lookup keyed by (user, type, entity)</label><label class="option"><input type="radio" name="q0" value="2"> Temporal queries valid-at-time</label><label class="option"><input type="radio" name="q0" value="3"> Semantic similarity over long conversations</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. What are the three stores Mem0 writes in parallel on each add()?</legend><label class="option"><input type="radio" name="q1" value="0"> Postgres, Redis, ClickHouse</label><label class="option"><input type="radio" name="q1" value="1"> Cache, queue, log</label><label class="option"><input type="radio" name="q1" value="2"> Embedding, attention, FFN</label><label class="option"><input type="radio" name="q1" value="3"> Vector, KV, graph</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. What three dimensions feed Mem0&#39;s fusion score?</legend><label class="option"><input type="radio" name="q2" value="0"> Confidence, perplexity, BLEU</label><label class="option"><input type="radio" name="q2" value="1"> Precision, recall, F1</label><label class="option"><input type="radio" name="q2" value="2"> Relevance, importance, recency</label><label class="option"><input type="radio" name="q2" value="3"> Latency, throughput, cost</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. What does Mem0g do when an incoming fact contradicts an existing edge?</legend><label class="option"><input type="radio" name="q3" value="0"> Raises an exception</label><label class="option"><input type="radio" name="q3" value="1"> Rewrites the user_id</label><label class="option"><input type="radio" name="q3" value="2"> Marks the existing edge invalid but does not delete it, so temporal queries can still traverse</label><label class="option"><input type="radio" name="q3" value="3"> Deletes the edge</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. Why does the lesson recommend tuning fusion weights per product?</legend><label class="option"><input type="radio" name="q4" value="0"> It is required by Apache 2.0</label><label class="option"><input type="radio" name="q4" value="1"> Vector libraries reject equal weights</label><label class="option"><input type="radio" name="q4" value="2"> Recency dominates for chat agents while importance dominates for compliance agents and relevance dominates for retrieval agents</label><label class="option"><input type="radio" name="q4" value="3"> Providers require it</label><p data-feedback="4"></p></fieldset><fieldset><legend>6. What is the scope taxonomy Mem0 uses?</legend><label class="option"><input type="radio" name="q5" value="0"> User, session, agent</label><label class="option"><input type="radio" name="q5" value="1"> Local, regional, global</label><label class="option"><input type="radio" name="q5" value="2"> Public, private, secret</label><label class="option"><input type="radio" name="q5" value="3"> Read, write, admin</label><p data-feedback="5"></p></fieldset><fieldset><legend>7. What is embedding drift in this pattern, and how does the lesson recommend mitigating it?</legend><label class="option"><input type="radio" name="q6" value="0"> Vectors get encrypted; rotate keys</label><label class="option"><input type="radio" name="q6" value="1"> The embedding API changes URL; pin a domain</label><label class="option"><input type="radio" name="q6" value="2"> Embeddings overflow integers; switch to float64</label><label class="option"><input type="radio" name="q6" value="3"> Vector retrieval quality degrades as the corpus grows; periodically re-embed the top-N most used records</label><p data-feedback="6"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/14-agent-engineering/08-memory-blocks-sleep-time-compute/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/14-agent-engineering/10-skill-libraries-voyager/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/14-agent-engineering/09-hybrid-memory-mem0/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

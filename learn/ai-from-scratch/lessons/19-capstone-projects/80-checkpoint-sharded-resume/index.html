@@ -1,0 +1,579 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>核核复核和核核复核 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-19-capstone-projects" data-lesson="19-capstone-projects/80-checkpoint-sharded-resume" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/19-capstone-projects/">综合项目</a> / LESSON 80</p><h1 class="lesson-title">核核复核和核核复核</h1><p>Sharded Checkpoint and Atomic Resume</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>核核复核和核核复核</h1>
+<blockquote>
+<p>节点失败每隔几小时就会停止70B参数训练工作. 检查点的格式决定你是否会失去30分钟或30小时. 一个分碎的检查站,并列写每个级别的分碎,并记录所有权在公开表中. 恢复将每个级别的分片从其自己的文件中加载, 重建状态在相同的世界尺寸, 原子写法可以防止一个半完成的检查点毒害下一个简历.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 19 Track C lessons 42-49
+<strong>Time:</strong> ~90 min</p>
+<h2>学习目标</h2>
+<ul>
+<li>保存一个多级检查点作为一个每级分片文件加上一个记录哪个级别拥有什么的表格.</li>
+<li>使用原子写模式 (写到临时路径,然后更名),这样一个崩盘中写永远不会产生半完成的检查点.</li>
+<li>从表格中恢复,验证对 fp16参数和Zero优化器状态的字节等级状态.</li>
+<li>保护表达式方案免受三种失败模式:世界规模变化,碎片数量不匹配和部分写.</li>
+</ul>
+<h2>问题</h2>
+<p>尼拉检查站将所有参数和优化状态读取到0级,收集,并编写一个文件. 对于70B模型来说,一个级别的网络端口是1.1TB的状态. 写作者阻碍了其他等级,因为他们忙等待聚会.  IO 带宽是单个GPU的网络链接最慢,而不是总数. 在实体集群中,收集然后写的步骤可能比上一次培训时间更长,这意味着工作人员每天都会出差不多一个检查点.</p>
+<p>碎片化检查站翻转了模式:每个级别都在平行地写出自己的碎片. 任何一块的记录可以让每块回归原来的位置. 总体写带宽尺度与集群. 一个1TB检查点需要4个小时通过一个排名,需要4分钟通过64个排名. 另外,手表给你一份不兼容的简历合同: 随着世界规模的变化, 部分写字可以检测到,</p>
+<h2>概念</h2>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-21d826efe0667b178835.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>显现式方案</h3>
+<pre><code class="language-json">{
+  &quot;world_size&quot;: 4,
+  &quot;step&quot;: 1234,
+  &quot;wall_clock_seconds&quot;: 4521,
+  &quot;shards&quot;: [
+    {&quot;rank&quot;: 0, &quot;path&quot;: &quot;rank0.bin&quot;, &quot;sha256&quot;: &quot;...&quot;, &quot;param_shard_offset&quot;: 0, &quot;param_shard_numel&quot;: 65536},
+    {&quot;rank&quot;: 1, &quot;path&quot;: &quot;rank1.bin&quot;, &quot;sha256&quot;: &quot;...&quot;, &quot;param_shard_offset&quot;: 65536, &quot;param_shard_numel&quot;: 65536}
+  ],
+  &quot;schema_version&quot;: 1
+}
+</code></pre>
+<p>现在有三个场面承载.<code>world_size</code>让一个不同尺寸的简历大声失败而不是默默腐败.<code>sha256</code>部分或腐败的写作.<code>param_shard_offset</code>其他<code>param_shard_numel</code>按分片,让载体在正确位置重建平面参数子.</p>
+<h3>原子写</h3>
+<p>标准模式:写每一个碎片到<code>&lt;name&gt;.tmp</code>写下明文给<code>manifest.json.tmp</code>由于在一个文件系统中,一个文件的重命名是原子的.新文件完全存在或旧文件是.在最后的重命名之前的崩离开了前一个检查点,作为现实.没有原子写,一个崩可以留下一个部分碎片,一个现有表格指向它,负载破坏了恢复的优化状态.</p>
+<h3>系统必须防范三个故障模式</h3>
+<table>
+<thead>
+<tr>
+<th>Failure</th>
+<th>Symptom</th>
+<th>Defence</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>World-size change</td>
+<td>resume on N=8 with manifest from N=4</td>
+<td>world_size mismatch in manifest, fail loudly</td>
+</tr>
+<tr>
+<td>Shard count mismatch</td>
+<td>resume sees fewer rank*.bin files than shards in manifest</td>
+<td>enumerate shards, verify every one exists</td>
+</tr>
+<tr>
+<td>Partial write</td>
+<td>shard file truncated mid-flush</td>
+<td>sha256 verification on load</td>
+</tr>
+</tbody>
+</table>
+<p>每个辩护都早些时候拒绝了坏负担; 替代方案是沉默的腐败,</p>
+<h3>为什么每位档案,而不是一个大档案</h3>
+<p>通过一个文件同时写<code>O_APPEND</code>在POSIX上使用字节一致的写字,但实际上,一个片段内的偏移跨度是MB大小区域,锁定占主导地位.当底层文件系统平行时,每级文件没有争议,并且从条纹中获益 (Lustre,GPFS).生产堆 (DeepSpeed,FSDP,NeMo) 都使用每级文件.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-852dedc5e3907256aca9.png" alt="ci-sharded-checkpoint 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<p><code>code/main.py</code>执行:</p>
+<ul>
+<li><code>ShardManifest</code>上面的方案加上数据类<code>to_json</code>现在,我们要去.<code>from_json</code>现在,我们要去.</li>
+<li><code>save_sharded(state_dict_per_rank, dir, step)</code>通过原子的时间,然后重命名模式,然后写出表格.</li>
+<li><code>load_sharded(dir, expected_world_size)</code>检查每个碎片的 sha256 ,并返回每级状态指令.</li>
+<li>复程测试:构建每级状态,保存,加载,断定字节等等.</li>
+</ul>
+<p>运行它:</p>
+<pre><code class="language-bash">python3 code/main.py
+</code></pre>
+<p>输出: 4 个分片文件加上写出表格,然后用字节等等验证重新加载.</p>
+<h2>野生生产模式</h2>
+<p>只有三个模式使检查站变得硬得可以运输.</p>
+<p>**Async write.**生产堆发出检查点写在单独的线程或过程,因此训练继续. 屏障在下一个检查点:不要开始下一个保存直到之前的完成.<code>async_io</code>课程保持写作同步,让步骤是可见的.</p>
+<p>**Local fast disk first, then async upload.**写到本地NVMe (快速) 然后与S3或GCS进行同步上传. 两层格式模式使集群中检查点保持恢复速度,同时将持久的副本出于集群用于档案.表格载有本地路径;上传表格载有远程路径.</p>
+<p>**Rotation matters.**生产运行保持最后的K检查点 (通常是3-5),并旋转最旧的.没有旋转,磁盘填满了运行中期,下一个检查点失败了.随着旋转,下一个保存首先删除了最旧的,从而释放了预算.</p>
+<h2>用它</h2>
+<p>生产模式:</p>
+<ul>
+<li><strong>DeepSpeed checkpointing.</strong> <code>deepspeed.save_checkpoint(tag=step)</code>编写每级文件和一个<code>latest</code>文件指向活跃标签.</li>
+<li><strong>PyTorch FSDP checkpointing.</strong> <code>torch.distributed.checkpoint</code>保存碎片状态<code>Planner</code>根据每位排名的排名.</li>
+<li>**NeMo.**绕着深速和FSDP的制服<code>save_to_checkpoint</code>增加元数据的API.</li>
+</ul>
+<h2>运送它</h2>
+<p>课81节节省了DDP+ZeRO的端到端运行的一个分断检查点,并将其重新加载到相同的世界规模,以证明简历合同有效.</p>
+<h2>运动</h2>
+<ol>
+<li>添加异步写:启动一个线程中的保存,让训练继续. 阻止下一个保存直到之前的保存完成.</li>
+<li>添加一个<code>last_5_steps</code>转换:保持最新的5个检查点,在保存新的之前删除最旧的检查点.</li>
+<li>加入仅使用CRC的快速验证路径,用于内部循环重装 (旋转将检查点转换为新的活跃点,没有完整 sha256).</li>
+<li>通过阅读表格,连接和重新分割,从N=4到N=8的碎片重平衡.</li>
+<li>添加一个上传到一个假的S3 (第二个目录) 和写上传说明书. 捍卫两层存储政策.</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Sharded checkpoint</td>
+<td>&quot;Per-rank save&quot;</td>
+<td>Each rank writes its own shard file in parallel</td>
+</tr>
+<tr>
+<td>Manifest</td>
+<td>&quot;Index&quot;</td>
+<td>JSON file recording shard paths, offsets, and sha256</td>
+</tr>
+<tr>
+<td>Atomic write</td>
+<td>&quot;tmp then rename&quot;</td>
+<td>Write to .tmp then POSIX rename so a crash leaves the previous file live</td>
+</tr>
+<tr>
+<td>Partial write</td>
+<td>&quot;Truncated shard&quot;</td>
+<td>A crash during write produces a corrupt shard; sha256 catches it</td>
+</tr>
+<tr>
+<td>Rotation</td>
+<td>&quot;Keep last K&quot;</td>
+<td>Delete oldest checkpoint before writing new one to bound disk usage</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://deepspeed.readthedocs.io/en/latest/model-checkpointing.html" rel="noreferrer" data-network="true">DeepSpeed checkpointing <small>↗ 需要联网</small></a></li>
+<li><a href="https://pytorch.org/docs/stable/distributed.checkpoint.html" rel="noreferrer" data-network="true">PyTorch torch.distributed.checkpoint <small>↗ 需要联网</small></a></li>
+<li><a href="https://pubs.opengroup.org/onlinepubs/9699919799/functions/rename.html" rel="noreferrer" data-network="true">POSIX rename atomicity <small>↗ 需要联网</small></a></li>
+<li>阶段19课程78 - 泽罗状态这个检查站是以保存</li>
+<li>第19阶段 第81课 - - 终端到终端的演示,回复保存的状态</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Sharded Checkpoint and Atomic Resume</h1>
+<blockquote>
+<p>A 70B-parameter training job is paused by a node failure every few hours. The checkpoint format decides whether you lose 30 minutes or 30 hours. A sharded checkpoint writes every rank's shard in parallel and records ownership in a manifest. Resume loads each rank's shard from its own file, reconstructs the state on the same world size, and the optimiser steps as if nothing happened. Atomic write keeps a half-finished checkpoint from poisoning the next resume.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 19 Track C lessons 42-49
+<strong>Time:</strong> ~90 min</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Save a multi-rank checkpoint as a per-rank shard file plus a manifest that records which rank owns what.</li>
+<li>Use the atomic write pattern (write to a temp path then rename) so a crash mid-write never produces a half-finished checkpoint.</li>
+<li>Resume from the manifest, verifying byte-equal state for both fp16 parameters and the ZeRO optimiser state on every rank.</li>
+<li>Defend the manifest schema against the three failure modes: world-size change, shard count mismatch, and partial write.</li>
+</ul>
+<h2>The Problem</h2>
+<p>A vanilla checkpoint reads all parameters and optimiser state into rank 0, gathers, and writes a single file. For a 70B model that is 1.1 TB of state through one rank's network port. The write blocks every other rank because they idle waiting for the gather. The IO bandwidth is the slowest single GPU's network link, not the aggregate. On a real cluster the gather-then-write step can take longer than the previous training hour, which means the job ships less than one checkpoint per training day.</p>
+<p>Sharded checkpoints flip the pattern: every rank writes its own shard to its own file in parallel. The manifest records which rank owned which shard so resume can put each shard back where it came from. The aggregate write bandwidth scales with the cluster. A 1 TB checkpoint that took 4 hours through one rank takes 4 minutes through 64 ranks. Plus the manifest gives you a contract for incompatible resumes: world-size change is detectable, partial writes are detectable, and the load path can fail loudly rather than silently using stale data.</p>
+<h2>The Concept</h2>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-21d826efe0667b178835.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>Manifest schema</h3>
+<pre><code class="language-json">{
+  &quot;world_size&quot;: 4,
+  &quot;step&quot;: 1234,
+  &quot;wall_clock_seconds&quot;: 4521,
+  &quot;shards&quot;: [
+    {&quot;rank&quot;: 0, &quot;path&quot;: &quot;rank0.bin&quot;, &quot;sha256&quot;: &quot;...&quot;, &quot;param_shard_offset&quot;: 0, &quot;param_shard_numel&quot;: 65536},
+    {&quot;rank&quot;: 1, &quot;path&quot;: &quot;rank1.bin&quot;, &quot;sha256&quot;: &quot;...&quot;, &quot;param_shard_offset&quot;: 65536, &quot;param_shard_numel&quot;: 65536}
+  ],
+  &quot;schema_version&quot;: 1
+}
+</code></pre>
+<p>Three fields are load-bearing. <code>world_size</code> makes a resume on a different size loudly fail rather than silently corrupt. <code>sha256</code> per shard catches partial or corrupted writes. <code>param_shard_offset</code> and <code>param_shard_numel</code> per shard let the loader reconstruct the flat parameter tensor at the correct position.</p>
+<h3>Atomic write</h3>
+<p>The standard pattern: write every shard to <code>&lt;name&gt;.tmp</code>, write the manifest to <code>manifest.json.tmp</code>, fsync each, then rename. POSIX rename within the same filesystem is atomic; either the new file is fully present or the old one is. A crash before the final rename leaves the previous checkpoint as the live one. Without atomic write a crash can leave a partial shard with a present manifest that points at it, and the load corrupts the optimiser state on resume.</p>
+<h3>Three failure modes the schema must defend against</h3>
+<table>
+<thead>
+<tr>
+<th>Failure</th>
+<th>Symptom</th>
+<th>Defence</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>World-size change</td>
+<td>resume on N=8 with manifest from N=4</td>
+<td>world_size mismatch in manifest, fail loudly</td>
+</tr>
+<tr>
+<td>Shard count mismatch</td>
+<td>resume sees fewer rank*.bin files than shards in manifest</td>
+<td>enumerate shards, verify every one exists</td>
+</tr>
+<tr>
+<td>Partial write</td>
+<td>shard file truncated mid-flush</td>
+<td>sha256 verification on load</td>
+</tr>
+</tbody>
+</table>
+<p>Each defence rejects the bad load early; the alternative is silent corruption that surfaces 100 steps later when loss goes to NaN.</p>
+<h3>Why per-rank files, not one big file</h3>
+<p>Concurrent write to one file via <code>O_APPEND</code> works on POSIX for byte-aligned writes, but in practice the offsets within one shard span MB-sized regions and the locking dominates. Per-rank files have no contention and benefit from striping when the underlying filesystem is parallel (Lustre, GPFS). Production stacks (DeepSpeed, FSDP, NeMo) all use per-rank files for that reason.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-852dedc5e3907256aca9.png" alt="ci-sharded-checkpoint 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<p><code>code/main.py</code> implements:</p>
+<ul>
+<li><code>ShardManifest</code> dataclass with the schema above plus <code>to_json</code>/<code>from_json</code>.</li>
+<li><code>save_sharded(state_dict_per_rank, dir, step)</code> that writes every rank's binary state to its own file using the atomic temp-then-rename pattern, then writes the manifest.</li>
+<li><code>load_sharded(dir, expected_world_size)</code> that reads the manifest, verifies each shard's sha256, and returns per-rank state dicts.</li>
+<li>A round-trip test: build per-rank state, save, load, assert byte-equal.</li>
+</ul>
+<p>Run it:</p>
+<pre><code class="language-bash">python3 code/main.py
+</code></pre>
+<p>Output: 4 shard files plus manifest written, then reloaded with byte-equal verification.</p>
+<h2>Production patterns in the wild</h2>
+<p>Three patterns harden the checkpoint enough to ship.</p>
+<p><strong>Async write.</strong> Production stacks issue the checkpoint write on a separate thread or process so training continues. The barrier is at next checkpoint: do not start the next save until the previous one is complete. DeepSpeed's <code>async_io</code> flag does exactly this. The lesson keeps the write synchronous so the steps are visible.</p>
+<p><strong>Local fast disk first, then async upload.</strong> Write to local NVMe (fast) then async-upload to S3 or GCS. The two-tier pattern keeps the in-cluster checkpoint fast for resume while shipping a durable copy off-cluster for archive. The manifest carries the local path; an upload manifest carries the remote path.</p>
+<p><strong>Rotation matters.</strong> Production runs keep the last K checkpoints (typically 3-5) and rotate the oldest. Without rotation the disk fills mid-run and the next checkpoint fails. With rotation the next save deletes the oldest first, freeing the budget.</p>
+<h2>Use It</h2>
+<p>Production patterns:</p>
+<ul>
+<li><strong>DeepSpeed checkpointing.</strong> <code>deepspeed.save_checkpoint(tag=step)</code> writes per-rank files and a <code>latest</code> file pointing at the active tag.</li>
+<li><strong>PyTorch FSDP checkpointing.</strong> <code>torch.distributed.checkpoint</code> saves sharded state with a <code>Planner</code> that decides per-rank layout.</li>
+<li><strong>NeMo.</strong> Wraps DeepSpeed and FSDP with a uniform <code>save_to_checkpoint</code> API that adds metadata.</li>
+</ul>
+<h2>Ship It</h2>
+<p>Lesson 81 saves a sharded checkpoint of the end-to-end DDP+ZeRO run and reloads it on the same world size to prove the resume contract holds.</p>
+<h2>Exercises</h2>
+<ol>
+<li>Add async write: kick off the save in a thread and let training continue. Block the next save until the previous one completes.</li>
+<li>Add a <code>last_5_steps</code> rotation: keep the 5 most recent checkpoints, delete the oldest before saving a new one.</li>
+<li>Add a CRC-only fast verification path for the inner-loop reload (rotation rolls a checkpoint into being the new active one without full sha256).</li>
+<li>Add a cross-world-size load: shard rebalance from N=4 to N=8 by reading the manifest, concatenating, and re-sharding.</li>
+<li>Add an upload to a fake S3 (a second directory) and write the upload manifest. Defend the two-tier storage policy.</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Sharded checkpoint</td>
+<td>&quot;Per-rank save&quot;</td>
+<td>Each rank writes its own shard file in parallel</td>
+</tr>
+<tr>
+<td>Manifest</td>
+<td>&quot;Index&quot;</td>
+<td>JSON file recording shard paths, offsets, and sha256</td>
+</tr>
+<tr>
+<td>Atomic write</td>
+<td>&quot;tmp then rename&quot;</td>
+<td>Write to .tmp then POSIX rename so a crash leaves the previous file live</td>
+</tr>
+<tr>
+<td>Partial write</td>
+<td>&quot;Truncated shard&quot;</td>
+<td>A crash during write produces a corrupt shard; sha256 catches it</td>
+</tr>
+<tr>
+<td>Rotation</td>
+<td>&quot;Keep last K&quot;</td>
+<td>Delete oldest checkpoint before writing new one to bound disk usage</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://deepspeed.readthedocs.io/en/latest/model-checkpointing.html" rel="noreferrer" data-network="true">DeepSpeed checkpointing <small>↗ 需要联网</small></a></li>
+<li><a href="https://pytorch.org/docs/stable/distributed.checkpoint.html" rel="noreferrer" data-network="true">PyTorch torch.distributed.checkpoint <small>↗ 需要联网</small></a></li>
+<li><a href="https://pubs.opengroup.org/onlinepubs/9699919799/functions/rename.html" rel="noreferrer" data-network="true">POSIX rename atomicity <small>↗ 需要联网</small></a></li>
+<li>Phase 19 Lesson 78 - the ZeRO state this checkpoint is shaped to save</li>
+<li>Phase 19 Lesson 81 - the end-to-end demo round-trips the saved state</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-19-capstone-projects--80-checkpoint-sharded-resume.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-19-capstone-projects--80-checkpoint-sharded-resume.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/80-checkpoint-sharded-resume/code/main.py">phases/19-capstone-projects/80-checkpoint-sharded-resume/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Sharded checkpoint with atomic write and verified resume.
+
+Saves a multi-rank training state as per-rank binary files plus a JSON
+manifest. The write is atomic: every file lands at &lt;name&gt;.tmp first, the
+manifest writes last, then a single rename moves everything to the final
+names. A crash mid-write leaves the previous checkpoint intact.
+
+Resume verifies the manifest schema (world_size, shard count, sha256 per
+shard) and reconstructs per-rank state byte-equal to what was saved.
+
+Run: python3 code/main.py
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import shutil
+import tempfile
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+
+import torch
+
+
+SCHEMA_VERSION = 1
+MANIFEST_NAME = &quot;manifest.json&quot;
+
+
+@dataclass
+class ShardEntry:
+    rank: int
+    path: str
+    sha256: str
+    param_shard_offset: int
+    param_shard_numel: int
+
+
+@dataclass
+class ShardManifest:
+    world_size: int
+    step: int
+    wall_clock_seconds: float
+    shards: list
+    schema_version: int = SCHEMA_VERSION
+
+    def to_json(self) -&gt; str:
+        return json.dumps({
+            &quot;world_size&quot;: self.world_size,
+            &quot;step&quot;: self.step,
+            &quot;wall_clock_seconds&quot;: self.wall_clock_seconds,
+            &quot;schema_version&quot;: self.schema_version,
+            &quot;shards&quot;: [asdict(s) for s in self.shards],
+        }, indent=2, sort_keys=True)
+
+    @classmethod
+    def from_json(cls, text: str) -&gt; &quot;ShardManifest&quot;:
+        data = json.loads(text)
+        return cls(
+            world_size=int(data[&quot;world_size&quot;]),
+            step=int(data[&quot;step&quot;]),
+            wall_clock_seconds=float(data[&quot;wall_clock_seconds&quot;]),
+            schema_version=int(data[&quot;schema_version&quot;]),
+            shards=[ShardEntry(**s) for s in data[&quot;shards&quot;]],
+        )
+
+
+class CheckpointError(Exception):
+    &quot;&quot;&quot;Raised when manifest validation or shard verification fails.&quot;&quot;&quot;
+
+
+def _sha256_bytes(data: bytes) -&gt; str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _fsync_dir(path: Path) -&gt; None:
+    &quot;&quot;&quot;Fsync a directory so rename metadata reaches disk; no-op where unsupported.&quot;&quot;&quot;
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _serialize_state(state: dict) -&gt; bytes:
+    &quot;&quot;&quot;Serialize a state dict deterministically using torch.save with pickle 4.&quot;&quot;&quot;
+    import io
+    buf = io.BytesIO()
+    torch.save(state, buf, pickle_protocol=4)
+    return buf.getvalue()
+
+
+def _deserialize_state(data: bytes) -&gt; dict:
+    import io
+    buf = io.BytesIO(data)
+    return torch.load(buf, weights_only=False)
+
+
+def save_sharded(per_rank_state: list, dest_dir: str, step: int,
+                 wall_clock_seconds: float = 0.0) -&gt; ShardManifest:
+    &quot;&quot;&quot;Write per-rank state files atomically; return the manifest written.
+
+    per_rank_state is a list indexed by rank. Each entry is a state dict that
+    will be torch.save&#39;d into rankN.bin. The function uses the .tmp + rename
+    pattern so a partial write never corrupts an existing checkpoint.
+    &quot;&quot;&quot;
+    dest = Path(dest_dir)
+    dest.mkdir(parents=True, exist_ok=True)
+    world_size = len(per_rank_state)
+    shards = []
+    tmp_paths = []
+    offset = 0
+    for rank, state in enumerate(per_rank_state):
+        payload = _serialize_state(state)
+        sha = _sha256_bytes(payload)
+        final_name = f&quot;rank{rank}.bin&quot;
+        tmp_name = f&quot;rank{rank}.bin.tmp&quot;
+        tmp_path = dest / tmp_name
+        with open(tmp_path, &quot;wb&quot;) as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        tmp_paths.append((tmp_path, dest / final_name))
+        param_shard = state.get(&quot;param_shard&quot;)
+        numel = param_shard.numel() if isinstance(param_shard, torch.Tensor) else 0
+        shards.append(ShardEntry(
+            rank=rank,
+            path=final_name,
+            sha256=sha,
+            param_shard_offset=offset,
+            param_shard_numel=numel,
+        ))
+        offset += numel
+    manifest = ShardManifest(
+        world_size=world_size,
+        step=step,
+        wall_clock_seconds=wall_clock_seconds,
+        shards=shards,
+    )
+    manifest_tmp = dest / (MANIFEST_NAME + &quot;.tmp&quot;)
+    manifest_final = dest / MANIFEST_NAME
+    with open(manifest_tmp, &quot;w&quot;) as f:
+        f.write(manifest.to_json())
+        f.flush()
+        os.fsync(f.fileno())
+    for tmp, final in tmp_paths:
+        os.replace(tmp, final)
+    os.replace(manifest_tmp, manifest_final)
+    _fsync_dir(dest)
+    return manifest
+
+
+def load_sharded(src_dir: str, expected_world_size: int) -&gt; tuple:
+    &quot;&quot;&quot;Read the manifest, verify every shard, return (manifest, per-rank state list).&quot;&quot;&quot;
+    src = Path(src_dir)
+    manifest_path = src / MANIFEST_NAME
+    if not manifest_path.exists():
+        raise CheckpointError(f&quot;manifest missing at {manifest_path}&quot;)
+    manifest = ShardManifest.from_json(manifest_path.read_text())
+    if manifest.world_size != expected_world_size:
+        raise CheckpointError(
+            f&quot;world_size mismatch: manifest={manifest.world_size}, expected={expected_world_size}&quot;
+        )
+    if manifest.schema_version != SCHEMA_VERSION:
+        raise CheckpointError(
+            f&quot;schema_version mismatch: manifest={manifest.schema_version}, expected={SCHEMA_VERSION}&quot;
+        )
+    if len(manifest.shards) != manifest.world_size:
+        raise CheckpointError(
+            f&quot;shard count != world_size: {len(manifest.shards)} vs {manifest.world_size}&quot;
+        )
+    per_rank = [None] * manifest.world_size
+    seen_ranks = set()
+    src_resolved = src.resolve()
+    for shard in manifest.shards:
+        if not (0 &lt;= shard.rank &lt; manifest.world_size):
+            raise CheckpointError(
+                f&quot;shard rank {shard.rank} out of range [0,{manifest.world_size})&quot;
+            )
+        if shard.rank in seen_ranks:
+            raise CheckpointError(f&quot;duplicate shard for rank {shard.rank}&quot;)
+        seen_ranks.add(shard.rank)
+        if os.path.isabs(shard.path) or os.sep in shard.path or &quot;/&quot; in shard.path or shard.path in (&quot;&quot;, &quot;.&quot;, &quot;..&quot;):
+            raise CheckpointError(f&quot;unsafe shard path: {shard.path!r}&quot;)
+        shard_path = (src / shard.path).resolve()
+        try:
+            shard_path.relative_to(src_resolved)
+        except ValueError as exc:
+            raise CheckpointError(f&quot;shard path escapes checkpoint dir: {shard.path!r}&quot;) from exc
+        if not shard_path.exists():
+            raise CheckpointError(f&quot;shard file missing: {shard_path}&quot;)
+        payload = shard_path.read_bytes()
+        actual = _sha256_bytes(payload)
+        if actual != shard.sha256:
+            raise CheckpointError(
+                f&quot;sha256 mismatch on rank {shard.rank}: &quot;
+                f&quot;recorded={shard.sha256[:12]}..., actual={actual[:12]}...&quot;
+            )
+        per_rank[shard.rank] = _deserialize_state(payload)
+    if len(seen_ranks) != manifest.world_size:
+        missing = sorted(set(range(manifest.world_size)) - seen_ranks)
+        raise CheckpointError(f&quot;manifest missing ranks: {missing}&quot;)
+    return manifest, per_rank
+
+
+def rotate_checkpoints(parent_dir: str, keep_last: int = 5) -&gt; list:
+    &quot;&quot;&quot;Delete oldest checkpoint directories so only the most recent keep_last remain.&quot;&quot;&quot;
+    if keep_last &lt; 0:
+        raise ValueError(f&quot;keep_last must be &gt;= 0, got {keep_last}&quot;)
+    parent = Path(parent_dir)
+    if not parent.exists():
+        return []
+    children = sorted(
+        [c for c in parent.iterdir() if c.is_dir() and c.name.startswith(&quot;step_&quot;)],
+        key=lambda c: (c.stat().st_mtime, c.name),
+    )
+    if keep_last == 0:
+        to_delete = children
+    elif len(children) &gt; keep_last:
+        to_delete = children[:-keep_last]
+    else:
+        to_delete = []
+    deleted = []
+    for c in to_delete:
+        shutil.rmtree(c, ignore_errors=True)
+        deleted.append(c.name)
+    return deleted
+
+
+def make_demo_state(rank: int, world_size: int) -&gt; dict:
+    &quot;&quot;&quot;Construct a representative per-rank state for the demo.&quot;&quot;&quot;
+    torch.manual_seed(31 + rank)
+    return {
+        &quot;rank&quot;: rank,
+        &quot;world_size&quot;: world_size,
+        &quot;param_shard&quot;: torch.randn(1024) + rank,
+        &quot;m_shard&quot;: torch.zeros(1024),
+        &quot;v_shard&quot;: torch.ones(1024) * 1e-6,
+        &quot;step&quot;: 100,
+    }
+
+
+def main() -&gt; int:
+    world_size = 4
+    workdir = tempfile.mkdtemp(prefix=&quot;aie_ckpt_&quot;)
+    print(f&quot;workdir: {workdir}&quot;)
+    states = [make_demo_state(r, world_size) for r in range(world_size)]
+    step_dir = os.path.join(workdir, &quot;step_0100&quot;)
+    print(&quot;saving sharded checkpoint...&quot;)
+    manifest = save_sharded(states, step_dir, step=100, wall_clock_seconds=42.0)
+    print(f&quot;manifest: world_size={manifest.world_size}, step={manifest.step}, shards={len(manifest.shards)}&quot;)
+    for entry in manifest.shards:
+        print(f&quot;  rank {entry.rank}: {entry.path} sha256={entry.sha256[:12]}... numel={entry.param_shard_numel}&quot;)
+    print(&quot;\nresuming...&quot;)
+    loaded_manifest, loaded_states = load_sharded(step_dir, expected_world_size=world_size)
+    for r in range(world_size):
+        before = states[r][&quot;param_shard&quot;]
+        after = loaded_states[r][&quot;param_shard&quot;]
+        assert torch.equal(before, after), f&quot;rank {r} param shard differs after resume&quot;
+    print(&quot;byte-equal round-trip verified for every rank&quot;)
+    print(&quot;\ntesting failure mode: wrong world size...&quot;)
+    try:
+        load_sharded(step_dir, expected_world_size=8)
+    except CheckpointError as e:
+        print(f&quot;  rejected as expected: {e}&quot;)
+    print(&quot;\ntesting failure mode: tampered shard...&quot;)
+    shard0 = Path(step_dir) / &quot;rank0.bin&quot;
+    backup = shard0.read_bytes()
+    shard0.write_bytes(backup + b&quot;corruption&quot;)
+    try:
+        load_sharded(step_dir, expected_world_size=world_size)
+    except CheckpointError as e:
+        print(f&quot;  rejected as expected: {e}&quot;)
+    shard0.write_bytes(backup)
+    print(&quot;\ntesting rotation: write 8 checkpoints, keep 5...&quot;)
+    for s in range(8):
+        sd = os.path.join(workdir, f&quot;step_{s:04d}&quot;)
+        save_sharded(states, sd, step=s)
+    deleted = rotate_checkpoints(workdir, keep_last=5)
+    print(f&quot;  rotated {len(deleted)} oldest: {deleted}&quot;)
+    shutil.rmtree(workdir, ignore_errors=True)
+    return 0
+
+
+if __name__ == &quot;__main__&quot;:
+    raise SystemExit(main())
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. Why is gather-then-write the wrong checkpoint pattern at scale?</legend><label class="option"><input type="radio" name="q0" value="0"> All state passes through rank 0; write bandwidth is the slowest single link, not the aggregate, so a TB-scale write takes hours</label><label class="option"><input type="radio" name="q0" value="1"> It needs special hardware</label><label class="option"><input type="radio" name="q0" value="2"> It uses too much CPU</label><label class="option"><input type="radio" name="q0" value="3"> It looks ugly</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. What does the manifest record that the shard files cannot?</legend><label class="option"><input type="radio" name="q1" value="0"> world_size, schema version, per-shard sha256, and shard ownership; gives the loader a contract to validate before touching state</label><label class="option"><input type="radio" name="q1" value="1"> Hostname</label><label class="option"><input type="radio" name="q1" value="2"> Random numbers</label><label class="option"><input type="radio" name="q1" value="3"> Filesystem name</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. Why write to &lt;name&gt;.tmp and rename instead of writing directly?</legend><label class="option"><input type="radio" name="q2" value="0"> Required by torch</label><label class="option"><input type="radio" name="q2" value="1"> Faster</label><label class="option"><input type="radio" name="q2" value="2"> Saves memory</label><label class="option"><input type="radio" name="q2" value="3"> POSIX rename within a filesystem is atomic: a crash mid-write leaves the previous file untouched. Direct writes can leave half-finished checkpoints that poison the next resume</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. What does sha256 per shard defend against?</legend><label class="option"><input type="radio" name="q3" value="0"> Slowdown</label><label class="option"><input type="radio" name="q3" value="1"> Network attacks</label><label class="option"><input type="radio" name="q3" value="2"> Partial or corrupted writes; verifying the hash on load catches truncated shards before they touch model state</label><label class="option"><input type="radio" name="q3" value="3"> Memory leak</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. Why does the load path reject a world_size mismatch loudly?</legend><label class="option"><input type="radio" name="q4" value="0"> Resuming a 4-rank shard layout on 8 ranks silently misassigns shards; loud rejection forces the operator to use the cross-world-size rebalance path</label><label class="option"><input type="radio" name="q4" value="1"> Hardware needs it</label><label class="option"><input type="radio" name="q4" value="2"> Easier to code</label><label class="option"><input type="radio" name="q4" value="3"> Cosmetic</label><p data-feedback="4"></p></fieldset><fieldset><legend>6. Why does production rotate checkpoints (keep last K)?</legend><label class="option"><input type="radio" name="q5" value="0"> Compression</label><label class="option"><input type="radio" name="q5" value="1"> Aesthetic</label><label class="option"><input type="radio" name="q5" value="2"> It does not</label><label class="option"><input type="radio" name="q5" value="3"> Without rotation the disk fills mid-run and the next checkpoint fails; rotation deletes the oldest before writing the new one, bounding disk usage</label><p data-feedback="5"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/19-capstone-projects/79-pipeline-parallel/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/19-capstone-projects/81-end-to-end-distributed-train/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/19-capstone-projects/80-checkpoint-sharded-resume/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

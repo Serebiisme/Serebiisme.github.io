@@ -1,0 +1,1132 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>语言模型评估套件 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-19-capstone-projects" data-lesson="19-capstone-projects/49-lm-eval-harness" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/19-capstone-projects/">综合项目</a> / LESSON 49</p><h1 class="lesson-title">语言模型评估套件</h1><p>Language Model Evaluation Harness</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>语言模型评估套件</h1>
+<blockquote>
+<p>没有什么可能的模型是一个不确定性的模型, 运用一个简短的形式, 换成一个.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 19 lessons 42 to 45
+<strong>Time:</strong> ~90 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>定义一个任务为一个JSONL文件<code>prompt</code>现在<code>targets</code>现在<code>metric</code>其他选择性<code>extras</code>举个例子.</li>
+<li>执行五个指标:精确匹配,Rouge-l F1,可执行的检查,多次选择,和子字符串含量.</li>
+<li>建立一个按任务进行批量的运行器,然后将其发送到可交换的模型适配器.</li>
+<li>发出一个排名表 JSON 每项任务分数,延迟,和可复制的总体平均值.</li>
+</ul>
+<h2>问题</h2>
+<p>每周都有新的语言模型.营销声称它做得很好.诚实的问题是:在什么方面?诚实答案是你自己写的排名表,因为供应商的排名表是他们调整的.</p>
+<p>没有一个带在你的 repo比较两个模型的振动.用一个带比较他们根据分数在一个固定任务组上,一个固定的指标,在一个JSON输出你可以区分.</p>
+<p>陷是过度将带连接到单个模型. 解决方案是逆向的陷: 带足够小,可以在15分钟内读取,任务足够小,可以在备忘录中发送, 换个适配器,排名板移动;换个任务,排名板移动. 别的东西不应该移动.</p>
+<h2>概念</h2>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-4473e13a31e63093de62.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>任务规范</h3>
+<p>每个例子都是一个JSONL行:</p>
+<pre><code class="language-json">{&quot;id&quot;: &quot;arith-00&quot;, &quot;prompt&quot;: &quot;compute: 2 + 2&quot;, &quot;targets&quot;: [&quot;4&quot;], &quot;metric&quot;: &quot;exact_match&quot;}
+</code></pre>
+<p>对于需要助手的指标,<code>extras</code>携带侧面的有效载荷:</p>
+<pre><code class="language-json">{
+  &quot;id&quot;: &quot;code-00&quot;,
+  &quot;prompt&quot;: &quot;python: write a function f that doubles its input&quot;,
+  &quot;targets&quot;: [&quot;ok&quot;],
+  &quot;metric&quot;: &quot;code_exec&quot;,
+  &quot;extras&quot;: {&quot;io_pairs&quot;: [[1, 2], [3, 6]]}
+}
+</code></pre>
+<p>任务是一个任务.<code>.jsonl</code>下面的文件<code>outputs/tasks/</code>文件名是任务名称. 文件中的所有例子都具有一个指标.</p>
+<h3>五项固定任务</h3>
+<table>
+<thead>
+<tr>
+<th>Task</th>
+<th>Metric</th>
+<th>What it tests</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>arithmetic</td>
+<td>exact_match</td>
+<td>Token-level correctness on a deterministic answer</td>
+</tr>
+<tr>
+<td>summary</td>
+<td>rouge_l</td>
+<td>Longest common subsequence F1 against a one-line reference summary</td>
+</tr>
+<tr>
+<td>code-exec</td>
+<td>code_exec</td>
+<td>Executable test: the predicted function must satisfy a list of input-output pairs</td>
+</tr>
+<tr>
+<td>multiple-choice</td>
+<td>multiple_choice</td>
+<td>First letter of the prediction must match an allowed letter</td>
+</tr>
+<tr>
+<td>generation</td>
+<td>substring_contains</td>
+<td>Free-form text must contain at least one target substring</td>
+</tr>
+</tbody>
+</table>
+<h3>计量合同</h3>
+<p>每个指标都是从<code>(prediction, targets, extras) -&gt; float in [0.0, 1.0]</code>杆平均每个例子分数,以获得任务分数,然后平均任务分数,以获得总数.</p>
+<ul>
+<li><code>exact_match</code>基本面:小文字,白色空间崩,平等.</li>
+<li><code>substring_contains</code>标准化,子字符串测试.</li>
+<li><code>multiple_choice</code>首个字符上.</li>
+<li><code>rouge_l</code>: LCS长度以预测和参考长度,精度和召回F1分.</li>
+<li><code>code_exec</code>: 执行预测在一个限制的名称空间,调用<code>f(x)</code>在每一个输出输入对, 计数匹配.</li>
+</ul>
+<p>代码_exec测量在一个剥离的内置命名空间中运行预测.课程测试表明<code>import os</code>爆炸是因为<code>os</code>文件系统不能从代码预测中访问.</p>
+<h3>模型适配器</h3>
+<pre><code class="language-python">class ModelAdapter(Protocol):
+    def generate(self, prompts: Sequence[str]) -&gt; List[str]: ...
+    @property
+    def name(self) -&gt; str: ...
+</code></pre>
+<p>适配器是接,课程是船只.<code>ToyAdapter</code>根据该系统的定义,一个确定性模式匹配器,在五个固定任务中返回每一个提示的正确答案.一个真正的适配器调用模型并返回其输出.</p>
+<h3>跑步者</h3>
+<p><code>run_task</code>批量<code>batch_size</code>按时提示,并发送到测量函数. <code>run_leaderboard</code>完成每项任务,平均.<code>write_leaderboard</code>发射JSON与一个方案字符串,以便未来的格式变化不会默默打破仪表板.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-a9f79d30823dc4836c98.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><figure><img src="/learn/ai-from-scratch/figures/figure-90abd0b9d8529d763a10.png" alt="eval-harness-matrix 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<p><code>code/main.py</code>它们是可运行的文物.</p>
+<h3>步骤1:种子固定任务</h3>
+<p><code>seed_fixture_tasks(target_dir)</code>写出五个<code>.jsonl</code>文件的第一批<code>main.py</code>在目录空时种种它们.</p>
+<h3>步骤2:负载任务</h3>
+<p><code>load_all_tasks(task_dir)</code>读到每一个<code>.jsonl</code>返回一个命令从任务名称到一个列表<code>Example</code>评论行开始于<code>#</code>没有空白的行列,以便贡献者可以注释文件.</p>
+<h3>步骤3:实现指标</h3>
+<p>每个指标都是一个小函数,一个单元测试.课程的测试套件包括13个案例,包括正常化,部分重叠,代码执行和不安全的代码拒绝.</p>
+<h3>步骤4:写出跑步</h3>
+<p><code>run_task</code>代批量并产生一个<code>TaskResult</code>通过分数,正确的计算,总数和延迟.<code>run_leaderboard</code>完成所有任务并产生一个<code>Leaderboard</code>总体平均水平.</p>
+<h3>步骤5:发射JSON</h3>
+<p><code>write_leaderboard</code>片的连载.<code>--include-per-example</code>标志将每例记录丢弃,以便你可以与前一次运行时的预测进行差异.</p>
+<p>运行它:</p>
+<pre><code class="language-bash">python3 code/main.py
+</code></pre>
+<p>脚本在第一次运行时种植装置,用玩具适配器 (它将每个装置都得到正确的),然后写<code>outputs/leaderboard.json</code>玩具适配器的总分为1.0, 玩具适配器的试验在<code>test_main.py</code>适配器不能回复时,相同的带产生0.0.</p>
+<h2>用它</h2>
+<p>为了连接一个真正的模型, 写一个适配器.</p>
+<pre><code class="language-python">class HttpAdapter:
+    name = &quot;vendor.v1&quot;
+
+    def __init__(self, endpoint, api_key):
+        self.endpoint = endpoint
+        self.api_key = api_key
+
+    def generate(self, prompts):
+        out = []
+        for prompt in prompts:
+            response = http_post(self.endpoint, prompt, self.api_key)
+            out.append(response[&quot;text&quot;])
+        return out
+</code></pre>
+<p>换换<code>ToyAdapter</code>为了<code>HttpAdapter</code>在顶部<code>main()</code>杆,任务,指标和排名表保持不变.</p>
+<p>在一个真正的项目中,在运送带时必须执行三个模式:</p>
+<ul>
+<li>**Pin the task files.**排名板.json 包含哈希嵌任务内容或它携带JSONLs;否则,任务文件在执行时,分数会移动,而您无法确定哪个.</li>
+<li>**Diff predictions, not just scores.**其他<code>--include-per-example</code>标志让你看到模型在分数下降的那天说什么.</li>
+<li>**Cap the batch size.**实际适配器的速度限制. 较小的批量量使得连接器在供应商之间保持兼容性.</li>
+</ul>
+<h2>运送它</h2>
+<p><code>outputs/skill-lm-eval-harness.md</code>包含配方:JSONL任务规格,五个指标,可交换的适配器,批量运行器,排名表 JSON 与方案字符串.<code>outputs/tasks/</code>它们是固定装置, 它们可以作为一个真正的项目.</p>
+<h2>运动</h2>
+<ol>
+<li>添加一个第六个任务,使用一个自定义的指标,你从零开始写 (像BLEU的重叠,像BLEURT的参考分数,任何有明确的合同).</li>
+<li>延长时间<code>code_exec</code>捕获击和接受预期击的目标列表.</li>
+<li>添加一个排名表差命令:给了两个 <code>leaderboard.json</code>文件,打印哪些任务移动,以及多少.</li>
+<li>缩适配器调用时间;单独地表面<code>timeouts</code>在排名表中列.</li>
+<li>按排名表中的 sha256 标签,以便未来的读者可以验证他们取得了相同的任务.</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Task spec</td>
+<td>&quot;The eval format&quot;</td>
+<td>JSONL file with prompt, targets, metric, optional extras per example</td>
+</tr>
+<tr>
+<td>Metric</td>
+<td>&quot;How you score&quot;</td>
+<td>Function from (prediction, targets, extras) to a float in [0, 1]</td>
+</tr>
+<tr>
+<td>Adapter</td>
+<td>&quot;The model client&quot;</td>
+<td>Object with a generate(prompts) -&gt; list[str] method; the only model-specific code</td>
+</tr>
+<tr>
+<td>Leaderboard</td>
+<td>&quot;The scoreboard&quot;</td>
+<td>JSON with per-task scores, total counts, latency, and an overall average</td>
+</tr>
+<tr>
+<td>Code exec metric</td>
+<td>&quot;Run it and check&quot;</td>
+<td>Execute the prediction in a restricted namespace, compare against input-output pairs</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li>生产参考原始lm评估,大得多,但形状相同.</li>
+<li>为了实现同样的合同,HuggingFace的轻松.</li>
+<li>阶段19课46涵盖了训练堆中使用的梯度积累模式.</li>
+<li>阶段19课时47课时,你将分数的检查点格式进行分析.</li>
+<li>第19阶段课时48涵盖了测试模型的分布式训练堆.</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Language Model Evaluation Harness</h1>
+<blockquote>
+<p>A model that does well on a task you cannot define is a model that does well by accident. The harness is the task definition, the metric, the runner, and the leaderboard, in one short, swappable shape.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 19 lessons 42 to 45
+<strong>Time:</strong> ~90 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Define a task as a JSONL file with <code>prompt</code>, <code>targets</code>, <code>metric</code>, and optional <code>extras</code> per example.</li>
+<li>Implement five metrics: exact match, rouge-l F1, executable check, multiple choice, and substring contains.</li>
+<li>Build a runner that batches examples per task and dispatches to a swappable model adapter.</li>
+<li>Emit a leaderboard JSON with per-task scores, latency, and an overall average that is reproducible.</li>
+</ul>
+<h2>The Problem</h2>
+<p>A new language model lands every week. The marketing claim is that it does well. The honest question is: well at what? The honest answer is the leaderboard you wrote yourself, because the vendor's leaderboard is the one they tuned to.</p>
+<p>Without a harness in your repo you compare two models by vibes. With a harness you compare them by score on a fixed task set with a fixed metric, on a JSON output you can diff. The harness is the contract between yesterday's run and today's run. Without it, regressions ship.</p>
+<p>The trap is over-fitting the harness to a single model. The fix is the same trap in reverse: the harness is small enough to read in fifteen minutes, the tasks are small enough to ship in the repo, the metrics are written from scratch so a colleague can audit them, and the adapter is the only place model-specific code lives. Swap the adapter, the leaderboard moves; swap the tasks, the leaderboard moves. Nothing else should move.</p>
+<h2>The Concept</h2>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-4473e13a31e63093de62.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>Task spec</h3>
+<p>Every example is one JSONL line:</p>
+<pre><code class="language-json">{&quot;id&quot;: &quot;arith-00&quot;, &quot;prompt&quot;: &quot;compute: 2 + 2&quot;, &quot;targets&quot;: [&quot;4&quot;], &quot;metric&quot;: &quot;exact_match&quot;}
+</code></pre>
+<p>For metrics that need scoring helpers, <code>extras</code> carries the side payload:</p>
+<pre><code class="language-json">{
+  &quot;id&quot;: &quot;code-00&quot;,
+  &quot;prompt&quot;: &quot;python: write a function f that doubles its input&quot;,
+  &quot;targets&quot;: [&quot;ok&quot;],
+  &quot;metric&quot;: &quot;code_exec&quot;,
+  &quot;extras&quot;: {&quot;io_pairs&quot;: [[1, 2], [3, 6]]}
+}
+</code></pre>
+<p>A task is a <code>.jsonl</code> file under <code>outputs/tasks/</code>. The file name is the task name. All examples in a file share a metric.</p>
+<h3>The five fixture tasks</h3>
+<table>
+<thead>
+<tr>
+<th>Task</th>
+<th>Metric</th>
+<th>What it tests</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>arithmetic</td>
+<td>exact_match</td>
+<td>Token-level correctness on a deterministic answer</td>
+</tr>
+<tr>
+<td>summary</td>
+<td>rouge_l</td>
+<td>Longest common subsequence F1 against a one-line reference summary</td>
+</tr>
+<tr>
+<td>code-exec</td>
+<td>code_exec</td>
+<td>Executable test: the predicted function must satisfy a list of input-output pairs</td>
+</tr>
+<tr>
+<td>multiple-choice</td>
+<td>multiple_choice</td>
+<td>First letter of the prediction must match an allowed letter</td>
+</tr>
+<tr>
+<td>generation</td>
+<td>substring_contains</td>
+<td>Free-form text must contain at least one target substring</td>
+</tr>
+</tbody>
+</table>
+<h3>The metric contract</h3>
+<p>Every metric is a function from <code>(prediction, targets, extras) -&gt; float in [0.0, 1.0]</code>. The harness averages the per-example scores to get a task score, then averages task scores to get the overall. The metric functions are tiny:</p>
+<ul>
+<li><code>exact_match</code>: lowercase, collapse whitespace, equality.</li>
+<li><code>substring_contains</code>: same normalization, substring test.</li>
+<li><code>multiple_choice</code>: first character uppercased.</li>
+<li><code>rouge_l</code>: LCS length divided by lengths of prediction and reference, F1 of precision and recall.</li>
+<li><code>code_exec</code>: execute the prediction in a restricted namespace, call <code>f(x)</code> on every input-output pair, count matches.</li>
+</ul>
+<p>The code_exec metric runs the prediction in a stripped builtins namespace. The lesson's test asserts that <code>import os</code> blows up because <code>os</code> is not in the namespace; you cannot reach the filesystem from a code prediction.</p>
+<h3>The model adapter</h3>
+<pre><code class="language-python">class ModelAdapter(Protocol):
+    def generate(self, prompts: Sequence[str]) -&gt; List[str]: ...
+    @property
+    def name(self) -&gt; str: ...
+</code></pre>
+<p>The adapter is the seam. The lesson ships <code>ToyAdapter</code>, a deterministic pattern matcher that returns the right answer for every prompt in the five fixture tasks. A real adapter calls the model and returns its output. The harness does not care which.</p>
+<h3>The runner</h3>
+<p><code>run_task</code> batches <code>batch_size</code> prompts at a time and dispatches to the metric function. <code>run_leaderboard</code> walks every task and averages. <code>write_leaderboard</code> emits JSON with a schema string so future format changes do not silently break dashboards.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-a9f79d30823dc4836c98.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><figure><img src="/learn/ai-from-scratch/figures/figure-90abd0b9d8529d763a10.png" alt="eval-harness-matrix 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<p><code>code/main.py</code> is the runnable artifact.</p>
+<h3>Step 1: seed fixture tasks</h3>
+<p><code>seed_fixture_tasks(target_dir)</code> writes the five <code>.jsonl</code> files. The first run of <code>main.py</code> seeds them when the directory is empty.</p>
+<h3>Step 2: load tasks</h3>
+<p><code>load_all_tasks(task_dir)</code> reads every <code>.jsonl</code> and returns a dict from task name to a list of <code>Example</code> records. Comment lines starting with <code>#</code> and blank lines are skipped so contributors can annotate the files.</p>
+<h3>Step 3: implement metrics</h3>
+<p>Each metric is a small function with a unit test. The lesson's test suite includes 13 cases covering normalization, partial overlap, code execution, and unsafe code rejection.</p>
+<h3>Step 4: write the runner</h3>
+<p><code>run_task</code> iterates batches and produces a <code>TaskResult</code> with score, correct count, total count, and latency. <code>run_leaderboard</code> walks all tasks and produces a <code>Leaderboard</code> with the overall average.</p>
+<h3>Step 5: emit JSON</h3>
+<p><code>write_leaderboard</code> serializes the board. The <code>--include-per-example</code> flag dumps the per-example records so you can diff predictions against the previous run when scores move.</p>
+<p>Run it:</p>
+<pre><code class="language-bash">python3 code/main.py
+</code></pre>
+<p>The script seeds the fixtures on first run, scores them with the toy adapter (which gets every fixture right), and writes <code>outputs/leaderboard.json</code>. Overall score is 1.0 with the toy adapter; the stub adapter test in <code>test_main.py</code> shows the same harness produces 0.0 when the adapter cannot answer.</p>
+<h2>Use It</h2>
+<p>To plug a real model in, write an adapter. The shape:</p>
+<pre><code class="language-python">class HttpAdapter:
+    name = &quot;vendor.v1&quot;
+
+    def __init__(self, endpoint, api_key):
+        self.endpoint = endpoint
+        self.api_key = api_key
+
+    def generate(self, prompts):
+        out = []
+        for prompt in prompts:
+            response = http_post(self.endpoint, prompt, self.api_key)
+            out.append(response[&quot;text&quot;])
+        return out
+</code></pre>
+<p>Swap <code>ToyAdapter</code> for <code>HttpAdapter</code> at the top of <code>main()</code>. The harness, the tasks, the metrics, and the leaderboard stay the same.</p>
+<p>Three patterns to enforce when shipping the harness in a real project:</p>
+<ul>
+<li><strong>Pin the task files.</strong> The leaderboard.json carries hash-pinned task content or it carries the JSONLs alongside; otherwise the score moves when the task file does, and you cannot tell which.</li>
+<li><strong>Diff predictions, not just scores.</strong> The <code>--include-per-example</code> flag lets you see what the model said the day the score dropped.</li>
+<li><strong>Cap the batch size.</strong> Real adapters have rate limits. A small batch size keeps the harness compatible across vendors.</li>
+</ul>
+<h2>Ship It</h2>
+<p><code>outputs/skill-lm-eval-harness.md</code> carries the recipe: JSONL task spec, five metrics, swappable adapter, batched runner, leaderboard JSON with schema string. The task files in <code>outputs/tasks/</code> are the fixtures; copy them into a real project as starters.</p>
+<h2>Exercises</h2>
+<ol>
+<li>Add a sixth task with a custom metric you write from scratch (BLEU-like overlap, BLEURT-like reference scoring, anything with a clear contract).</li>
+<li>Extend <code>code_exec</code> to capture stdout and accept a list of expected stdouts as targets.</li>
+<li>Add a leaderboard diff command: given two <code>leaderboard.json</code> files, print which tasks moved and by how much.</li>
+<li>Cap latency per example. Wrap the adapter call in a timeout; surface a separate <code>timeouts</code> column in the leaderboard.</li>
+<li>Pin task content with a sha256 in the leaderboard so a future reader can verify they scored the same tasks.</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Task spec</td>
+<td>&quot;The eval format&quot;</td>
+<td>JSONL file with prompt, targets, metric, optional extras per example</td>
+</tr>
+<tr>
+<td>Metric</td>
+<td>&quot;How you score&quot;</td>
+<td>Function from (prediction, targets, extras) to a float in [0, 1]</td>
+</tr>
+<tr>
+<td>Adapter</td>
+<td>&quot;The model client&quot;</td>
+<td>Object with a generate(prompts) -&gt; list[str] method; the only model-specific code</td>
+</tr>
+<tr>
+<td>Leaderboard</td>
+<td>&quot;The scoreboard&quot;</td>
+<td>JSON with per-task scores, total counts, latency, and an overall average</td>
+</tr>
+<tr>
+<td>Code exec metric</td>
+<td>&quot;Run it and check&quot;</td>
+<td>Execute the prediction in a restricted namespace, compare against input-output pairs</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li>The original lm-evaluation-harness for the production reference, much larger but the same shape.</li>
+<li>HuggingFace's lighteval for an alternative implementation of the same contract.</li>
+<li>Phase 19 lesson 46 covers the gradient accumulation patterns used in the training stack the harness scores.</li>
+<li>Phase 19 lesson 47 covers the checkpoint format you score against; pin the checkpoint hash in the leaderboard.</li>
+<li>Phase 19 lesson 48 covers the distributed training stack that produced the model under test.</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-19-capstone-projects--49-lm-eval-harness.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-19-capstone-projects--49-lm-eval-harness.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/49-lm-eval-harness/code/main.py">phases/19-capstone-projects/49-lm-eval-harness/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Language model evaluation harness from scratch.
+
+Task spec is a JSONL line per example with `prompt`, `targets`, and
+`metric`. Five metrics ship: exact match for arithmetic, rouge-l F1 for
+summary, executable check for code, accuracy for multiple choice, and
+substring contains for generation. The runner batches examples by task,
+runs them against a swappable model adapter, and emits a leaderboard
+JSON with per-task and overall scores.
+
+The model adapter is the seam. The default adapter is a deterministic
+toy that pattern-matches the prompt; it has just enough behavior to make
+the harness&#39;s scoring code exercise every metric. Swap the adapter for
+an HTTP client, a local inference call, or a mock in tests.
+
+Run: python3 code/main.py
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import argparse
+import ast
+import json
+import operator
+import re
+import sys
+import textwrap
+import time
+from collections import Counter
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+from typing import Callable, Dict, Iterable, List, Optional, Protocol, Sequence
+
+
+HERE = Path(__file__).parent
+OUT_DIR = HERE.parent / &quot;outputs&quot;
+TASKS_DIR = OUT_DIR / &quot;tasks&quot;
+LEADERBOARD = OUT_DIR / &quot;leaderboard.json&quot;
+
+
+@dataclass
+class Example:
+    id: str
+    prompt: str
+    targets: List[str]
+    metric: str
+    extras: Dict[str, object] = field(default_factory=dict)
+
+
+@dataclass
+class TaskResult:
+    task: str
+    metric: str
+    score: float
+    correct: int
+    total: int
+    per_example: List[Dict[str, object]] = field(default_factory=list)
+    latency_ms: float = 0.0
+
+
+@dataclass
+class Leaderboard:
+    schema: str
+    timestamp: float
+    overall_score: float
+    tasks: List[TaskResult]
+
+
+class ModelAdapter(Protocol):
+    def generate(self, prompts: Sequence[str]) -&gt; List[str]:
+        ...
+
+    @property
+    def name(self) -&gt; str:
+        ...
+
+
+class ToyAdapter:
+    &quot;&quot;&quot;Deterministic adapter that pattern-matches each task.
+
+    The point is not to score well; the point is to give the harness a
+    fixed set of outputs to score against. Replace with a real client
+    when you ship the harness against a model.
+    &quot;&quot;&quot;
+
+    name = &quot;toy.v1&quot;
+
+    def generate(self, prompts: Sequence[str]) -&gt; List[str]:
+        return [self._answer(p) for p in prompts]
+
+    def _answer(self, prompt: str) -&gt; str:
+        text = prompt.strip()
+        if text.startswith(&quot;compute:&quot;):
+            expr = text[len(&quot;compute:&quot;):].strip()
+            try:
+                return str(safe_arith_eval(expr))
+            except Exception:
+                return &quot;&quot;
+        if text.startswith(&quot;summarize:&quot;):
+            body = text[len(&quot;summarize:&quot;):].strip()
+            sentences = re.split(r&quot;(?&lt;=[.!?])\s+&quot;, body)
+            return sentences[0] if sentences else body
+        if text.startswith(&quot;python:&quot;):
+            body = text[len(&quot;python:&quot;):].strip()
+            if &quot;double&quot; in body:
+                return &quot;def f(x):\n    return x * 2\n&quot;
+            if &quot;increment&quot; in body:
+                return &quot;def f(x):\n    return x + 1\n&quot;
+            if &quot;square&quot; in body:
+                return &quot;def f(x):\n    return x * x\n&quot;
+            return &quot;def f(x):\n    return x\n&quot;
+        if text.startswith(&quot;choose:&quot;):
+            body = text[len(&quot;choose:&quot;):].strip()
+            return body.split(&quot;|&quot;, 1)[0].strip()[:1].upper()
+        if text.startswith(&quot;write:&quot;):
+            body = text[len(&quot;write:&quot;):].strip()
+            return body
+        return text
+
+
+_ARITH_OPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod,
+    ast.UAdd: operator.pos,
+    ast.USub: operator.neg,
+    ast.Pow: operator.pow,
+}
+
+
+def safe_arith_eval(expr: str) -&gt; float:
+    &quot;&quot;&quot;Evaluate a small arithmetic expression without exposing eval.&quot;&quot;&quot;
+    tree = ast.parse(expr, mode=&quot;eval&quot;)
+    return _safe_eval(tree.body)
+
+
+def _safe_eval(node: ast.AST) -&gt; float:
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return node.value
+    if isinstance(node, ast.BinOp) and type(node.op) in _ARITH_OPS:
+        return _ARITH_OPS[type(node.op)](_safe_eval(node.left), _safe_eval(node.right))
+    if isinstance(node, ast.UnaryOp) and type(node.op) in _ARITH_OPS:
+        return _ARITH_OPS[type(node.op)](_safe_eval(node.operand))
+    raise ValueError(f&quot;unsafe node: {ast.dump(node)}&quot;)
+
+
+def normalize(s: str) -&gt; str:
+    return re.sub(r&quot;\s+&quot;, &quot; &quot;, s.strip().lower())
+
+
+def metric_exact_match(prediction: str, targets: List[str]) -&gt; float:
+    norm_pred = normalize(prediction)
+    return 1.0 if any(normalize(t) == norm_pred for t in targets) else 0.0
+
+
+def metric_substring_contains(prediction: str, targets: List[str]) -&gt; float:
+    norm_pred = normalize(prediction)
+    return 1.0 if any(normalize(t) in norm_pred for t in targets) else 0.0
+
+
+def metric_multiple_choice(prediction: str, targets: List[str]) -&gt; float:
+    pred = prediction.strip()[:1].upper()
+    return 1.0 if pred in {t.strip()[:1].upper() for t in targets} else 0.0
+
+
+def _tokens(s: str) -&gt; List[str]:
+    return re.findall(r&quot;[a-z0-9]+&quot;, s.lower())
+
+
+def _lcs_length(a: List[str], b: List[str]) -&gt; int:
+    if not a or not b:
+        return 0
+    prev = [0] * (len(b) + 1)
+    for ai in a:
+        cur = [0] * (len(b) + 1)
+        for j, bj in enumerate(b):
+            if ai == bj:
+                cur[j + 1] = prev[j] + 1
+            else:
+                cur[j + 1] = max(prev[j + 1], cur[j])
+        prev = cur
+    return prev[-1]
+
+
+def metric_rouge_l(prediction: str, targets: List[str]) -&gt; float:
+    pred = _tokens(prediction)
+    if not pred:
+        return 0.0
+    best = 0.0
+    for ref in targets:
+        ref_toks = _tokens(ref)
+        if not ref_toks:
+            continue
+        lcs = _lcs_length(pred, ref_toks)
+        if lcs == 0:
+            continue
+        prec = lcs / len(pred)
+        rec = lcs / len(ref_toks)
+        if prec + rec == 0:
+            continue
+        f1 = 2 * prec * rec / (prec + rec)
+        if f1 &gt; best:
+            best = f1
+    return best
+
+
+def metric_code_exec(prediction: str, targets: List[str], extras: Dict[str, object]) -&gt; float:
+    &quot;&quot;&quot;Execute the prediction in a small namespace and compare against
+    expected outputs.
+
+    Targets is a list of stringified expected results; extras carries a
+    list of (input, output) pairs the function is checked against. The
+    code runs in a stripped builtins namespace so it cannot reach the
+    filesystem or network.
+    &quot;&quot;&quot;
+    pairs = extras.get(&quot;io_pairs&quot;) or []
+    if not isinstance(pairs, list) or not pairs:
+        return 0.0
+    safe_globals = {&quot;__builtins__&quot;: {&quot;range&quot;: range, &quot;len&quot;: len, &quot;min&quot;: min, &quot;max&quot;: max, &quot;abs&quot;: abs, &quot;int&quot;: int, &quot;float&quot;: float}}
+    local: Dict[str, object] = {}
+    try:
+        exec(prediction, safe_globals, local)
+    except Exception:
+        return 0.0
+    fn = local.get(&quot;f&quot;)
+    if not callable(fn):
+        return 0.0
+    correct = 0
+    for pair in pairs:
+        if not (isinstance(pair, list) and len(pair) == 2):
+            continue
+        x, expected = pair
+        try:
+            actual = fn(x)
+        except Exception:
+            continue
+        if actual == expected:
+            correct += 1
+    if not pairs:
+        return 0.0
+    return correct / len(pairs)
+
+
+METRIC_FNS: Dict[str, Callable[..., float]] = {
+    &quot;exact_match&quot;: lambda p, t, e: metric_exact_match(p, t),
+    &quot;substring_contains&quot;: lambda p, t, e: metric_substring_contains(p, t),
+    &quot;multiple_choice&quot;: lambda p, t, e: metric_multiple_choice(p, t),
+    &quot;rouge_l&quot;: lambda p, t, e: metric_rouge_l(p, t),
+    &quot;code_exec&quot;: lambda p, t, e: metric_code_exec(p, t, e),
+}
+
+
+def load_task_jsonl(path: Path) -&gt; List[Example]:
+    examples: List[Example] = []
+    with path.open(&quot;r&quot;, encoding=&quot;utf-8&quot;) as f:
+        for line_num, raw in enumerate(f, start=1):
+            raw = raw.strip()
+            if not raw or raw.startswith(&quot;#&quot;):
+                continue
+            try:
+                obj = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f&quot;bad json at {path}:{line_num}: {exc}&quot;) from exc
+            examples.append(Example(
+                id=str(obj.get(&quot;id&quot;, f&quot;ex-{line_num}&quot;)),
+                prompt=obj[&quot;prompt&quot;],
+                targets=list(obj[&quot;targets&quot;]),
+                metric=obj[&quot;metric&quot;],
+                extras=dict(obj.get(&quot;extras&quot;, {})),
+            ))
+    return examples
+
+
+def write_task_jsonl(examples: Iterable[Example], path: Path) -&gt; None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open(&quot;w&quot;, encoding=&quot;utf-8&quot;) as f:
+        for ex in examples:
+            f.write(json.dumps({
+                &quot;id&quot;: ex.id,
+                &quot;prompt&quot;: ex.prompt,
+                &quot;targets&quot;: ex.targets,
+                &quot;metric&quot;: ex.metric,
+                **({&quot;extras&quot;: ex.extras} if ex.extras else {}),
+            }) + &quot;\n&quot;)
+
+
+def run_task(
+    task_name: str,
+    examples: List[Example],
+    adapter: ModelAdapter,
+    *,
+    batch_size: int = 8,
+) -&gt; TaskResult:
+    if batch_size &lt;= 0:
+        raise ValueError(f&quot;batch_size must be &gt; 0, got {batch_size}&quot;)
+    if not examples:
+        return TaskResult(task=task_name, metric=&quot;none&quot;, score=0.0, correct=0, total=0)
+    metric = examples[0].metric
+    assert all(ex.metric == metric for ex in examples), f&quot;task {task_name} mixes metrics&quot;
+    metric_fn = METRIC_FNS[metric]
+    per_example: List[Dict[str, object]] = []
+    correct_sum = 0.0
+    total = 0
+    start = time.perf_counter()
+    for i in range(0, len(examples), batch_size):
+        chunk = examples[i:i + batch_size]
+        prompts = [ex.prompt for ex in chunk]
+        outputs = adapter.generate(prompts)
+        if len(outputs) != len(chunk):
+            raise ValueError(
+                f&quot;adapter returned {len(outputs)} outputs for {len(chunk)} prompts in task {task_name}&quot;
+            )
+        for ex, out in zip(chunk, outputs, strict=True):
+            score = metric_fn(out, ex.targets, ex.extras)
+            correct_sum += score
+            total += 1
+            per_example.append({
+                &quot;id&quot;: ex.id,
+                &quot;prompt&quot;: ex.prompt,
+                &quot;prediction&quot;: out,
+                &quot;targets&quot;: ex.targets,
+                &quot;score&quot;: score,
+            })
+    latency_ms = (time.perf_counter() - start) * 1000.0
+    score = correct_sum / total if total else 0.0
+    correct_int = int(round(correct_sum))
+    return TaskResult(
+        task=task_name,
+        metric=metric,
+        score=score,
+        correct=correct_int,
+        total=total,
+        per_example=per_example,
+        latency_ms=latency_ms,
+    )
+
+
+def run_leaderboard(
+    tasks: Dict[str, List[Example]],
+    adapter: ModelAdapter,
+    *,
+    batch_size: int = 8,
+) -&gt; Leaderboard:
+    results: List[TaskResult] = []
+    for name in sorted(tasks):
+        result = run_task(name, tasks[name], adapter, batch_size=batch_size)
+        results.append(result)
+    if results:
+        overall = sum(r.score for r in results) / len(results)
+    else:
+        overall = 0.0
+    return Leaderboard(
+        schema=&quot;leaderboard.v1&quot;,
+        timestamp=time.time(),
+        overall_score=overall,
+        tasks=results,
+    )
+
+
+def write_leaderboard(
+    board: Leaderboard,
+    path: Path,
+    *,
+    adapter_name: str,
+    include_per_example: bool = False,
+) -&gt; None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        &quot;schema&quot;: board.schema,
+        &quot;timestamp&quot;: board.timestamp,
+        &quot;overall_score&quot;: board.overall_score,
+        &quot;adapter&quot;: adapter_name,
+        &quot;tasks&quot;: [
+            {
+                &quot;task&quot;: r.task,
+                &quot;metric&quot;: r.metric,
+                &quot;score&quot;: r.score,
+                &quot;correct&quot;: r.correct,
+                &quot;total&quot;: r.total,
+                &quot;latency_ms&quot;: r.latency_ms,
+                **({&quot;per_example&quot;: r.per_example} if include_per_example else {}),
+            }
+            for r in board.tasks
+        ],
+    }
+    path.write_text(json.dumps(payload, indent=2) + &quot;\n&quot;)
+
+
+def build_arithmetic_task() -&gt; List[Example]:
+    items = [(&quot;2 + 2&quot;, &quot;4&quot;), (&quot;7 - 3&quot;, &quot;4&quot;), (&quot;6 * 4&quot;, &quot;24&quot;), (&quot;100 / 4&quot;, &quot;25.0&quot;), (&quot;12 + 9&quot;, &quot;21&quot;)]
+    return [Example(id=f&quot;arith-{i:02d}&quot;, prompt=f&quot;compute: {q}&quot;, targets=[a], metric=&quot;exact_match&quot;) for i, (q, a) in enumerate(items)]
+
+
+def build_summary_task() -&gt; List[Example]:
+    items = [
+        (&quot;Cats are mammals. Mammals are warm blooded.&quot;, &quot;cats are mammals&quot;),
+        (&quot;Python uses indentation. Indentation defines blocks.&quot;, &quot;python uses indentation&quot;),
+        (&quot;The river flows east. Boats pass slowly.&quot;, &quot;the river flows east&quot;),
+        (&quot;Storms approach the coast. Waves rise quickly.&quot;, &quot;storms approach the coast&quot;),
+        (&quot;Bread bakes at high heat. Crust forms last.&quot;, &quot;bread bakes at high heat&quot;),
+    ]
+    return [Example(id=f&quot;sum-{i:02d}&quot;, prompt=f&quot;summarize: {p}&quot;, targets=[t], metric=&quot;rouge_l&quot;) for i, (p, t) in enumerate(items)]
+
+
+def build_code_task() -&gt; List[Example]:
+    items = [
+        (&quot;write a function f that doubles its input&quot;, &quot;double&quot;, [[1, 2], [3, 6], [5, 10]]),
+        (&quot;write a function f that increments its input&quot;, &quot;increment&quot;, [[1, 2], [5, 6], [10, 11]]),
+        (&quot;write a function f that squares its input&quot;, &quot;square&quot;, [[2, 4], [3, 9], [4, 16]]),
+        (&quot;write a function f that doubles its input again&quot;, &quot;double&quot;, [[7, 14], [9, 18]]),
+        (&quot;write a function f that increments its input again&quot;, &quot;increment&quot;, [[0, 1], [2, 3]]),
+    ]
+    return [
+        Example(
+            id=f&quot;code-{i:02d}&quot;,
+            prompt=f&quot;python: {prompt}&quot;,
+            targets=[&quot;ok&quot;],
+            metric=&quot;code_exec&quot;,
+            extras={&quot;io_pairs&quot;: pairs, &quot;tag&quot;: tag},
+        )
+        for i, (prompt, tag, pairs) in enumerate(items)
+    ]
+
+
+def build_choice_task() -&gt; List[Example]:
+    items = [
+        (&quot;A | mammal, B | reptile, C | bird&quot;, [&quot;A&quot;]),
+        (&quot;A | apple, B | car, C | tree&quot;, [&quot;A&quot;]),
+        (&quot;A | water, B | iron, C | wood&quot;, [&quot;A&quot;]),
+        (&quot;A | square, B | triangle, C | circle&quot;, [&quot;A&quot;]),
+        (&quot;A | bread, B | rock, C | leaf&quot;, [&quot;A&quot;]),
+    ]
+    return [Example(id=f&quot;mc-{i:02d}&quot;, prompt=f&quot;choose: {q}&quot;, targets=t, metric=&quot;multiple_choice&quot;) for i, (q, t) in enumerate(items)]
+
+
+def build_generation_task() -&gt; List[Example]:
+    items = [
+        (&quot;hello world&quot;, [&quot;hello&quot;]),
+        (&quot;training language models&quot;, [&quot;language&quot;]),
+        (&quot;evaluation harness&quot;, [&quot;evaluation&quot;]),
+        (&quot;gradient accumulation step&quot;, [&quot;gradient&quot;]),
+        (&quot;distributed parameter sharding&quot;, [&quot;distributed&quot;]),
+    ]
+    return [Example(id=f&quot;gen-{i:02d}&quot;, prompt=f&quot;write: {p}&quot;, targets=t, metric=&quot;substring_contains&quot;) for i, (p, t) in enumerate(items)]
+
+
+def seed_fixture_tasks(target_dir: Path) -&gt; Dict[str, Path]:
+    target_dir.mkdir(parents=True, exist_ok=True)
+    tasks = {
+        &quot;arithmetic&quot;: build_arithmetic_task(),
+        &quot;summary&quot;: build_summary_task(),
+        &quot;code-exec&quot;: build_code_task(),
+        &quot;multiple-choice&quot;: build_choice_task(),
+        &quot;generation&quot;: build_generation_task(),
+    }
+    paths: Dict[str, Path] = {}
+    for name, examples in tasks.items():
+        path = target_dir / f&quot;{name}.jsonl&quot;
+        write_task_jsonl(examples, path)
+        paths[name] = path
+    return paths
+
+
+def load_all_tasks(task_dir: Path) -&gt; Dict[str, List[Example]]:
+    tasks: Dict[str, List[Example]] = {}
+    for path in sorted(task_dir.glob(&quot;*.jsonl&quot;)):
+        tasks[path.stem] = load_task_jsonl(path)
+    return tasks
+
+
+def parse_args() -&gt; argparse.Namespace:
+    p = argparse.ArgumentParser()
+    p.add_argument(&quot;--task-dir&quot;, type=Path, default=TASKS_DIR)
+    p.add_argument(&quot;--out&quot;, type=Path, default=LEADERBOARD)
+    p.add_argument(&quot;--batch-size&quot;, type=int, default=4)
+    p.add_argument(&quot;--include-per-example&quot;, action=&quot;store_true&quot;)
+    p.add_argument(&quot;--seed-fixtures&quot;, action=&quot;store_true&quot;)
+    return p.parse_args()
+
+
+def main() -&gt; int:
+    args = parse_args()
+    if args.seed_fixtures or not args.task_dir.exists() or not list(args.task_dir.glob(&quot;*.jsonl&quot;)):
+        print(f&quot;seeding fixture tasks into {args.task_dir}&quot;)
+        seed_fixture_tasks(args.task_dir)
+    tasks = load_all_tasks(args.task_dir)
+    print(f&quot;loaded {len(tasks)} tasks: {sorted(tasks)}&quot;)
+    adapter = ToyAdapter()
+    board = run_leaderboard(tasks, adapter, batch_size=args.batch_size)
+    write_leaderboard(
+        board,
+        args.out,
+        adapter_name=adapter.name,
+        include_per_example=args.include_per_example,
+    )
+    print(f&quot;overall_score = {board.overall_score:.3f}&quot;)
+    for r in board.tasks:
+        print(f&quot;  {r.task:&gt;16}  metric={r.metric:&gt;18}  score={r.score:0.3f}  ({r.correct}/{r.total})  latency_ms={r.latency_ms:.1f}&quot;)
+    print(f&quot;wrote {args.out}&quot;)
+    return 0
+
+
+if __name__ == &quot;__main__&quot;:
+    raise SystemExit(main())
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/49-lm-eval-harness/code/test_main.py">phases/19-capstone-projects/49-lm-eval-harness/code/test_main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Tests for the eval harness: metric scoring, task loading, runner.&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+HERE = Path(__file__).parent
+sys.path.insert(0, str(HERE))
+
+import main as harness
+
+
+class MetricTests(unittest.TestCase):
+    def test_exact_match_normalizes_case_and_whitespace(self):
+        self.assertEqual(harness.metric_exact_match(&quot;  Hello  WORLD &quot;, [&quot;hello world&quot;]), 1.0)
+        self.assertEqual(harness.metric_exact_match(&quot;hello&quot;, [&quot;hi&quot;]), 0.0)
+
+    def test_multiple_choice_uses_first_letter(self):
+        self.assertEqual(harness.metric_multiple_choice(&quot;a) the apple&quot;, [&quot;A&quot;]), 1.0)
+        self.assertEqual(harness.metric_multiple_choice(&quot;B&quot;, [&quot;A&quot;]), 0.0)
+
+    def test_rouge_l_returns_perfect_on_identical_strings(self):
+        score = harness.metric_rouge_l(&quot;the river flows east&quot;, [&quot;the river flows east&quot;])
+        self.assertAlmostEqual(score, 1.0, places=6)
+
+    def test_rouge_l_partial_overlap_below_one(self):
+        score = harness.metric_rouge_l(&quot;the river flows east&quot;, [&quot;the river bends slowly&quot;])
+        self.assertGreater(score, 0.0)
+        self.assertLess(score, 1.0)
+
+    def test_substring_contains_truthy_when_target_inside(self):
+        self.assertEqual(harness.metric_substring_contains(&quot;the gradient is good&quot;, [&quot;gradient&quot;]), 1.0)
+        self.assertEqual(harness.metric_substring_contains(&quot;no match here&quot;, [&quot;gradient&quot;]), 0.0)
+
+    def test_code_exec_runs_pairs_and_blocks_unsafe(self):
+        prediction = &quot;def f(x):\n    return x * 2\n&quot;
+        pairs = {&quot;io_pairs&quot;: [[1, 2], [3, 6]]}
+        self.assertEqual(harness.metric_code_exec(prediction, [], pairs), 1.0)
+        bad = &quot;import os\ndef f(x):\n    return os.getcwd()\n&quot;
+        self.assertEqual(harness.metric_code_exec(bad, [], {&quot;io_pairs&quot;: [[1, &quot;anything&quot;]]}), 0.0)
+
+
+class SafeArithTests(unittest.TestCase):
+    def test_arith_eval_basic_ops(self):
+        self.assertEqual(harness.safe_arith_eval(&quot;1 + 2 * 3&quot;), 7)
+        self.assertEqual(harness.safe_arith_eval(&quot;(8 - 2) / 3&quot;), 2.0)
+
+    def test_arith_eval_rejects_calls(self):
+        with self.assertRaises(ValueError):
+            harness.safe_arith_eval(&quot;__import__(&#39;os&#39;).system(&#39;echo&#39;)&quot;)
+
+
+class TaskIOTests(unittest.TestCase):
+    def test_round_trip_jsonl(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            examples = harness.build_arithmetic_task()
+            path = Path(tmp) / &quot;arith.jsonl&quot;
+            harness.write_task_jsonl(examples, path)
+            loaded = harness.load_task_jsonl(path)
+            self.assertEqual(len(loaded), len(examples))
+            self.assertEqual(loaded[0].metric, &quot;exact_match&quot;)
+            self.assertEqual(loaded[0].id, examples[0].id)
+
+    def test_load_skips_comments_and_blanks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / &quot;comments.jsonl&quot;
+            path.write_text(&quot;# comment\n\n{\&quot;prompt\&quot;:\&quot;compute: 1 + 1\&quot;,\&quot;targets\&quot;:[\&quot;2\&quot;],\&quot;metric\&quot;:\&quot;exact_match\&quot;}\n&quot;)
+            loaded = harness.load_task_jsonl(path)
+            self.assertEqual(len(loaded), 1)
+
+
+class RunnerTests(unittest.TestCase):
+    def test_runner_full_score_with_toy_adapter(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = harness.seed_fixture_tasks(Path(tmp))
+            tasks = harness.load_all_tasks(Path(tmp))
+            self.assertEqual(len(tasks), 5)
+            adapter = harness.ToyAdapter()
+            board = harness.run_leaderboard(tasks, adapter, batch_size=3)
+            self.assertEqual(board.schema, &quot;leaderboard.v1&quot;)
+            self.assertEqual(len(board.tasks), 5)
+            for r in board.tasks:
+                self.assertEqual(r.total, 5)
+                self.assertGreater(r.score, 0.5, msg=f&quot;low score on {r.task}: {r.score}&quot;)
+
+    def test_runner_handles_mixed_failure(self):
+        class StubAdapter:
+            name = &quot;stub&quot;
+
+            def generate(self, prompts):
+                return [&quot;&quot; for _ in prompts]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = harness.seed_fixture_tasks(Path(tmp))
+            tasks = harness.load_all_tasks(Path(tmp))
+            board = harness.run_leaderboard(tasks, StubAdapter(), batch_size=2)
+            self.assertEqual(len(board.tasks), 5)
+            for r in board.tasks:
+                self.assertEqual(r.score, 0.0)
+            self.assertEqual(board.overall_score, 0.0)
+
+
+class LeaderboardOutputTests(unittest.TestCase):
+    def test_leaderboard_json_contains_schema(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = harness.seed_fixture_tasks(Path(tmp) / &quot;tasks&quot;)
+            tasks = harness.load_all_tasks(Path(tmp) / &quot;tasks&quot;)
+            adapter = harness.ToyAdapter()
+            board = harness.run_leaderboard(tasks, adapter)
+            out = Path(tmp) / &quot;leaderboard.json&quot;
+            harness.write_leaderboard(board, out, adapter_name=adapter.name)
+            payload = json.loads(out.read_text())
+            self.assertEqual(payload[&quot;schema&quot;], &quot;leaderboard.v1&quot;)
+            self.assertEqual(payload[&quot;adapter&quot;], adapter.name)
+            self.assertEqual(len(payload[&quot;tasks&quot;]), 5)
+            for entry in payload[&quot;tasks&quot;]:
+                self.assertNotIn(&quot;per_example&quot;, entry)
+            harness.write_leaderboard(board, out, adapter_name=adapter.name, include_per_example=True)
+            payload2 = json.loads(out.read_text())
+            for entry in payload2[&quot;tasks&quot;]:
+                self.assertIn(&quot;per_example&quot;, entry)
+
+
+if __name__ == &quot;__main__&quot;:
+    unittest.main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/49-lm-eval-harness/outputs/leaderboard.json">phases/19-capstone-projects/49-lm-eval-harness/outputs/leaderboard.json</a><details><summary>查看原始文本</summary><pre><code>{
+  &quot;schema&quot;: &quot;leaderboard.v1&quot;,
+  &quot;timestamp&quot;: 1779820461.3824089,
+  &quot;overall_score&quot;: 1.0,
+  &quot;adapter&quot;: &quot;arithmetic&quot;,
+  &quot;tasks&quot;: [
+    {
+      &quot;task&quot;: &quot;arithmetic&quot;,
+      &quot;metric&quot;: &quot;exact_match&quot;,
+      &quot;score&quot;: 1.0,
+      &quot;correct&quot;: 5,
+      &quot;total&quot;: 5,
+      &quot;latency_ms&quot;: 0.09666697587817907
+    },
+    {
+      &quot;task&quot;: &quot;code-exec&quot;,
+      &quot;metric&quot;: &quot;code_exec&quot;,
+      &quot;score&quot;: 1.0,
+      &quot;correct&quot;: 5,
+      &quot;total&quot;: 5,
+      &quot;latency_ms&quot;: 0.1051250146701932
+    },
+    {
+      &quot;task&quot;: &quot;generation&quot;,
+      &quot;metric&quot;: &quot;substring_contains&quot;,
+      &quot;score&quot;: 1.0,
+      &quot;correct&quot;: 5,
+      &quot;total&quot;: 5,
+      &quot;latency_ms&quot;: 0.02195802517235279
+    },
+    {
+      &quot;task&quot;: &quot;multiple-choice&quot;,
+      &quot;metric&quot;: &quot;multiple_choice&quot;,
+      &quot;score&quot;: 1.0,
+      &quot;correct&quot;: 5,
+      &quot;total&quot;: 5,
+      &quot;latency_ms&quot;: 0.011208001524209976
+    },
+    {
+      &quot;task&quot;: &quot;summary&quot;,
+      &quot;metric&quot;: &quot;rouge_l&quot;,
+      &quot;score&quot;: 1.0,
+      &quot;correct&quot;: 5,
+      &quot;total&quot;: 5,
+      &quot;latency_ms&quot;: 0.1154160127043724
+    }
+  ]
+}
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/49-lm-eval-harness/outputs/skill-lm-eval-harness.md">phases/19-capstone-projects/49-lm-eval-harness/outputs/skill-lm-eval-harness.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: lm-eval-harness
+description: Minimal language model evaluation harness with JSONL task spec, five metrics, swappable adapter, and leaderboard JSON output.
+version: 1.0.0
+phase: 19
+lesson: 49
+tags: [evaluation, metrics, leaderboard, harness]
+---
+
+## When to use
+
+Compare two models, two checkpoints, or two prompt templates against a fixed set of tasks. Anything that ships and that you need to monitor over time.
+
+## Task spec
+
+One JSONL line per example:
+
+```json
+{&quot;id&quot;: &quot;ex-001&quot;, &quot;prompt&quot;: &quot;...&quot;, &quot;targets&quot;: [&quot;...&quot;], &quot;metric&quot;: &quot;exact_match&quot;, &quot;extras&quot;: {}}
+```
+
+All examples in a file share a metric. The file name is the task name.
+
+## Metrics
+
+| Metric | Signature | Use for |
+|--------|-----------|---------|
+| exact_match | normalize lower + whitespace, equality | Arithmetic, factoid answers |
+| substring_contains | target must appear in normalized prediction | Free-form generation with anchor words |
+| multiple_choice | first letter match | A/B/C/D style questions |
+| rouge_l | LCS F1 over tokenized text | Summary, paraphrase |
+| code_exec | run prediction&#39;s `f` on io_pairs, count matches | Code generation |
+
+All metrics return float in [0.0, 1.0]. Task score is the mean.
+
+## Adapter
+
+```python
+class Adapter(Protocol):
+    name: str
+    def generate(self, prompts: list[str]) -&gt; list[str]: ...
+```
+
+The adapter is the only model-specific code.
+
+## Leaderboard JSON
+
+Schema string, timestamp, per-task scores and latency, overall mean. Include per-example records when comparing runs so prediction-level regressions are visible.
+
+## Failure modes
+
+- Metric returns outside [0, 1]: overall score becomes uninterpretable.
+- Mixed metrics in one task file: assertion fires; keep one metric per file.
+- code_exec without restricted namespace: arbitrary code execution.
+- No schema string: format evolution breaks downstream dashboards.
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/49-lm-eval-harness/outputs/tasks/arithmetic.jsonl">phases/19-capstone-projects/49-lm-eval-harness/outputs/tasks/arithmetic.jsonl</a><details><summary>查看原始文本</summary><pre><code>{&quot;id&quot;: &quot;arith-00&quot;, &quot;prompt&quot;: &quot;compute: 2 + 2&quot;, &quot;targets&quot;: [&quot;4&quot;], &quot;metric&quot;: &quot;exact_match&quot;}
+{&quot;id&quot;: &quot;arith-01&quot;, &quot;prompt&quot;: &quot;compute: 7 - 3&quot;, &quot;targets&quot;: [&quot;4&quot;], &quot;metric&quot;: &quot;exact_match&quot;}
+{&quot;id&quot;: &quot;arith-02&quot;, &quot;prompt&quot;: &quot;compute: 6 * 4&quot;, &quot;targets&quot;: [&quot;24&quot;], &quot;metric&quot;: &quot;exact_match&quot;}
+{&quot;id&quot;: &quot;arith-03&quot;, &quot;prompt&quot;: &quot;compute: 100 / 4&quot;, &quot;targets&quot;: [&quot;25.0&quot;], &quot;metric&quot;: &quot;exact_match&quot;}
+{&quot;id&quot;: &quot;arith-04&quot;, &quot;prompt&quot;: &quot;compute: 12 + 9&quot;, &quot;targets&quot;: [&quot;21&quot;], &quot;metric&quot;: &quot;exact_match&quot;}
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/49-lm-eval-harness/outputs/tasks/code-exec.jsonl">phases/19-capstone-projects/49-lm-eval-harness/outputs/tasks/code-exec.jsonl</a><details><summary>查看原始文本</summary><pre><code>{&quot;id&quot;: &quot;code-00&quot;, &quot;prompt&quot;: &quot;python: write a function f that doubles its input&quot;, &quot;targets&quot;: [&quot;ok&quot;], &quot;metric&quot;: &quot;code_exec&quot;, &quot;extras&quot;: {&quot;io_pairs&quot;: [[1, 2], [3, 6], [5, 10]], &quot;tag&quot;: &quot;double&quot;}}
+{&quot;id&quot;: &quot;code-01&quot;, &quot;prompt&quot;: &quot;python: write a function f that increments its input&quot;, &quot;targets&quot;: [&quot;ok&quot;], &quot;metric&quot;: &quot;code_exec&quot;, &quot;extras&quot;: {&quot;io_pairs&quot;: [[1, 2], [5, 6], [10, 11]], &quot;tag&quot;: &quot;increment&quot;}}
+{&quot;id&quot;: &quot;code-02&quot;, &quot;prompt&quot;: &quot;python: write a function f that squares its input&quot;, &quot;targets&quot;: [&quot;ok&quot;], &quot;metric&quot;: &quot;code_exec&quot;, &quot;extras&quot;: {&quot;io_pairs&quot;: [[2, 4], [3, 9], [4, 16]], &quot;tag&quot;: &quot;square&quot;}}
+{&quot;id&quot;: &quot;code-03&quot;, &quot;prompt&quot;: &quot;python: write a function f that doubles its input again&quot;, &quot;targets&quot;: [&quot;ok&quot;], &quot;metric&quot;: &quot;code_exec&quot;, &quot;extras&quot;: {&quot;io_pairs&quot;: [[7, 14], [9, 18]], &quot;tag&quot;: &quot;double&quot;}}
+{&quot;id&quot;: &quot;code-04&quot;, &quot;prompt&quot;: &quot;python: write a function f that increments its input again&quot;, &quot;targets&quot;: [&quot;ok&quot;], &quot;metric&quot;: &quot;code_exec&quot;, &quot;extras&quot;: {&quot;io_pairs&quot;: [[0, 1], [2, 3]], &quot;tag&quot;: &quot;increment&quot;}}
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/49-lm-eval-harness/outputs/tasks/generation.jsonl">phases/19-capstone-projects/49-lm-eval-harness/outputs/tasks/generation.jsonl</a><details><summary>查看原始文本</summary><pre><code>{&quot;id&quot;: &quot;gen-00&quot;, &quot;prompt&quot;: &quot;write: hello world&quot;, &quot;targets&quot;: [&quot;hello&quot;], &quot;metric&quot;: &quot;substring_contains&quot;}
+{&quot;id&quot;: &quot;gen-01&quot;, &quot;prompt&quot;: &quot;write: training language models&quot;, &quot;targets&quot;: [&quot;language&quot;], &quot;metric&quot;: &quot;substring_contains&quot;}
+{&quot;id&quot;: &quot;gen-02&quot;, &quot;prompt&quot;: &quot;write: evaluation harness&quot;, &quot;targets&quot;: [&quot;evaluation&quot;], &quot;metric&quot;: &quot;substring_contains&quot;}
+{&quot;id&quot;: &quot;gen-03&quot;, &quot;prompt&quot;: &quot;write: gradient accumulation step&quot;, &quot;targets&quot;: [&quot;gradient&quot;], &quot;metric&quot;: &quot;substring_contains&quot;}
+{&quot;id&quot;: &quot;gen-04&quot;, &quot;prompt&quot;: &quot;write: distributed parameter sharding&quot;, &quot;targets&quot;: [&quot;distributed&quot;], &quot;metric&quot;: &quot;substring_contains&quot;}
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/49-lm-eval-harness/outputs/tasks/multiple-choice.jsonl">phases/19-capstone-projects/49-lm-eval-harness/outputs/tasks/multiple-choice.jsonl</a><details><summary>查看原始文本</summary><pre><code>{&quot;id&quot;: &quot;mc-00&quot;, &quot;prompt&quot;: &quot;choose: A | mammal, B | reptile, C | bird&quot;, &quot;targets&quot;: [&quot;A&quot;], &quot;metric&quot;: &quot;multiple_choice&quot;}
+{&quot;id&quot;: &quot;mc-01&quot;, &quot;prompt&quot;: &quot;choose: A | apple, B | car, C | tree&quot;, &quot;targets&quot;: [&quot;A&quot;], &quot;metric&quot;: &quot;multiple_choice&quot;}
+{&quot;id&quot;: &quot;mc-02&quot;, &quot;prompt&quot;: &quot;choose: A | water, B | iron, C | wood&quot;, &quot;targets&quot;: [&quot;A&quot;], &quot;metric&quot;: &quot;multiple_choice&quot;}
+{&quot;id&quot;: &quot;mc-03&quot;, &quot;prompt&quot;: &quot;choose: A | square, B | triangle, C | circle&quot;, &quot;targets&quot;: [&quot;A&quot;], &quot;metric&quot;: &quot;multiple_choice&quot;}
+{&quot;id&quot;: &quot;mc-04&quot;, &quot;prompt&quot;: &quot;choose: A | bread, B | rock, C | leaf&quot;, &quot;targets&quot;: [&quot;A&quot;], &quot;metric&quot;: &quot;multiple_choice&quot;}
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/49-lm-eval-harness/outputs/tasks/summary.jsonl">phases/19-capstone-projects/49-lm-eval-harness/outputs/tasks/summary.jsonl</a><details><summary>查看原始文本</summary><pre><code>{&quot;id&quot;: &quot;sum-00&quot;, &quot;prompt&quot;: &quot;summarize: Cats are mammals. Mammals are warm blooded.&quot;, &quot;targets&quot;: [&quot;cats are mammals&quot;], &quot;metric&quot;: &quot;rouge_l&quot;}
+{&quot;id&quot;: &quot;sum-01&quot;, &quot;prompt&quot;: &quot;summarize: Python uses indentation. Indentation defines blocks.&quot;, &quot;targets&quot;: [&quot;python uses indentation&quot;], &quot;metric&quot;: &quot;rouge_l&quot;}
+{&quot;id&quot;: &quot;sum-02&quot;, &quot;prompt&quot;: &quot;summarize: The river flows east. Boats pass slowly.&quot;, &quot;targets&quot;: [&quot;the river flows east&quot;], &quot;metric&quot;: &quot;rouge_l&quot;}
+{&quot;id&quot;: &quot;sum-03&quot;, &quot;prompt&quot;: &quot;summarize: Storms approach the coast. Waves rise quickly.&quot;, &quot;targets&quot;: [&quot;storms approach the coast&quot;], &quot;metric&quot;: &quot;rouge_l&quot;}
+{&quot;id&quot;: &quot;sum-04&quot;, &quot;prompt&quot;: &quot;summarize: Bread bakes at high heat. Crust forms last.&quot;, &quot;targets&quot;: [&quot;bread bakes at high heat&quot;], &quot;metric&quot;: &quot;rouge_l&quot;}
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. What four fields define a task example in the harness&#39;s JSONL format?</legend><label class="option"><input type="radio" name="q0" value="0"> id, prompt, targets, metric, and an optional extras dict for side data the metric needs</label><label class="option"><input type="radio" name="q0" value="1"> name, score, payload, vendor</label><label class="option"><input type="radio" name="q0" value="2"> weights and bias</label><label class="option"><input type="radio" name="q0" value="3"> input and output</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. Why is the metric function signature (prediction, targets, extras) -&gt; float?</legend><label class="option"><input type="radio" name="q1" value="0"> It returns an integer</label><label class="option"><input type="radio" name="q1" value="1"> It needs the model object</label><label class="option"><input type="radio" name="q1" value="2"> It is the smallest signature that handles single-target string match, multi-reference rouge-l, and code_exec with side data, while keeping scores in a comparable [0.0, 1.0] range</label><label class="option"><input type="radio" name="q1" value="3"> Random choice</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. How does the code_exec metric resist malicious predictions?</legend><label class="option"><input type="radio" name="q2" value="0"> It uses sandbox containers</label><label class="option"><input type="radio" name="q2" value="1"> It runs the prediction with a stripped __builtins__ dict so the namespace exposes only a few safe names; import statements fail because the importer is not in scope</label><label class="option"><input type="radio" name="q2" value="2"> It does not</label><label class="option"><input type="radio" name="q2" value="3"> It rejects anything that contains def</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. What does the model adapter abstraction buy you?</legend><label class="option"><input type="radio" name="q3" value="0"> It is the only model-specific code in the harness; swap the adapter to point at a new vendor, and the tasks, metrics, runner, and leaderboard format stay the same</label><label class="option"><input type="radio" name="q3" value="1"> It is required by torch</label><label class="option"><input type="radio" name="q3" value="2"> Nothing</label><label class="option"><input type="radio" name="q3" value="3"> It makes the model faster</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. Why does the leaderboard JSON carry a schema string like leaderboard.v1?</legend><label class="option"><input type="radio" name="q4" value="0"> So future format changes bump the version and downstream dashboards can dispatch on it instead of breaking silently</label><label class="option"><input type="radio" name="q4" value="1"> It compresses the file</label><label class="option"><input type="radio" name="q4" value="2"> For SEO</label><label class="option"><input type="radio" name="q4" value="3"> It is random</label><p data-feedback="4"></p></fieldset><fieldset><legend>6. Reading a leaderboard, overall_score is computed how, and what should you watch for when comparing two runs?</legend><label class="option"><input type="radio" name="q5" value="0"> Random sample</label><label class="option"><input type="radio" name="q5" value="1"> Sum of correct counts</label><label class="option"><input type="radio" name="q5" value="2"> Mean of per-task scores (each in [0,1]); when comparing, also diff per-example predictions for tasks whose scores moved, because the score alone hides which examples regressed</label><label class="option"><input type="radio" name="q5" value="3"> Best task score</label><p data-feedback="5"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/19-capstone-projects/48-distributed-fsdp-ddp/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/19-capstone-projects/50-hypothesis-generator/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/19-capstone-projects/49-lm-eval-harness/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

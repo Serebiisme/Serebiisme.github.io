@@ -1,0 +1,128 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>RAG Freshness Pipeline · Serebii Labs</title></head><body data-pack="ai-from-scratch-project-rag-freshness-pipeline" data-lesson="" data-project="rag-freshness-pipeline"><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow">PROJECT / rag-freshness-pipeline</p><h1 class="lesson-title">RAG Freshness Pipeline</h1><p class="notice">本站中文导读 + 原作者英文全文 · 代码运行未验证</p><p>这是原课程的「RAG Freshness Pipeline」实践项目。先阅读下方原始目标与阶段说明，再按课序实现功能、运行评分器并比较参考实现。英文全文未缩写；中文长文尚未翻译。</p><p>练习骨架 starter：原项目未提供，勿将 solution 当作骨架；参考实现 solution：6 个文件。运行前按 README 准备依赖与输入；模型、数据或在线服务不包含在离线阅读包中。</p><div class="save-panel"><button type="button" data-save>保存本项目阅读资料</button><span data-save-status role="status">未检测离线状态</span></div><p><a download href="/learn/ai-from-scratch/downloads/project-rag-freshness-pipeline.zip">下载完整项目 ZIP（需联网，或单独保存）</a> <button data-save-download="/learn/ai-from-scratch/downloads/project-rag-freshness-pipeline.zip" type="button">单独保存项目 ZIP</button></p><section><h2>学习目标（原作者）</h2><ul><li>Normalize documents and fingerprint content</li><li>Plan inserts updates deletions and refreshes</li><li>Persist an index with atomic replacement</li><li>Exclude expired evidence at query time</li></ul></section><section class="prose" lang="en"><h1>RAG Freshness Pipeline</h1>
+<p>A stale-answer incident lab proving an edited or deleted policy can no longer be cited.</p>
+<p>The Orchard policy keeps the same document id when its timeout changes. Normalize Unicode and line endings before hashing the body, and retain updated time separately. A later observation of unchanged content is a refresh, not a rewrite.</p>
+<h2>Start with a learner workspace</h2>
+<p><a href="/learn/ai-from-scratch/lessons/00-setup-and-tooling/09-data-management/">Data management</a>, <a href="/learn/ai-from-scratch/lessons/11-llm-engineering/06-rag/">Retrieval augmented generation</a>. Language foundation: <a href="https://docs.python.org/3/tutorial/datastructures.html" rel="noreferrer" data-network="true">Python data structures <small>↗ 需要联网</small></a>.</p>
+<p>Use Python 3.10+ and its standard library. POSIX is required where the project uses file locks or process-group supervision.</p>
+<pre><code class="language-bash">python3 scripts/project_test.py rag-freshness-pipeline --init learning-artifacts/rag-freshness-pipeline
+python3 scripts/project_test.py rag-freshness-pipeline --stage 1 --path learning-artifacts/rag-freshness-pipeline
+</code></pre>
+<h2>Build route</h2>
+<ol>
+<li><a href="/learn/ai-from-scratch/projects/rag-freshness-pipeline/#01-fingerprint">Normalize documents and fingerprint content</a></li>
+<li><a href="/learn/ai-from-scratch/projects/rag-freshness-pipeline/#02-changes">Plan inserts updates deletions and refreshes</a></li>
+<li><a href="/learn/ai-from-scratch/projects/rag-freshness-pipeline/#03-snapshot">Persist an index with atomic replacement</a></li>
+<li><a href="/learn/ai-from-scratch/projects/rag-freshness-pipeline/#04-retrieve">Exclude expired evidence at query time</a></li>
+</ol>
+<h2>Run with your own inputs</h2>
+<p>After completing the stages, these commands run your workspace code on the original Orchard examples. Replace the sample paths with your own files.</p>
+<pre><code class="language-bash">python3 learning-artifacts/rag-freshness-pipeline/cli.py ingest orchard-index.json projects/rag-freshness-pipeline/examples/before.json
+python3 learning-artifacts/rag-freshness-pipeline/cli.py ingest orchard-index.json projects/rag-freshness-pipeline/examples/after.json
+python3 learning-artifacts/rag-freshness-pipeline/cli.py query orchard-index.json tokens --now 210 --max-age 60
+</code></pre>
+<p>To inspect the complete reference first, replace <code>learning-artifacts/rag-freshness-pipeline</code> with <code>projects/rag-freshness-pipeline/solution</code> in the same command. JSON results use <code>schema_version: 1</code>; paths and argument examples are explicit so another tool can consume them.</p>
+<h2>Integration boundary</h2>
+<p>The importer expects the complete corpus, not a partial change feed. POSIX flock coordinates local writers; it is not a distributed database lock. Retrieval is lexical and source timestamps are caller supplied.</p>
+<pre><code class="language-bash">python3 scripts/project_test.py rag-freshness-pipeline --all --solution --strict
+python3 scripts/project_test.py rag-freshness-pipeline --all --path learning-artifacts/rag-freshness-pipeline --strict
+</code></pre>
+<p>The first command checks the reference. The second checks your implementation. The published examples and tests are regression evidence, not a production certification or an unseen benchmark.</p>
+</section><section id="01-fingerprint"><h2>01-fingerprint · 原始阶段说明</h2><div class="prose" lang="en"><h1>Normalize documents and fingerprint content</h1>
+<p><strong>Stage 1 of 4.</strong> Python. Plan about 2 hours.</p>
+<p>Identity and content are different keys. Preserve the caller id while hashing normalized Unicode content, so equivalent encodings do not trigger unnecessary indexing. Timestamps remain metadata: changing a timestamp must not pretend that the document content changed.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-ff15e06979393863f2b7.png" alt="pj-rag-freshness-pipeline-1 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Implementation boundary</h2>
+<pre><code class="language-python">def normalize(doc):
+    raise NotImplementedError(&quot;Implement the stage contract&quot;)
+</code></pre>
+<p>Primary reference: <a href="https://docs.python.org/3/library/os.html#os.replace" rel="noreferrer" data-network="true">Reference 1 <small>↗ 需要联网</small></a>.</p>
+<h2>Worked Orchard case</h2>
+<p>Before coding, review <a href="https://docs.python.org/3/tutorial/datastructures.html" rel="noreferrer" data-network="true">Python data structures <small>↗ 需要联网</small></a> and <a href="/learn/ai-from-scratch/lessons/00-setup-and-tooling/09-data-management/">Data management</a>.</p>
+<p>The Orchard policy keeps the same document id when its timeout changes. Normalize Unicode and line endings before hashing the body, and retain updated time separately. A later observation of unchanged content is a refresh, not a rewrite.</p>
+<pre><code class="language-text">id=orchard-auth
+text: tokens expire after 60 minutes
+updated: 100 -&gt; 200
+content hash: unchanged
+</code></pre>
+<h2>Build and inspect</h2>
+<p>Hash normalized UTF-8 bytes. Do not hash the timestamp into content identity.</p>
+<p>Implement the stage in your learner workspace. The CLI helpers are provided adapters and import your functions; they do not substitute the reference solution.</p>
+<pre><code class="language-bash">python3 scripts/project_test.py rag-freshness-pipeline --init learning-artifacts/rag-freshness-pipeline
+python3 scripts/project_test.py rag-freshness-pipeline --stage 1 --path learning-artifacts/rag-freshness-pipeline
+</code></pre>
+<p>Predict the intermediate state above, then run the stage. A fresh stub fails; a passing reference run does not establish completion of your learner workspace.</p>
+<h2>Investigate next</h2>
+<p>Why should two differently encoded versions of café produce the same fingerprint?</p>
+</div></section><section id="02-changes"><h2>02-changes · 原始阶段说明</h2><div class="prose" lang="en"><h1>Plan inserts updates deletions and refreshes</h1>
+<p><strong>Stage 2 of 4.</strong> Python. Plan about 2 hours.</p>
+<p>Compute the whole plan before changing the index. A missing id is a deletion, a changed hash is an update, and unchanged content with new metadata is a refresh. Treat duplicate ids as an error because silently keeping one would make ingestion depend on input order.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-5a4151a4b41297817d42.png" alt="pj-rag-freshness-pipeline-2 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Implementation boundary</h2>
+<pre><code class="language-python">def diff(previous,incoming):
+    raise NotImplementedError(&quot;Implement the stage contract&quot;)
+</code></pre>
+<p>Primary reference: <a href="https://docs.python.org/3/library/os.html#os.replace" rel="noreferrer" data-network="true">Reference 1 <small>↗ 需要联网</small></a>.</p>
+<h2>Worked Orchard case</h2>
+<p>Before coding, review <a href="https://docs.python.org/3/tutorial/datastructures.html" rel="noreferrer" data-network="true">Python data structures <small>↗ 需要联网</small></a> and <a href="/learn/ai-from-scratch/lessons/00-setup-and-tooling/09-data-management/">Data management</a>. Complete <a href="/learn/ai-from-scratch/projects/rag-freshness-pipeline/#01-fingerprint">stage 1</a> first.</p>
+<p>Ingestion receives a complete corpus snapshot. The after fixture replaces a retired backup note and edits the token lifetime. Missing ids must be deleted so obsolete evidence cannot remain searchable.</p>
+<pre><code class="language-text">before ids: orchard-auth, retired-backup
+after ids: orchard-auth, restore-runbook
+update: orchard-auth; delete: retired-backup; insert: restore-runbook
+</code></pre>
+<h2>Build and inspect</h2>
+<p>Build the incoming id map before deciding any operation. A duplicate incoming id is an error, not last-write-wins.</p>
+<p>Implement the stage in your learner workspace. The CLI helpers are provided adapters and import your functions; they do not substitute the reference solution.</p>
+<pre><code class="language-bash">python3 scripts/project_test.py rag-freshness-pipeline --stage 2 --path learning-artifacts/rag-freshness-pipeline
+</code></pre>
+<p>Predict the intermediate state above, then run the stage. A fresh stub fails; a passing reference run does not establish completion of your learner workspace.</p>
+<h2>Investigate next</h2>
+<p>How would the contract change if the importer received only a partial change feed?</p>
+</div></section><section id="03-snapshot"><h2>03-snapshot · 原始阶段说明</h2><div class="prose" lang="en"><h1>Persist an index with atomic replacement</h1>
+<p><strong>Stage 3 of 4.</strong> Python. Plan about 2 hours.</p>
+<p>Write the complete next snapshot beside the destination, flush it, then replace the destination atomically. A version precondition rejects stale writers. The persistent sibling lock uses POSIX flock to serialize local writer processes around the version check and replacement. Atomic replacement protects readers from partial files, not from every distributed race.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-60b8a1154c564f7560c4.png" alt="pj-rag-freshness-pipeline-3 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Implementation boundary</h2>
+<pre><code class="language-python">def read_snapshot(path):
+    raise NotImplementedError(&quot;Implement the stage contract&quot;)
+</code></pre>
+<p>Primary reference: <a href="https://docs.python.org/3/library/os.html#os.replace" rel="noreferrer" data-network="true">Reference 1 <small>↗ 需要联网</small></a>.</p>
+<h2>Worked Orchard case</h2>
+<p>Before coding, review <a href="https://docs.python.org/3/tutorial/datastructures.html" rel="noreferrer" data-network="true">Python data structures <small>↗ 需要联网</small></a> and <a href="/learn/ai-from-scratch/lessons/00-setup-and-tooling/09-data-management/">Data management</a>. Complete <a href="/learn/ai-from-scratch/projects/rag-freshness-pipeline/#02-changes">stage 2</a> first.</p>
+<p>Two ingestion processes can read version 1 simultaneously. A persistent sibling lock serializes their version checks and replacement writes. Exactly one may commit with expected_version=1; the next writer must reread.</p>
+<pre><code class="language-text">writer A expects 1 -&gt; commits version 2
+writer B expects 1 -&gt; stale index version
+index.json.lock remains as the stable lock inode
+</code></pre>
+<h2>Build and inspect</h2>
+<p>On POSIX, hold flock across read, compare, fsync and rename. Never unlink the lock after release: waiting processes could then lock different files.</p>
+<p>Implement the stage in your learner workspace. The CLI helpers are provided adapters and import your functions; they do not substitute the reference solution.</p>
+<pre><code class="language-bash">python3 scripts/project_test.py rag-freshness-pipeline --stage 3 --path learning-artifacts/rag-freshness-pipeline
+</code></pre>
+<p>Predict the intermediate state above, then run the stage. A fresh stub fails; a passing reference run does not establish completion of your learner workspace.</p>
+<h2>Investigate next</h2>
+<p>What happens if a process exits after writing the temporary file but before rename?</p>
+</div></section><section id="04-retrieve"><h2>04-retrieve · 原始阶段说明</h2><div class="prose" lang="en"><h1>Exclude expired evidence at query time</h1>
+<p><strong>Stage 4 of 4.</strong> Python. Plan about 2 hours.</p>
+<p>Freshness is a query-time contract as well as an ingestion concern. A background job can fail, so every candidate must satisfy the age limit before ranking. Inject the clock instead of calling the system clock inside tests, and reject future timestamps rather than treating them as extra fresh.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-f818c48018c380dc36b5.png" alt="pj-rag-freshness-pipeline-4 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Implementation boundary</h2>
+<pre><code class="language-python">def retrieve(documents,query,now,max_age=3600,k=3):
+    raise NotImplementedError(&quot;Implement the stage contract&quot;)
+</code></pre>
+<p>Primary reference: <a href="https://docs.python.org/3/library/os.html#os.replace" rel="noreferrer" data-network="true">Reference 1 <small>↗ 需要联网</small></a>.</p>
+<h2>Worked Orchard case</h2>
+<p>Before coding, review <a href="https://docs.python.org/3/tutorial/datastructures.html" rel="noreferrer" data-network="true">Python data structures <small>↗ 需要联网</small></a> and <a href="/learn/ai-from-scratch/lessons/00-setup-and-tooling/09-data-management/">Data management</a>. Complete <a href="/learn/ai-from-scratch/projects/rag-freshness-pipeline/#03-snapshot">stage 3</a> first.</p>
+<p>After the edit, a query must return the 15-minute policy and never the retired 60-minute text. Freshness is enforced when answering, even if no ingestion job has run since the last snapshot.</p>
+<pre><code class="language-text">updated=200; now=210; max_age=60 -&gt; age 10, eligible
+updated=200; now=500; max_age=60 -&gt; age 300, excluded
+</code></pre>
+<h2>Build and inspect</h2>
+<p>Read one committed snapshot for the query. Return its version and the source hash with each hit so callers can detect stale citations.</p>
+<p>Implement the stage in your learner workspace. The CLI helpers are provided adapters and import your functions; they do not substitute the reference solution.</p>
+<pre><code class="language-bash">python3 scripts/project_test.py rag-freshness-pipeline --stage 4 --path learning-artifacts/rag-freshness-pipeline
+</code></pre>
+<p>After the cumulative stages pass, run your artifact on the original sample input from the repository root:</p>
+<pre><code class="language-bash">python3 learning-artifacts/rag-freshness-pipeline/cli.py ingest orchard-index.json projects/rag-freshness-pipeline/examples/before.json
+python3 learning-artifacts/rag-freshness-pipeline/cli.py ingest orchard-index.json projects/rag-freshness-pipeline/examples/after.json
+python3 learning-artifacts/rag-freshness-pipeline/cli.py query orchard-index.json tokens --now 210 --max-age 60
+</code></pre>
+<p>The importer expects the complete corpus, not a partial change feed. POSIX flock coordinates local writers; it is not a distributed database lock. Retrieval is lexical and source timestamps are caller supplied.</p>
+<h2>Investigate next</h2>
+<p>Should a future-dated document receive a negative age and become the best result?</p>
+</div></section><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

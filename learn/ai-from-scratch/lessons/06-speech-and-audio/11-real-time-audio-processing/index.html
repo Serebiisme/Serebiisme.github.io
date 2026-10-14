@@ -1,0 +1,764 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>实时音频处理 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-06-speech-and-audio" data-lesson="06-speech-and-audio/11-real-time-audio-processing" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/06-speech-and-audio/">语音与音频</a> / LESSON 11</p><h1 class="lesson-title">实时音频处理</h1><p>Real-Time Audio Processing</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>实时音频处理</h1>
+<blockquote>
+<p>批量管道处理一个文件. 实时管道处理下20毫秒前,下20毫秒到来. 每个对话人工智能,广播工作室和电话机器人都以这个延迟预算生活和死亡.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 6 · 02 (Spectrograms), Phase 6 · 04 (ASR), Phase 6 · 07 (TTS)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>问题</h2>
+<p>您想要一个感觉活跃的语音助理. 人类对话转换延迟约230ms (沉默回应).500ms以上的任何东西都感觉机器人;1500ms以上的东西感觉破碎.<strong>hear → understand → respond → speak</strong>2026年循环是:</p>
+<table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>Budget</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Mic → buffer</td>
+<td>20 ms</td>
+</tr>
+<tr>
+<td>VAD</td>
+<td>10 ms</td>
+</tr>
+<tr>
+<td>ASR (streaming)</td>
+<td>150 ms</td>
+</tr>
+<tr>
+<td>LLM (first token)</td>
+<td>100 ms</td>
+</tr>
+<tr>
+<td>TTS (first chunk)</td>
+<td>100 ms</td>
+</tr>
+<tr>
+<td>Render → speaker</td>
+<td>20 ms</td>
+</tr>
+<tr>
+<td><strong>Total</strong></td>
+<td><strong>~400 ms</strong></td>
+</tr>
+</tbody>
+</table>
+<p>莫希 (九台,2024) 完成了200 ms的全双重时钟.GPT-4o实时 (2024) 钟~320 ms. 2022 年的管道以 2500 ms 运输. 10 倍的改进来自三个技术: (1) 流通到处, (2) 有部分结果的异步管道, (3) 可断断的生成.</p>
+<h2>概念</h2>
+<p><img src="/learn/ai-from-scratch/files/phases/06-speech-and-audio/11-real-time-audio-processing/assets/real-time.svg" alt="Streaming audio pipeline with ring buffer, VAD gate, interruption" loading="lazy"></p>
+<p>**Frame / chunk / window.**现实时间音频流动是固定尺寸的块. 常见选择:20 ms (320 个样本在 16 kHz). 下游的所有东西都必须跟上这个节奏.</p>
+<p>**Ring buffer.**固体尺寸圆形缓冲器.生产线写出新的框架,消费线阅读.防止在热路中的分配. 尺寸≈最大延迟 ×样品速率; 2 秒 16 kHz 环 = 32,000 样品.</p>
+<p>**VAD (Voice Activity Detection).**通过&quot;Silero VAD 4.0 (2024) &quot;在CPU上运行每30ms的框架. <code>webrtcvad</code>现在,我们需要一个更好的选择.</p>
+<p>**Streaming ASR.**通过传输方式 (NeMo, 2024) 发射部分转录的模型. 子-CTC-0.6B 在流媒体模式下 (NeMo, 2024) 在 320 ms 延迟时实现25% WER. 声流 (Macháček等, 2023) 块 Whisper 在 ~ 2 秒的延迟时进行近流.</p>
+<p>**Interruption.**当用户在助理在说话时,你必须 (a) 检测到入, (b) 停止TTS, (c) 丢弃剩余的LLM输出.所有这些都在100ms内,否则用户会感知助理是聋的.</p>
+<p>**WebRTC Opus transport.**浏览器和移动设备的标准. 莱夫基特,日报.co,皮昂是2026年建立语音应用程序的堆.</p>
+<p>**Jitter buffer.**网络包裹到达时间已过时. 节缓冲器重新排序和平滑; 太小 → 听力间隙,太大 → 延迟. 典型的6080 ms.</p>
+<h3>常见的</h3>
+<ul>
+<li>**Thread contention.**通过使用C-callback音频库 (音频设备,PortAudio) 让Python远离热线.</li>
+<li>**Sample-rate conversion latency.**输入管道内重新样本增加520ms.<code>soxr_hq</code>)</li>
+<li>**TTS priming.**即使像Kokoro这样的快速TTS也可以在第一次请求时加热100200ms.缓存模型+在第一次真正转之前用模拟运行加热.</li>
+<li>**Echo cancellation.**没有AEC,TTS输出重新进入麦克风,并触发机器人自己的声音上的ASR.WebRTC AEC3是开源默认的.</li>
+</ul>
+<figure><img src="/learn/ai-from-scratch/figures/figure-6770f8341abac5070e45.png" alt="nyquist-aliasing 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<h3>步骤1:环保器</h3>
+<pre><code class="language-python">import collections
+
+class RingBuffer:
+    def __init__(self, capacity):
+        self.buf = collections.deque(maxlen=capacity)
+    def write(self, frame):
+        self.buf.extend(frame)
+    def read(self, n):
+        return [self.buf.popleft() for _ in range(min(n, len(self.buf)))]
+    def level(self):
+        return len(self.buf)
+</code></pre>
+<p>容量决定了最大缓冲延迟.</p>
+<h3>步骤2:VAD门</h3>
+<pre><code class="language-python">def simple_energy_vad(frame, threshold=0.01):
+    return sum(x * x for x in frame) / len(frame) &gt; threshold ** 2
+</code></pre>
+<p>在生产中用Silero VAD取代:</p>
+<pre><code class="language-python">import torch
+vad, _ = torch.hub.load(&quot;snakers4/silero-vad&quot;, &quot;silero_vad&quot;)
+is_speech = vad(torch.tensor(frame), 16000).item() &gt; 0.5
+</code></pre>
+<h3>步骤3: 流媒体ASR</h3>
+<pre><code class="language-python"># Parakeet-CTC-0.6B streaming via NeMo
+from nemo.collections.asr.models import EncDecCTCModelBPE
+asr = EncDecCTCModelBPE.from_pretrained(&quot;nvidia/parakeet-ctc-0.6b&quot;)
+# chunk_ms=320 ms, look_ahead_ms=80 ms
+for chunk in audio_stream():
+    partial_text = asr.transcribe_streaming(chunk)
+    print(partial_text, end=&quot;\r&quot;)
+</code></pre>
+<h3>步骤4: 断路处理器</h3>
+<pre><code class="language-python">class Dialog:
+    def __init__(self):
+        self.tts_task = None
+
+    def on_user_speech(self, frame):
+        if self.tts_task and not self.tts_task.done():
+            self.tts_task.cancel()   # barge-in
+        # then feed to streaming ASR
+
+    def on_final_user_utterance(self, text):
+        self.tts_task = asyncio.create_task(self.reply(text))
+
+    async def reply(self, text):
+        async for tts_chunk in llm_then_tts(text):
+            speaker.write(tts_chunk)
+</code></pre>
+<p>网络网络同行连接.停止() 在音频轨道是正规的方式.</p>
+<h2>用它</h2>
+<p>现在,我们要做什么?</p>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Pick</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Transport</td>
+<td>LiveKit (WebRTC) or Pion (Go)</td>
+</tr>
+<tr>
+<td>VAD</td>
+<td>Silero VAD 4.0</td>
+</tr>
+<tr>
+<td>Streaming ASR</td>
+<td>Parakeet-CTC-0.6B or Whisper-Streaming</td>
+</tr>
+<tr>
+<td>LLM first-token</td>
+<td>Groq, Cerebras, vLLM-streaming</td>
+</tr>
+<tr>
+<td>Streaming TTS</td>
+<td>Kokoro or ElevenLabs Turbo v2.5</td>
+</tr>
+<tr>
+<td>Echo cancel</td>
+<td>WebRTC AEC3</td>
+</tr>
+<tr>
+<td>End-to-end native</td>
+<td>OpenAI Realtime API or Moshi</td>
+</tr>
+</tbody>
+</table>
+<h2>陷</h2>
+<ul>
+<li>**Buffering 500 ms to be safe.**缓冲器是你的延迟地板.</li>
+<li>**Not pinning threads.**在优先级低于UI线程上的音频回调 = 负载下出现故障.</li>
+<li>**TTS chunks too small.**微分数为200ms,使声码器的文物听起来.</li>
+<li>**No jitter buffer.**实际的网络是紧张的,没有平滑的你得到了爆发.</li>
+<li>**Single-shot error handling.**音频管道必须是防撞的.</li>
+</ul>
+<h2>运送它</h2>
+<p>保存如<code>outputs/skill-realtime-designer.md</code>设计一个实时音频管道,每个阶段的具体延迟预算.</p>
+<h2>运动</h2>
+<ol>
+<li>**Easy.**跑步<code>code/main.py</code>模拟环保器+能量VAD; 打印假的10秒流的阶段延迟.</li>
+<li>**Medium.**使用<code>sounddevice</code>通过一个循环,将你的麦克风处理在20毫米的框架中,</li>
+<li>**Hard.**通过 构建一个完整的双重回声测试<code>aiortc</code>通过1kHz脉冲测量玻璃到玻璃延迟.</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Ring buffer</td>
+<td>The circular queue</td>
+<td>Fixed-size, lock-free (or SPSC-locked) FIFO for audio frames.</td>
+</tr>
+<tr>
+<td>VAD</td>
+<td>Silence gate</td>
+<td>Model or heuristic marking speech vs non-speech.</td>
+</tr>
+<tr>
+<td>Streaming ASR</td>
+<td>Real-time STT</td>
+<td>Emits partial text as audio arrives; bounded lookahead.</td>
+</tr>
+<tr>
+<td>Jitter buffer</td>
+<td>Network smoother</td>
+<td>Queue reordering out-of-order packets; 60–80 ms typical.</td>
+</tr>
+<tr>
+<td>AEC</td>
+<td>Echo cancellation</td>
+<td>Subtracts speaker-to-mic feedback path.</td>
+</tr>
+<tr>
+<td>Barge-in</td>
+<td>User interrupt</td>
+<td>System detects user speech mid-TTS; must cancel playback.</td>
+</tr>
+<tr>
+<td>Full duplex</td>
+<td>Simultaneous both ways</td>
+<td>User and bot can talk at the same time; Moshi is full duplex.</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2307.14743" rel="noreferrer" data-network="true">Macháček et al. (2023). Whisper-Streaming <small>↗ 需要联网</small></a></li>
+<li><a href="https://kyutai.org/Moshi.pdf" rel="noreferrer" data-network="true">Kyutai (2024). Moshi <small>↗ 需要联网</small></a> 完全双重200 ms延迟</li>
+<li><a href="https://docs.livekit.io/agents/" rel="noreferrer" data-network="true">LiveKit Agents framework (2024) <small>↗ 需要联网</small></a>制作音频代理管弦乐.</li>
+<li><a href="https://github.com/snakers4/silero-vad" rel="noreferrer" data-network="true">Silero VAD repo <small>↗ 需要联网</small></a>下-1 ms VAD,Apache 2.0.</li>
+<li><a href="https://webrtc.googlesource.com/src/+/main/modules/audio_processing/aec3/" rel="noreferrer" data-network="true">WebRTC AEC3 paper <small>↗ 需要联网</small></a>在开源下回声取消.</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Real-Time Audio Processing</h1>
+<blockquote>
+<p>Batch pipelines process a file. Real-time pipelines process the next 20 milliseconds before the next 20 arrive. Every conversational AI, broadcast studio, and telephony bot lives and dies by this latency budget.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 6 · 02 (Spectrograms), Phase 6 · 04 (ASR), Phase 6 · 07 (TTS)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>The Problem</h2>
+<p>You want a voice assistant that feels alive. Human conversational turn-taking latency is ~230 ms (silence-to-response). Anything above 500 ms feels robotic; above 1500 ms feels broken. The budget for a full <strong>hear → understand → respond → speak</strong> loop in 2026 is:</p>
+<table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>Budget</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Mic → buffer</td>
+<td>20 ms</td>
+</tr>
+<tr>
+<td>VAD</td>
+<td>10 ms</td>
+</tr>
+<tr>
+<td>ASR (streaming)</td>
+<td>150 ms</td>
+</tr>
+<tr>
+<td>LLM (first token)</td>
+<td>100 ms</td>
+</tr>
+<tr>
+<td>TTS (first chunk)</td>
+<td>100 ms</td>
+</tr>
+<tr>
+<td>Render → speaker</td>
+<td>20 ms</td>
+</tr>
+<tr>
+<td><strong>Total</strong></td>
+<td><strong>~400 ms</strong></td>
+</tr>
+</tbody>
+</table>
+<p>Moshi (Kyutai, 2024) clocked 200 ms full-duplex. GPT-4o-realtime (2024) clocks ~320 ms. Cascaded pipelines in 2022 shipped at 2500 ms. The 10× improvement came from three techniques: (1) streaming everywhere, (2) asynchronous pipelining with partial results, (3) interruptible generation.</p>
+<h2>The Concept</h2>
+<p><img src="/learn/ai-from-scratch/files/phases/06-speech-and-audio/11-real-time-audio-processing/assets/real-time.svg" alt="Streaming audio pipeline with ring buffer, VAD gate, interruption" loading="lazy"></p>
+<p><strong>Frame / chunk / window.</strong> Real-time audio flows as fixed-size blocks. Common choice: 20 ms (320 samples at 16 kHz). Everything downstream must keep up with this cadence.</p>
+<p><strong>Ring buffer.</strong> Fixed-size circular buffer. Producer thread writes new frames, consumer thread reads. Prevents allocations in the hot path. Size ≈ maximum-latency × sample-rate; a 2-second 16 kHz ring = 32,000 samples.</p>
+<p><strong>VAD (Voice Activity Detection).</strong> Gates downstream work when nobody is speaking. Silero VAD 4.0 (2024) runs &lt;1 ms per 30 ms frame on CPU. <code>webrtcvad</code> is the older alternative.</p>
+<p><strong>Streaming ASR.</strong> Models that emit partial transcripts as audio arrives. Parakeet-CTC-0.6B in streaming mode (NeMo, 2024) does 2–5% WER at 320 ms latency. Whisper-Streaming (Macháček et al., 2023) chunks Whisper for near-streaming at ~2 s latency.</p>
+<p><strong>Interruption.</strong> When the user speaks while the assistant is talking, you must (a) detect the barge-in, (b) stop the TTS, (c) discard the remaining LLM output. All within 100 ms, or the user perceives deaf assistant.</p>
+<p><strong>WebRTC Opus transport.</strong> 20 ms frames, 48 kHz, adaptive bitrate 8–128 kbps. Standard for browser and mobile. LiveKit, Daily.co, Pion are the 2026 stacks for building voice apps.</p>
+<p><strong>Jitter buffer.</strong> Network packets arrive out of order / late. The jitter buffer reorders and smooths; too small → audible gaps, too large → latency. 60–80 ms typical.</p>
+<h3>Common gotchas</h3>
+<ul>
+<li><strong>Thread contention.</strong> Python's GIL + heavy models can starve the audio thread. Use a C-callback audio library (sounddevice, PortAudio) and keep Python off the hot path.</li>
+<li><strong>Sample-rate conversion latency.</strong> Resampling inside the pipeline adds 5–20 ms. Either resample upfront or use a zero-latency resampler (PolyPhase, <code>soxr_hq</code>).</li>
+<li><strong>TTS priming.</strong> Even fast TTS like Kokoro has a 100–200 ms warm-up on first request. Cache model + warm it with a dummy run before the first real turn.</li>
+<li><strong>Echo cancellation.</strong> Without AEC, TTS output re-enters the mic and triggers ASR on the bot's own voice. WebRTC AEC3 is the open-source default.</li>
+</ul>
+<figure><img src="/learn/ai-from-scratch/figures/figure-6770f8341abac5070e45.png" alt="nyquist-aliasing 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<h3>Step 1: ring buffer</h3>
+<pre><code class="language-python">import collections
+
+class RingBuffer:
+    def __init__(self, capacity):
+        self.buf = collections.deque(maxlen=capacity)
+    def write(self, frame):
+        self.buf.extend(frame)
+    def read(self, n):
+        return [self.buf.popleft() for _ in range(min(n, len(self.buf)))]
+    def level(self):
+        return len(self.buf)
+</code></pre>
+<p>Capacity determines max buffering latency. 32,000 samples at 16 kHz = 2 s.</p>
+<h3>Step 2: VAD gate</h3>
+<pre><code class="language-python">def simple_energy_vad(frame, threshold=0.01):
+    return sum(x * x for x in frame) / len(frame) &gt; threshold ** 2
+</code></pre>
+<p>Replace with Silero VAD in production:</p>
+<pre><code class="language-python">import torch
+vad, _ = torch.hub.load(&quot;snakers4/silero-vad&quot;, &quot;silero_vad&quot;)
+is_speech = vad(torch.tensor(frame), 16000).item() &gt; 0.5
+</code></pre>
+<h3>Step 3: streaming ASR</h3>
+<pre><code class="language-python"># Parakeet-CTC-0.6B streaming via NeMo
+from nemo.collections.asr.models import EncDecCTCModelBPE
+asr = EncDecCTCModelBPE.from_pretrained(&quot;nvidia/parakeet-ctc-0.6b&quot;)
+# chunk_ms=320 ms, look_ahead_ms=80 ms
+for chunk in audio_stream():
+    partial_text = asr.transcribe_streaming(chunk)
+    print(partial_text, end=&quot;\r&quot;)
+</code></pre>
+<h3>Step 4: interruption handler</h3>
+<pre><code class="language-python">class Dialog:
+    def __init__(self):
+        self.tts_task = None
+
+    def on_user_speech(self, frame):
+        if self.tts_task and not self.tts_task.done():
+            self.tts_task.cancel()   # barge-in
+        # then feed to streaming ASR
+
+    def on_final_user_utterance(self, text):
+        self.tts_task = asyncio.create_task(self.reply(text))
+
+    async def reply(self, text):
+        async for tts_chunk in llm_then_tts(text):
+            speaker.write(tts_chunk)
+</code></pre>
+<p>Hinges on async I/O and cancellable TTS streaming. WebRTC peerconnection.stop() on the audio track is the canonical way.</p>
+<h2>Use It</h2>
+<p>The 2026 stack:</p>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Pick</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Transport</td>
+<td>LiveKit (WebRTC) or Pion (Go)</td>
+</tr>
+<tr>
+<td>VAD</td>
+<td>Silero VAD 4.0</td>
+</tr>
+<tr>
+<td>Streaming ASR</td>
+<td>Parakeet-CTC-0.6B or Whisper-Streaming</td>
+</tr>
+<tr>
+<td>LLM first-token</td>
+<td>Groq, Cerebras, vLLM-streaming</td>
+</tr>
+<tr>
+<td>Streaming TTS</td>
+<td>Kokoro or ElevenLabs Turbo v2.5</td>
+</tr>
+<tr>
+<td>Echo cancel</td>
+<td>WebRTC AEC3</td>
+</tr>
+<tr>
+<td>End-to-end native</td>
+<td>OpenAI Realtime API or Moshi</td>
+</tr>
+</tbody>
+</table>
+<h2>Pitfalls</h2>
+<ul>
+<li><strong>Buffering 500 ms to be safe.</strong> The buffer <em>is</em> your latency floor. Shrink it.</li>
+<li><strong>Not pinning threads.</strong> Audio callback on a priority-lower-than-UI thread = glitches under load.</li>
+<li><strong>TTS chunks too small.</strong> Sub-200 ms chunks make vocoder artifacts audible. 320 ms chunks are the sweet spot.</li>
+<li><strong>No jitter buffer.</strong> Real networks are jittery; without smoothing you get pops.</li>
+<li><strong>Single-shot error handling.</strong> Audio pipelines must be crash-proof. One exception kills the session.</li>
+</ul>
+<h2>Ship It</h2>
+<p>Save as <code>outputs/skill-realtime-designer.md</code>. Design a real-time audio pipeline with concrete latency budgets per stage.</p>
+<h2>Exercises</h2>
+<ol>
+<li><strong>Easy.</strong> Run <code>code/main.py</code>. Simulates a ring buffer + energy VAD; prints stage latencies for a fake 10-second stream.</li>
+<li><strong>Medium.</strong> Using <code>sounddevice</code>, build a passthrough loop that processes your mic in 20 ms frames and prints VAD state at each frame.</li>
+<li><strong>Hard.</strong> Build a full duplex echo test with <code>aiortc</code>: browser → WebRTC → Python → WebRTC → browser. Measure glass-to-glass latency with a 1 kHz pulse.</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Ring buffer</td>
+<td>The circular queue</td>
+<td>Fixed-size, lock-free (or SPSC-locked) FIFO for audio frames.</td>
+</tr>
+<tr>
+<td>VAD</td>
+<td>Silence gate</td>
+<td>Model or heuristic marking speech vs non-speech.</td>
+</tr>
+<tr>
+<td>Streaming ASR</td>
+<td>Real-time STT</td>
+<td>Emits partial text as audio arrives; bounded lookahead.</td>
+</tr>
+<tr>
+<td>Jitter buffer</td>
+<td>Network smoother</td>
+<td>Queue reordering out-of-order packets; 60–80 ms typical.</td>
+</tr>
+<tr>
+<td>AEC</td>
+<td>Echo cancellation</td>
+<td>Subtracts speaker-to-mic feedback path.</td>
+</tr>
+<tr>
+<td>Barge-in</td>
+<td>User interrupt</td>
+<td>System detects user speech mid-TTS; must cancel playback.</td>
+</tr>
+<tr>
+<td>Full duplex</td>
+<td>Simultaneous both ways</td>
+<td>User and bot can talk at the same time; Moshi is full duplex.</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2307.14743" rel="noreferrer" data-network="true">Macháček et al. (2023). Whisper-Streaming <small>↗ 需要联网</small></a> — chunked near-streaming Whisper.</li>
+<li><a href="https://kyutai.org/Moshi.pdf" rel="noreferrer" data-network="true">Kyutai (2024). Moshi <small>↗ 需要联网</small></a> — full-duplex 200 ms latency.</li>
+<li><a href="https://docs.livekit.io/agents/" rel="noreferrer" data-network="true">LiveKit Agents framework (2024) <small>↗ 需要联网</small></a> — production audio agent orchestration.</li>
+<li><a href="https://github.com/snakers4/silero-vad" rel="noreferrer" data-network="true">Silero VAD repo <small>↗ 需要联网</small></a> — sub-1 ms VAD, Apache 2.0.</li>
+<li><a href="https://webrtc.googlesource.com/src/+/main/modules/audio_processing/aec3/" rel="noreferrer" data-network="true">WebRTC AEC3 paper <small>↗ 需要联网</small></a> — echo cancellation under open source.</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-06-speech-and-audio--11-real-time-audio-processing.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-06-speech-and-audio--11-real-time-audio-processing.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/06-speech-and-audio/11-real-time-audio-processing/code/main.py">phases/06-speech-and-audio/11-real-time-audio-processing/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Real-time voice agent pipeline simulator.
+
+Simulates an audio chunk stream through VAD → STT → LLM → TTS with a
+latency budget. No real models; tracks timing to show where budget goes.
+
+Run: python3 code/main.py
+&quot;&quot;&quot;
+
+import math
+import random
+import time
+
+
+CHUNK_MS = 20
+VAD_THRESHOLD_DBFS = -40.0
+
+
+def rms_dbfs(chunk):
+    rms = (sum(x * x for x in chunk) / len(chunk)) ** 0.5
+    return 20.0 * math.log10(max(rms, 1e-10))
+
+
+def simulate_chunk(is_speech, rng):
+    n = int(0.001 * CHUNK_MS * 16000)
+    if is_speech:
+        return [0.15 * rng.gauss(0, 1.0) for _ in range(n)]
+    return [0.002 * rng.gauss(0, 1.0) for _ in range(n)]
+
+
+def vad(chunk, threshold_dbfs=VAD_THRESHOLD_DBFS):
+    return rms_dbfs(chunk) &gt; threshold_dbfs
+
+
+def fake_stt(utterance_duration_s):
+    latency_ms = 80 + utterance_duration_s * 50
+    time.sleep(latency_ms / 1000.0)
+    return &quot;hello world&quot;
+
+
+def fake_llm(text):
+    time.sleep(0.15)
+    return &quot;sure, one second&quot;
+
+
+def fake_tts_first_audio(text):
+    time.sleep(0.10)
+    return &quot;(audio chunk)&quot;
+
+
+def main():
+    random.seed(0)
+    rng = random.Random(0)
+
+    print(&quot;=== Step 1: simulate 1.5 s of user speech as 20 ms chunks ===&quot;)
+    chunks = [simulate_chunk(True, rng) for _ in range(75)]
+    chunks += [simulate_chunk(False, rng) for _ in range(20)]
+    print(f&quot;  generated {len(chunks)} chunks, {CHUNK_MS} ms each = {len(chunks)*CHUNK_MS} ms&quot;)
+
+    print()
+    print(&quot;=== Step 2: VAD-gate and buffer speech ===&quot;)
+    buffered = []
+    in_speech = False
+    for c in chunks:
+        active = vad(c)
+        if active:
+            buffered.extend(c)
+            in_speech = True
+        elif in_speech and len(buffered) &gt;= 16000 * 0.3:
+            break
+    print(f&quot;  buffered {len(buffered) / 16000:.3f} s of speech&quot;)
+
+    print()
+    print(&quot;=== Step 3: simulate STT / LLM / TTS with timing ===&quot;)
+    budget = {}
+    t = time.time()
+
+    t0 = time.time()
+    text = fake_stt(len(buffered) / 16000.0)
+    budget[&quot;STT&quot;] = (time.time() - t0) * 1000
+
+    t0 = time.time()
+    reply = fake_llm(text)
+    budget[&quot;LLM&quot;] = (time.time() - t0) * 1000
+
+    t0 = time.time()
+    first_audio = fake_tts_first_audio(reply)
+    budget[&quot;TTS TTFA&quot;] = (time.time() - t0) * 1000
+
+    total = (time.time() - t) * 1000
+
+    print(f&quot;  user said: {text!r}&quot;)
+    print(f&quot;  agent replied: {reply!r}&quot;)
+    print()
+    print(&quot;  latency breakdown:&quot;)
+    for stage, ms in budget.items():
+        bar = &quot;#&quot; * int(ms / 10)
+        print(f&quot;    {stage:&lt;10s}  {ms:&gt;6.1f} ms  {bar}&quot;)
+    print(f&quot;  end-to-end: {total:.1f} ms   (target: &amp;lt; 500 ms)&quot;)
+
+    print()
+    print(&quot;=== Step 4: where the 2026 production budget goes ===&quot;)
+    rows = [
+        (&quot;network in&quot;,  &quot;50-100&quot;),
+        (&quot;VAD&quot;,          &quot;20-80&quot;),
+        (&quot;STT stream&quot;,   &quot;100-300&quot;),
+        (&quot;LLM stream&quot;,   &quot;100-500&quot;),
+        (&quot;TTS TTFA&quot;,     &quot;100-300&quot;),
+        (&quot;network out&quot;,  &quot;50-100&quot;),
+        (&quot;TOTAL&quot;,        &quot;400-1400&quot;),
+    ]
+    print(&quot;  | stage           | typical ms |&quot;)
+    for name, ms in rows:
+        print(f&quot;  | {name:&lt;15} | {ms:&gt;10} |&quot;)
+
+    print()
+    print(&quot;  sub-500 ms: LiveKit + Silero + Deepgram + GPT-4o + Cartesia&quot;)
+    print(&quot;  sub-200 ms: Moshi (full-duplex) or Sesame CSM — different architecture (see lesson 15)&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/06-speech-and-audio/11-real-time-audio-processing/code/main.rs">phases/06-speech-and-audio/11-real-time-audio-processing/code/main.rs</a><details><summary>查看原始文本</summary><pre><code>// Lesson: Real-Time Audio Processing (phase 06 / lesson 11)
+// Topic: stream a 16 kHz mono sine wave through 20 ms frames, apply a gain stage
+// and a 9-tap low-pass FIR filter, measure per-frame and aggregate throughput.
+// This is the inner loop every voice agent runs under VAD/ASR/TTS.
+// Refs:
+//   https://doc.rust-lang.org/std/time/struct.Instant.html
+//   https://en.wikipedia.org/wiki/Finite_impulse_response
+//   https://webrtc.googlesource.com/src/+/refs/heads/main/modules/audio_processing  (20 ms frame convention)
+// Build: rustc --edition 2021 -O code/main.rs -o /tmp/lesson_audio &amp;&amp; /tmp/lesson_audio
+
+use std::f32::consts::PI;
+use std::time::Instant;
+
+const SAMPLE_RATE: u32 = 16_000;
+const FRAME_MS: u32 = 20;
+const FRAME_LEN: usize = (SAMPLE_RATE / 1000 * FRAME_MS) as usize; // 320 samples
+const TONE_HZ: f32 = 440.0;
+const TOTAL_SECONDS: f32 = 2.0;
+const GAIN_DB: f32 = -3.0;
+
+// 9-tap symmetric low-pass FIR. Hand-tuned, sum ~= 1.0 so DC is preserved.
+const FIR_TAPS: [f32; 9] = [
+    0.02, 0.06, 0.12, 0.18, 0.24, 0.18, 0.12, 0.06, 0.02,
+];
+
+fn db_to_linear(db: f32) -&gt; f32 {
+    10f32.powf(db / 20.0)
+}
+
+fn synth_sine_frame(start_sample: u64, freq_hz: f32, sr: u32) -&gt; Vec&lt;f32&gt; {
+    let mut frame = Vec::with_capacity(FRAME_LEN);
+    let two_pi_f_over_sr = 2.0 * PI * freq_hz / sr as f32;
+    for n in 0..FRAME_LEN {
+        let t = (start_sample + n as u64) as f32;
+        frame.push((two_pi_f_over_sr * t).sin());
+    }
+    frame
+}
+
+fn apply_gain(frame: &amp;mut [f32], gain_lin: f32) {
+    for s in frame.iter_mut() {
+        *s *= gain_lin;
+    }
+}
+
+// Streaming FIR. `state` carries the last (taps-1) samples across frame boundaries
+// so the filter sees a continuous signal, not 20 ms islands with edge artefacts.
+fn fir_streaming(frame: &amp;mut [f32], taps: &amp;[f32], state: &amp;mut Vec&lt;f32&gt;) {
+    let order = taps.len();
+    let mut buf = Vec::with_capacity(state.len() + frame.len());
+    buf.extend_from_slice(state);
+    buf.extend_from_slice(frame);
+
+    for n in 0..frame.len() {
+        let mut acc = 0.0;
+        for k in 0..order {
+            acc += taps[k] * buf[n + order - 1 - k];
+        }
+        frame[n] = acc;
+    }
+
+    let keep = order - 1;
+    state.clear();
+    state.extend_from_slice(&amp;buf[buf.len() - keep..]);
+}
+
+fn rms(frame: &amp;[f32]) -&gt; f32 {
+    let sum_sq: f32 = frame.iter().map(|x| x * x).sum();
+    (sum_sq / frame.len() as f32).sqrt()
+}
+
+fn rms_dbfs(frame: &amp;[f32]) -&gt; f32 {
+    let r = rms(frame).max(1e-10);
+    20.0 * r.log10()
+}
+
+fn percentile(sorted_us: &amp;[f64], pct: f64) -&gt; f64 {
+    if sorted_us.is_empty() {
+        return 0.0;
+    }
+    let idx = ((sorted_us.len() as f64 - 1.0) * pct).round() as usize;
+    sorted_us[idx]
+}
+
+fn main() {
+    let total_samples = (SAMPLE_RATE as f32 * TOTAL_SECONDS) as u64;
+    let total_frames = (total_samples as usize) / FRAME_LEN;
+    let gain_lin = db_to_linear(GAIN_DB);
+
+    println!();
+    println!(&quot;=== Real-time audio benchmark (Rust, single thread) ===&quot;);
+    println!();
+    println!(&quot;Sample rate  : {} Hz&quot;, SAMPLE_RATE);
+    println!(&quot;Frame size   : {} ms ({} samples)&quot;, FRAME_MS, FRAME_LEN);
+    println!(&quot;Stream length: {:.1} s ({} frames)&quot;, TOTAL_SECONDS, total_frames);
+    println!(&quot;Tone         : {} Hz sine&quot;, TONE_HZ);
+    println!(&quot;Gain stage   : {:+.1} dB&quot;, GAIN_DB);
+    println!(&quot;FIR          : {}-tap symmetric low-pass&quot;, FIR_TAPS.len());
+    println!();
+
+    let mut fir_state = vec![0.0f32; FIR_TAPS.len() - 1];
+    let mut per_frame_us: Vec&lt;f64&gt; = Vec::with_capacity(total_frames);
+    let mut rms_in_db = 0.0f32;
+    let mut rms_out_db = 0.0f32;
+
+    let wall = Instant::now();
+    for f in 0..total_frames {
+        let start_sample = (f * FRAME_LEN) as u64;
+        let mut frame = synth_sine_frame(start_sample, TONE_HZ, SAMPLE_RATE);
+
+        let t_frame = Instant::now();
+        if f == 0 { rms_in_db = rms_dbfs(&amp;frame); }
+
+        apply_gain(&amp;mut frame, gain_lin);
+        fir_streaming(&amp;mut frame, &amp;FIR_TAPS, &amp;mut fir_state);
+
+        if f == 0 { rms_out_db = rms_dbfs(&amp;frame); }
+        per_frame_us.push(t_frame.elapsed().as_secs_f64() * 1e6);
+    }
+    let wall_ms = wall.elapsed().as_secs_f64() * 1000.0;
+
+    let mut sorted = per_frame_us.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let p50 = percentile(&amp;sorted, 0.50);
+    let p95 = percentile(&amp;sorted, 0.95);
+    let p99 = percentile(&amp;sorted, 0.99);
+    let mean = per_frame_us.iter().sum::&lt;f64&gt;() / per_frame_us.len() as f64;
+
+    let budget_us = (FRAME_MS as f64) * 1000.0;
+    let headroom = budget_us / p99.max(1e-9);
+
+    println!(&quot;Per-frame latency (us):&quot;);
+    println!(&quot;  p50   {:&gt;9.2}&quot;, p50);
+    println!(&quot;  p95   {:&gt;9.2}&quot;, p95);
+    println!(&quot;  p99   {:&gt;9.2}&quot;, p99);
+    println!(&quot;  mean  {:&gt;9.2}&quot;, mean);
+    println!();
+    println!(&quot;Aggregate:&quot;);
+    println!(&quot;  wall time         {:&gt;8.2} ms&quot;, wall_ms);
+    println!(&quot;  realtime budget   {:&gt;8.2} ms ({} frames * {} ms)&quot;, total_frames as f64 * FRAME_MS as f64, total_frames, FRAME_MS);
+    println!(&quot;  realtime factor   {:&gt;8.1}x   (wall/budget; lower is faster)&quot;, wall_ms / (total_frames as f64 * FRAME_MS as f64));
+    println!(&quot;  headroom per p99  {:&gt;8.1}x   (budget / p99)&quot;, headroom);
+    println!();
+    println!(&quot;Signal levels (frame 0):&quot;);
+    println!(&quot;  RMS in   {:&gt;7.2} dBFS&quot;, rms_in_db);
+    println!(&quot;  RMS out  {:&gt;7.2} dBFS  (after {:+.1} dB gain + FIR)&quot;, rms_out_db, GAIN_DB);
+    println!();
+
+    if headroom &gt;= 50.0 {
+        println!(&quot;Verdict: huge headroom. VAD + STT + LLM + TTS all fit in the 20 ms slot.&quot;);
+    } else if headroom &gt;= 5.0 {
+        println!(&quot;Verdict: comfortable headroom. Streaming pipeline will fit.&quot;);
+    } else {
+        println!(&quot;Verdict: too slow. Pipeline will drop frames at this DSP cost.&quot;);
+    }
+    println!();
+}
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/06-speech-and-audio/11-real-time-audio-processing/outputs/skill-realtime-pipeline.md">phases/06-speech-and-audio/11-real-time-audio-processing/outputs/skill-realtime-pipeline.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: realtime-voice-pipeline
+description: Pick transport, VAD, streaming STT, LLM, streaming TTS, and orchestration for a target end-to-end latency.
+version: 1.0.0
+phase: 6
+lesson: 11
+tags: [voice-agent, livekit, pipecat, silero, streaming, latency]
+---
+
+Given the target (latency P50/P95, language, channel, offline vs cloud, call volume), output:
+
+1. Transport. WebRTC (LiveKit / Daily) · WebSocket · SIP trunking (Twilio / Telnyx). Reason tied to jitter tolerance + use case.
+2. VAD + turn-taking. Silero VAD (open, 99.5% TPR) · Cobra (commercial) · LiveKit turn-detector. Threshold, min speech duration, silence hang-over.
+3. Streaming STT. Parakeet TDT (fastest open) · Kyutai STT (with flush trick) · Deepgram Nova-3 (API, ~150 ms) · Whisper-streaming. Reason.
+4. LLM + streaming. Pin the first 20 tokens before TTS kicks in. Model + streaming config + guardrails for prompt injection.
+5. Streaming TTS. Kokoro-82M (~100 ms TTFA) · Orpheus · Cartesia Sonic · ElevenLabs Turbo. Voice-pack or cloning guard (Lesson 8).
+6. Orchestration. LiveKit Agents · Pipecat · Vapi · Retell · custom Rust. Reason tied to team skills + scale.
+7. Observability. P50/P95/P99 per-stage histograms; false-positive interruption rate; drop-call rate; WER on call samples.
+
+Refuse deploys that buffer entire utterances before STT. Refuse TTS that does not stream. Refuse evaluation by average latency — require P95. Refuse managed platforms (Vapi / Retell) for &amp;gt; 100k minutes/month without a cost-comparison to build-your-own.
+
+Example input: &quot;Voice agent for car insurance quoting. &amp;lt; 500 ms P95. English, US. 50k minutes/week. Compliance: HIPAA-adjacent (no PII in logs).&quot;
+
+Example output:
+- Transport: LiveKit Agents + Twilio SIP. Proven at call-center scale, HIPAA-mode opt-in.
+- VAD: Silero VAD @ threshold 0.45, min speech 220 ms, silence hang-over 400 ms. LiveKit turn-detector overlay.
+- STT: Deepgram Nova-3 English (~150 ms P95); fall-back to Parakeet-TDT if on-prem audit required.
+- LLM: GPT-4o streaming via OpenAI realtime API; guard against prompt injection with a post-filter; pin first 20 tokens to TTS.
+- TTS: Cartesia Sonic 2 (~150 ms TTFA, voice cloning not used — predefined voice).
+- Orchestration: LiveKit Agents. Observability via Hamming AI for production.
+- Logs: strip CVV / SSN / DOB with a regex + NER pass before persistence. Retain 30 days.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原课程未提供测验。</p></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/06-speech-and-audio/10-audio-language-models/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/06-speech-and-audio/12-voice-assistant-pipeline/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/06-speech-and-audio/11-real-time-audio-processing/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

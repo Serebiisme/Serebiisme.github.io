@@ -1,0 +1,857 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>3D视觉 点云和NeRF · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-04-computer-vision" data-lesson="04-computer-vision/13-3d-vision-nerf" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/04-computer-vision/">计算机视觉</a> / LESSON 13</p><h1 class="lesson-title">3D视觉 点云和NeRF</h1><p>3D Vision — Point Clouds &amp; NeRFs</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>3D视觉 点云和NeRF</h1>
+<blockquote>
+<p>3D视觉有两个种类:点云是传感器的原始输出.NeRF是学习的体积场.</p>
+</blockquote>
+<p><strong>Type:</strong> Learn + Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 4 Lesson 03 (CNNs), Phase 1 Lesson 12 (Tensor Operations)
+<strong>Time:</strong> ~45 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>区分明确的3D表示 (点云,网格,语xel) 和隐含的3D表示 (签署距离场,NeRF)</li>
+<li>了解PointNet的对称函数技巧,使神经网络的变量变异在一个无序的点组上</li>
+<li>追踪NeRF前进传输:射线造,体积造,位置编码,MLP密度+颜色头</li>
+<li>使用<code>nerfstudio</code>或<code>instant-ngp</code>预训练式3D重建从一组小的姿势图像</li>
+</ul>
+<h2>问题</h2>
+<p>摄像头产生2D图像.LIDAR产生一组无序的3D点.一个结构-从动作管道产生稀疏的3D键点云.NeRF从少数姿势图像中重建整个3D场景.所有这些都是&quot;视觉&quot;,但它们都看起来没有像CNN想要的密集子.</p>
+<p>3D视觉很重要,因为几乎每一个具有高价值的机器人任务都在3D中运行:抓住,避免障碍,导航,AR封闭,捕获3D内容.只了解2D图像的视觉工程师被锁定在最快增长的领域 (AR/VR内容,机器人,自动驾驶堆,基于NeRF的房地产或建筑的3D重建).</p>
+<p>两个表示以不同的原因占主导地位.点云是传感器免费提供的东西.NeRF和其继任者 (3D高斯的光,神经SDF) 是你要求神经网络学习一个场景时得到的东西.</p>
+<h2>概念</h2>
+<h3>点云</h3>
+<p>点云是R^3中的 N点的无序集合,可选每个点都有特征 (颜色,强度,正常).</p>
+<pre><code>cloud = [
+  (x1, y1, z1, r1, g1, b1),
+  (x2, y2, z2, r2, g2, b2),
+  ...
+  (xN, yN, zN, rN, gN, bN),
+]
+</code></pre>
+<p>两个特性使神经网络难以实现:</p>
+<ul>
+<li><strong>Permutation invariance</strong>输出不得依赖点顺序.</li>
+<li><strong>Variable N</strong>单个模型必须处理不同尺寸的云.</li>
+</ul>
+<p>PointNet (Qi et al., 2017) 通过一个想法解决了这两个问题:将共享MLP应用于每个点,然后用对称函数 (最大积分组) 进行聚合.结果是一个不依赖顺序的固定尺寸向量.</p>
+<pre><code>f(P) = max_{p in P} MLP(p)
+</code></pre>
+<p>这就是PointNet的核心.更深层次的变体 (PointNet++,Point Transformer) 增加了层次性样本和本地聚合,但对称函数技巧没有改变.</p>
+<h3>点网架构</h3>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-bd5bb1782631812c5e41.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>&quot;共享MLP&quot;是指每个点均独立运行相同的MLP. 实现为效率的点维度1x1 conv.</p>
+<h3>神经辐射场 (Neural Radiance Fields)</h3>
+<p>根据N照片的数据,我们可以重新构建一个3D场景吗?<code>(x, y, z, viewing_direction)</code>为了<code>(density, colour)</code>通过网络进行光线射线循环.</p>
+<pre><code>NeRF MLP:  (x, y, z, theta, phi) -&gt; (sigma, r, g, b)
+
+To render a pixel (u, v) of a new view:
+  1. Cast a ray from the camera through pixel (u, v)
+  2. Sample points along the ray at distances t_1, t_2, ..., t_N
+  3. Query the MLP at each point
+  4. Composite the colours weighted by (1 - exp(-sigma * dt))
+  5. The sum is the rendered pixel colour
+</code></pre>
+<p>输出比较了染的像素与训练照片中的地面真相像素.通过染步骤,后方更新了MLP.没有3D地面真相,没有明确的几何学.</p>
+<h3>在 NeRF 中定位编码</h3>
+<p>尼拉的.<code>(x, y, z)</code>由于MLP偏向于低频率,因此不能代表高频率细节.NeRF通过在MLP之前将每个坐标编码为Fourier特征向量来解决这一问题:</p>
+<pre><code>gamma(p) = (sin(2^0 pi p), cos(2^0 pi p), sin(2^1 pi p), cos(2^1 pi p), ...)
+</code></pre>
+<p>转换器使用的方法是相同的,并且在扩散时间调节中再次出现 (课 10).没有它,NeRF看起来模糊.</p>
+<h3>量度表现</h3>
+<pre><code>C(r) = sum_i T_i * (1 - exp(-sigma_i * delta_i)) * c_i
+
+T_i  = exp(- sum_{j&lt;i} sigma_j * delta_j)
+delta_i = t_{i+1} - t_i
+</code></pre>
+<p><code>T_i</code>传输率是多少光存活到点i.<code>(1 - exp(-sigma_i * delta_i))</code>是点i的度.<code>c_i</code>最后一个像素是沿光线的重量总数.</p>
+<h3>什么替代了NeRF</h3>
+<p>纯 NeRF 训练速度慢 (小时) 和染速度慢 (每张图片的秒).</p>
+<ul>
+<li><strong>Instant-NGP</strong>(2022) 哈希网编码取代了MLP的位置输入;列车在秒钟内.</li>
+<li><strong>Mip-NeRF 360</strong>处理无限场景和反化.</li>
+<li><strong>3D Gaussian Splatting</strong>将数百万的3D高斯人取代了体积领域;列车在几分钟内,实时染.目前的生产默认.</li>
+</ul>
+<p>几乎2026年每一个真正的NeRF产品都是3D高斯的光.</p>
+<h3>数据集和基准</h3>
+<ul>
+<li><strong>ShapeNet</strong> 3D CAD模型的分类和分类为点云.</li>
+<li><strong>ScanNet</strong>实在的室内扫描,以进行分类.</li>
+<li><strong>KITTI</strong>自动驾驶的户外LIDAR点云.</li>
+<li><strong>NeRF Synthetic</strong>现在,<strong>Blended MVS</strong> 视图合成的呈现图像数据集.</li>
+<li><strong>Mip-NeRF 360</strong>无限的真实场景.</li>
+</ul>
+<figure><img src="/learn/ai-from-scratch/figures/figure-84b348e3d43eb8086cad.png" alt="nerf-rays 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<h3>步骤1:PointNet分类器</h3>
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+class PointNet(nn.Module):
+    def __init__(self, num_classes=10):
+        super().__init__()
+        self.mlp1 = nn.Sequential(
+            nn.Conv1d(3, 64, 1),    nn.BatchNorm1d(64),   nn.ReLU(inplace=True),
+            nn.Conv1d(64, 64, 1),   nn.BatchNorm1d(64),   nn.ReLU(inplace=True),
+        )
+        self.mlp2 = nn.Sequential(
+            nn.Conv1d(64, 128, 1),  nn.BatchNorm1d(128),  nn.ReLU(inplace=True),
+            nn.Conv1d(128, 1024, 1), nn.BatchNorm1d(1024), nn.ReLU(inplace=True),
+        )
+        self.head = nn.Sequential(
+            nn.Linear(1024, 512),   nn.BatchNorm1d(512),  nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(512, 256),    nn.BatchNorm1d(256),  nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(256, num_classes),
+        )
+
+    def forward(self, x):
+        # x: (N, 3, num_points) — transposed for Conv1d
+        x = self.mlp1(x)
+        x = self.mlp2(x)
+        x = torch.max(x, dim=-1)[0]       # (N, 1024)
+        return self.head(x)
+
+pts = torch.randn(4, 3, 1024)
+net = PointNet(num_classes=10)
+print(f&quot;output: {net(pts).shape}&quot;)
+print(f&quot;params: {sum(p.numel() for p in net.parameters()):,}&quot;)
+</code></pre>
+<p>运行在每云1024点.</p>
+<h3>步骤2: 位置编码</h3>
+<pre><code class="language-python">def positional_encoding(x, L=10):
+    &quot;&quot;&quot;
+    x: (..., D) -&gt; (..., D * 2 * L)
+    &quot;&quot;&quot;
+    freqs = 2.0 ** torch.arange(L, dtype=x.dtype, device=x.device)
+    args = x.unsqueeze(-1) * freqs * 3.141592653589793
+    sinc = torch.cat([args.sin(), args.cos()], dim=-1)
+    return sinc.reshape(*x.shape[:-1], -1)
+
+x = torch.randn(5, 3)
+y = positional_encoding(x, L=10)
+print(f&quot;input:  {x.shape}&quot;)
+print(f&quot;encoded: {y.shape}     # (5, 60)&quot;)
+</code></pre>
+<p>乘以<code>2^l * pi</code>它们的频率会逐渐提高.</p>
+<h3>步骤3:小 NeRF MLP</h3>
+<pre><code class="language-python">class TinyNeRF(nn.Module):
+    def __init__(self, L_pos=10, L_dir=4, hidden=128):
+        super().__init__()
+        self.L_pos = L_pos
+        self.L_dir = L_dir
+        pos_dim = 3 * 2 * L_pos
+        dir_dim = 3 * 2 * L_dir
+        self.trunk = nn.Sequential(
+            nn.Linear(pos_dim, hidden), nn.ReLU(inplace=True),
+            nn.Linear(hidden, hidden),  nn.ReLU(inplace=True),
+            nn.Linear(hidden, hidden),  nn.ReLU(inplace=True),
+            nn.Linear(hidden, hidden),  nn.ReLU(inplace=True),
+        )
+        self.sigma = nn.Linear(hidden, 1)
+        self.color = nn.Sequential(
+            nn.Linear(hidden + dir_dim, hidden // 2), nn.ReLU(inplace=True),
+            nn.Linear(hidden // 2, 3), nn.Sigmoid(),
+        )
+
+    def forward(self, x, d):
+        x_enc = positional_encoding(x, self.L_pos)
+        d_enc = positional_encoding(d, self.L_dir)
+        h = self.trunk(x_enc)
+        sigma = torch.relu(self.sigma(h)).squeeze(-1)
+        rgb = self.color(torch.cat([h, d_enc], dim=-1))
+        return sigma, rgb
+
+nerf = TinyNeRF()
+x = torch.randn(128, 3)
+d = torch.randn(128, 3)
+s, c = nerf(x, d)
+print(f&quot;sigma: {s.shape}   rgb: {c.shape}&quot;)
+</code></pre>
+<p>与原始NeRF相比较小 (具有2个深度8MLP干).足以展示建筑.</p>
+<h3>步骤4:沿光线进行体积成像</h3>
+<pre><code class="language-python">def volumetric_render(sigma, rgb, t_vals):
+    &quot;&quot;&quot;
+    sigma: (..., N_samples)
+    rgb:   (..., N_samples, 3)
+    t_vals: (N_samples,) distances along the ray
+    &quot;&quot;&quot;
+    delta = torch.cat([t_vals[1:] - t_vals[:-1], torch.full_like(t_vals[:1], 1e10)])
+    alpha = 1.0 - torch.exp(-sigma * delta)
+    trans = torch.cumprod(torch.cat([torch.ones_like(alpha[..., :1]), 1.0 - alpha + 1e-10], dim=-1), dim=-1)[..., :-1]
+    weights = alpha * trans
+    rendered = (weights.unsqueeze(-1) * rgb).sum(dim=-2)
+    depth = (weights * t_vals).sum(dim=-1)
+    return rendered, depth, weights
+
+
+N = 64
+t_vals = torch.linspace(2.0, 6.0, N)
+sigma = torch.rand(N) * 0.5
+rgb = torch.rand(N, 3)
+rendered, depth, weights = volumetric_render(sigma, rgb, t_vals)
+print(f&quot;rendered colour: {rendered.tolist()}&quot;)
+print(f&quot;depth:           {depth.item():.2f}&quot;)
+</code></pre>
+<p>一个光线,64个样本,复合到一个RGB像素和深度.</p>
+<h2>用它</h2>
+<p>为了真正的工作:</p>
+<ul>
+<li><code>nerfstudio</code>目前的NeRF/Instant-NGP/Gaussian Splatting参考库.命令行加上网页浏览器.</li>
+<li><code>pytorch3d</code>可分化染,点云工具,网页操作.</li>
+<li><code>open3d</code>点云处理,注册,可视化.</li>
+</ul>
+<p>对于部署,3D高斯式光器已大大取代纯 NeRF,因为它使其速度快100倍.重建质量可比较.</p>
+<h2>运送它</h2>
+<p>这一课产生了:</p>
+<ul>
+<li><code>outputs/prompt-3d-task-router.md</code>基于任务和输入数据,一个提示将其引导到正确的3D表示 (点云,网格,语音,NeRF,高斯)</li>
+<li><code>outputs/skill-point-cloud-loader.md</code>写PyTorch的技能<code>Dataset</code>对于 .ply / .pcd / .xyz文件,正常的标准化,中心化和点样本.</li>
+</ul>
+<h2>运动</h2>
+<ol>
+<li>**(Easy)**显示PointNet是变量不变的:运行相同的云两次,一次是混合点. 检查输出均等到浮点噪音.</li>
+<li>**(Medium)**实现最小射线生成函数,鉴于相机内在性和姿势,为每一个H x W图像的像素产生射线起源和方向.</li>
+<li>**(Hard)**训练一个TinyNeRF在合成数据集上呈现色立方体的视图 (通过可分化呈现或简单的射线追踪器生成).报告在1,10和100期的呈现损失.该模型在哪个时代产生可识别的视图?</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Point cloud</td>
+<td>&quot;3D points from LIDAR&quot;</td>
+<td>Unordered set of (x, y, z) + optional features per point</td>
+</tr>
+<tr>
+<td>PointNet</td>
+<td>&quot;First neural net on point clouds&quot;</td>
+<td>Shared MLP per point + symmetric (max) pool; permutation-invariant by construction</td>
+</tr>
+<tr>
+<td>NeRF</td>
+<td>&quot;MLP that is the scene&quot;</td>
+<td>Network mapping (x, y, z, dir) to (density, colour); rendered by ray casting</td>
+</tr>
+<tr>
+<td>Positional encoding</td>
+<td>&quot;Fourier features&quot;</td>
+<td>Encode each coordinate into sin/cos at multiple frequencies to overcome MLP low-frequency bias</td>
+</tr>
+<tr>
+<td>Volumetric rendering</td>
+<td>&quot;Ray integration&quot;</td>
+<td>Composite samples along a ray into a single pixel using transmittance and alpha</td>
+</tr>
+<tr>
+<td>Instant-NGP</td>
+<td>&quot;Hash-grid NeRF&quot;</td>
+<td>Replaces NeRF's coordinate MLP with a multi-resolution hash grid; 100-1000x faster</td>
+</tr>
+<tr>
+<td>3D Gaussian splatting</td>
+<td>&quot;Millions of Gaussians&quot;</td>
+<td>Scene = collection of 3D Gaussians; renders in real time, trains in minutes</td>
+</tr>
+<tr>
+<td>SDF</td>
+<td>&quot;Signed distance field&quot;</td>
+<td>Function returning signed distance to the nearest surface; another implicit representation</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/1612.00593" rel="noreferrer" data-network="true">PointNet (Qi et al., 2017) <small>↗ 需要联网</small></a>变量变量分类器</li>
+<li><a href="https://arxiv.org/abs/2003.08934" rel="noreferrer" data-network="true">NeRF (Mildenhall et al., 2020) <small>↗ 需要联网</small></a>使3D复制照片成为神经网络问题</li>
+<li><a href="https://arxiv.org/abs/2201.05989" rel="noreferrer" data-network="true">Instant-NGP (Müller et al., 2022) <small>↗ 需要联网</small></a>哈希网,加快1000倍</li>
+<li><a href="https://arxiv.org/abs/2308.04079" rel="noreferrer" data-network="true">3D Gaussian Splatting (Kerbl et al., 2023) <small>↗ 需要联网</small></a>在生产中取代NeRF的架构</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>3D Vision — Point Clouds &amp; NeRFs</h1>
+<blockquote>
+<p>3D vision comes in two flavours. Point clouds are the sensor's raw output. NeRFs are the learned volumetric field. Both answer &quot;what is where in space.&quot;</p>
+</blockquote>
+<p><strong>Type:</strong> Learn + Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 4 Lesson 03 (CNNs), Phase 1 Lesson 12 (Tensor Operations)
+<strong>Time:</strong> ~45 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Distinguish explicit (point cloud, mesh, voxel) and implicit (signed distance field, NeRF) 3D representations and when each is used</li>
+<li>Understand PointNet's symmetric-function trick that makes a neural network permutation-invariant over an unordered set of points</li>
+<li>Trace a NeRF forward pass: ray casting, volumetric rendering, positional encoding, MLP density+colour head</li>
+<li>Use <code>nerfstudio</code> or <code>instant-ngp</code> for pretrained 3D reconstruction from a small set of posed images</li>
+</ul>
+<h2>The Problem</h2>
+<p>A camera produces a 2D image. A LIDAR produces a set of 3D points with no ordering. A structure-from-motion pipeline produces a sparse cloud of 3D keypoints. A NeRF reconstructs an entire 3D scene from a handful of posed images. All of these are &quot;vision&quot; but none of them look like the dense tensor a CNN wants.</p>
+<p>3D vision matters because almost every high-value robot task runs in 3D: grasping, obstacle avoidance, navigation, AR occlusion, 3D content capture. A vision engineer who only understands 2D images is locked out of the fastest-growing slice of the field (AR/VR content, robotics, autonomous driving stacks, NeRF-based 3D reconstruction for real-estate or construction).</p>
+<p>The two representations dominate for different reasons. Point clouds are what sensors give you for free. NeRFs and their successors (3D Gaussian splatting, neural SDFs) are what you get when you ask a neural network to learn a scene.</p>
+<h2>The Concept</h2>
+<h3>Point clouds</h3>
+<p>A point cloud is an unordered set of N points in R^3, optionally each with features (colour, intensity, normal).</p>
+<pre><code>cloud = [
+  (x1, y1, z1, r1, g1, b1),
+  (x2, y2, z2, r2, g2, b2),
+  ...
+  (xN, yN, zN, rN, gN, bN),
+]
+</code></pre>
+<p>No grid, no connectivity. Two properties make this hard for neural networks:</p>
+<ul>
+<li><strong>Permutation invariance</strong> — the output must not depend on point order.</li>
+<li><strong>Variable N</strong> — a single model must handle clouds of different sizes.</li>
+</ul>
+<p>PointNet (Qi et al., 2017) solved both with one idea: apply a shared MLP to every point, then aggregate with a symmetric function (max pool). The result is a fixed-size vector that does not depend on order.</p>
+<pre><code>f(P) = max_{p in P} MLP(p)
+</code></pre>
+<p>This is the entire core of PointNet. Deeper variants (PointNet++, Point Transformer) add hierarchical sampling and local aggregation but the symmetric-function trick is unchanged.</p>
+<h3>The PointNet architecture</h3>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-bd5bb1782631812c5e41.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>&quot;Shared MLP&quot; means the same MLP runs on every point independently. Implemented as a 1x1 conv over the point dimension for efficiency.</p>
+<h3>Neural Radiance Fields (NeRFs)</h3>
+<p>NeRFs (Mildenhall et al., 2020) took the question &quot;can we reconstruct a 3D scene from N photos?&quot; and answered with a neural network that is the scene. The network maps <code>(x, y, z, viewing_direction)</code> to <code>(density, colour)</code>. Rendering a new view is a ray-casting loop over this network.</p>
+<pre><code>NeRF MLP:  (x, y, z, theta, phi) -&gt; (sigma, r, g, b)
+
+To render a pixel (u, v) of a new view:
+  1. Cast a ray from the camera through pixel (u, v)
+  2. Sample points along the ray at distances t_1, t_2, ..., t_N
+  3. Query the MLP at each point
+  4. Composite the colours weighted by (1 - exp(-sigma * dt))
+  5. The sum is the rendered pixel colour
+</code></pre>
+<p>A loss compares the rendered pixel to the ground-truth pixel in the training photos. Backprop through the rendering step updates the MLP. No 3D ground truth, no explicit geometry — the scene is stored in the MLP weights.</p>
+<h3>Positional encoding in NeRF</h3>
+<p>A vanilla MLP on <code>(x, y, z)</code> cannot represent high-frequency details because MLPs are spectrally biased toward low frequencies. NeRF fixes this by encoding each coordinate into a Fourier feature vector before the MLP:</p>
+<pre><code>gamma(p) = (sin(2^0 pi p), cos(2^0 pi p), sin(2^1 pi p), cos(2^1 pi p), ...)
+</code></pre>
+<p>Up to L=10 frequency levels. This is the same trick transformers use for positions, and it appears again in diffusion time conditioning (Lesson 10). Without it, NeRFs look blurry.</p>
+<h3>Volumetric rendering</h3>
+<pre><code>C(r) = sum_i T_i * (1 - exp(-sigma_i * delta_i)) * c_i
+
+T_i  = exp(- sum_{j&lt;i} sigma_j * delta_j)
+delta_i = t_{i+1} - t_i
+</code></pre>
+<p><code>T_i</code> is transmittance — how much light survives to point i. <code>(1 - exp(-sigma_i * delta_i))</code> is the opacity at point i. <code>c_i</code> is the colour. The final pixel is a weighted sum along the ray.</p>
+<h3>What replaced NeRFs</h3>
+<p>Pure NeRFs are slow to train (hours) and slow to render (seconds per image). The lineage since:</p>
+<ul>
+<li><strong>Instant-NGP</strong> (2022) — hash-grid encoding replaces the MLP's position input; trains in seconds.</li>
+<li><strong>Mip-NeRF 360</strong> — handles unbounded scenes and anti-aliasing.</li>
+<li><strong>3D Gaussian Splatting</strong> (2023) — replaces the volumetric field with millions of 3D Gaussians; trains in minutes, renders in real time. The current production default.</li>
+</ul>
+<p>Almost every real NeRF product in 2026 is actually 3D Gaussian splatting. The mental model is still NeRF.</p>
+<h3>Datasets and benchmarks</h3>
+<ul>
+<li><strong>ShapeNet</strong> — classification and segmentation of 3D CAD models as point clouds.</li>
+<li><strong>ScanNet</strong> — real indoor scans for segmentation.</li>
+<li><strong>KITTI</strong> — outdoor LIDAR point clouds for autonomous driving.</li>
+<li><strong>NeRF Synthetic</strong> / <strong>Blended MVS</strong> — posed-image datasets for view synthesis.</li>
+<li><strong>Mip-NeRF 360</strong> dataset — unbounded real scenes.</li>
+</ul>
+<figure><img src="/learn/ai-from-scratch/figures/figure-84b348e3d43eb8086cad.png" alt="nerf-rays 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<h3>Step 1: PointNet classifier</h3>
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+class PointNet(nn.Module):
+    def __init__(self, num_classes=10):
+        super().__init__()
+        self.mlp1 = nn.Sequential(
+            nn.Conv1d(3, 64, 1),    nn.BatchNorm1d(64),   nn.ReLU(inplace=True),
+            nn.Conv1d(64, 64, 1),   nn.BatchNorm1d(64),   nn.ReLU(inplace=True),
+        )
+        self.mlp2 = nn.Sequential(
+            nn.Conv1d(64, 128, 1),  nn.BatchNorm1d(128),  nn.ReLU(inplace=True),
+            nn.Conv1d(128, 1024, 1), nn.BatchNorm1d(1024), nn.ReLU(inplace=True),
+        )
+        self.head = nn.Sequential(
+            nn.Linear(1024, 512),   nn.BatchNorm1d(512),  nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(512, 256),    nn.BatchNorm1d(256),  nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(256, num_classes),
+        )
+
+    def forward(self, x):
+        # x: (N, 3, num_points) — transposed for Conv1d
+        x = self.mlp1(x)
+        x = self.mlp2(x)
+        x = torch.max(x, dim=-1)[0]       # (N, 1024)
+        return self.head(x)
+
+pts = torch.randn(4, 3, 1024)
+net = PointNet(num_classes=10)
+print(f&quot;output: {net(pts).shape}&quot;)
+print(f&quot;params: {sum(p.numel() for p in net.parameters()):,}&quot;)
+</code></pre>
+<p>About 1.6M parameters. Runs on 1,024 points per cloud.</p>
+<h3>Step 2: Positional encoding</h3>
+<pre><code class="language-python">def positional_encoding(x, L=10):
+    &quot;&quot;&quot;
+    x: (..., D) -&gt; (..., D * 2 * L)
+    &quot;&quot;&quot;
+    freqs = 2.0 ** torch.arange(L, dtype=x.dtype, device=x.device)
+    args = x.unsqueeze(-1) * freqs * 3.141592653589793
+    sinc = torch.cat([args.sin(), args.cos()], dim=-1)
+    return sinc.reshape(*x.shape[:-1], -1)
+
+x = torch.randn(5, 3)
+y = positional_encoding(x, L=10)
+print(f&quot;input:  {x.shape}&quot;)
+print(f&quot;encoded: {y.shape}     # (5, 60)&quot;)
+</code></pre>
+<p>Multiplying by <code>2^l * pi</code> gives progressively higher frequencies.</p>
+<h3>Step 3: Tiny NeRF MLP</h3>
+<pre><code class="language-python">class TinyNeRF(nn.Module):
+    def __init__(self, L_pos=10, L_dir=4, hidden=128):
+        super().__init__()
+        self.L_pos = L_pos
+        self.L_dir = L_dir
+        pos_dim = 3 * 2 * L_pos
+        dir_dim = 3 * 2 * L_dir
+        self.trunk = nn.Sequential(
+            nn.Linear(pos_dim, hidden), nn.ReLU(inplace=True),
+            nn.Linear(hidden, hidden),  nn.ReLU(inplace=True),
+            nn.Linear(hidden, hidden),  nn.ReLU(inplace=True),
+            nn.Linear(hidden, hidden),  nn.ReLU(inplace=True),
+        )
+        self.sigma = nn.Linear(hidden, 1)
+        self.color = nn.Sequential(
+            nn.Linear(hidden + dir_dim, hidden // 2), nn.ReLU(inplace=True),
+            nn.Linear(hidden // 2, 3), nn.Sigmoid(),
+        )
+
+    def forward(self, x, d):
+        x_enc = positional_encoding(x, self.L_pos)
+        d_enc = positional_encoding(d, self.L_dir)
+        h = self.trunk(x_enc)
+        sigma = torch.relu(self.sigma(h)).squeeze(-1)
+        rgb = self.color(torch.cat([h, d_enc], dim=-1))
+        return sigma, rgb
+
+nerf = TinyNeRF()
+x = torch.randn(128, 3)
+d = torch.randn(128, 3)
+s, c = nerf(x, d)
+print(f&quot;sigma: {s.shape}   rgb: {c.shape}&quot;)
+</code></pre>
+<p>Tiny compared to the original NeRF (which has 2 MLP trunks of depth 8). Enough to demonstrate the architecture.</p>
+<h3>Step 4: Volumetric rendering along a ray</h3>
+<pre><code class="language-python">def volumetric_render(sigma, rgb, t_vals):
+    &quot;&quot;&quot;
+    sigma: (..., N_samples)
+    rgb:   (..., N_samples, 3)
+    t_vals: (N_samples,) distances along the ray
+    &quot;&quot;&quot;
+    delta = torch.cat([t_vals[1:] - t_vals[:-1], torch.full_like(t_vals[:1], 1e10)])
+    alpha = 1.0 - torch.exp(-sigma * delta)
+    trans = torch.cumprod(torch.cat([torch.ones_like(alpha[..., :1]), 1.0 - alpha + 1e-10], dim=-1), dim=-1)[..., :-1]
+    weights = alpha * trans
+    rendered = (weights.unsqueeze(-1) * rgb).sum(dim=-2)
+    depth = (weights * t_vals).sum(dim=-1)
+    return rendered, depth, weights
+
+
+N = 64
+t_vals = torch.linspace(2.0, 6.0, N)
+sigma = torch.rand(N) * 0.5
+rgb = torch.rand(N, 3)
+rendered, depth, weights = volumetric_render(sigma, rgb, t_vals)
+print(f&quot;rendered colour: {rendered.tolist()}&quot;)
+print(f&quot;depth:           {depth.item():.2f}&quot;)
+</code></pre>
+<p>One ray, 64 samples, composite to a single RGB pixel and a depth.</p>
+<h2>Use It</h2>
+<p>For real work:</p>
+<ul>
+<li><code>nerfstudio</code> (Tancik et al.) — the current reference library for NeRF / Instant-NGP / Gaussian Splatting. Command-line plus a web viewer.</li>
+<li><code>pytorch3d</code> (Meta) — differentiable rendering, point-cloud utilities, mesh ops.</li>
+<li><code>open3d</code> — point cloud processing, registration, visualisation.</li>
+</ul>
+<p>For deployment, 3D Gaussian splatting has largely replaced pure NeRFs because it renders 100x faster. The reconstruction quality is comparable.</p>
+<h2>Ship It</h2>
+<p>This lesson produces:</p>
+<ul>
+<li><code>outputs/prompt-3d-task-router.md</code> — a prompt that routes to the right 3D representation (point cloud, mesh, voxel, NeRF, Gaussian splat) based on task and input data.</li>
+<li><code>outputs/skill-point-cloud-loader.md</code> — a skill that writes a PyTorch <code>Dataset</code> for .ply / .pcd / .xyz files with correct normalisation, centring, and point sampling.</li>
+</ul>
+<h2>Exercises</h2>
+<ol>
+<li><strong>(Easy)</strong> Show that PointNet is permutation-invariant: run the same cloud through twice, once with points shuffled. Verify outputs are identical up to floating-point noise.</li>
+<li><strong>(Medium)</strong> Implement a minimal ray-generation function that, given camera intrinsics and pose, produces ray origins and directions for every pixel of an H x W image.</li>
+<li><strong>(Hard)</strong> Train a TinyNeRF on a synthetic dataset of rendered views of a coloured cube (generated via differentiable rendering or a simple ray tracer). Report rendering loss at epoch 1, 10, and 100. At what epoch does the model produce recognisable views?</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Point cloud</td>
+<td>&quot;3D points from LIDAR&quot;</td>
+<td>Unordered set of (x, y, z) + optional features per point</td>
+</tr>
+<tr>
+<td>PointNet</td>
+<td>&quot;First neural net on point clouds&quot;</td>
+<td>Shared MLP per point + symmetric (max) pool; permutation-invariant by construction</td>
+</tr>
+<tr>
+<td>NeRF</td>
+<td>&quot;MLP that is the scene&quot;</td>
+<td>Network mapping (x, y, z, dir) to (density, colour); rendered by ray casting</td>
+</tr>
+<tr>
+<td>Positional encoding</td>
+<td>&quot;Fourier features&quot;</td>
+<td>Encode each coordinate into sin/cos at multiple frequencies to overcome MLP low-frequency bias</td>
+</tr>
+<tr>
+<td>Volumetric rendering</td>
+<td>&quot;Ray integration&quot;</td>
+<td>Composite samples along a ray into a single pixel using transmittance and alpha</td>
+</tr>
+<tr>
+<td>Instant-NGP</td>
+<td>&quot;Hash-grid NeRF&quot;</td>
+<td>Replaces NeRF's coordinate MLP with a multi-resolution hash grid; 100-1000x faster</td>
+</tr>
+<tr>
+<td>3D Gaussian splatting</td>
+<td>&quot;Millions of Gaussians&quot;</td>
+<td>Scene = collection of 3D Gaussians; renders in real time, trains in minutes</td>
+</tr>
+<tr>
+<td>SDF</td>
+<td>&quot;Signed distance field&quot;</td>
+<td>Function returning signed distance to the nearest surface; another implicit representation</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/1612.00593" rel="noreferrer" data-network="true">PointNet (Qi et al., 2017) <small>↗ 需要联网</small></a> — the permutation-invariant classifier</li>
+<li><a href="https://arxiv.org/abs/2003.08934" rel="noreferrer" data-network="true">NeRF (Mildenhall et al., 2020) <small>↗ 需要联网</small></a> — the paper that made 3D reconstruction from photos a neural-net problem</li>
+<li><a href="https://arxiv.org/abs/2201.05989" rel="noreferrer" data-network="true">Instant-NGP (Müller et al., 2022) <small>↗ 需要联网</small></a> — hash grids, 1000x speedup</li>
+<li><a href="https://arxiv.org/abs/2308.04079" rel="noreferrer" data-network="true">3D Gaussian Splatting (Kerbl et al., 2023) <small>↗ 需要联网</small></a> — the architecture that replaced NeRFs in production</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-04-computer-vision--13-3d-vision-nerf.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-04-computer-vision--13-3d-vision-nerf.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/04-computer-vision/13-3d-vision-nerf/code/main.py">phases/04-computer-vision/13-3d-vision-nerf/code/main.py</a><details><summary>查看原始文本</summary><pre><code>import math
+import torch
+import torch.nn as nn
+
+
+class PointNet(nn.Module):
+    def __init__(self, num_classes=10):
+        super().__init__()
+        self.mlp1 = nn.Sequential(
+            nn.Conv1d(3, 64, 1), nn.BatchNorm1d(64), nn.ReLU(inplace=True),
+            nn.Conv1d(64, 64, 1), nn.BatchNorm1d(64), nn.ReLU(inplace=True),
+        )
+        self.mlp2 = nn.Sequential(
+            nn.Conv1d(64, 128, 1), nn.BatchNorm1d(128), nn.ReLU(inplace=True),
+            nn.Conv1d(128, 1024, 1), nn.BatchNorm1d(1024), nn.ReLU(inplace=True),
+        )
+        self.head = nn.Sequential(
+            nn.Linear(1024, 512), nn.BatchNorm1d(512), nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(512, 256), nn.BatchNorm1d(256), nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(256, num_classes),
+        )
+
+    def forward(self, x):
+        x = self.mlp1(x)
+        x = self.mlp2(x)
+        x = torch.max(x, dim=-1)[0]
+        return self.head(x)
+
+
+def positional_encoding(x, L=10):
+    freqs = 2.0 ** torch.arange(L, dtype=x.dtype, device=x.device)
+    args = x.unsqueeze(-1) * freqs * math.pi
+    sinc = torch.cat([args.sin(), args.cos()], dim=-1)
+    return sinc.reshape(*x.shape[:-1], -1)
+
+
+class TinyNeRF(nn.Module):
+    def __init__(self, L_pos=10, L_dir=4, hidden=128):
+        super().__init__()
+        self.L_pos = L_pos
+        self.L_dir = L_dir
+        pos_dim = 3 * 2 * L_pos
+        dir_dim = 3 * 2 * L_dir
+        self.trunk = nn.Sequential(
+            nn.Linear(pos_dim, hidden), nn.ReLU(inplace=True),
+            nn.Linear(hidden, hidden), nn.ReLU(inplace=True),
+            nn.Linear(hidden, hidden), nn.ReLU(inplace=True),
+            nn.Linear(hidden, hidden), nn.ReLU(inplace=True),
+        )
+        self.sigma = nn.Linear(hidden, 1)
+        self.color = nn.Sequential(
+            nn.Linear(hidden + dir_dim, hidden // 2), nn.ReLU(inplace=True),
+            nn.Linear(hidden // 2, 3), nn.Sigmoid(),
+        )
+
+    def forward(self, x, d):
+        x_enc = positional_encoding(x, self.L_pos)
+        d_enc = positional_encoding(d, self.L_dir)
+        h = self.trunk(x_enc)
+        sigma = torch.relu(self.sigma(h)).squeeze(-1)
+        rgb = self.color(torch.cat([h, d_enc], dim=-1))
+        return sigma, rgb
+
+
+def volumetric_render(sigma, rgb, t_vals):
+    delta = torch.cat([t_vals[1:] - t_vals[:-1], torch.full_like(t_vals[:1], 1e10)])
+    alpha = 1.0 - torch.exp(-sigma * delta)
+    trans = torch.cumprod(
+        torch.cat([torch.ones_like(alpha[..., :1]), 1.0 - alpha + 1e-10], dim=-1),
+        dim=-1,
+    )[..., :-1]
+    weights = alpha * trans
+    rendered = (weights.unsqueeze(-1) * rgb).sum(dim=-2)
+    depth = (weights * t_vals).sum(dim=-1)
+    return rendered, depth, weights
+
+
+def permutation_invariance_check():
+    pts = torch.randn(1, 3, 512)
+    net = PointNet(num_classes=5).eval()
+    idx = torch.randperm(512)
+    shuffled = pts[:, :, idx]
+    with torch.no_grad():
+        out_a = net(pts)
+        out_b = net(shuffled)
+    return (out_a - out_b).abs().max().item()
+
+
+def main():
+    torch.manual_seed(0)
+
+    print(&quot;[pointnet]&quot;)
+    pts = torch.randn(4, 3, 1024)
+    net = PointNet(num_classes=10)
+    print(f&quot;  output: {tuple(net(pts).shape)}  params: {sum(p.numel() for p in net.parameters()):,}&quot;)
+    print(f&quot;  permutation invariance  max|diff|={permutation_invariance_check():.2e}&quot;)
+
+    print(&quot;\n[positional encoding]&quot;)
+    x = torch.randn(5, 3)
+    y = positional_encoding(x, L=10)
+    print(f&quot;  input  {tuple(x.shape)} -&gt; encoded {tuple(y.shape)}&quot;)
+
+    print(&quot;\n[tiny nerf forward]&quot;)
+    nerf = TinyNeRF()
+    x = torch.randn(128, 3)
+    d = torch.randn(128, 3)
+    sigma, rgb = nerf(x, d)
+    print(f&quot;  sigma: {tuple(sigma.shape)}   rgb: {tuple(rgb.shape)}&quot;)
+
+    print(&quot;\n[volumetric render]&quot;)
+    t_vals = torch.linspace(2.0, 6.0, 64)
+    sigma_ray = torch.rand(64) * 0.5
+    rgb_ray = torch.rand(64, 3)
+    rendered, depth, weights = volumetric_render(sigma_ray, rgb_ray, t_vals)
+    print(f&quot;  rendered colour:   {rendered.tolist()}&quot;)
+    print(f&quot;  depth:             {depth.item():.2f}&quot;)
+    print(f&quot;  weights sum:       {weights.sum().item():.3f}&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/04-computer-vision/13-3d-vision-nerf/outputs/prompt-3d-task-router.md">phases/04-computer-vision/13-3d-vision-nerf/outputs/prompt-3d-task-router.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: prompt-3d-task-router
+description: Route to the right 3D representation (point cloud, mesh, voxel, NeRF, Gaussian splat) based on task and input
+phase: 4
+lesson: 13
+---
+
+You are a 3D task router.
+
+## Inputs
+
+- `task`: classify | segment | detect | reconstruct | render_novel_view | simulate_physics
+- `input_modality`: LIDAR_points | RGB_single | RGB_posed_multi_view | mesh | depth_map
+- `output_modality`: labels | mesh | voxel | novel_image | SDF
+- `latency_budget_ms`: inference latency at test time; drives real-time vs quality trade (see Rules)
+
+## Decision
+
+### Classify / segment LIDAR points
+-&gt; **PointNet++** or **Point Transformer**. Use voxel-based **MinkowskiNet** if points exceed 50k per frame.
+
+### 3D object detection on LIDAR
+-&gt; **PointPillars** (fast) or **CenterPoint** (accurate).
+
+### Reconstruct a scene from posed RGB views
+- Training time tolerable (hours), max quality -&gt; **NeRF** (reference), **Mip-NeRF 360** (unbounded scenes).
+- Training time tight, real-time rendering required -&gt; **3D Gaussian Splatting**.
+- Very few views (1-5) -&gt; **InstantSplat** or **Gaussian Splatting from few views**.
+
+### Render a novel view from a few posed images
+-&gt; same as reconstruction, but tune renderer for speed: Instant-NGP for MLP-backed, Gaussian Splatting for rasterised.
+
+### Mesh extraction
+-&gt; Train a NeRF / Gaussian splat, run **marching cubes** on the density field to get a mesh.
+
+### Physics simulation / robotics grasping
+-&gt; Convert to mesh or voxel; simulators prefer explicit geometry.
+
+## Output
+
+```
+[task]
+  type:     &lt;task&gt;
+  input:    &lt;modality&gt;
+  output:   &lt;modality&gt;
+
+[representation]
+  pick:     point_cloud | mesh | voxel | NeRF | Gaussian_splat | SDF
+
+[model]
+  name:     &lt;specific&gt;
+  pretrain: &lt;if available&gt;
+
+[notes]
+  - training compute estimate
+  - rendering speed estimate
+  - known failure modes on this task
+```
+
+## Rules
+
+- Never recommend NeRF for real-time rendering (`latency_budget_ms &lt; 33` =&gt; &gt;= 30 fps) on commodity GPUs; Gaussian Splatting is the answer.
+- `latency_budget_ms &lt; 100` — require Gaussian Splatting or Instant-NGP for rendering; plain NeRF will not meet the budget.
+- `latency_budget_ms &gt;= 1000` — plain NeRF and diffusion-based methods are acceptable; quality over speed.
+- For edge / mobile, avoid any NeRF / Gaussian variant above 50MB model size; recommend mesh-based methods instead.
+- If `input_modality == RGB_single`, route to a monocular depth estimator first (e.g. DepthAnythingV2) before any 3D task.
+- Do not output SDF for tasks that need colour; SDFs encode geometry only.
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/04-computer-vision/13-3d-vision-nerf/outputs/skill-point-cloud-loader.md">phases/04-computer-vision/13-3d-vision-nerf/outputs/skill-point-cloud-loader.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: skill-point-cloud-loader
+description: Write a PyTorch Dataset for .ply / .pcd / .xyz files with correct normalisation, centring, and point sampling
+version: 1.0.0
+phase: 4
+lesson: 13
+tags: [3d-vision, point-cloud, data-loading, pytorch]
+---
+
+# Point Cloud Loader
+
+Turn a folder of 3D scan files into a ready-to-train PyTorch `Dataset`.
+
+## When to use
+
+- Starting a new point-cloud classification / segmentation project.
+- Switching between `.ply`, `.pcd`, and `.xyz` formats.
+- Debugging a model that trains without error but converges poorly; often the data loader normalisation is wrong.
+
+## Inputs
+
+- `data_root`: folder of point-cloud files and an optional CSV with labels.
+- `file_format`: ply | pcd | xyz | npy.
+- `num_points`: fixed sampling size, typically 1024 or 2048.
+- `augmentation`: none | rotate | jitter | mixup.
+
+## Normalisation policy
+
+Every production point-cloud pipeline applies in order:
+
+1. **Centre** the cloud: subtract the centroid.
+2. **Scale** to unit sphere: divide by the max distance from centre.
+3. **Sample** `num_points` points. If the cloud has more, use **farthest point sampling** (FPS) for faithful shape representation or random sampling for speed. If fewer, repeat points.
+4. **Shuffle** point order (order should not matter for the model anyway, but shuffling breaks accidental order dependencies).
+
+## Output template
+
+```python
+import numpy as np
+import torch
+from torch.utils.data import Dataset
+
+try:
+    import open3d as o3d
+    HAS_O3D = True
+except ImportError:
+    HAS_O3D = False
+
+def _read_ply(path):
+    if HAS_O3D:
+        pc = o3d.io.read_point_cloud(path)
+        return np.asarray(pc.points, dtype=np.float32)
+    # Fallback: minimal ascii-ply reader
+    ...
+
+def _fps(points, k):
+    idx = np.zeros(k, dtype=np.int64)
+    dist = np.full(len(points), np.inf)
+    seed = np.random.randint(len(points))
+    idx[0] = seed
+    for i in range(1, k):
+        dist = np.minimum(dist, ((points - points[idx[i-1]]) ** 2).sum(axis=1))
+        idx[i] = int(np.argmax(dist))
+    return idx
+
+def normalise(points):
+    centre = points.mean(axis=0)
+    points = points - centre
+    scale = np.max(np.linalg.norm(points, axis=1))
+    return points / max(scale, 1e-8)
+
+class PointCloudDataset(Dataset):
+    def __init__(self, files, labels, num_points=1024, augment=False):
+        self.files = files
+        self.labels = labels
+        self.num_points = num_points
+        self.augment = augment
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, i):
+        pts = _read_ply(self.files[i])
+        pts = normalise(pts)
+        if len(pts) &gt;= self.num_points:
+            idx = _fps(pts, self.num_points)
+            pts = pts[idx]
+        else:
+            reps = int(np.ceil(self.num_points / len(pts)))
+            pts = np.tile(pts, (reps, 1))[:self.num_points]
+        # Shuffle point order to break any accidental dependencies (especially
+        # important when tiling repeats points in deterministic order).
+        np.random.shuffle(pts)
+        if self.augment:
+            theta = np.random.uniform(0, 2 * np.pi)
+            R = np.array([[np.cos(theta), 0, np.sin(theta)],
+                          [0, 1, 0],
+                          [-np.sin(theta), 0, np.cos(theta)]], dtype=np.float32)
+            pts = pts @ R
+            pts = pts + np.random.normal(0, 0.02, pts.shape).astype(np.float32)
+        pts = np.ascontiguousarray(pts, dtype=np.float32)
+        return torch.from_numpy(pts).transpose(0, 1), int(self.labels[i])
+```
+
+## Report
+
+```
+[dataset]
+  files:          &lt;N&gt;
+  format:         &lt;ply|pcd|xyz|npy&gt;
+  points_per_sample: &lt;int&gt;
+  normalise:      centre + unit sphere
+  sampling:       FPS | random
+  augmentation:   &lt;list&gt;
+```
+
+## Rules
+
+- Always centre before scaling; swapping the order changes the meaning of &quot;unit sphere&quot;.
+- Prefer FPS over random sampling for shape tasks; random is fine for segmentation where every point matters anyway.
+- Never augment during evaluation; only during training.
+- If point cloud files include colour or normals as extra channels, extend the Dataset to return a `(3 + C, num_points)` tensor, not just xyz.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. Why cannot a plain CNN process a point cloud directly?</legend><label class="option"><input type="radio" name="q0" value="0"> Point clouds require quaternions</label><label class="option"><input type="radio" name="q0" value="1"> A CNN assumes input pixels arranged on a regular grid with neighbourhood structure; a point cloud is an unordered set of points in R^3 with no grid and variable size, violating both assumptions</label><label class="option"><input type="radio" name="q0" value="2"> CNNs only work on grayscale</label><label class="option"><input type="radio" name="q0" value="3"> Point clouds are too large</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. What trick makes PointNet permutation-invariant over the input points?</legend><label class="option"><input type="radio" name="q1" value="0"> Sorting the points before the forward pass</label><label class="option"><input type="radio" name="q1" value="1"> Batch normalisation</label><label class="option"><input type="radio" name="q1" value="2"> A special loss function</label><label class="option"><input type="radio" name="q1" value="3"> A shared MLP applied to every point independently, followed by a symmetric aggregation (max pool or sum); since the aggregation ignores point order, the whole network&#39;s output is order-invariant</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. A vanilla NeRF MLP fed with raw (x, y, z) coordinates produces blurry results. What fixes it?</legend><label class="option"><input type="radio" name="q2" value="0"> Adding more training data</label><label class="option"><input type="radio" name="q2" value="1"> Switching to a CNN</label><label class="option"><input type="radio" name="q2" value="2"> Positional encoding: project coordinates into Fourier features (sin/cos of 2^l * pi * x for multiple l) before the MLP; this lets the low-frequency-biased MLP represent high-frequency details</label><label class="option"><input type="radio" name="q2" value="3"> Using 16-bit precision</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. How is a NeRF rendered pixel computed?</legend><label class="option"><input type="radio" name="q3" value="0"> By casting a ray from the camera through the pixel, sampling N points along the ray, querying the MLP at each point for (density, colour), and compositing the samples with a volumetric rendering equation that accumulates alpha-weighted colours along the ray</label><label class="option"><input type="radio" name="q3" value="1"> By running a convolution over a depth map</label><label class="option"><input type="radio" name="q3" value="2"> By looking up a precomputed voxel grid</label><label class="option"><input type="radio" name="q3" value="3"> As the output of the final MLP layer</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. Why has 3D Gaussian splatting largely replaced NeRF in production?</legend><label class="option"><input type="radio" name="q4" value="0"> NeRFs were shown to be mathematically incorrect</label><label class="option"><input type="radio" name="q4" value="1"> It is an explicit representation (millions of 3D Gaussians with opacity and colour) that renders in real time via rasterisation instead of MLP queries on sampled rays; training is minutes instead of hours, rendering is 100x faster, and quality is comparable</label><label class="option"><input type="radio" name="q4" value="2"> Gaussians are more compressible</label><label class="option"><input type="radio" name="q4" value="3"> It produces higher-quality images</label><p data-feedback="4"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/04-computer-vision/12-video-understanding/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/04-computer-vision/14-vision-transformers/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/04-computer-vision/13-3d-vision-nerf/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

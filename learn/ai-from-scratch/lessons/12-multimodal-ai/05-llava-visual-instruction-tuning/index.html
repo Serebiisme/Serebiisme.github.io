@@ -1,0 +1,675 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>视觉指令调整 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-12-multimodal-ai" data-lesson="12-multimodal-ai/05-llava-visual-instruction-tuning" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/12-multimodal-ai/">多模态 AI</a> / LESSON 05</p><h1 class="lesson-title">视觉指令调整</h1><p>LLaVA and Visual Instruction Tuning</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>视觉指令调整</h1>
+<blockquote>
+<p>拉瓦 (四月2023年) 是地球上最多复制的多式建筑. 它用2层MLP取代BLIP-2的Q-Former,用天真的代币连接取代Flamingo的门禁交叉注意力,并从仅仅是文字的标题中训练了GPT-4生成的158k视觉指令转折. 任何在2023年至2026年之间建造VLM的实践者都会构建一些LLaVA的变体. 增加了AnyRes. 拉瓦-下一个升级分辨率. 单一的图像,多个图像和视频. 这一课阅读了食谱,应用了投影机,并解释了&quot;简单的获胜&quot;的原因.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python (stdlib, projector + instruction-template builder)
+<strong>Prerequisites:</strong> Phase 12 · 02 (CLIP), Phase 11 (LLM Engineering — instruction tuning)
+<strong>Time:</strong> ~180 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>构建一个2层的MLP投影机,将ViT补丁嵌入式 (dim 1024) 映射到LLM的嵌入式 dim (dim 4096).</li>
+<li>按照LLaVA的两阶段配方进行操作: (1) 在558万个字幕对等上进行投影器对齐, (2) 在158万个GPT-4生成的转折上进行视觉指令调整.</li>
+<li>构建一个LLaVA格式提示符,使用图像代币定位符,系统提示符和用户/助理转.</li>
+<li>解释为什么社区从Q-Former转移到MLP,</li>
+</ul>
+<h2>问题</h2>
+<p>蓝皮-2的Q-Former (课时12.03) 将图像压缩到32个代币. 清洁,高效,适合基准. 但它有两个问题.</p>
+<p>首先,Q-Former可以训练,但其丢失并不是最终任务.第一阶段训练ITC+ITM+ITG.第二阶段训练LM损失.查询学习一些中间表示,LLM然后必须解码.信息在瓶中丢失.</p>
+<p>第二,Q-Former需要188万个参数,在LLaVA的2023级别上,你必须与你的目标LLM共同设计.改变LLM,重新训练Q-Former.改变视觉编码器,重新训练.每个组合都是一个独立的研发项目.</p>
+<p>简单的LLaVA答案是令人尬的:取了ViT的576个补丁代币,<code>1024 → 4096 → 4096</code>没有瓶,没有阶段1预训练, 只是训练MLP直接LM损失.</p>
+<p>数据来自哪里?LLaVA的第二个见解:使用GPT-4 (仅用于文字) 来生成指令数据.为图像提供GPT-4的COCO标题和边界框数据,要求它产生对话,描述和复杂的推理问题.158k的指令响应免费转换.没有人注释.</p>
+<p>结果是,VLM在8架A100上运行了一天,在MMMU上击败了Flamingo,并发出了一个可以扩展社区的开放检查点.到2023年底,它已经产生了50多个叉子.</p>
+<h2>概念</h2>
+<h3>建筑</h3>
+<p>杆-1,5在13B:</p>
+<ul>
+<li>视觉编码器:CLIP ViT-L/14 @ 336 (在1阶段冷,可在2阶段冷).</li>
+<li>投影机:具有GELU激活的2层MLP,<code>1024 → 4096 → 4096</code>现在,我们要去.</li>
+<li>士:维库纳-13B (后来是Llama-3.1-8B).</li>
+</ul>
+<p>转发图像+文字提示:</p>
+<pre><code>img -&gt; ViT -&gt; 576 patches of dim 1024
+patches -&gt; MLP -&gt; 576 tokens of dim 4096
+prompt: system + &quot;&lt;image&gt;&quot; placeholder + user question
+replace &lt;image&gt; token with the 576 projected tokens
+feed the full sequence to the LLM
+decode response
+</code></pre>
+<p>图像占据了LLM文本的576个代币.在2048文本上,留下了1472个代币.在32k文本上,这是一个圆形错误.</p>
+<h3>阶段1:投影机的配线</h3>
+<p>结ViT.结LLM. 训练只有2层MLP. 数据集:558k图像标题对 (LAION-CC-SBU). 损失:标题上的语言建模,根据投影图像代币.</p>
+<p>在单个时代中,在128批次中,这在几个小时内完成.投影器学习将ViT空间映射到LLM空间.没有具体任务的监督.</p>
+<h3>阶段2:视觉指令调整</h3>
+<p>解投影机 (仍然可以训练).解LLM (通常完全,有时LoRA).训练158k视觉指导转折.</p>
+<p>等人通过:</p>
+<ol>
+<li>拍摄一个COCO图片.</li>
+<li>摘出文本描述 (5个字幕+界限框列表).</li>
+<li>通过三个提示模板向GPT-4发送:
+<ul>
+<li>对话: &quot;用户和助理之间就此图像进行反复对话&quot;.</li>
+<li>详细描述: &quot;给出图片的丰富,详细描述.</li>
+<li>复杂的推理: &quot;问一个需要对图像进行推理的问题,然后回答&quot;.</li>
+</ul>
+</li>
+<li>解析GPT-4的输出成 (指令,响应) 双.</li>
+</ol>
+<p>任何这些都直接触及图像,只有文字描述.GPT-4幻觉可信的图像内容.一些噪音,但它奏效:158万转折足以解锁对话.</p>
+<h3>为什么社区复制了这</h3>
+<ul>
+<li>没有1阶段的损失,整个LM损失.</li>
+<li>投影机在几个小时内运行,而不是几天.</li>
+<li>通过重新训练只能将投影机进行更换 (LLaVA-Llama2,LLaVA-Mistral,LLaVA-Llama3).</li>
+<li>视觉指令数据管道使用GPT-4,并且为新域进行再生便宜.</li>
+</ul>
+<h3>拉瓦-1.5 和拉瓦-下XT</h3>
+<p>拉瓦-1.5 (2023年10月) 补充:</p>
+<ul>
+<li>混合在指令调整中,将学术任务数据 (VQA,OKVQA, RefCOCO) 进行调整.</li>
+<li>系统更快.</li>
+<li>2048 → 32k 文本.</li>
+</ul>
+<p>拉瓦-内XT (2024年1月) 补充道:</p>
+<ul>
+<li>任何Res:将高分辨率图像分为336x336种作物的2x2或1x3格式,加上一个全球低分辨率小图片.每个作物成为576个代币;每张图片总共约有2880个视觉代币.OCR和图表任务跳跃.</li>
+<li>较好的指令数据混合与 ShareGPT4V (高质量的GPT-4V标题)</li>
+<li>强大的基础法学 (Mistral-7B, Yi-34B).</li>
+</ul>
+<h3>视频</h3>
+<p>12.08课程涵盖OneVision的深度.短版本:相同的投影机,但以一个模型的单一图像,多图像和视频课程进行培训,共享视觉标志预算.</p>
+<h3>与Q-Former的比较</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Q-Former (BLIP-2)</th>
+<th>MLP (LLaVA)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Visual tokens per image</td>
+<td>32</td>
+<td>576 (base) or 2880 (AnyRes)</td>
+</tr>
+<tr>
+<td>Trainable params</td>
+<td>188M + LM</td>
+<td>40M + LM</td>
+</tr>
+<tr>
+<td>Stage 1 loss</td>
+<td>ITC+ITM+ITG</td>
+<td>LM only</td>
+</tr>
+<tr>
+<td>LLM drop-in</td>
+<td>Requires retrain</td>
+<td>Swap with minimal retrain</td>
+</tr>
+<tr>
+<td>Multi-image</td>
+<td>Awkward</td>
+<td>Natural (concat)</td>
+</tr>
+<tr>
+<td>Video</td>
+<td>Awkward</td>
+<td>Natural (per-frame concat)</td>
+</tr>
+<tr>
+<td>Token budget</td>
+<td>Small</td>
+<td>Large</td>
+</tr>
+</tbody>
+</table>
+<p>简单化和代币灵活性是MLP的胜利.Q-Former在代币预算中获胜.到2023年底,代币预算不再是约束力的约束 (LLM背景增长到32k-128k+) 而简单性占据主导地位.</p>
+<h3>提示格式</h3>
+<pre><code>A chat between a curious human and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the human's questions. USER: &lt;image&gt; Describe this image in detail. ASSISTANT: The image shows ...
+</code></pre>
+<p><code>&lt;image&gt;</code>在代币化之前,它被取代为576个视觉代币 (或2880个随 AnyRes).代币化器看到比它训练的稍长一段序列,但LLM处理新输入,因为第一阶段教了它.</p>
+<h3>参数经济</h3>
+<hr>
+<ul>
+<li>临床检查 (CLIPS ViT-L/14 @ 336: 303M (冷阶段1,通常未冷阶段2).</li>
+<li>投影机 (2x线性): ~22M可训练.</li>
+<li>星7B:7B</li>
+<li>总数:7.3B参数. 训练可在第二阶段进行:全7B+22M投影机.</li>
+</ul>
+<p>训练费用:第2阶段:在8xA100上工作20小时.这是一个节点,可重复的关键号码.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-2241a264870643bf96e8.png" alt="mm-llava-projector 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>用它</h2>
+<p><code>code/main.py</code>执行:</p>
+<ol>
+<li>纯Python中的2层MLP投影机 (玩具尺寸为16 → 32 → 32).</li>
+<li>快速构建管道:系统快速<code>&lt;image&gt;</code>换成N预测代币+用户转换+助手生成位数.</li>
+<li>视觉化器为在LLM背景下576代币视觉区块的外观 (占2k/32k/128k背景的占比).</li>
+</ol>
+<h2>运送它</h2>
+<p>这一课产生了<code>outputs/skill-llava-vibes-eval.md</code>由于LLaVA家族检查点,它运行了10个即时振动式套件 (3个字幕,3个VQA,2个推理,2个拒绝) 并报告了一个可以读取的人类的分数卡.不是基准;一个烟雾测试来确认投影机和LLM的连接良好.</p>
+<h2>运动</h2>
+<ol>
+<li>
+<p>计算2层MLP投影器的可训练参数数量<code>1024 → 4096 → 4096</code>通过GELU和偏差,它代表了LLaVA-13B的多少分?</p>
+</li>
+<li>
+<p>构建一个&quot;拒绝&quot;案例的LLaVA提示图片 图片包含一个私人. 写出预期的助理反应. 为什么LLaVA应该拒绝这种零射击,以及需要什么培训数据来加强拒绝?</p>
+</li>
+<li>
+<p>阅读LLaVA-NeXT博客的AnyRes部分.计算在AnyRes上1344x672图像的视觉代币数量.将其与336x336的基 576代币进行比较.</p>
+</li>
+<li>
+<p>视觉指令调整 (视觉指令调整) 直接进入第二阶段,则会发生什么?</p>
+</li>
+<li>
+<p>对于一个新领域 (医疗X射线,卫星图像),描述四步数据管道生成域指示.每一步可能会发生什么问题?</p>
+</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Projector</td>
+<td>&quot;MLP bridge&quot;</td>
+<td>2-layer MLP with GELU mapping ViT dim to LLM dim</td>
+</tr>
+<tr>
+<td>Image token</td>
+<td>&quot;&lt;image&gt; placeholder&quot;</td>
+<td>Prompt marker replaced by N projected visual tokens before inference</td>
+</tr>
+<tr>
+<td>Visual instruction tuning</td>
+<td>&quot;LLaVA stage 2&quot;</td>
+<td>Training on GPT-4-generated (image, instruction, response) triplets</td>
+</tr>
+<tr>
+<td>Stage 1 alignment</td>
+<td>&quot;Projector pretraining&quot;</td>
+<td>Freeze ViT and LLM, train projector with LM loss on captions</td>
+</tr>
+<tr>
+<td>AnyRes</td>
+<td>&quot;Multi-crop tiling&quot;</td>
+<td>Split high-res image into a tile grid and concatenate each tile's visual tokens</td>
+</tr>
+<tr>
+<td>LLaVA-Instruct</td>
+<td>&quot;GPT-4-generated&quot;</td>
+<td>158k instruction-response pairs synthesized from COCO captions + GPT-4</td>
+</tr>
+<tr>
+<td>Vision encoder freeze</td>
+<td>&quot;Backbone locked&quot;</td>
+<td>CLIP weights do not update in stage 1, sometimes not in stage 2 either</td>
+</tr>
+<tr>
+<td>ShareGPT4V</td>
+<td>&quot;Better captions&quot;</td>
+<td>1M dense captions generated by GPT-4V, used for higher-quality alignment</td>
+</tr>
+<tr>
+<td>VQA</td>
+<td>&quot;Visual question answering&quot;</td>
+<td>Task of answering a free-form question about an image</td>
+</tr>
+<tr>
+<td>Prismatic VLMs</td>
+<td>&quot;Design-space paper&quot;</td>
+<td>Karamcheti 2024 ablation systematically testing projector and data choices</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2304.08485" rel="noreferrer" data-network="true">Liu et al. — Visual Instruction Tuning (arXiv:2304.08485) <small>↗ 需要联网</small></a>LLaVA纸</li>
+<li><a href="https://arxiv.org/abs/2310.03744" rel="noreferrer" data-network="true">Liu et al. — Improved Baselines with Visual Instruction Tuning (arXiv:2310.03744) <small>↗ 需要联网</small></a> LLaVA-1.5.</li>
+<li><a href="https://arxiv.org/abs/2311.12793" rel="noreferrer" data-network="true">Chen et al. — ShareGPT4V (arXiv:2311.12793) <small>↗ 需要联网</small></a>密集字幕数据集.</li>
+<li><a href="https://arxiv.org/abs/2402.07865" rel="noreferrer" data-network="true">Karamcheti et al. — Prismatic VLMs (arXiv:2402.07865) <small>↗ 需要联网</small></a>设计空间的排放.</li>
+<li><a href="https://arxiv.org/abs/2408.03326" rel="noreferrer" data-network="true">Li et al. — LLaVA-OneVision (arXiv:2408.03326) <small>↗ 需要联网</small></a>统一单个图像,多个图像,视频.</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>LLaVA and Visual Instruction Tuning</h1>
+<blockquote>
+<p>LLaVA (April 2023) is the most copied multimodal architecture on the planet. It replaced BLIP-2's Q-Former with a 2-layer MLP, replaced Flamingo's gated cross-attention with naive token concatenation, and trained on 158k visual-instruction turns generated by GPT-4 from text-only captions. Any practitioner who built a VLM between 2023 and 2026 built some variant of LLaVA. LLaVA-1.5 added AnyRes. LLaVA-NeXT bumped resolution. LLaVA-OneVision unified image, multi-image, and video in one recipe. This lesson reads the recipe, implements the projector, and explains why &quot;simpler won.&quot;</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python (stdlib, projector + instruction-template builder)
+<strong>Prerequisites:</strong> Phase 12 · 02 (CLIP), Phase 11 (LLM Engineering — instruction tuning)
+<strong>Time:</strong> ~180 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Build a 2-layer MLP projector that maps ViT patch embeddings (dim 1024) to an LLM's embedding dim (dim 4096).</li>
+<li>Walk the LLaVA two-stage recipe: (1) projector alignment on 558k caption pairs, (2) visual instruction tuning on 158k GPT-4-generated turns.</li>
+<li>Construct a LLaVA-format prompt with the image token placeholder, system prompt, and user/assistant turns.</li>
+<li>Explain why the community moved from Q-Former to MLP despite Q-Former's token-budget win.</li>
+</ul>
+<h2>The Problem</h2>
+<p>BLIP-2's Q-Former (Lesson 12.03) compresses an image to 32 tokens. Clean, efficient, good for benchmarks. But it has two problems.</p>
+<p>First, the Q-Former is trainable but its loss is not the final task. Stage 1 trains ITC+ITM+ITG. Stage 2 trains LM loss. The queries learn some intermediate representation that the LLM then has to decode. Information is lost in the bottleneck.</p>
+<p>Second, the Q-Former takes 188M params, and at LLaVA's 2023 scale you had to co-design it with your target LLM. Change the LLM, retrain the Q-Former. Change the vision encoder, retrain. Every combination was a separate R&amp;D project.</p>
+<p>The LLaVA answer was embarrassing in its simplicity: take the ViT's 576 patch tokens, pass each through a 2-layer MLP (<code>1024 → 4096 → 4096</code>), and dump all 576 into the LLM's input sequence. No bottleneck. No stage 1 pretraining on weird objectives. Just train the MLP on a direct LM loss.</p>
+<p>Where does the data come from? LLaVA's second insight: use GPT-4 (text-only) to generate instruction data. Feed GPT-4 the COCO caption and bounding-box data for an image, ask it to produce conversations, descriptions, and complex reasoning questions. 158k instruction-response turns for free. No human annotation.</p>
+<p>The result: a VLM that ran on 8 A100s for one day, beat Flamingo on MMMU, and shipped an open checkpoint the community could extend. By late 2023 it had spawned 50+ forks.</p>
+<h2>The Concept</h2>
+<h3>The architecture</h3>
+<p>LLaVA-1.5 at 13B:</p>
+<ul>
+<li>Vision encoder: CLIP ViT-L/14 @ 336 (frozen during stage 1, optionally unfrozen stage 2).</li>
+<li>Projector: 2-layer MLP with GELU activation, <code>1024 → 4096 → 4096</code>.</li>
+<li>LLM: Vicuna-13B (later Llama-3.1-8B).</li>
+</ul>
+<p>Forward pass on an image + text prompt:</p>
+<pre><code>img -&gt; ViT -&gt; 576 patches of dim 1024
+patches -&gt; MLP -&gt; 576 tokens of dim 4096
+prompt: system + &quot;&lt;image&gt;&quot; placeholder + user question
+replace &lt;image&gt; token with the 576 projected tokens
+feed the full sequence to the LLM
+decode response
+</code></pre>
+<p>The image occupies 576 tokens of the LLM context. At 2048 context, that leaves 1472 tokens for text. At 32k context, it is a rounding error.</p>
+<h3>Stage 1: projector alignment</h3>
+<p>Freeze ViT. Freeze LLM. Train only the 2-layer MLP. Dataset: 558k image-caption pairs (LAION-CC-SBU). Loss: language modeling on the caption, conditioned on the projected image tokens.</p>
+<p>In a single epoch at batch 128 this is done in a few hours. The projector learns to map ViT-space to LLM-space. No task-specific supervision.</p>
+<h3>Stage 2: visual instruction tuning</h3>
+<p>Unfreeze the projector (still trainable). Unfreeze the LLM (usually fully, sometimes LoRA). Train on 158k visual-instruction turns.</p>
+<p>The instruction data is the trick. Liu et al. generated it by:</p>
+<ol>
+<li>Take a COCO image.</li>
+<li>Extract the text description (5 human captions + bounding-box list).</li>
+<li>Send to GPT-4 with three prompt templates:
+<ul>
+<li>Conversation: &quot;Generate a back-and-forth dialogue between a user and assistant about this image.&quot;</li>
+<li>Detailed description: &quot;Give a rich, detailed description of the image.&quot;</li>
+<li>Complex reasoning: &quot;Ask a question that requires reasoning about the image, then answer it.&quot;</li>
+</ul>
+</li>
+<li>Parse GPT-4's output into (instruction, response) pairs.</li>
+</ol>
+<p>None of this touches the image directly — only the text description. GPT-4 hallucinates plausible image content. Some noise, but it worked: 158k turns was enough to unlock dialogue.</p>
+<h3>Why the community copied this</h3>
+<ul>
+<li>No stage-1-specific losses to tune. LM loss throughout.</li>
+<li>Projector trains in hours, not days.</li>
+<li>LLM can be swapped (LLaVA-Llama2, LLaVA-Mistral, LLaVA-Llama3) by retraining just the projector.</li>
+<li>Visual-instruction data pipeline uses GPT-4 and is cheap to regenerate for a new domain.</li>
+</ul>
+<h3>LLaVA-1.5 and LLaVA-NeXT</h3>
+<p>LLaVA-1.5 (October 2023) added:</p>
+<ul>
+<li>Academic-task data (VQA, OKVQA, RefCOCO) mixed into instruction tuning.</li>
+<li>Better system prompt.</li>
+<li>2048 → 32k context.</li>
+</ul>
+<p>LLaVA-NeXT (January 2024) added:</p>
+<ul>
+<li>AnyRes: split high-res images into a 2x2 or 1x3 grid of 336x336 crops, plus one global low-res thumbnail. Each crop becomes 576 tokens; total around 2880 visual tokens per image. OCR and chart tasks jumped.</li>
+<li>Better instruction data mixture with ShareGPT4V (high-quality GPT-4V captions).</li>
+<li>Stronger base LLMs (Mistral-7B, Yi-34B).</li>
+</ul>
+<h3>LLaVA-OneVision</h3>
+<p>Lesson 12.08 covers OneVision in depth. Short version: same projector, but trained with a curriculum that covers single-image, multi-image, and video in one model with shared visual-token budget.</p>
+<h3>The comparison to Q-Former</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Q-Former (BLIP-2)</th>
+<th>MLP (LLaVA)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Visual tokens per image</td>
+<td>32</td>
+<td>576 (base) or 2880 (AnyRes)</td>
+</tr>
+<tr>
+<td>Trainable params</td>
+<td>188M + LM</td>
+<td>40M + LM</td>
+</tr>
+<tr>
+<td>Stage 1 loss</td>
+<td>ITC+ITM+ITG</td>
+<td>LM only</td>
+</tr>
+<tr>
+<td>LLM drop-in</td>
+<td>Requires retrain</td>
+<td>Swap with minimal retrain</td>
+</tr>
+<tr>
+<td>Multi-image</td>
+<td>Awkward</td>
+<td>Natural (concat)</td>
+</tr>
+<tr>
+<td>Video</td>
+<td>Awkward</td>
+<td>Natural (per-frame concat)</td>
+</tr>
+<tr>
+<td>Token budget</td>
+<td>Small</td>
+<td>Large</td>
+</tr>
+</tbody>
+</table>
+<p>MLP wins on simplicity and token flexibility. Q-Former wins on token budget. By late 2023 the token budget was no longer the binding constraint (LLM contexts grew to 32k-128k+) and simplicity dominated.</p>
+<h3>The prompt format</h3>
+<pre><code>A chat between a curious human and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the human's questions. USER: &lt;image&gt; Describe this image in detail. ASSISTANT: The image shows ...
+</code></pre>
+<p><code>&lt;image&gt;</code> is a placeholder token. Before tokenization, it is replaced with the 576 visual tokens (or 2880 with AnyRes). Tokenizer sees a slightly longer sequence than it was trained on, but the LLM handles the novel input because stage 1 taught it to.</p>
+<h3>Parameter economy</h3>
+<p>LLaVA-1.5-7B breakdown:</p>
+<ul>
+<li>CLIP ViT-L/14 @ 336: 303M (frozen stage 1, often unfrozen stage 2).</li>
+<li>Projector (2x linear): ~22M trainable.</li>
+<li>Llama-7B: 7B.</li>
+<li>Total: 7.3B params. Trainable during stage 2: full 7B + 22M projector.</li>
+</ul>
+<p>Training cost for stage 2: ~20 hours on 8xA100. This is the key number — one day, one node, reproducible. That is why LLaVA spread.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-2241a264870643bf96e8.png" alt="mm-llava-projector 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Use It</h2>
+<p><code>code/main.py</code> implements:</p>
+<ol>
+<li>The 2-layer MLP projector (dim 16 → 32 → 32 for toy scale) in pure Python.</li>
+<li>The prompt-building pipeline: system prompt + <code>&lt;image&gt;</code> replaced with N projected tokens + user turn + assistant generation placeholder.</li>
+<li>A visualizer for what the 576-token visual block looks like in LLM context (percentage of 2k / 32k / 128k context consumed).</li>
+</ol>
+<h2>Ship It</h2>
+<p>This lesson produces <code>outputs/skill-llava-vibes-eval.md</code>. Given a LLaVA-family checkpoint, it runs a 10-prompt vibes-eval suite (3 captioning, 3 VQA, 2 reasoning, 2 refusal) and reports a human-readable scorecard. Not a benchmark; a smoke test to confirm the projector and LLM are connecting well.</p>
+<h2>Exercises</h2>
+<ol>
+<li>
+<p>Compute the trainable-parameter count for the 2-layer MLP projector at <code>1024 → 4096 → 4096</code>. With GELU and bias, what fraction of LLaVA-13B does it represent?</p>
+</li>
+<li>
+<p>Construct a LLaVA prompt for a &quot;refusal&quot; case — the image contains a private individual. Write the expected assistant response. Why should LLaVA refuse this zero-shot and what training data would be needed to reinforce the refusal?</p>
+</li>
+<li>
+<p>Read the AnyRes section of the LLaVA-NeXT blog. Compute the visual token count for a 1344x672 image at AnyRes. Compare to base 576 tokens at 336x336.</p>
+</li>
+<li>
+<p>The LLaVA stage-1 projector is trained with LM loss on captions. What happens if you skip stage 1 and go straight to stage 2 (visual instruction tuning)? Cite the Prismatic VLMs ablation (arXiv:2402.07865) for the answer.</p>
+</li>
+<li>
+<p>LLaVA-Instruct-150k uses GPT-4 with COCO captions to generate instructions. For a new domain (medical X-rays, satellite imagery), describe the four-step data pipeline to generate domain instructions. What could go wrong at each step?</p>
+</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Projector</td>
+<td>&quot;MLP bridge&quot;</td>
+<td>2-layer MLP with GELU mapping ViT dim to LLM dim</td>
+</tr>
+<tr>
+<td>Image token</td>
+<td>&quot;&lt;image&gt; placeholder&quot;</td>
+<td>Prompt marker replaced by N projected visual tokens before inference</td>
+</tr>
+<tr>
+<td>Visual instruction tuning</td>
+<td>&quot;LLaVA stage 2&quot;</td>
+<td>Training on GPT-4-generated (image, instruction, response) triplets</td>
+</tr>
+<tr>
+<td>Stage 1 alignment</td>
+<td>&quot;Projector pretraining&quot;</td>
+<td>Freeze ViT and LLM, train projector with LM loss on captions</td>
+</tr>
+<tr>
+<td>AnyRes</td>
+<td>&quot;Multi-crop tiling&quot;</td>
+<td>Split high-res image into a tile grid and concatenate each tile's visual tokens</td>
+</tr>
+<tr>
+<td>LLaVA-Instruct</td>
+<td>&quot;GPT-4-generated&quot;</td>
+<td>158k instruction-response pairs synthesized from COCO captions + GPT-4</td>
+</tr>
+<tr>
+<td>Vision encoder freeze</td>
+<td>&quot;Backbone locked&quot;</td>
+<td>CLIP weights do not update in stage 1, sometimes not in stage 2 either</td>
+</tr>
+<tr>
+<td>ShareGPT4V</td>
+<td>&quot;Better captions&quot;</td>
+<td>1M dense captions generated by GPT-4V, used for higher-quality alignment</td>
+</tr>
+<tr>
+<td>VQA</td>
+<td>&quot;Visual question answering&quot;</td>
+<td>Task of answering a free-form question about an image</td>
+</tr>
+<tr>
+<td>Prismatic VLMs</td>
+<td>&quot;Design-space paper&quot;</td>
+<td>Karamcheti 2024 ablation systematically testing projector and data choices</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2304.08485" rel="noreferrer" data-network="true">Liu et al. — Visual Instruction Tuning (arXiv:2304.08485) <small>↗ 需要联网</small></a> — the LLaVA paper.</li>
+<li><a href="https://arxiv.org/abs/2310.03744" rel="noreferrer" data-network="true">Liu et al. — Improved Baselines with Visual Instruction Tuning (arXiv:2310.03744) <small>↗ 需要联网</small></a> — LLaVA-1.5.</li>
+<li><a href="https://arxiv.org/abs/2311.12793" rel="noreferrer" data-network="true">Chen et al. — ShareGPT4V (arXiv:2311.12793) <small>↗ 需要联网</small></a> — dense captions dataset.</li>
+<li><a href="https://arxiv.org/abs/2402.07865" rel="noreferrer" data-network="true">Karamcheti et al. — Prismatic VLMs (arXiv:2402.07865) <small>↗ 需要联网</small></a> — design-space ablations.</li>
+<li><a href="https://arxiv.org/abs/2408.03326" rel="noreferrer" data-network="true">Li et al. — LLaVA-OneVision (arXiv:2408.03326) <small>↗ 需要联网</small></a> — unified single-image, multi-image, video.</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-12-multimodal-ai--05-llava-visual-instruction-tuning.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-12-multimodal-ai--05-llava-visual-instruction-tuning.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/12-multimodal-ai/05-llava-visual-instruction-tuning/code/main.py">phases/12-multimodal-ai/05-llava-visual-instruction-tuning/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;LLaVA 2-layer MLP projector + prompt builder — stdlib Python.
+
+Walks the LLaVA forward pass:
+  - toy ViT emits 16 patch tokens of dim 16
+  - 2-layer MLP projects each patch to dim 24 (the &#39;LLM&#39; dim)
+  - build a LLaVA-format prompt with &lt;image&gt; placeholder replaced by the 16
+    projected tokens
+  - report context budget at 2k / 32k / 128k LLM windows
+
+No numpy, no torch. Linear layers and GELU implemented by hand.
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import math
+import random
+
+rng = random.Random(11)
+
+PATCH_COUNT = 16
+PATCH_DIM = 16
+HIDDEN_DIM = 32
+LLM_DIM = 24
+
+
+def vec(n: int) -&gt; list[float]:
+    return [rng.gauss(0, 0.3) for _ in range(n)]
+
+
+def mat(rows: int, cols: int) -&gt; list[list[float]]:
+    return [vec(cols) for _ in range(rows)]
+
+
+def linear(W: list[list[float]], b: list[float], x: list[float]) -&gt; list[float]:
+    return [sum(r * v for r, v in zip(row, x)) + bi
+            for row, bi in zip(W, b)]
+
+
+def gelu(x: float) -&gt; float:
+    return 0.5 * x * (1.0 + math.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * x * x * x)))
+
+
+def gelu_vec(v: list[float]) -&gt; list[float]:
+    return [gelu(x) for x in v]
+
+
+class MLPProjector:
+    def __init__(self, in_dim: int, hidden: int, out_dim: int):
+        self.W1 = mat(hidden, in_dim)
+        self.b1 = [0.0] * hidden
+        self.W2 = mat(out_dim, hidden)
+        self.b2 = [0.0] * out_dim
+
+    def forward(self, x: list[float]) -&gt; list[float]:
+        h = gelu_vec(linear(self.W1, self.b1, x))
+        return linear(self.W2, self.b2, h)
+
+    def num_params(self) -&gt; int:
+        return (len(self.W1) * len(self.W1[0]) + len(self.b1)
+                + len(self.W2) * len(self.W2[0]) + len(self.b2))
+
+
+def fake_vit_output() -&gt; list[list[float]]:
+    return [vec(PATCH_DIM) for _ in range(PATCH_COUNT)]
+
+
+def build_llava_prompt(system: str, user: str, image_tokens: int) -&gt; dict:
+    placeholder = &quot;&lt;image&gt;&quot;
+    template = (
+        f&quot;SYSTEM: {system}\n&quot;
+        f&quot;USER: {placeholder} {user}\n&quot;
+        f&quot;ASSISTANT: &quot;
+    )
+    return {
+        &quot;raw_prompt&quot;: template,
+        &quot;placeholder&quot;: placeholder,
+        &quot;image_tokens&quot;: image_tokens,
+        &quot;text_token_estimate&quot;: len(template.split()) + 10,
+    }
+
+
+def visualize_context(num_image_tokens: int, text_tokens: int) -&gt; None:
+    print(&quot;\ncontext budget at different LLM windows&quot;)
+    print(&quot;-&quot; * 60)
+    totals = (2048, 8192, 32768, 131072)
+    for t in totals:
+        used = num_image_tokens + text_tokens
+        remain = t - used
+        pct_image = 100 * num_image_tokens / t
+        print(f&quot;  window {t:&gt;6d}: image {pct_image:5.1f}% | &quot;
+              f&quot;text {100*text_tokens/t:4.1f}% | remain {max(remain, 0):&gt;6d} tokens&quot;)
+
+
+def demo_projector() -&gt; None:
+    print(&quot;\nDEMO 1: 2-layer MLP projector forward pass&quot;)
+    print(&quot;-&quot; * 60)
+    patches = fake_vit_output()
+    proj = MLPProjector(PATCH_DIM, HIDDEN_DIM, LLM_DIM)
+
+    print(f&quot;  ViT out: {PATCH_COUNT} patches of dim {PATCH_DIM}&quot;)
+    print(f&quot;  MLP:     {PATCH_DIM} -&gt; {HIDDEN_DIM} -&gt; {LLM_DIM}&quot;)
+    print(f&quot;  params:  {proj.num_params():,}&quot;)
+
+    visual_tokens = [proj.forward(p) for p in patches]
+    print(f&quot;  output:  {len(visual_tokens)} visual tokens of dim &quot;
+          f&quot;{len(visual_tokens[0])}&quot;)
+    print(f&quot;  token 0 sample: {[round(x, 3) for x in visual_tokens[0][:6]]}&quot;)
+
+
+def demo_prompt() -&gt; None:
+    print(&quot;\nDEMO 2: LLaVA prompt template&quot;)
+    print(&quot;-&quot; * 60)
+    system = (&quot;A chat between a curious human and an artificial intelligence &quot;
+              &quot;assistant.&quot;)
+    user = &quot;Describe what you see in this image in detail.&quot;
+    prompt = build_llava_prompt(system, user, image_tokens=576)
+
+    print(&quot;  raw prompt (LLM receives this after image-token replacement):&quot;)
+    print(&quot;  &quot; + &quot;-&quot; * 56)
+    for line in prompt[&quot;raw_prompt&quot;].split(&quot;\n&quot;):
+        print(f&quot;    {line}&quot;)
+    print(f&quot;  &lt;image&gt; placeholder -&gt; replaced with {prompt[&#39;image_tokens&#39;]} &quot;
+          &quot;visual tokens&quot;)
+    print(f&quot;  text token estimate: ~{prompt[&#39;text_token_estimate&#39;]} tokens&quot;)
+    visualize_context(prompt[&quot;image_tokens&quot;], prompt[&quot;text_token_estimate&quot;])
+
+
+def demo_anyres() -&gt; None:
+    print(&quot;\nDEMO 3: LLaVA-NeXT AnyRes token cost&quot;)
+    print(&quot;-&quot; * 60)
+    tile_tokens = 576
+    configs = [
+        (&quot;336x336 (base)&quot;, 1, 0),
+        (&quot;672x336 (1x2)&quot;, 2, 1),
+        (&quot;672x672 (2x2)&quot;, 4, 1),
+        (&quot;1344x672 (2x4)&quot;, 8, 1),
+        (&quot;1344x1344 (4x4)&quot;, 16, 1),
+    ]
+    for name, tiles, thumb in configs:
+        total = tiles * tile_tokens + thumb * tile_tokens
+        print(f&quot;  {name:20s}: {tiles:2d} tiles + {thumb} thumbnail &quot;
+              f&quot;= {total:5d} tokens&quot;)
+
+
+def main() -&gt; None:
+    print(&quot;=&quot; * 60)
+    print(&quot;LLAVA VISUAL INSTRUCTION TUNING (Phase 12, Lesson 05)&quot;)
+    print(&quot;=&quot; * 60)
+    demo_projector()
+    demo_prompt()
+    demo_anyres()
+    print(&quot;\n&quot; + &quot;=&quot; * 60)
+    print(&quot;TAKEAWAYS&quot;)
+    print(&quot;-&quot; * 60)
+    print(&quot;  · 2-layer MLP projector: 22M params (trivial next to the 7B LLM)&quot;)
+    print(&quot;  · &lt;image&gt; placeholder -&gt; replace with N projected visual tokens&quot;)
+    print(&quot;  · base LLaVA: 576 tokens per image (30% of 2k context)&quot;)
+    print(&quot;  · AnyRes: up to 2880 tokens for high-res OCR / chart inputs&quot;)
+    print(&quot;  · stage 1: train projector alone (hours)&quot;)
+    print(&quot;  · stage 2: train projector + LLM on 158k GPT-4 instructions&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/12-multimodal-ai/05-llava-visual-instruction-tuning/outputs/skill-llava-vibes-eval.md">phases/12-multimodal-ai/05-llava-visual-instruction-tuning/outputs/skill-llava-vibes-eval.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: llava-vibes-eval
+description: Run a 10-prompt vibes-eval on a LLaVA-family VLM and produce a human-readable scorecard.
+version: 1.0.0
+phase: 12
+lesson: 05
+tags: [llava, vlm, vibes-eval, instruction-tuning]
+---
+
+Given a LLaVA-family VLM (LLaVA-1.5, LLaVA-NeXT, LLaVA-OneVision, or a community fork) and a test image set, run a 10-prompt smoke test covering captioning, VQA, reasoning, refusal, and format compliance. Produce a scorecard that confirms the projector and LLM are connecting correctly.
+
+Produce:
+
+1. Ten prompts with expected-behavior descriptions:
+   - Three captioning (short, detailed, creative).
+   - Three VQA (counting, color, presence of object).
+   - Two reasoning (compare two regions, cause-and-effect).
+   - Two refusal (private individual, PII-identifying).
+2. Per-prompt score. Pass / partial / fail with one-line justification.
+3. Overall pattern diagnosis. If captioning passes but VQA fails, suspect stage-2 data mix. If detailed captioning shows hallucination, suspect insufficient ShareGPT4V-style data. If refusals fail, flag a safety-data gap.
+4. Resolution check. Run one OCR-requiring prompt at 336x336 base and again at AnyRes; note the delta. Low-res failure is expected; high-res failure means AnyRes is mis-configured.
+5. Suggested follow-up. Three specific training-data additions the caller could run if specific categories fail.
+
+Hard rejects:
+- Scoring VLMs on benchmark numbers without also running the vibes suite. Benchmarks can be gamed; vibes reveal real deployment readiness.
+- Conflating hallucination with stylistic verbosity. Flag specifically which objects are invented vs merely elaborately described.
+- Claiming a pass on reasoning prompts without checking the reasoning chain, not just the final answer.
+
+Refusal rules:
+- If the caller asks to vibes-eval a proprietary VLM (Gemini, Claude, GPT-5V) without API access, refuse — the test needs actual inference.
+- If the target use case is medical diagnosis or legal advice, refuse — vibes-eval is not a certification and must not be used for high-stakes domains.
+- If no images are provided, refuse — the test is image-grounded by definition.
+
+Output: a scorecard with 10 rows (prompt, image, expected, actual, pass/partial/fail), an overall pattern diagnosis, and a three-item follow-up list. End with a &quot;what to read next&quot; paragraph pointing to Lesson 12.06 (AnyRes) for resolution-related failures or Lesson 12.07 (ablations) for data-mixture tuning.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原课程未提供测验。</p></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/12-multimodal-ai/04-flamingo-gated-cross-attention/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/12-multimodal-ai/06-any-resolution-patch-n-pack/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/12-multimodal-ai/05-llava-visual-instruction-tuning/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

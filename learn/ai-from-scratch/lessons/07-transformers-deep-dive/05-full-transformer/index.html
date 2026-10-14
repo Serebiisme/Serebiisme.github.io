@@ -1,0 +1,1070 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>完整变压器 编码器+解码器 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-07-transformers-deep-dive" data-lesson="07-transformers-deep-dive/05-full-transformer" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/07-transformers-deep-dive/">深入 Transformer</a> / LESSON 05</p><h1 class="lesson-title">完整变压器 编码器+解码器</h1><p>The Full Transformer — Encoder + Decoder</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>完整变压器 编码器+解码器</h1>
+<blockquote>
+<p>其他一切,剩余物,正常化,向前传递,交叉注意,</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 7 · 02 (Self-Attention), Phase 7 · 03 (Multi-Head Attention), Phase 7 · 04 (Positional Encoding)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>问题</h2>
+<p>单一注意力层是一个特征提取器,而不是模型.每层一个不够语言容量.你需要没有正确的管道.</p>
+<p>2017年瓦斯瓦尼论文包装了六项设计决定,将一个注意层转化为可堆叠的块.自编码器 (BERT),解码器 (GPT),编码器-解码器 (T5) 以来,每个变压器都继承了相同的骨架.2026年,这些块已经被精炼 (RMSNorm,SwiGLU,预规范,RoPE),但骨架是相同的.</p>
+<p>接下来的课程将其专业化为编码器,07为解码器,08为编码器-解码器.</p>
+<h2>概念</h2>
+<p><img src="/learn/ai-from-scratch/files/phases/07-transformers-deep-dive/05-full-transformer/assets/full-transformer.svg" alt="Encoder and decoder block internals, wired" loading="lazy"></p>
+<h3>六个小块</h3>
+<ol>
+<li>**Embedding + positional signal.**标志 → 矢量. 通过 RoPE (现代) 或突形 (经典) 注射的位置.</li>
+<li>**Self-attention.**每个位置都在互相关联,隐藏在解码器中.</li>
+<li>**Feed-forward network (FFN).**位置的两层MLP: <code>W_2 · activation(W_1 · x)</code>预设扩展率为4×.</li>
+<li><strong>Residual connection.</strong> <code>x + sublayer(x)</code>没有它,梯度消失了6层.</li>
+<li><strong>Layer normalization.</strong> <code>LayerNorm</code>或<code>RMSNorm</code>稳定了剩余的流量.</li>
+<li>**Cross-attention (decoder only).**查询来自解码器,密钥和值来自编码器输出.</li>
+</ol>
+<p>观察一个向量通过一个块流动:注意力在各个位置之间混合,残余物将其运行向前,FFN将其转化,并且规范保持流动稳定.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-7dfa12a49f78269bf36c.png" alt="transformer-block 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h3>编码器块 (BERT,T5编码器使用)</h3>
+<pre><code>x → LN → MHA(self) → + → LN → FFN → + → out
+                     ^              ^
+                     |              |
+                     └── residual ──┘
+</code></pre>
+<p>编码器是双向的,没有掩盖,所有位置都能看到所有位置.</p>
+<h3>解码器块 (GPT,T5解码器使用)</h3>
+<pre><code>x → LN → MHA(masked self) → + → LN → MHA(cross to encoder) → + → LN → FFN → + → out
+</code></pre>
+<p>解码器每块有三个子层.中间的  交叉注意力是信息从编码器流向解码器的唯一地方.在纯解码器架构 (GPT) 中,交叉注意力被遗漏,你只掩盖了自我注意力 + FFN.</p>
+<h3>标准前与标准后</h3>
+<p>原始纸:<code>x + sublayer(LN(x))</code>其他<code>LN(x + sublayer(x))</code>在没有仔细的加热的情况下,更难进行深度训练.<code>LN</code>之前的子层) 是2026年默认的:Llama,Qwen,GPT-3+,Mistral都使用它.</p>
+<h3>2026年现代化区块</h3>
+<p>瓦斯瓦尼2017年出货LayerNorm + ReLU.现代堆取代了这两者.</p>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>2017</th>
+<th>2026</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Normalization</td>
+<td>LayerNorm</td>
+<td>RMSNorm</td>
+</tr>
+<tr>
+<td>FFN activation</td>
+<td>ReLU</td>
+<td>SwiGLU</td>
+</tr>
+<tr>
+<td>FFN expansion</td>
+<td>4×</td>
+<td>2.6× (SwiGLU uses three matrices, total params match)</td>
+</tr>
+<tr>
+<td>Position</td>
+<td>Sinusoidal absolute</td>
+<td>RoPE</td>
+</tr>
+<tr>
+<td>Attention</td>
+<td>Full MHA</td>
+<td>GQA (or MLA)</td>
+</tr>
+<tr>
+<td>Bias terms</td>
+<td>Yes</td>
+<td>No</td>
+</tr>
+</tbody>
+</table>
+<p>格鲁 (SwiGLU) 则可以通过格鲁 (SwiGLU) 进行格鲁 (SwiGLU) 进行格鲁 (SwiGLU) 格鲁 (SwiGLU) 格鲁 (SwiGLU) 格鲁 (SwiGLU) 格鲁 (SwiGLU) 格鲁 (SwiGLU) 格鲁 (SwiGLU) 格鲁 (SwiGLU) 格鲁 (SwiGLU) 格鲁 (SwiGLU) 格鲁 (SwiGLU) 格鲁 (SwiGLU) 格鲁 (SwiGLU) 格鲁 (SwiGLU) 格鲁 (SwiGLU) 格鲁 (SwiGLU) 格鲁 (SwiGLU) 格鲁 (SwiGLU) 格鲁 (SwiGLU) 格鲁 (SwiGLU) 格鲁 (SwiGLU) 格鲁 (SwiGLU) 格鲁 (SwiGLU) 格鲁 (S) 格鲁) 格鲁 (Sw) 格鲁 (Sw) 格鲁) 格鲁 (Sw) 格鲁 (Sw) 格鲁 (Sw) 格鲁) 格鲁 (Sw)<code>Swish(W1 x) ⊙ W3 x</code>) 持续超过Llama,PaLM和Qwen论文中的ReLU/GELU FFN的0.5分点.</p>
+<h3>参数数量</h3>
+<p>为了一个街区<code>d_model = d</code>及FFN扩张<code>r</code>其他:</p>
+<ul>
+<li>鱼类<code>4 · d²</code>预测量</li>
+<li>转移: 转移:<code>3 · d · (r · d)</code>≈ ≈<code>3rd²</code></li>
+<li>标准: 无关可视</li>
+</ul>
+<p>在<code>d = 4096, r = 2.6, layers = 32</code>(大约是Llama 3 8B),总数: <code>32 · (4·4096² + 3·2.6·4096²) ≈ 32 · (16 + 32) M = ~1.5B parameters per layer × 32 ≈ 7B</code>发行匹配数量.</p>
+<h2>建立它</h2>
+<h3>步骤1:建筑块</h3>
+<p>通过使用小小的<code>Matrix</code>课03 (为了独立,复制到本文件):</p>
+<ul>
+<li><code>layer_norm(x, eps=1e-5)</code>减去平均值,分为 std.</li>
+<li><code>rms_norm(x, eps=1e-6)</code> 分为RMS. 没有中减.</li>
+<li><code>gelu(x)</code>其他<code>silu(x) * W3 x</code>现在我们要去做什么?</li>
+<li><code>ffn_swiglu(x, W1, W2, W3)</code>现在,我们要去.</li>
+<li><code>encoder_block(x, params)</code>其他<code>decoder_block(x, enc_out, params)</code>现在,我们要去.</li>
+</ul>
+<p>看到<code>code/main.py</code>为了完整的电线.</p>
+<h3>步骤2:将2层编码器和2层解码器连接</h3>
+<p>输出出码器输入每个解码器交叉注意力. 在输出投影之前添加最后的LN.</p>
+<pre><code class="language-python">def encode(tokens, params):
+    x = embed(tokens, params.emb) + sinusoidal(len(tokens), params.d)
+    for block in params.encoder_blocks:
+        x = encoder_block(x, block)
+    return x
+
+def decode(target_tokens, encoder_out, params):
+    x = embed(target_tokens, params.emb) + sinusoidal(len(target_tokens), params.d)
+    for block in params.decoder_blocks:
+        x = decoder_block(x, encoder_out, block)
+    return x
+</code></pre>
+<h3>步骤3:在玩具示例上前行</h3>
+<p>输出源源和目标源源为5个代币.<code>(5, vocab)</code>没有培训,这堂课是关于建筑,不是损失.</p>
+<h3>步骤 4: RMSNorm + SwiGLU 中交换</h3>
+<p>通过RMSNorm和SwiGLU取代LayerNorm和ReLU-FFN. 确认形状仍然匹配.这是2026年现代化,一个函数的替代.</p>
+<h2>用它</h2>
+<p>PyTorch/TF 参考实施方案: <code>nn.TransformerEncoderLayer</code>现在<code>nn.TransformerDecoderLayer</code>但大部分2026生产代码都用了自己的块,因为:</p>
+<ul>
+<li>闪光注意力是通过内部注意力而不是通过<code>nn.MultiheadAttention</code>现在,我们要去.</li>
+<li>没有任何关于GQA/MLA的参考.</li>
+<li>,RMSNorm,SwiGLU不是PyTorch默认的.</li>
+</ul>
+<p><code>transformers</code>您应该阅读的清洁参考区块: <code>modeling_llama.py</code>只有2026个解码器的区块. 它大约500行,值得一遍走过.</p>
+<p><strong>Encoder vs decoder vs encoder-decoder — when to pick:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Need</th>
+<th>Pick</th>
+<th>Example</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Classification, embeddings, QA over text</td>
+<td>Encoder-only</td>
+<td>BERT, DeBERTa, ModernBERT</td>
+</tr>
+<tr>
+<td>Text generation, chat, code, reasoning</td>
+<td>Decoder-only</td>
+<td>GPT, Llama, Claude, Qwen</td>
+</tr>
+<tr>
+<td>Structured input → structured output (translation, summarization)</td>
+<td>Encoder-decoder</td>
+<td>T5, BART, Whisper</td>
+</tr>
+</tbody>
+</table>
+<p>仅使用解码器才能获胜,因为它规模最清洁,处理理解和生成. 输入中具有清晰的&quot;源序列&quot;身份 (翻译,语音识别,结构化任务) 时,解码器仍然是最好的.</p>
+<h2>运送它</h2>
+<p>看到<code>outputs/skill-transformer-block-reviewer.md</code>技能检查了对2026年默认的变压器块的新实施,并标记了缺失的零件 (前标准,RoPE,RMSNorm,GQA,FFN扩展比).</p>
+<h2>运动</h2>
+<ol>
+<li>**Easy.**计算您的编码_区块中的参数<code>d_model=512, n_heads=8, ffn_expansion=4, swiglu=True</code>通过实现区块和使用<code>sum(p.numel() for p in block.parameters())</code>现在,我们要去.</li>
+<li>**Medium.**切换从后规范到前规范. 启动两者,并在随机输入中测量12层堆叠后的激活规范. 后规范的激活应爆炸; 前规则应保持局限.</li>
+<li>**Hard.**实现4层编码解码器在玩具复制任务 (复制 <code>x</code>换 RMSNorm + SwiGLU + RoPE  损失下降吗?</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Block</td>
+<td>&quot;One transformer layer&quot;</td>
+<td>Stack of norm + attention + norm + FFN, wrapped in residual connections.</td>
+</tr>
+<tr>
+<td>Residual</td>
+<td>&quot;Skip connection&quot;</td>
+<td><code>x + f(x)</code> output; enables gradient flow through deep stacks.</td>
+</tr>
+<tr>
+<td>Pre-norm</td>
+<td>&quot;Normalize before, not after&quot;</td>
+<td>Modern: <code>x + sublayer(LN(x))</code>. Trains deeper without warmup gymnastics.</td>
+</tr>
+<tr>
+<td>RMSNorm</td>
+<td>&quot;LayerNorm without the mean&quot;</td>
+<td>Divide by RMS; one less op, same empirical stability.</td>
+</tr>
+<tr>
+<td>SwiGLU</td>
+<td>&quot;The FFN everyone switched to&quot;</td>
+<td><code>Swish(W1 x) ⊙ W3 x → W2</code>. Beats ReLU/GELU on LM ppl.</td>
+</tr>
+<tr>
+<td>Cross-attention</td>
+<td>&quot;How the decoder sees the encoder&quot;</td>
+<td>MHA with Q from decoder, K/V from encoder outputs.</td>
+</tr>
+<tr>
+<td>FFN expansion</td>
+<td>&quot;How wide the middle MLP is&quot;</td>
+<td>Ratio of hidden-size to d_model, usually 4 (LayerNorm) or 2.6 (SwiGLU).</td>
+</tr>
+<tr>
+<td>Bias-free</td>
+<td>&quot;Drop the +b terms&quot;</td>
+<td>Modern stacks omit biases in linear layers; slight ppl improvement, smaller model.</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/1706.03762" rel="noreferrer" data-network="true">Vaswani et al. (2017). Attention Is All You Need <small>↗ 需要联网</small></a>原始的块规格.</li>
+<li><a href="https://arxiv.org/abs/2002.04745" rel="noreferrer" data-network="true">Xiong et al. (2020). On Layer Normalization in the Transformer Architecture <small>↗ 需要联网</small></a>为什么前规则比后规则更深.</li>
+<li><a href="https://arxiv.org/abs/1910.07467" rel="noreferrer" data-network="true">Zhang, Sennrich (2019). Root Mean Square Layer Normalization <small>↗ 需要联网</small></a></li>
+<li><a href="https://arxiv.org/abs/2002.05202" rel="noreferrer" data-network="true">Shazeer (2020). GLU Variants Improve Transformer <small>↗ 需要联网</small></a>SwiGLU的报纸.</li>
+<li><a href="https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py" rel="noreferrer" data-network="true">HuggingFace <code>modeling_llama.py</code> <small>↗ 需要联网</small></a>可信 2026 单独使用解码器的区块.</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>The Full Transformer — Encoder + Decoder</h1>
+<blockquote>
+<p>Attention is the star. Everything else — residuals, normalization, feed-forward, cross-attention — is the scaffolding that lets you stack it deep.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 7 · 02 (Self-Attention), Phase 7 · 03 (Multi-Head Attention), Phase 7 · 04 (Positional Encoding)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>The Problem</h2>
+<p>A single attention layer is a feature extractor, not a model. One matmul per layer is not enough capacity for language. You need depth — and depth breaks without the right plumbing.</p>
+<p>The 2017 Vaswani paper packaged six design decisions that turned one attention layer into a stackable block. Every transformer since — encoder-only (BERT), decoder-only (GPT), encoder-decoder (T5) — inherits the same skeleton. In 2026 the blocks have been refined (RMSNorm, SwiGLU, pre-norm, RoPE) but the skeleton is identical.</p>
+<p>This lesson is the skeleton. Next lessons specialize it — 06 for encoders, 07 for decoders, 08 for encoder-decoder.</p>
+<h2>The Concept</h2>
+<p><img src="/learn/ai-from-scratch/files/phases/07-transformers-deep-dive/05-full-transformer/assets/full-transformer.svg" alt="Encoder and decoder block internals, wired" loading="lazy"></p>
+<h3>The six pieces</h3>
+<ol>
+<li><strong>Embedding + positional signal.</strong> Tokens → vectors. Position injected via RoPE (modern) or sinusoidal (classic).</li>
+<li><strong>Self-attention.</strong> Every position attends to every other. Masked in decoders.</li>
+<li><strong>Feed-forward network (FFN).</strong> Position-wise two-layer MLP: <code>W_2 · activation(W_1 · x)</code>. Expansion ratio 4× by default.</li>
+<li><strong>Residual connection.</strong> <code>x + sublayer(x)</code>. Without this, gradients vanish past ~6 layers.</li>
+<li><strong>Layer normalization.</strong> <code>LayerNorm</code> or <code>RMSNorm</code> (modern). Stabilizes the residual stream.</li>
+<li><strong>Cross-attention (decoder only).</strong> Queries come from the decoder, keys and values from the encoder output.</li>
+</ol>
+<p>Watch a vector flow through one block: attention mixes across positions, the residual carries it forward, the FFN transforms it, and norm keeps the stream stable.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-7dfa12a49f78269bf36c.png" alt="transformer-block 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h3>Encoder block (used by BERT, T5 encoder)</h3>
+<pre><code>x → LN → MHA(self) → + → LN → FFN → + → out
+                     ^              ^
+                     |              |
+                     └── residual ──┘
+</code></pre>
+<p>Encoder is bidirectional. No masking. All positions see all positions.</p>
+<h3>Decoder block (used by GPT, T5 decoder)</h3>
+<pre><code>x → LN → MHA(masked self) → + → LN → MHA(cross to encoder) → + → LN → FFN → + → out
+</code></pre>
+<p>Decoder has three sublayers per block. The middle one — cross-attention — is the only place information flows from encoder to decoder. In a pure decoder-only architecture (GPT), cross-attention is omitted and you just have masked self-attention + FFN.</p>
+<h3>Pre-norm vs post-norm</h3>
+<p>Original paper: <code>x + sublayer(LN(x))</code> vs <code>LN(x + sublayer(x))</code>. Post-norm lost favor around 2019 — it is harder to train deeply without careful warmup. Pre-norm (<code>LN</code> <em>before</em> sublayer) is the 2026 default: Llama, Qwen, GPT-3+, Mistral all use it.</p>
+<h3>The 2026 modernized block</h3>
+<p>Vaswani 2017 shipped LayerNorm + ReLU. Modern stacks replaced both. What production blocks actually look like:</p>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>2017</th>
+<th>2026</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Normalization</td>
+<td>LayerNorm</td>
+<td>RMSNorm</td>
+</tr>
+<tr>
+<td>FFN activation</td>
+<td>ReLU</td>
+<td>SwiGLU</td>
+</tr>
+<tr>
+<td>FFN expansion</td>
+<td>4×</td>
+<td>2.6× (SwiGLU uses three matrices, total params match)</td>
+</tr>
+<tr>
+<td>Position</td>
+<td>Sinusoidal absolute</td>
+<td>RoPE</td>
+</tr>
+<tr>
+<td>Attention</td>
+<td>Full MHA</td>
+<td>GQA (or MLA)</td>
+</tr>
+<tr>
+<td>Bias terms</td>
+<td>Yes</td>
+<td>No</td>
+</tr>
+</tbody>
+</table>
+<p>RMSNorm drops the mean-centering of LayerNorm (one fewer subtraction), which saves compute and is empirically at least as stable. SwiGLU (<code>Swish(W1 x) ⊙ W3 x</code>) consistently outperforms ReLU/GELU FFN by ~0.5 point ppl in the Llama, PaLM and Qwen papers.</p>
+<h3>Parameter count</h3>
+<p>For one block with <code>d_model = d</code> and FFN expansion <code>r</code>:</p>
+<ul>
+<li>MHA: <code>4 · d²</code> (Q, K, V, O projections)</li>
+<li>FFN (SwiGLU): <code>3 · d · (r · d)</code> ≈ <code>3rd²</code></li>
+<li>Norms: negligible</li>
+</ul>
+<p>At <code>d = 4096, r = 2.6, layers = 32</code> (roughly Llama 3 8B), total: <code>32 · (4·4096² + 3·2.6·4096²) ≈ 32 · (16 + 32) M = ~1.5B parameters per layer × 32 ≈ 7B</code> (plus embeddings and head). Matches published counts.</p>
+<h2>Build It</h2>
+<h3>Step 1: the building blocks</h3>
+<p>Using the tiny <code>Matrix</code> class from Lesson 03 (copied to this file for independence):</p>
+<ul>
+<li><code>layer_norm(x, eps=1e-5)</code> — subtract mean, divide by std.</li>
+<li><code>rms_norm(x, eps=1e-6)</code> — divide by RMS. No mean subtraction.</li>
+<li><code>gelu(x)</code> and <code>silu(x) * W3 x</code> (SwiGLU).</li>
+<li><code>ffn_swiglu(x, W1, W2, W3)</code>.</li>
+<li><code>encoder_block(x, params)</code> and <code>decoder_block(x, enc_out, params)</code>.</li>
+</ul>
+<p>See <code>code/main.py</code> for the full wiring.</p>
+<h3>Step 2: wire a 2-layer encoder and a 2-layer decoder</h3>
+<p>Stack them. Pass the encoder output into every decoder cross-attention. Add a final LN before the output projection.</p>
+<pre><code class="language-python">def encode(tokens, params):
+    x = embed(tokens, params.emb) + sinusoidal(len(tokens), params.d)
+    for block in params.encoder_blocks:
+        x = encoder_block(x, block)
+    return x
+
+def decode(target_tokens, encoder_out, params):
+    x = embed(target_tokens, params.emb) + sinusoidal(len(target_tokens), params.d)
+    for block in params.decoder_blocks:
+        x = decoder_block(x, encoder_out, block)
+    return x
+</code></pre>
+<h3>Step 3: run forward on a toy example</h3>
+<p>Feed a 6-token source and a 5-token target through. Verify the output shape is <code>(5, vocab)</code>. No training — this lesson is about the architecture, not the loss.</p>
+<h3>Step 4: swap in RMSNorm + SwiGLU</h3>
+<p>Replace LayerNorm and ReLU-FFN with RMSNorm and SwiGLU. Confirm shapes still match. This is the 2026 modernization with one function substitution.</p>
+<h2>Use It</h2>
+<p>The PyTorch/TF reference implementations: <code>nn.TransformerEncoderLayer</code>, <code>nn.TransformerDecoderLayer</code>. But most 2026 production code rolls its own block because:</p>
+<ul>
+<li>Flash Attention is called inside attention, not via <code>nn.MultiheadAttention</code>.</li>
+<li>GQA / MLA are not in the stdlib reference.</li>
+<li>RoPE, RMSNorm, SwiGLU are not the PyTorch defaults.</li>
+</ul>
+<p>HF <code>transformers</code> has clean reference blocks you should read: <code>modeling_llama.py</code> is the canonical 2026 decoder-only block. It's ~500 lines and worth walking through once.</p>
+<p><strong>Encoder vs decoder vs encoder-decoder — when to pick:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Need</th>
+<th>Pick</th>
+<th>Example</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Classification, embeddings, QA over text</td>
+<td>Encoder-only</td>
+<td>BERT, DeBERTa, ModernBERT</td>
+</tr>
+<tr>
+<td>Text generation, chat, code, reasoning</td>
+<td>Decoder-only</td>
+<td>GPT, Llama, Claude, Qwen</td>
+</tr>
+<tr>
+<td>Structured input → structured output (translation, summarization)</td>
+<td>Encoder-decoder</td>
+<td>T5, BART, Whisper</td>
+</tr>
+</tbody>
+</table>
+<p>Decoder-only won language because it scales cleanest and handles both comprehension and generation. Encoder-decoder is still best when the input has a clear &quot;source sequence&quot; identity (translation, speech recognition, structured tasks).</p>
+<h2>Ship It</h2>
+<p>See <code>outputs/skill-transformer-block-reviewer.md</code>. The skill reviews a new transformer block implementation against the 2026 defaults and flags missing pieces (pre-norm, RoPE, RMSNorm, GQA, FFN expansion ratio).</p>
+<h2>Exercises</h2>
+<ol>
+<li><strong>Easy.</strong> Count the parameters in your encoder_block at <code>d_model=512, n_heads=8, ffn_expansion=4, swiglu=True</code>. Validate by implementing the block and using <code>sum(p.numel() for p in block.parameters())</code>.</li>
+<li><strong>Medium.</strong> Switch from post-norm to pre-norm. Initialize both and measure the activation norm after 12 stacked layers on random input. Post-norm's activations should explode; pre-norm's should stay bounded.</li>
+<li><strong>Hard.</strong> Implement a 4-layer encoder-decoder on a toy copy task (copy <code>x</code> reversed). Train 100 steps. Report loss. Swap in RMSNorm + SwiGLU + RoPE — does loss drop?</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Block</td>
+<td>&quot;One transformer layer&quot;</td>
+<td>Stack of norm + attention + norm + FFN, wrapped in residual connections.</td>
+</tr>
+<tr>
+<td>Residual</td>
+<td>&quot;Skip connection&quot;</td>
+<td><code>x + f(x)</code> output; enables gradient flow through deep stacks.</td>
+</tr>
+<tr>
+<td>Pre-norm</td>
+<td>&quot;Normalize before, not after&quot;</td>
+<td>Modern: <code>x + sublayer(LN(x))</code>. Trains deeper without warmup gymnastics.</td>
+</tr>
+<tr>
+<td>RMSNorm</td>
+<td>&quot;LayerNorm without the mean&quot;</td>
+<td>Divide by RMS; one less op, same empirical stability.</td>
+</tr>
+<tr>
+<td>SwiGLU</td>
+<td>&quot;The FFN everyone switched to&quot;</td>
+<td><code>Swish(W1 x) ⊙ W3 x → W2</code>. Beats ReLU/GELU on LM ppl.</td>
+</tr>
+<tr>
+<td>Cross-attention</td>
+<td>&quot;How the decoder sees the encoder&quot;</td>
+<td>MHA with Q from decoder, K/V from encoder outputs.</td>
+</tr>
+<tr>
+<td>FFN expansion</td>
+<td>&quot;How wide the middle MLP is&quot;</td>
+<td>Ratio of hidden-size to d_model, usually 4 (LayerNorm) or 2.6 (SwiGLU).</td>
+</tr>
+<tr>
+<td>Bias-free</td>
+<td>&quot;Drop the +b terms&quot;</td>
+<td>Modern stacks omit biases in linear layers; slight ppl improvement, smaller model.</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/1706.03762" rel="noreferrer" data-network="true">Vaswani et al. (2017). Attention Is All You Need <small>↗ 需要联网</small></a> — original block spec.</li>
+<li><a href="https://arxiv.org/abs/2002.04745" rel="noreferrer" data-network="true">Xiong et al. (2020). On Layer Normalization in the Transformer Architecture <small>↗ 需要联网</small></a> — why pre-norm beats post-norm deeply.</li>
+<li><a href="https://arxiv.org/abs/1910.07467" rel="noreferrer" data-network="true">Zhang, Sennrich (2019). Root Mean Square Layer Normalization <small>↗ 需要联网</small></a> — RMSNorm.</li>
+<li><a href="https://arxiv.org/abs/2002.05202" rel="noreferrer" data-network="true">Shazeer (2020). GLU Variants Improve Transformer <small>↗ 需要联网</small></a> — the SwiGLU paper.</li>
+<li><a href="https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py" rel="noreferrer" data-network="true">HuggingFace <code>modeling_llama.py</code> <small>↗ 需要联网</small></a> — canonical 2026 decoder-only block.</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-07-transformers-deep-dive--05-full-transformer.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-07-transformers-deep-dive--05-full-transformer.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/07-transformers-deep-dive/05-full-transformer/code/main.jl">phases/07-transformers-deep-dive/05-full-transformer/code/main.jl</a><details><summary>查看原始文本</summary><pre><code># Full transformer in Julia: encoder + decoder blocks (pre-norm), multi-head
+# attention, SwiGLU FFN, LayerNorm and RMSNorm forward + backward gradient
+# check against finite differences. Stdlib only. Sources:
+#   https://arxiv.org/abs/1706.03762
+#   https://arxiv.org/abs/1910.07467
+#   https://docs.julialang.org/en/v1/stdlib/LinearAlgebra/
+
+using Random
+using LinearAlgebra
+using Printf
+
+
+function randn_matrix(rng::AbstractRNG, rows::Int, cols::Int;
+                     scale::Union{Nothing, Float64}=nothing)::Matrix{Float64}
+    s = scale === nothing ? sqrt(2.0 / (rows + cols)) : scale
+    return s .* randn(rng, rows, cols)
+end
+
+
+function softmax_rows(M::Matrix{Float64};
+                     mask::Union{Nothing, Matrix{Bool}}=nothing)::Matrix{Float64}
+    out = similar(M)
+    rows, cols = size(M)
+    for i in 1:rows
+        row = M[i, :]
+        if mask !== nothing
+            row = [mask[i, j] ? -Inf : row[j] for j in 1:cols]
+        end
+        finite = filter(isfinite, row)
+        m = isempty(finite) ? 0.0 : maximum(finite)
+        e = [isfinite(v) ? exp(v - m) : 0.0 for v in row]
+        s = sum(e)
+        out[i, :] = s &gt; 0 ? e ./ s : zeros(cols)
+    end
+    return out
+end
+
+
+function layer_norm(X::Matrix{Float64}; eps::Float64=1e-5)::Matrix{Float64}
+    out = similar(X)
+    for i in 1:size(X, 1)
+        row = X[i, :]
+        mu = sum(row) / length(row)
+        var = sum((row .- mu) .^ 2) / length(row)
+        denom = sqrt(var + eps)
+        out[i, :] = (row .- mu) ./ denom
+    end
+    return out
+end
+
+
+function rms_norm(X::Matrix{Float64}; eps::Float64=1e-6)::Matrix{Float64}
+    out = similar(X)
+    for i in 1:size(X, 1)
+        row = X[i, :]
+        rms = sqrt(sum(row .* row) / length(row) + eps)
+        out[i, :] = row ./ rms
+    end
+    return out
+end
+
+
+function layer_norm_backward(X::Matrix{Float64}, dY::Matrix{Float64};
+                            eps::Float64=1e-5)::Matrix{Float64}
+    rows, d = size(X)
+    dX = similar(X)
+    for i in 1:rows
+        x = X[i, :]
+        dy = dY[i, :]
+        mu = sum(x) / d
+        xc = x .- mu
+        var = sum(xc .* xc) / d
+        denom = sqrt(var + eps)
+        xhat = xc ./ denom
+        dxhat = dy
+        dvar = sum(dxhat .* xc) * -0.5 * (var + eps) ^ (-1.5)
+        dmu = sum(dxhat .* (-1.0 ./ denom)) + dvar * sum(-2.0 .* xc) / d
+        dX[i, :] = dxhat ./ denom .+ dvar .* 2.0 .* xc ./ d .+ dmu / d
+    end
+    return dX
+end
+
+
+function rms_norm_backward(X::Matrix{Float64}, dY::Matrix{Float64};
+                          eps::Float64=1e-6)::Matrix{Float64}
+    rows, d = size(X)
+    dX = similar(X)
+    for i in 1:rows
+        x = X[i, :]
+        dy = dY[i, :]
+        ms = sum(x .* x) / d + eps
+        rms = sqrt(ms)
+        inv_rms = 1.0 / rms
+        dot_dy_x = sum(dy .* x)
+        dX[i, :] = dy .* inv_rms .- (x .* (dot_dy_x / (d * ms * rms)))
+    end
+    return dX
+end
+
+
+function silu(x::Float64)::Float64
+    return x / (1.0 + exp(-x))
+end
+
+
+function ffn_swiglu(X::Matrix{Float64}, W1::Matrix{Float64},
+                   W2::Matrix{Float64}, W3::Matrix{Float64})::Matrix{Float64}
+    h1 = X * W1
+    h3 = X * W3
+    gated = silu.(h1) .* h3
+    return gated * W2
+end
+
+
+function ffn_relu(X::Matrix{Float64}, W1::Matrix{Float64},
+                 W2::Matrix{Float64})::Matrix{Float64}
+    h = X * W1
+    h = max.(h, 0.0)
+    return h * W2
+end
+
+
+function scaled_dot_product_attention(Q::Matrix{Float64}, K::Matrix{Float64},
+                                     V::Matrix{Float64}; causal::Bool=false)
+    dk = size(Q, 2)
+    scores = (Q * transpose(K)) ./ sqrt(dk)
+    mask = nothing
+    if causal
+        n = size(scores, 1)
+        mask = [j &gt; i for i in 1:n, j in 1:size(scores, 2)]
+    end
+    weights = softmax_rows(scores; mask=mask)
+    return weights * V
+end
+
+
+function multi_head_attention(X::Matrix{Float64},
+                             Wq::Matrix{Float64}, Wk::Matrix{Float64},
+                             Wv::Matrix{Float64}, Wo::Matrix{Float64};
+                             n_heads::Int=1, causal::Bool=false,
+                             kv_source::Union{Nothing, Matrix{Float64}}=nothing)
+    @assert n_heads &gt; 0 &quot;n_heads must be &gt; 0&quot;
+    Q = X * Wq
+    kv_input = kv_source === nothing ? X : kv_source
+    K = kv_input * Wk
+    V = kv_input * Wv
+    d_total = size(Q, 2)
+    @assert d_total % n_heads == 0 &quot;projected dimension must be divisible by n_heads&quot;
+    d_head = d_total ÷ n_heads
+    head_outs = Matrix{Float64}[]
+    for h in 1:n_heads
+        cols = ((h - 1) * d_head + 1):(h * d_head)
+        Qh = Q[:, cols]
+        Kh = K[:, cols]
+        Vh = V[:, cols]
+        push!(head_outs, scaled_dot_product_attention(Qh, Kh, Vh; causal=causal))
+    end
+    concat = hcat(head_outs...)
+    return concat * Wo
+end
+
+
+struct BlockParams
+    d::Int
+    n_heads::Int
+    use_swiglu::Bool
+    Wq::Matrix{Float64}
+    Wk::Matrix{Float64}
+    Wv::Matrix{Float64}
+    Wo::Matrix{Float64}
+    W1::Matrix{Float64}
+    W2::Matrix{Float64}
+    W3::Matrix{Float64}
+    Wq_x::Matrix{Float64}
+    Wk_x::Matrix{Float64}
+    Wv_x::Matrix{Float64}
+    Wo_x::Matrix{Float64}
+end
+
+
+function BlockParams(d::Int, n_heads::Int, ffn_expansion::Float64,
+                    rng::AbstractRNG; use_swiglu::Bool=true)
+    @assert n_heads &gt; 0 &quot;n_heads must be &gt; 0&quot;
+    @assert d % n_heads == 0 &quot;d must be divisible by n_heads&quot;
+    h = Int(round(d * ffn_expansion))
+    Wq = randn_matrix(rng, d, d)
+    Wk = randn_matrix(rng, d, d)
+    Wv = randn_matrix(rng, d, d)
+    Wo = randn_matrix(rng, d, d)
+    W1 = randn_matrix(rng, d, h)
+    W2 = randn_matrix(rng, h, d)
+    W3 = use_swiglu ? randn_matrix(rng, d, h) : zeros(d, h)
+    Wq_x = randn_matrix(rng, d, d)
+    Wk_x = randn_matrix(rng, d, d)
+    Wv_x = randn_matrix(rng, d, d)
+    Wo_x = randn_matrix(rng, d, d)
+    return BlockParams(d, n_heads, use_swiglu,
+                      Wq, Wk, Wv, Wo, W1, W2, W3,
+                      Wq_x, Wk_x, Wv_x, Wo_x)
+end
+
+
+function encoder_block(x::Matrix{Float64}, p::BlockParams)::Matrix{Float64}
+    h = rms_norm(x)
+    a = multi_head_attention(h, p.Wq, p.Wk, p.Wv, p.Wo; n_heads=p.n_heads)
+    x = x .+ a
+    h = rms_norm(x)
+    f = p.use_swiglu ? ffn_swiglu(h, p.W1, p.W2, p.W3) : ffn_relu(h, p.W1, p.W2)
+    return x .+ f
+end
+
+
+function decoder_block(x::Matrix{Float64}, enc_out::Matrix{Float64},
+                      p::BlockParams)::Matrix{Float64}
+    h = rms_norm(x)
+    a = multi_head_attention(h, p.Wq, p.Wk, p.Wv, p.Wo;
+                            n_heads=p.n_heads, causal=true)
+    x = x .+ a
+    h = rms_norm(x)
+    a = multi_head_attention(h, p.Wq_x, p.Wk_x, p.Wv_x, p.Wo_x;
+                            n_heads=p.n_heads, kv_source=enc_out)
+    x = x .+ a
+    h = rms_norm(x)
+    f = p.use_swiglu ? ffn_swiglu(h, p.W1, p.W2, p.W3) : ffn_relu(h, p.W1, p.W2)
+    return x .+ f
+end
+
+
+function numerical_grad(f, X::Matrix{Float64}; h::Float64=1e-5)::Matrix{Float64}
+    out = similar(X)
+    for i in 1:length(X)
+        orig = X[i]
+        X[i] = orig + h
+        plus = f(X)
+        X[i] = orig - h
+        minus = f(X)
+        X[i] = orig
+        out[i] = (plus - minus) / (2h)
+    end
+    return out
+end
+
+
+function gradient_check_layer_norm()
+    println(&quot;=&quot; ^ 60)
+    println(&quot;LAYER NORM: ANALYTIC vs NUMERICAL GRADIENT&quot;)
+    println(&quot;=&quot; ^ 60)
+    rng = MersenneTwister(0)
+    X = randn(rng, 4, 6)
+    rng_v = MersenneTwister(1)
+    v = randn(rng_v, 4, 6)
+
+    loss_fn = Y -&gt; sum(layer_norm(Y) .* v)
+    analytic = layer_norm_backward(X, v)
+    numeric = numerical_grad(loss_fn, copy(X))
+    err = maximum(abs.(analytic .- numeric))
+    @printf(&quot;\nMax abs error (LayerNorm): %.3e\n&quot;, err)
+end
+
+
+function gradient_check_rms_norm()
+    println(&quot;\n&quot; * &quot;=&quot; ^ 60)
+    println(&quot;RMS NORM: ANALYTIC vs NUMERICAL GRADIENT&quot;)
+    println(&quot;=&quot; ^ 60)
+    rng = MersenneTwister(2)
+    X = randn(rng, 4, 6)
+    rng_v = MersenneTwister(3)
+    v = randn(rng_v, 4, 6)
+
+    loss_fn = Y -&gt; sum(rms_norm(Y) .* v)
+    analytic = rms_norm_backward(X, v)
+    numeric = numerical_grad(loss_fn, copy(X))
+    err = maximum(abs.(analytic .- numeric))
+    @printf(&quot;\nMax abs error (RMSNorm): %.3e\n&quot;, err)
+end
+
+
+function compare_norm_outputs()
+    println(&quot;\n&quot; * &quot;=&quot; ^ 60)
+    println(&quot;LAYERNORM vs RMSNORM OUTPUTS&quot;)
+    println(&quot;=&quot; ^ 60)
+    rng = MersenneTwister(7)
+    X = randn(rng, 3, 6)
+    Y_ln = layer_norm(X)
+    Y_rms = rms_norm(X)
+    println(&quot;\nLayerNorm row means (should be ~0):&quot;)
+    for i in 1:3
+        @printf(&quot;  row %d: mean=%+.6f  std=%.6f\n&quot;,
+                i, sum(Y_ln[i, :]) / 6, sqrt(sum(Y_ln[i, :] .^ 2) / 6))
+    end
+    println(&quot;\nRMSNorm row RMS (should be ~1):&quot;)
+    for i in 1:3
+        @printf(&quot;  row %d: mean=%+.6f  rms=%.6f\n&quot;,
+                i, sum(Y_rms[i, :]) / 6, sqrt(sum(Y_rms[i, :] .^ 2) / 6))
+    end
+    println(&quot;\nRMSNorm leaves the row mean intact; LayerNorm centers it.&quot;)
+end
+
+
+function demo_full_transformer()
+    println(&quot;\n&quot; * &quot;=&quot; ^ 60)
+    println(&quot;FULL TRANSFORMER FORWARD PASS&quot;)
+    println(&quot;=&quot; ^ 60)
+    rng = MersenneTwister(42)
+    d = 8
+    n_heads = 2
+    ffn_exp = 2.0
+    src_len = 6
+    tgt_len = 5
+
+    src = randn_matrix(rng, src_len, d; scale=0.5)
+    tgt = randn_matrix(rng, tgt_len, d; scale=0.5)
+
+    enc_params = [BlockParams(d, n_heads, ffn_exp, rng) for _ in 1:2]
+    dec_params = [BlockParams(d, n_heads, ffn_exp, rng) for _ in 1:2]
+
+    enc_out = src
+    for p in enc_params
+        enc_out = encoder_block(enc_out, p)
+    end
+
+    dec_out = tgt
+    for p in dec_params
+        dec_out = decoder_block(dec_out, enc_out, p)
+    end
+
+    @printf(&quot;\nsource shape:           (%d, %d)\n&quot;, size(src, 1), size(src, 2))
+    @printf(&quot;encoder output shape:   (%d, %d)\n&quot;, size(enc_out, 1), size(enc_out, 2))
+    @printf(&quot;target shape:           (%d, %d)\n&quot;, size(tgt, 1), size(tgt, 2))
+    @printf(&quot;decoder output shape:   (%d, %d)\n&quot;, size(dec_out, 1), size(dec_out, 2))
+    println(&quot;\nfirst 3 rows of encoder output:&quot;)
+    for i in 1:3
+        println(&quot;  &quot; * join([@sprintf(&quot;%+.3f&quot;, enc_out[i, j]) for j in 1:4], &quot;  &quot;))
+    end
+    println(&quot;\nfirst 3 rows of decoder output:&quot;)
+    for i in 1:3
+        println(&quot;  &quot; * join([@sprintf(&quot;%+.3f&quot;, dec_out[i, j]) for j in 1:4], &quot;  &quot;))
+    end
+    println(&quot;\nstack: 2-layer encoder + 2-layer decoder, pre-norm, RMSNorm, SwiGLU.&quot;)
+end
+
+
+function main()
+    compare_norm_outputs()
+    gradient_check_layer_norm()
+    gradient_check_rms_norm()
+    demo_full_transformer()
+end
+
+
+if abspath(PROGRAM_FILE) == @__FILE__
+    main()
+end
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/07-transformers-deep-dive/05-full-transformer/code/main.py">phases/07-transformers-deep-dive/05-full-transformer/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;The full transformer: encoder + decoder blocks in pure stdlib.
+
+Demonstrates:
+- LayerNorm vs RMSNorm
+- ReLU-FFN vs SwiGLU FFN
+- encoder block (bidirectional) vs decoder block (causal + cross-attn)
+- pre-norm wiring (2026 default)
+&quot;&quot;&quot;
+
+import math
+import random
+from typing import List
+
+
+class Matrix:
+    __slots__ = (&quot;rows&quot;, &quot;cols&quot;, &quot;data&quot;)
+
+    def __init__(self, rows, cols, fill=0.0, data=None):
+        self.rows = rows
+        self.cols = cols
+        self.data = data if data is not None else [fill] * (rows * cols)
+
+    def get(self, i, j):
+        return self.data[i * self.cols + j]
+
+    def set(self, i, j, v):
+        self.data[i * self.cols + j] = v
+
+    def row(self, i):
+        return self.data[i * self.cols:(i + 1) * self.cols]
+
+    def copy(self):
+        return Matrix(self.rows, self.cols, data=list(self.data))
+
+
+def randn(rows, cols, rng, scale=None):
+    if scale is None:
+        scale = math.sqrt(2.0 / (rows + cols))
+    m = Matrix(rows, cols)
+    for i in range(rows * cols):
+        m.data[i] = rng.gauss(0.0, scale)
+    return m
+
+
+def matmul(A, B):
+    out = Matrix(A.rows, B.cols)
+    for i in range(A.rows):
+        for k in range(A.cols):
+            aik = A.get(i, k)
+            if aik == 0.0:
+                continue
+            base_i = i * B.cols
+            base_k = k * B.cols
+            for j in range(B.cols):
+                out.data[base_i + j] += aik * B.data[base_k + j]
+    return out
+
+
+def transpose(A):
+    out = Matrix(A.cols, A.rows)
+    for i in range(A.rows):
+        for j in range(A.cols):
+            out.set(j, i, A.get(i, j))
+    return out
+
+
+def add(A, B):
+    assert (A.rows, A.cols) == (B.rows, B.cols)
+    return Matrix(A.rows, A.cols, data=[a + b for a, b in zip(A.data, B.data)])
+
+
+def softmax_rows(A, mask=None):
+    out = Matrix(A.rows, A.cols)
+    for i in range(A.rows):
+        row = A.row(i)
+        if mask is not None:
+            row = [row[j] if not mask[i][j] else float(&quot;-inf&quot;) for j in range(A.cols)]
+        m = max(v for v in row if v != float(&quot;-inf&quot;))
+        exps = [math.exp(v - m) if v != float(&quot;-inf&quot;) else 0.0 for v in row]
+        s = sum(exps)
+        for j, e in enumerate(exps):
+            out.set(i, j, e / s if s &gt; 0 else 0.0)
+    return out
+
+
+def layer_norm(X, eps=1e-5):
+    out = Matrix(X.rows, X.cols)
+    for i in range(X.rows):
+        row = X.row(i)
+        mean = sum(row) / len(row)
+        var = sum((v - mean) ** 2 for v in row) / len(row)
+        denom = math.sqrt(var + eps)
+        for j in range(X.cols):
+            out.set(i, j, (row[j] - mean) / denom)
+    return out
+
+
+def rms_norm(X, eps=1e-6):
+    out = Matrix(X.rows, X.cols)
+    for i in range(X.rows):
+        row = X.row(i)
+        rms = math.sqrt(sum(v * v for v in row) / len(row) + eps)
+        for j in range(X.cols):
+            out.set(i, j, row[j] / rms)
+    return out
+
+
+def silu(x):
+    return x / (1.0 + math.exp(-x))
+
+
+def ffn_swiglu(X, W1, W2, W3):
+    h1 = matmul(X, W1)
+    h3 = matmul(X, W3)
+    gated = Matrix(h1.rows, h1.cols)
+    for i in range(len(h1.data)):
+        gated.data[i] = silu(h1.data[i]) * h3.data[i]
+    return matmul(gated, W2)
+
+
+def ffn_relu(X, W1, W2):
+    h = matmul(X, W1)
+    for i in range(len(h.data)):
+        if h.data[i] &lt; 0:
+            h.data[i] = 0.0
+    return matmul(h, W2)
+
+
+def scaled_dot_product_attention(Q, K, V, causal=False):
+    dk = Q.cols
+    scores = matmul(Q, transpose(K))
+    inv = 1.0 / math.sqrt(dk)
+    for i in range(len(scores.data)):
+        scores.data[i] *= inv
+    mask = None
+    if causal:
+        mask = [[j &gt; i for j in range(scores.cols)] for i in range(scores.rows)]
+    w = softmax_rows(scores, mask=mask)
+    return matmul(w, V)
+
+
+def multi_head_attention(X, Wq, Wk, Wv, Wo, n_heads, causal=False, kv_source=None):
+    Q = matmul(X, Wq)
+    kv_input = kv_source if kv_source is not None else X
+    K = matmul(kv_input, Wk)
+    V = matmul(kv_input, Wv)
+    d_head = Q.cols // n_heads
+    head_outs = []
+    for h in range(n_heads):
+        Qh = Matrix(Q.rows, d_head, data=[Q.get(i, h * d_head + j) for i in range(Q.rows) for j in range(d_head)])
+        Kh = Matrix(K.rows, d_head, data=[K.get(i, h * d_head + j) for i in range(K.rows) for j in range(d_head)])
+        Vh = Matrix(V.rows, d_head, data=[V.get(i, h * d_head + j) for i in range(V.rows) for j in range(d_head)])
+        head_outs.append(scaled_dot_product_attention(Qh, Kh, Vh, causal=causal))
+    concat = Matrix(X.rows, Q.cols)
+    for h, H in enumerate(head_outs):
+        for i in range(H.rows):
+            for j in range(d_head):
+                concat.set(i, h * d_head + j, H.get(i, j))
+    return matmul(concat, Wo)
+
+
+class BlockParams:
+    &quot;&quot;&quot;All weights for one encoder or decoder block.&quot;&quot;&quot;
+    def __init__(self, d, n_heads, ffn_expansion, rng, use_swiglu=True):
+        self.d = d
+        self.n_heads = n_heads
+        self.use_swiglu = use_swiglu
+        self.Wq = randn(d, d, rng)
+        self.Wk = randn(d, d, rng)
+        self.Wv = randn(d, d, rng)
+        self.Wo = randn(d, d, rng)
+        h = int(d * ffn_expansion)
+        if use_swiglu:
+            self.W1 = randn(d, h, rng)
+            self.W2 = randn(h, d, rng)
+            self.W3 = randn(d, h, rng)
+        else:
+            self.W1 = randn(d, h, rng)
+            self.W2 = randn(h, d, rng)
+        # cross-attention (decoder)
+        self.Wq_x = randn(d, d, rng)
+        self.Wk_x = randn(d, d, rng)
+        self.Wv_x = randn(d, d, rng)
+        self.Wo_x = randn(d, d, rng)
+
+
+def encoder_block(x, p):
+    # pre-norm self-attention + residual
+    h = rms_norm(x)
+    a = multi_head_attention(h, p.Wq, p.Wk, p.Wv, p.Wo, p.n_heads)
+    x = add(x, a)
+    # pre-norm FFN + residual
+    h = rms_norm(x)
+    f = ffn_swiglu(h, p.W1, p.W2, p.W3) if p.use_swiglu else ffn_relu(h, p.W1, p.W2)
+    return add(x, f)
+
+
+def decoder_block(x, enc_out, p):
+    # 1) masked self-attention
+    h = rms_norm(x)
+    a = multi_head_attention(h, p.Wq, p.Wk, p.Wv, p.Wo, p.n_heads, causal=True)
+    x = add(x, a)
+    # 2) cross-attention to encoder output
+    h = rms_norm(x)
+    a = multi_head_attention(h, p.Wq_x, p.Wk_x, p.Wv_x, p.Wo_x, p.n_heads, kv_source=enc_out)
+    x = add(x, a)
+    # 3) FFN
+    h = rms_norm(x)
+    f = ffn_swiglu(h, p.W1, p.W2, p.W3) if p.use_swiglu else ffn_relu(h, p.W1, p.W2)
+    return add(x, f)
+
+
+def main():
+    rng = random.Random(42)
+    d = 8
+    n_heads = 2
+    ffn_expansion = 2.0
+    src_len = 6
+    tgt_len = 5
+
+    src = randn(src_len, d, rng, scale=0.5)
+    tgt = randn(tgt_len, d, rng, scale=0.5)
+
+    enc_params = [BlockParams(d, n_heads, ffn_expansion, rng) for _ in range(2)]
+    dec_params = [BlockParams(d, n_heads, ffn_expansion, rng) for _ in range(2)]
+
+    enc_out = src
+    for p in enc_params:
+        enc_out = encoder_block(enc_out, p)
+
+    dec_out = tgt
+    for p in dec_params:
+        dec_out = decoder_block(dec_out, enc_out, p)
+
+    print(&quot;=== full transformer forward pass ===&quot;)
+    print(f&quot;source shape:           ({src.rows}, {src.cols})&quot;)
+    print(f&quot;encoder output shape:   ({enc_out.rows}, {enc_out.cols})&quot;)
+    print(f&quot;target shape:           ({tgt.rows}, {tgt.cols})&quot;)
+    print(f&quot;decoder output shape:   ({dec_out.rows}, {dec_out.cols})&quot;)
+    print()
+    print(&quot;first 3 cells of encoder output:&quot;)
+    for i in range(3):
+        print(&quot;  &quot; + &quot;  &quot;.join(f&quot;{v:+.3f}&quot; for v in enc_out.row(i)[:4]))
+    print()
+    print(&quot;first 3 cells of decoder output:&quot;)
+    for i in range(3):
+        print(&quot;  &quot; + &quot;  &quot;.join(f&quot;{v:+.3f}&quot; for v in dec_out.row(i)[:4]))
+    print()
+    print(&quot;stack: 2-layer encoder + 2-layer decoder, pre-norm, RMSNorm, SwiGLU.&quot;)
+    print(&quot;this is the 2026 block skeleton (minus RoPE).&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/07-transformers-deep-dive/05-full-transformer/outputs/skill-transformer-block-reviewer.md">phases/07-transformers-deep-dive/05-full-transformer/outputs/skill-transformer-block-reviewer.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: transformer-block-reviewer
+description: Review a transformer block implementation against 2026 defaults and flag drift.
+version: 1.0.0
+phase: 7
+lesson: 5
+tags: [transformers, architecture, review]
+---
+
+Given a transformer block source (PyTorch / JAX / numpy / pseudocode) and its intended role (encoder / decoder / encoder-decoder), output:
+
+1. Wiring check. Pre-norm or post-norm. Residual connections around each sublayer. Flag post-norm as non-default for 2026 unless the author states why.
+2. Normalization. LayerNorm vs RMSNorm. RMSNorm preferred. Flag if bias terms are present in Q/K/V/O projections — most 2026 models drop them.
+3. Attention shape. MHA / GQA / MQA / MLA. For decoder blocks: confirm causal mask is applied. For cross-attention: confirm Q from decoder, K/V from encoder.
+4. FFN. Activation (ReLU / GELU / SwiGLU / GeGLU). Expansion ratio. SwiGLU with ~2.67× is modern default; 4× ReLU/GELU is classic.
+5. Positional signal. Confirm RoPE / ALiBi / absolute is applied where expected (typically Q,K projections for RoPE).
+
+Refuse to sign off on a block that stacks more than 12 layers with post-norm and no warmup schedule — training will diverge. Refuse a decoder block without causal masking. Flag any block whose FFN expansion drops below 2× as likely under-capacity. Warn if the block hard-codes `d_model` without a config field for swap-in sizing.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原课程未提供测验。</p></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/07-transformers-deep-dive/04-positional-encoding/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/07-transformers-deep-dive/06-bert-masked-language-modeling/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/07-transformers-deep-dive/05-full-transformer/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

@@ -1,0 +1,538 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>并行工具调用和与工具的流媒体 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-13-tools-and-protocols" data-lesson="13-tools-and-protocols/03-parallel-and-streaming-tool-calls" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/13-tools-and-protocols/">工具与协议</a> / LESSON 03</p><h1 class="lesson-title">并行工具调用和与工具的流媒体</h1><p>Parallel Tool Calls and Streaming with Tools</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>并行工具调用和与工具的流媒体</h1>
+<blockquote>
+<p>通过三次独立的天气查询,将进行三次回路.并行运行它们,总时间将崩到最慢的单次通话.每个边境提供商现在在单次转换中发出多次工具通话. 收益是真实的;管道是微妙的. 这一课程走着两个半端:并行风扇和流动论点重新组装,强调了ID相关陷.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python (stdlib, thread pool + streaming harness)
+<strong>Prerequisites:</strong> Phase 13 · 02 (function calling deep dive)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>解释原因<code>parallel_tool_calls: true</code>任何可能存在的信息,以及何时将其禁用.</li>
+<li>在平行风扇中将流动的参数块与右工具调用ID相关.</li>
+<li>部分重组<code>arguments</code>无需提前解析,将字符串转化为完整的JSON.</li>
+<li>运行一个三个城市的天气基准, 显示序列与并行延迟.</li>
+</ul>
+<h2>问题</h2>
+<p>没有相对通话,一个代理人回答&quot;孟加拉,东京和苏黎世的天气是什么&quot;这样做:</p>
+<pre><code>user -&gt; LLM
+LLM -&gt; call get_weather(Bengaluru)
+host -&gt; run executor, reply with result
+LLM -&gt; call get_weather(Tokyo)
+host -&gt; run executor, reply with result
+LLM -&gt; call get_weather(Zurich)
+host -&gt; run executor, reply with result
+LLM -&gt; final text answer
+</code></pre>
+<p>执行员的延迟也在每个过程中, 约是理想的墙钟时间的4倍.</p>
+<p>通过并行调用:</p>
+<pre><code>user -&gt; LLM
+LLM -&gt; call get_weather(Bengaluru); call get_weather(Tokyo); call get_weather(Zurich)
+host -&gt; run all three executors concurrently, reply with three results
+LLM -&gt; final text answer
+</code></pre>
+<p>士师资格的高达10万美元,是我国第一届高中教育大学的高中教育专业.</p>
+<p>价格是相关性复杂性. 当三个通话完成时,你的结果必须保持匹配.<code>tool_call_id</code>结果流时,您必须在执行之前将部分参数碎片组装成完整的JSON.双子座3部分添加了独特的ID,以解决一个现实世界问题,其中两个对同一工具的并行调用是无法区分的.</p>
+<h2>概念</h2>
+<h3>允许并行</h3>
+<ul>
+<li><strong>OpenAI.</strong> <code>parallel_tool_calls: true</code>默认启动<code>false</code>强迫一系列.</li>
+<li>**Anthropic.**通过<code>disable_parallel_tool_use: false</code>(在Claude 3.5及以上的默认情况下).<code>true</code>为了连载.</li>
+<li>**Gemini.**总是可行;<code>tool_config.function_calling_config.mode = &quot;AUTO&quot;</code>让模型决定.</li>
+</ul>
+<p>工具有顺序依赖性时,禁用并行 (<code>create_file</code>然后<code>write_file</code>),当一个调用输出通知另一个输入时,或者速度限制器无法处理风扇.</p>
+<h3>相关性</h3>
+<p>每次电话,模型发射的电话都有一个<code>id</code>没有这个,结果是模糊的.</p>
+<ul>
+<li><strong>OpenAI.</strong> <code>tool_call_id</code>在每个工具角色信息上.</li>
+<li><strong>Anthropic.</strong> <code>tool_use_id</code>在每一个<code>tool_result</code>区块.</li>
+<li><strong>Gemini.</strong> <code>id</code>在每一个<code>functionResponse</code>(双子座3及以上;双子座2与名字相匹配,而与同名并行通话打破).</li>
+</ul>
+<h3>同时进行电话</h3>
+<p>接待者在自己的线程,Coroutine或远程工作者上运行每个呼叫的执行器.最简单的带使用线程池;生产使用asyncio与 <code>asyncio.gather</code>完成顺序是不可预测的  id是标识符.</p>
+<p>答案的结果是调用列表顺序而不是完成顺序.<code>tool_call_id</code>结果被丢弃或重复,则不顺序提交使调试变得更加困难.</p>
+<h3>流媒体工具的呼叫</h3>
+<p>当模型流动时,<code>arguments</code>接下来,三个相对通话的分别流量在线上交互.</p>
+<p>提供商的形状:</p>
+<ul>
+<li>**OpenAI.**每个部分都是<code>choices[0].delta.tool_calls[i].function.arguments</code>部分弦. 部分带着<code>index</code>您按指数积累,读取<code>id</code>当它第一次出现时,并解析JSON当<code>finish_reason = &quot;tool_calls&quot;</code>现在,我们要去.</li>
+<li>**Anthropic.**流媒体事件是<code>message_start</code>然后一个<code>content_block_start</code>每块,有类型<code>tool_use</code>(包含身份证,名称,空格输入). <code>content_block_delta</code>事件的运行<code>input_json_delta</code>子.<code>content_block_stop</code>关闭每一个街区.</li>
+<li><strong>Gemini.</strong> <code>streamFunctionCallArguments</code>双子三级以上) 发射了<code>functionCallId</code>在双子座3之前,流媒体回应一次一次一次.</li>
+</ul>
+<h3>部分JSON和分析早期陷</h3>
+<p>你不能分析.<code>arguments</code>部分JSON,如<code>{&quot;city&quot;: &quot;Beng</code>合适的门是提供商的终端通话信号:OpenAI的<code>finish_reason = &quot;tool_calls&quot;</code>美国人文学报<code>content_block_stop</code>只有那时才尝试.<code>json.loads</code>更加强大的方法采用一个增量JSON解析器,随着结构完成时生成事件;OpenAI的流媒体指南建议为 UX使用这种方法,该指标显示了现场&quot;思考&quot;指标. 数计数是不可靠的,作为完整性测试 (引用字符串内或逃逸内容导致虚假阳性),并且只应作为非正式的调试数.</p>
+<h3>订单外完成</h3>
+<pre><code>call_A: fast API, returns first
+call_B: slow API, returns second
+call_C: median API, returns third
+</code></pre>
+<p>接待者答复必须引用以下身份证:</p>
+<pre><code>[{role: &quot;tool&quot;, tool_call_id: &quot;call_A&quot;, content: ...},
+ {role: &quot;tool&quot;, tool_call_id: &quot;call_B&quot;, content: ...},
+ {role: &quot;tool&quot;, tool_call_id: &quot;call_C&quot;, content: ...}]
+</code></pre>
+<p>答案中的顺序对OpenAI或Anthropic的准确性并不重要.只要ID匹配,双胞胎会接受任何订单.</p>
+<h3>基准:连续对平行</h3>
+<p>带里面<code>code/main.py</code>模拟三个执行器,400,600和800ms延迟. 序列运行在1800ms总. 并行运行在最大400,600,800) =800ms. 差异是恒定,不成比例,因此节省随着工具数量增长.</p>
+<p>现实世界警告:并行通话压力下游API.一个10个方式的风扇到一个限速服务将失败.13 · 17阶段涵盖门口级压力;重试语义计划在未来阶段.</p>
+<h3>流动风扇外墙钟</h3>
+<p>如果模型本身流,你可以在一个调用的参数完成后开始执行,而不是等待所有调用完成.这是一个优化 OpenAI 文档,但不是所有的 SDK 暴露.本课程中的杆是这样做的:一旦模拟流产生完整的参数对象,主机启动了调用.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-a318921d2cba79540a69.png" alt="tp-parallel-fanout 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>用它</h2>
+<p><code>code/main.py</code>首先,它运行了三个模拟的天气调用,<code>concurrent.futures.ThreadPoolExecutor</code>另一半重复了一个假的流媒体响应<code>arguments</code>在一个流中交互的三个并行调用,并将它们重新组装成每个ID<code>StreamAccumulator</code>没有法学士,没有网络,只是重新组装逻辑.</p>
+<p>什么要看:</p>
+<ul>
+<li>顺序计时器达到1.8秒,并行计时器达到0.8秒,</li>
+<li>积累器只处理到达不顺序的块,通过按标识缓冲和解析,</li>
+<li>执行器在所有流程结束后,不但在ID的论点完成后就开始.</li>
+</ul>
+<h2>运送它</h2>
+<p>这一课产生了<code>outputs/skill-parallel-call-safety-check.md</code>鉴于工具登记,技能审计是哪些工具可以安全地并行化,有订单依赖性,并且会压倒下游利率限制 每工具的修订登记 <code>parallel_safe</code>旗.</p>
+<h2>运动</h2>
+<ol>
+<li>
+<p>跑步<code>code/main.py</code>确认平行到序列比率是大约<code>max/sum</code>(实际运行因线程安排,串行和带上层费而略有偏离于理想).</p>
+</li>
+<li>
+<p>扩展蓄积器以处理&quot;中流取消电话&quot;的情况下,<code>cancelled</code>哪个提供商明确记录了这个案例?<code>content_block_stop</code>语义和OpenAI的研究<code>finish_reason: &quot;length&quot;</code>如何表现?</p>
+</li>
+<li>
+<p>替换线池为<code>asyncio.gather</code>由于下文交换成本,你应该看到小的胜利,但只有执行器做真正的I/O.</p>
+</li>
+<li>
+<p>选择两个不应该平行的工具 (例如:<code>create_file</code>然后<code>write_file</code>添加一个<code>ordering_dependency</code>对于依赖意识的规划,这是一个未来的代理工程阶段正式化的最低机械.</p>
+</li>
+<li>
+<p>阅读OpenAI的并行函数调用部分和Anthropic的部分.<code>disable_parallel_tool_use</code>鉴定人类推禁用并行性 (提示:同一资源的后果突变).</p>
+</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Parallel tool calls</td>
+<td>&quot;Fan-out in one turn&quot;</td>
+<td>Model emits multiple tool calls in a single assistant message</td>
+</tr>
+<tr>
+<td><code>parallel_tool_calls</code></td>
+<td>&quot;OpenAI's flag&quot;</td>
+<td>Enable or disable multi-call emission</td>
+</tr>
+<tr>
+<td><code>disable_parallel_tool_use</code></td>
+<td>&quot;Anthropic's inverse&quot;</td>
+<td>Opt-out flag; default is parallel enabled</td>
+</tr>
+<tr>
+<td>Tool call id</td>
+<td>&quot;Correlation handle&quot;</td>
+<td>Per-call identifier the result message must echo</td>
+</tr>
+<tr>
+<td>Accumulator</td>
+<td>&quot;Stream buffer&quot;</td>
+<td>Per-id string buffer for partial <code>arguments</code> chunks</td>
+</tr>
+<tr>
+<td>Out-of-order completion</td>
+<td>&quot;Fastest first&quot;</td>
+<td>Parallel calls finish in unpredictable order; ids are the glue</td>
+</tr>
+<tr>
+<td>Dependency graph</td>
+<td>&quot;Ordering constraints&quot;</td>
+<td>Tools whose outputs feed into inputs of other tools; cannot parallelize</td>
+</tr>
+<tr>
+<td>Parse-early trap</td>
+<td>&quot;JSON.parse exploded&quot;</td>
+<td>Attempting to parse an incomplete <code>arguments</code> string</td>
+</tr>
+<tr>
+<td><code>streamFunctionCallArguments</code></td>
+<td>&quot;Gemini 3 feature&quot;</td>
+<td>Streamed argument chunks with unique id per call</td>
+</tr>
+<tr>
+<td>Completion-order reply</td>
+<td>&quot;Don't wait for all&quot;</td>
+<td>Reply with results as they arrive, keyed by id</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://platform.openai.com/docs/guides/function-calling#parallel-function-calling" rel="noreferrer" data-network="true">OpenAI — Parallel function calling <small>↗ 需要联网</small></a>默认行为和选择退出标志</li>
+<li><a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/parallel-tool-use" rel="noreferrer" data-network="true">Anthropic — Parallel tool use <small>↗ 需要联网</small></a> <code>disable_parallel_tool_use</code>结果批量</li>
+<li><a href="https://ai.google.dev/gemini-api/docs/function-calling" rel="noreferrer" data-network="true">Google — Gemini function calling parallel section <small>↗ 需要联网</small></a>来自双子座3的ID相关的并行电话</li>
+<li><a href="https://platform.openai.com/docs/api-reference/responses-streaming" rel="noreferrer" data-network="true">OpenAI — Streaming responses with tools <small>↗ 需要联网</small></a> 对于OpenAI流的分断参数重组</li>
+<li><a href="https://docs.anthropic.com/en/api/messages-streaming" rel="noreferrer" data-network="true">Anthropic — Streaming messages <small>↗ 需要联网</small></a> <code>content_block_delta</code>随着<code>input_json_delta</code></li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Parallel Tool Calls and Streaming with Tools</h1>
+<blockquote>
+<p>Three independent weather lookups serialized is three round trips. Run them in parallel and total time collapses to the slowest single call. Every frontier provider now emits multiple tool calls in a single turn. The payoff is real; the plumbing is subtle. This lesson walks both halves: the parallel fan-out and the streamed-argument reassembly, with emphasis on the id-correlation trap.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python (stdlib, thread pool + streaming harness)
+<strong>Prerequisites:</strong> Phase 13 · 02 (function calling deep dive)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Explain why <code>parallel_tool_calls: true</code> exists and when to disable it.</li>
+<li>Correlate streamed argument chunks to the right tool-call id during parallel fan-out.</li>
+<li>Reassemble partial <code>arguments</code> strings into complete JSON without parsing early.</li>
+<li>Run a three-city weather benchmark that demonstrates sequential vs parallel latency.</li>
+</ul>
+<h2>The Problem</h2>
+<p>Without parallel calls, an agent answering &quot;what is the weather in Bengaluru, Tokyo, and Zurich&quot; does this:</p>
+<pre><code>user -&gt; LLM
+LLM -&gt; call get_weather(Bengaluru)
+host -&gt; run executor, reply with result
+LLM -&gt; call get_weather(Tokyo)
+host -&gt; run executor, reply with result
+LLM -&gt; call get_weather(Zurich)
+host -&gt; run executor, reply with result
+LLM -&gt; final text answer
+</code></pre>
+<p>Three LLM round trips, each of which also pays the executor latency. Roughly 4x the ideal wall-clock time.</p>
+<p>With parallel calls:</p>
+<pre><code>user -&gt; LLM
+LLM -&gt; call get_weather(Bengaluru); call get_weather(Tokyo); call get_weather(Zurich)
+host -&gt; run all three executors concurrently, reply with three results
+LLM -&gt; final text answer
+</code></pre>
+<p>One LLM round trip. Executor time is the maximum of the three, not the sum. Production benchmarks on OpenAI, Anthropic, and Gemini show 60 to 70 percent wall-clock reduction on fan-out workloads.</p>
+<p>The price is correlation complexity. When the three calls complete out of order, your results must carry the matching <code>tool_call_id</code> so the model can line them up. When results stream, you must assemble partial argument fragments into complete JSON before executing. Gemini 3 added unique ids in part to solve a real-world issue where two parallel calls to the same tool were indistinguishable.</p>
+<h2>The Concept</h2>
+<h3>Enabling parallel</h3>
+<ul>
+<li><strong>OpenAI.</strong> <code>parallel_tool_calls: true</code> on by default. Set <code>false</code> to force serial.</li>
+<li><strong>Anthropic.</strong> Parallel via <code>disable_parallel_tool_use: false</code> (default on Claude 3.5 and up). Set <code>true</code> for serial.</li>
+<li><strong>Gemini.</strong> Always parallel-capable; <code>tool_config.function_calling_config.mode = &quot;AUTO&quot;</code> lets the model decide.</li>
+</ul>
+<p>Disable parallel when tools have ordering dependencies (<code>create_file</code> then <code>write_file</code>), when one call's output informs another's input, or when the rate limiter cannot handle fan-out.</p>
+<h3>Id correlation</h3>
+<p>Every call the model emits has an <code>id</code>. Every result the host returns must include the same id. Without this, results are ambiguous.</p>
+<ul>
+<li><strong>OpenAI.</strong> <code>tool_call_id</code> on each tool-role message.</li>
+<li><strong>Anthropic.</strong> <code>tool_use_id</code> on each <code>tool_result</code> block.</li>
+<li><strong>Gemini.</strong> <code>id</code> on each <code>functionResponse</code> (Gemini 3 and up; Gemini 2 matched by name which broke for same-name parallel calls).</li>
+</ul>
+<h3>Running calls concurrently</h3>
+<p>The host runs each call's executor on its own thread, coroutine, or remote worker. The simplest harness uses a thread pool; production uses asyncio with <code>asyncio.gather</code> or structured concurrency. Order of completion is unpredictable — the id is the identifier.</p>
+<p>One common bug: reply with results in call-list order instead of completion order. This usually works because the model only cares about <code>tool_call_id</code>, but if a result is dropped or duplicated, out-of-order submission makes debugging harder. Prefer to reply in completion order with explicit ids.</p>
+<h3>Streaming tool calls</h3>
+<p>When the model streams, <code>arguments</code> arrive in pieces. Three separate streams of chunks for three parallel calls interleave on the wire. You need one accumulator per id.</p>
+<p>Shape by provider:</p>
+<ul>
+<li><strong>OpenAI.</strong> Each chunk is <code>choices[0].delta.tool_calls[i].function.arguments</code> (partial string). The chunk carries <code>index</code> (position in the call list). You accumulate per-index, read <code>id</code> when it first appears, and parse JSON when <code>finish_reason = &quot;tool_calls&quot;</code>.</li>
+<li><strong>Anthropic.</strong> Stream events are <code>message_start</code>, then one <code>content_block_start</code> per block with type <code>tool_use</code> (containing id, name, empty input). <code>content_block_delta</code> events carry <code>input_json_delta</code> chunks. <code>content_block_stop</code> closes each block.</li>
+<li><strong>Gemini.</strong> <code>streamFunctionCallArguments</code> (Gemini 3 and up) emits chunks with a <code>functionCallId</code> so calls interleave cleanly. Before Gemini 3, streaming returned one complete call at a time.</li>
+</ul>
+<h3>Partial JSON and the parse-early trap</h3>
+<p>You cannot parse <code>arguments</code> until it is complete. Partial JSON such as <code>{&quot;city&quot;: &quot;Beng</code> is not valid and will raise. The correct gate is the provider's end-of-call signal: OpenAI's <code>finish_reason = &quot;tool_calls&quot;</code>, Anthropic's <code>content_block_stop</code>, or Gemini's stream-end event. Only then attempt <code>json.loads</code>. A more robust approach uses an incremental JSON parser that yields events as structure completes; OpenAI's streaming guide recommends this for UX that shows a live &quot;thinking&quot; indicator. Brace-counting is unreliable as a completeness test (braces inside quoted strings or escaped content cause false positives) and should only be used as an informal debug heuristic.</p>
+<h3>Out-of-order completion</h3>
+<pre><code>call_A: fast API, returns first
+call_B: slow API, returns second
+call_C: median API, returns third
+</code></pre>
+<p>The host reply must still cite the ids:</p>
+<pre><code>[{role: &quot;tool&quot;, tool_call_id: &quot;call_A&quot;, content: ...},
+ {role: &quot;tool&quot;, tool_call_id: &quot;call_B&quot;, content: ...},
+ {role: &quot;tool&quot;, tool_call_id: &quot;call_C&quot;, content: ...}]
+</code></pre>
+<p>Order in the reply does not matter for correctness on OpenAI or Anthropic. Gemini accepts any order so long as ids match.</p>
+<h3>Benchmark: sequential vs parallel</h3>
+<p>The harness in <code>code/main.py</code> simulates three executors with 400, 600, and 800 ms latency. Sequential runs it in 1800 ms total. Parallel runs it in max(400, 600, 800) = 800 ms. The difference is constant, not proportional, so the savings grow with tool count.</p>
+<p>Real-world caveat: parallel calls stress downstream APIs. A 10-way fan-out to a rate-limited service will fail. Phase 13 · 17 covers gateway-level backpressure; retry semantics are planned for a future phase.</p>
+<h3>Streaming fan-out wall-clock</h3>
+<p>If the model itself streams, you can start executing as soon as one call's arguments are complete, rather than waiting for all calls to finalize. This is an optimization OpenAI documents but not all SDKs expose. The harness in this lesson does it: as soon as the simulated stream yields a complete argument object, the host kicks off that call.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-a318921d2cba79540a69.png" alt="tp-parallel-fanout 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Use It</h2>
+<p><code>code/main.py</code> has two halves. The first runs three simulated weather calls sequentially and in parallel using <code>concurrent.futures.ThreadPoolExecutor</code> and prints wall-clock time. The second half replays a fake streaming response — chunks of <code>arguments</code> for three parallel calls interleaved on one stream — and reassembles them per-id with <code>StreamAccumulator</code>. No LLM, no network, just the reassembly logic.</p>
+<p>What to look at:</p>
+<ul>
+<li>The sequential timer hits 1.8 seconds. The parallel timer hits 0.8 seconds on the same fake latencies.</li>
+<li>The accumulator handles chunks arriving out of order by buffering per-id and parsing only when each call's JSON is complete.</li>
+<li>The executor kicks off as soon as an id's arguments finalize, not after all streams end.</li>
+</ul>
+<h2>Ship It</h2>
+<p>This lesson produces <code>outputs/skill-parallel-call-safety-check.md</code>. Given a tool registry, the skill audits which tools are safe to parallelize, which have ordering dependencies, and which would overwhelm downstream rate limits — returning a revised registry with per-tool <code>parallel_safe</code> flags.</p>
+<h2>Exercises</h2>
+<ol>
+<li>
+<p>Run <code>code/main.py</code> and vary the simulated latencies. Confirm that the parallel-to-sequential ratio is approximately <code>max/sum</code> (real runs deviate slightly from the ideal because of thread scheduling, serialization, and harness overhead). At what latency distribution does parallel stop mattering?</p>
+</li>
+<li>
+<p>Extend the accumulator to handle a &quot;call was cancelled mid-stream&quot; case by dropping its buffer and emitting a <code>cancelled</code> event. What provider documents this case explicitly? Check Anthropic's <code>content_block_stop</code> semantics and OpenAI's <code>finish_reason: &quot;length&quot;</code> behavior.</p>
+</li>
+<li>
+<p>Replace the thread pool with <code>asyncio.gather</code>. Benchmark both. You should see small wins on async because of lower context-switch cost, but only if executors do real I/O.</p>
+</li>
+<li>
+<p>Pick two tools that should NOT parallelize (e.g. <code>create_file</code> then <code>write_file</code>). Add an <code>ordering_dependency</code> graph to the registry and gate the parallel fan-out on that graph. This is the minimum machinery for dependency-aware scheduling, which a future agent-engineering phase formalizes.</p>
+</li>
+<li>
+<p>Read OpenAI's parallel-function-calling section and Anthropic's <code>disable_parallel_tool_use</code> docs. Identify the one real-world tool type where Anthropic recommends disabling parallelism. (Hint: consequential mutations on the same resource.)</p>
+</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Parallel tool calls</td>
+<td>&quot;Fan-out in one turn&quot;</td>
+<td>Model emits multiple tool calls in a single assistant message</td>
+</tr>
+<tr>
+<td><code>parallel_tool_calls</code></td>
+<td>&quot;OpenAI's flag&quot;</td>
+<td>Enable or disable multi-call emission</td>
+</tr>
+<tr>
+<td><code>disable_parallel_tool_use</code></td>
+<td>&quot;Anthropic's inverse&quot;</td>
+<td>Opt-out flag; default is parallel enabled</td>
+</tr>
+<tr>
+<td>Tool call id</td>
+<td>&quot;Correlation handle&quot;</td>
+<td>Per-call identifier the result message must echo</td>
+</tr>
+<tr>
+<td>Accumulator</td>
+<td>&quot;Stream buffer&quot;</td>
+<td>Per-id string buffer for partial <code>arguments</code> chunks</td>
+</tr>
+<tr>
+<td>Out-of-order completion</td>
+<td>&quot;Fastest first&quot;</td>
+<td>Parallel calls finish in unpredictable order; ids are the glue</td>
+</tr>
+<tr>
+<td>Dependency graph</td>
+<td>&quot;Ordering constraints&quot;</td>
+<td>Tools whose outputs feed into inputs of other tools; cannot parallelize</td>
+</tr>
+<tr>
+<td>Parse-early trap</td>
+<td>&quot;JSON.parse exploded&quot;</td>
+<td>Attempting to parse an incomplete <code>arguments</code> string</td>
+</tr>
+<tr>
+<td><code>streamFunctionCallArguments</code></td>
+<td>&quot;Gemini 3 feature&quot;</td>
+<td>Streamed argument chunks with unique id per call</td>
+</tr>
+<tr>
+<td>Completion-order reply</td>
+<td>&quot;Don't wait for all&quot;</td>
+<td>Reply with results as they arrive, keyed by id</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://platform.openai.com/docs/guides/function-calling#parallel-function-calling" rel="noreferrer" data-network="true">OpenAI — Parallel function calling <small>↗ 需要联网</small></a> — default behavior and the opt-out flag</li>
+<li><a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/parallel-tool-use" rel="noreferrer" data-network="true">Anthropic — Parallel tool use <small>↗ 需要联网</small></a> — <code>disable_parallel_tool_use</code> and result batching</li>
+<li><a href="https://ai.google.dev/gemini-api/docs/function-calling" rel="noreferrer" data-network="true">Google — Gemini function calling parallel section <small>↗ 需要联网</small></a> — id-correlated parallel calls from Gemini 3</li>
+<li><a href="https://platform.openai.com/docs/api-reference/responses-streaming" rel="noreferrer" data-network="true">OpenAI — Streaming responses with tools <small>↗ 需要联网</small></a> — chunked argument reassembly for OpenAI streams</li>
+<li><a href="https://docs.anthropic.com/en/api/messages-streaming" rel="noreferrer" data-network="true">Anthropic — Streaming messages <small>↗ 需要联网</small></a> — <code>content_block_delta</code> with <code>input_json_delta</code></li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-13-tools-and-protocols--03-parallel-and-streaming-tool-calls.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-13-tools-and-protocols--03-parallel-and-streaming-tool-calls.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/13-tools-and-protocols/03-parallel-and-streaming-tool-calls/code/main.py">phases/13-tools-and-protocols/03-parallel-and-streaming-tool-calls/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Phase 13 Lesson 03 - parallel and streaming tool calls.
+
+Two demos, stdlib only:
+  1. Three-city weather run, sequential vs parallel (thread pool).
+     Measures wall-clock and shows the max vs sum pattern.
+  2. Stream accumulator for out-of-order argument chunks.
+     Replays a fake OpenAI-shaped stream of three interleaved parallel calls
+     and reassembles each per-id before executing.
+
+Run: python code/main.py
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import json
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+
+
+# ------------------------------------------------------------------
+# demo 1: sequential vs parallel weather lookup
+# ------------------------------------------------------------------
+
+SIMULATED_LATENCY_MS = {&quot;Bengaluru&quot;: 400, &quot;Tokyo&quot;: 600, &quot;Zurich&quot;: 800}
+
+
+def executor_weather(city: str) -&gt; dict:
+    latency = SIMULATED_LATENCY_MS.get(city, 500)
+    time.sleep(latency / 1000.0)
+    return {&quot;city&quot;: city, &quot;temp_c&quot;: hash(city) % 35}
+
+
+def run_sequential(cities: list[str]) -&gt; tuple[float, list[dict]]:
+    start = time.perf_counter()
+    results = [executor_weather(c) for c in cities]
+    dt_ms = (time.perf_counter() - start) * 1000
+    return dt_ms, results
+
+
+def run_parallel(cities: list[str]) -&gt; tuple[float, list[dict]]:
+    start = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=len(cities)) as pool:
+        results = list(pool.map(executor_weather, cities))
+    dt_ms = (time.perf_counter() - start) * 1000
+    return dt_ms, results
+
+
+# ------------------------------------------------------------------
+# demo 2: stream accumulator
+# ------------------------------------------------------------------
+
+@dataclass
+class CallBuffer:
+    id: str
+    name: str = &quot;&quot;
+    args_buf: str = &quot;&quot;
+    done: bool = False
+
+    def try_parse(self) -&gt; dict | None:
+        if not self.done:
+            return None
+        return json.loads(self.args_buf)
+
+
+@dataclass
+class StreamAccumulator:
+    buffers: dict[str, CallBuffer] = field(default_factory=dict)
+
+    def on_event(self, event: dict) -&gt; list[CallBuffer]:
+        kind = event[&quot;type&quot;]
+        idx = event.get(&quot;id&quot;)
+        completed: list[CallBuffer] = []
+        if kind == &quot;call_start&quot;:
+            self.buffers[idx] = CallBuffer(id=idx, name=event[&quot;name&quot;])
+        elif kind == &quot;args_delta&quot;:
+            buf = self.buffers[idx]
+            buf.args_buf += event[&quot;chunk&quot;]
+        elif kind == &quot;call_stop&quot;:
+            buf = self.buffers[idx]
+            buf.done = True
+            completed.append(buf)
+        return completed
+
+
+def fake_openai_stream():
+    &quot;&quot;&quot;Three interleaved parallel calls. Real streams look like this.&quot;&quot;&quot;
+    yield {&quot;type&quot;: &quot;call_start&quot;, &quot;id&quot;: &quot;call_A&quot;, &quot;name&quot;: &quot;get_weather&quot;}
+    yield {&quot;type&quot;: &quot;call_start&quot;, &quot;id&quot;: &quot;call_B&quot;, &quot;name&quot;: &quot;get_weather&quot;}
+    yield {&quot;type&quot;: &quot;call_start&quot;, &quot;id&quot;: &quot;call_C&quot;, &quot;name&quot;: &quot;get_weather&quot;}
+    yield {&quot;type&quot;: &quot;args_delta&quot;, &quot;id&quot;: &quot;call_A&quot;, &quot;chunk&quot;: &#39;{&quot;city&quot;&#39;}
+    yield {&quot;type&quot;: &quot;args_delta&quot;, &quot;id&quot;: &quot;call_B&quot;, &quot;chunk&quot;: &#39;{&quot;city&#39;}
+    yield {&quot;type&quot;: &quot;args_delta&quot;, &quot;id&quot;: &quot;call_A&quot;, &quot;chunk&quot;: &#39;:&quot;Beng&#39;}
+    yield {&quot;type&quot;: &quot;args_delta&quot;, &quot;id&quot;: &quot;call_C&quot;, &quot;chunk&quot;: &#39;{&quot;city&quot;:&quot;Zu&#39;}
+    yield {&quot;type&quot;: &quot;args_delta&quot;, &quot;id&quot;: &quot;call_A&quot;, &quot;chunk&quot;: &#39;aluru&quot;}&#39;}
+    yield {&quot;type&quot;: &quot;call_stop&quot;, &quot;id&quot;: &quot;call_A&quot;}
+    yield {&quot;type&quot;: &quot;args_delta&quot;, &quot;id&quot;: &quot;call_B&quot;, &quot;chunk&quot;: &#39;&quot;:&quot;Tokyo&quot;}&#39;}
+    yield {&quot;type&quot;: &quot;call_stop&quot;, &quot;id&quot;: &quot;call_B&quot;}
+    yield {&quot;type&quot;: &quot;args_delta&quot;, &quot;id&quot;: &quot;call_C&quot;, &quot;chunk&quot;: &#39;rich&quot;}&#39;}
+    yield {&quot;type&quot;: &quot;call_stop&quot;, &quot;id&quot;: &quot;call_C&quot;}
+
+
+def replay_and_execute() -&gt; dict[str, dict]:
+    acc = StreamAccumulator()
+    results: dict[str, dict] = {}
+    in_flight: dict[str, &quot;Future&quot;] = {}  # type: ignore
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for event in fake_openai_stream():
+            completed = acc.on_event(event)
+            for buf in completed:
+                args = buf.try_parse()
+                print(f&quot;  call {buf.id} args complete -&gt; {args}&quot;)
+                in_flight[buf.id] = pool.submit(executor_weather, args[&quot;city&quot;])
+        for cid, fut in in_flight.items():
+            results[cid] = fut.result()
+    return results
+
+
+# ------------------------------------------------------------------
+# main
+# ------------------------------------------------------------------
+
+def main() -&gt; None:
+    print(&quot;=&quot; * 72)
+    print(&quot;PHASE 13 LESSON 03 - PARALLEL AND STREAMING TOOL CALLS&quot;)
+    print(&quot;=&quot; * 72)
+
+    cities = [&quot;Bengaluru&quot;, &quot;Tokyo&quot;, &quot;Zurich&quot;]
+    sum_lat = sum(SIMULATED_LATENCY_MS.values())
+    max_lat = max(SIMULATED_LATENCY_MS.values())
+
+    print(&quot;\n--- demo 1: three-city weather (simulated) ---&quot;)
+    print(f&quot;per-city simulated latency : {SIMULATED_LATENCY_MS}&quot;)
+    print(f&quot;theoretical sequential     : {sum_lat} ms  (sum)&quot;)
+    print(f&quot;theoretical parallel       : {max_lat} ms  (max)&quot;)
+
+    seq_ms, seq_res = run_sequential(cities)
+    par_ms, par_res = run_parallel(cities)
+    print(f&quot;\nactual sequential : {seq_ms:.0f} ms&quot;)
+    print(f&quot;actual parallel   : {par_ms:.0f} ms&quot;)
+    speedup = seq_ms / par_ms if par_ms else 0
+    print(f&quot;speedup           : {speedup:.2f}x&quot;)
+
+    print(&quot;\n--- demo 2: stream accumulator ---&quot;)
+    print(&quot;replaying fake interleaved stream of three parallel calls ...&quot;)
+    results = replay_and_execute()
+    print(&quot;\nfinal results (keyed by tool_call_id):&quot;)
+    for cid, r in results.items():
+        print(f&quot;  {cid} -&gt; {r}&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/13-tools-and-protocols/03-parallel-and-streaming-tool-calls/outputs/skill-parallel-call-safety-check.md">phases/13-tools-and-protocols/03-parallel-and-streaming-tool-calls/outputs/skill-parallel-call-safety-check.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: parallel-call-safety-check
+description: Audit a tool registry for safe parallelization. Mark each tool parallel_safe, note ordering dependencies, and flag downstream rate-limit risk.
+version: 1.0.0
+phase: 13
+lesson: 03
+tags: [parallel-tool-calls, streaming, correlation, rate-limits]
+---
+
+Given a tool registry (list of tools with names, descriptions, and executors), return an annotated copy with `parallel_safe: bool`, `ordering_deps: [tool_name]`, and `rate_limit_group: name` fields added.
+
+Produce:
+
+1. Per-tool classification. For each tool, decide: safe to run in parallel within the same turn (pure reads, different resources); unsafe (mutations, shared resources, external rate limits).
+2. Dependency graph. Identify pairs where one tool&#39;s output should feed another&#39;s input. Cannot parallelize within a turn. Mark with `ordering_deps`.
+3. Rate-limit grouping. Tools that hit the same downstream API share a group. Host should cap per-group concurrency, not per-tool.
+4. Safety recommendations. For each unsafe tool, state whether to disable parallel for that turn, queue, or shard by resource.
+5. Provider-specific flags. Recommend `parallel_tool_calls=false` on OpenAI or `disable_parallel_tool_use=true` on Anthropic when any unsafe tool is in the set.
+
+Hard rejects:
+- Any registry with no classification after the audit. Default-deny; unknown means unsafe.
+- Any write-path tool on a shared resource marked `parallel_safe: true`. Race conditions.
+- Any tool that hits a rate-limited external API without a `rate_limit_group`.
+
+Refusal rules:
+- If asked to mark all tools parallel-safe without inspection, refuse.
+- If the registry includes consequential tools on the same resource (`delete_file` and `write_file` on the same path), refuse to parallelize and direct to Phase 14 · 09 for sandbox-level serialization.
+- If the user argues that their tools never race, refuse and ask for the proof (tests, logs, or a formal argument). Racing happens silently in production.
+
+Output: a revised registry as a JSON blob with the three new fields per tool, followed by a short summary naming the highest-risk parallelization choice and the recommended mitigation. End with a suggested `tool_choice` override for the current turn.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原课程未提供测验。</p></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/13-tools-and-protocols/02-function-calling-deep-dive/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/13-tools-and-protocols/04-structured-output/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/13-tools-and-protocols/03-parallel-and-streaming-tool-calls/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

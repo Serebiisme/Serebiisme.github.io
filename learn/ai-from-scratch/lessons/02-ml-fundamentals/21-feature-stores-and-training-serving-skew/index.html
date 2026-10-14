@@ -1,0 +1,1572 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>专业货物及培训服务器 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-02-ml-fundamentals" data-lesson="02-ml-fundamentals/21-feature-stores-and-training-serving-skew" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/02-ml-fundamentals/">机器学习基础</a> / LESSON 21</p><h1 class="lesson-title">专业货物及培训服务器</h1><p>Feature Stores and Training-Serving Skew</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>专业货物及培训服务器</h1>
+<blockquote>
+<p>训练读取其历史,每个标签时间,服务读取其最新值.当两个读者不同意时,模型会看到从未训练过的输入.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 2, Lessons 08 (Feature Engineering), 13 (ML Pipelines), 15 (Time Series), and 19 (ML System Design)
+<strong>Time:</strong> ~100 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>描述离线商店,在线商店,实体,活动时间标签,TTL,以及每个商店的工作</li>
+<li>实现一个时刻正确的结合,并展示一个天真的结合如何将未来的值复制到培训数据中</li>
+<li>列出训练服务偏差的四个原因:两个代码路径,过时功能,不同的默认功能和时间旅行</li>
+<li>建立一个功能登记库,其中一个定义提供了训练路径和服务路径</li>
+<li>填写一个新的功能在过去的日期上,而不读取每日后的数据</li>
+<li>通过对照记录的服务功能和同一实体和时间的训练路径来检测偏差</li>
+</ul>
+<h2>问题</h2>
+<p>一个团队构建了一个缩模型.每个标签显示用户在标签日后30天内是否没有购买.团队将标签加入用户功能表.<code>user_id</code>们的们<code>days_since_last_purchase</code>离线准确度为0.948.</p>
+<p>在现场流量上,该模型比较旧,简单的版本更糟糕. 标签日后的几周,每个用户的功能表包含了最新的值. 一个用户最后购买的115天显示了175天的60个空白日, 另一支团队又在另一家服务中写下了服务功能. 他们的30天窗口包括一个额外的天,</p>
+<p>训练和服务是以两种不同的方式计算的&quot;相同的功能&quot;.这个课程从零开始构建功能商店的部分.你写一个注册表,一个后填,一个点在时间的连接,一个有TTL的在线商店和一个偏差检查.演示程序使用数字复制了两个缺陷.</p>
+<h2>概念</h2>
+<h3>两个同样的读者</h3>
+<p>训练和服务要求不同的特征:</p>
+<table>
+<thead>
+<tr>
+<th>Property</th>
+<th>Training (offline)</th>
+<th>Serving (online)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Question</td>
+<td>&quot;What was the value for each of 10 million (entity, time) pairs?&quot;</td>
+<td>&quot;What is the value for this one entity now?&quot;</td>
+</tr>
+<tr>
+<td>Time</td>
+<td>Many points in the past</td>
+<td>The present</td>
+</tr>
+<tr>
+<td>Volume</td>
+<td>Millions of rows per job</td>
+<td>One row per request</td>
+</tr>
+<tr>
+<td>Latency</td>
+<td>Minutes are fine</td>
+<td>A few milliseconds</td>
+</tr>
+<tr>
+<td>Storage</td>
+<td>Offline store: full history with timestamps, in columnar files or a warehouse</td>
+<td>Online store: the latest value per entity, in a key-value database</td>
+</tr>
+</tbody>
+</table>
+<p>功能商店将两个商店从一个集合的功能定义中填满.物质化是将最新值从线下商店复制到网上商店的工作.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-943702ccbf7b1f65e330.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>实体,时间和TL</h3>
+<p>四个术语描述每个特征行:</p>
+<ul>
+<li>**Entity.**描述一个特征的关键,例如<code>user_id</code>或<code>card_id</code>现在,我们要去.</li>
+<li>**Event timestamp.**购买计数&quot;截至14日&quot;的时间表为14日.</li>
+<li>**Created timestamp.**系统编写了行时.今天运行的后填写时刻标记和新创建的时刻标记.</li>
+<li>**TTL (time to live).**值的最大年龄. 比TL较大的值被认为是缺失的,因此读者使用默认值.</li>
+</ul>
+<p>一组具有相同的实体,源和TTL的功能通常被称为功能视图.</p>
+<h3>时间点正确的结合</h3>
+<p>训练行对标签与标签时存在的特征值. 时点结合对每个标签进行这样:</p>
+<ol>
+<li>找出同一实体的特征行.</li>
+<li>保持活动时间标记在标签时间标记前或前的行列.</li>
+<li>接下来,我们要把最后一行.</li>
+<li>如果标签时间减其事件时间超过TTL,则放下.</li>
+</ol>
+<p>以下是一个用户,16日的标签,以及每周的功能行列:</p>
+<table>
+<thead>
+<tr>
+<th>Feature row day</th>
+<th><code>purchases_30d</code></th>
+<th>Point-in-time join</th>
+<th>Naive join on <code>user_id</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>7</td>
+<td>4</td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>14</td>
+<td>3</td>
+<td>Selected</td>
+<td></td>
+</tr>
+<tr>
+<td>21</td>
+<td>1</td>
+<td>Future</td>
+<td></td>
+</tr>
+<tr>
+<td>28</td>
+<td>0</td>
+<td>Future</td>
+<td>Selected</td>
+</tr>
+</tbody>
+</table>
+<p>标签问用户在17到46天购买什么东西吗.28日行已经计算了标签日后的安静的日子.它显示了0次购买,因为用户停止购买,这是标签测量的事件.天真的加入复制了答案到输入中.</p>
+<p>我们在时间系列课程中分类数据以时间为同样的原因.一个点在时间合并适用于每个行,而不是一个分点.</p>
+<h3>培训服务偏差的原因</h3>
+<p>谷歌机器学习规则定义了训练服务偏差,即训练期间的性能和服务期间的性能之间的差异.它们列出了三个原因:两个管道中的不同数据处理,训练和服务之间的数据变化和反循环.在功能管道中,四个具体原因一再出现:</p>
+<table>
+<thead>
+<tr>
+<th>Cause</th>
+<th>What happens</th>
+<th>Example from the demo</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Two code paths</td>
+<td>Training and serving compute the feature with different code</td>
+<td>The serving window includes day <code>now - 30</code>, and the training window does not</td>
+</tr>
+<tr>
+<td>Stale features</td>
+<td>The value that serving reads has a different age from the value that training used</td>
+<td>Training reads weekly snapshots, and a new service computes fresh values</td>
+</tr>
+<tr>
+<td>Different defaults</td>
+<td>The two paths fill a missing value differently</td>
+<td>Training uses 365 for &quot;no purchase yet&quot;, and serving uses -1</td>
+</tr>
+<tr>
+<td>Time travel</td>
+<td>Training reads a value from after the label time</td>
+<td>The naive join reads the newest snapshot for every label</td>
+</tr>
+</tbody>
+</table>
+<p>训练管道和服务管道之间,每当可能时,都应重复使用代码.</p>
+<h3>功能登记器</h3>
+<p>登记是特征定义的目录.每个条目包含一个名称,实体,源,转换,窗口,默认值,TTL,所有者,版本和描述.</p>
+<p>两条规则是安全的:</p>
+<ul>
+<li>任何服务都不会保存转换的私下副本.</li>
+<li>换个定义,就会产生一个新的版本.旧版本仍然存在,所以旧模型保留了他们训练的功能.</li>
+</ul>
+<h3>后面填料</h3>
+<p>一个新功能没有历史,但训练需要在每一个旧标签时间运行其价值.一个后填充程序运行每个过去日期的定义,并以每一个实体和日期写一行.每个运行只读取其日期或之前的时间标签的事件.</p>
+<p>后填料的成本计算是随着实体数量乘以日期数量的增加而增加的.它们还带来微妙的泄漏.今天运行的后填料会用旧事件时间印写行,但它可以读取迟到或后来纠正的数据.严格的时刻合并也检查创建的时间印是否在标签时间之前.</p>
+<h3>检测偏差</h3>
+<p>根据该指南的第29条规则,要在服务时间记录特征,并在训练中使用它们.即使是一个小的记录样本,也可以检查一致性.将每个记录的值与训练路径为同一实体和时间产生的值进行比较.对于每个特征,报告不匹配的比例和平均绝对差异.</p>
+<p>为了找到原因,比较三个对:</p>
+<ol>
+<li>网上商店阅读与训练合并. 这样测试整个系统,应该显示零偏差.</li>
+<li>计算与训练的新结合,这将使得停滞不前.</li>
+<li>另一条代码路径与新的计算. 这将隔离代码差异,如窗户和默认.</li>
+</ol>
+<figure><img src="/learn/ai-from-scratch/figures/figure-e167921ff32a0b305e7c.png" alt="mlprod-pit-join 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<p>编码在<code>code/main.py</code>时间是整数天.每周的一批工作写出7日,14日等,直到175天.</p>
+<h3>步骤1:功能定义和登记</h3>
+<p><code>FeatureDefinition</code>转换的数据:一个总体,一个窗口,一个默认.<code>compute</code>方法从来没有读到事件之后<code>as_of</code>现在,我们要去.</p>
+<pre><code class="language-python">@dataclass(frozen=True)
+class FeatureDefinition:
+    name: str
+    entity: str
+    aggregate: str
+    window_days: int | None
+    default: float
+    version: int = 1
+    owner: str = &quot;growth-team&quot;
+    description: str = &quot;&quot;
+
+    def compute(self, events: list[Event], as_of: int) -&gt; float:
+        visible = [e for e in events if e.day &lt;= as_of]
+        if self.window_days is not None:
+            visible = [e for e in visible if e.day &gt; as_of - self.window_days]
+        if self.aggregate == &quot;count&quot;:
+            return float(len(visible))
+        if self.aggregate == &quot;sum&quot;:
+            return round(sum(e.amount for e in visible), 2)
+        if self.aggregate == &quot;days_since_last&quot;:
+            return float(as_of - max(e.day for e in visible)) if visible else self.default
+        raise ValueError(f&quot;unknown aggregate {self.aggregate!r}&quot;)
+</code></pre>
+<p><code>FeatureRegistry.register</code>两次接受相同的定义,但拒绝使用相同名称和版本的不同的定义. <code>fill_defaults</code>给出两个路径相同的默认值.</p>
+<p>模型将定义附加在一个引用符上,例如<code>spend_30d@1</code>现在,我们要去.<code>compute</code>其他<code>fill_defaults</code>解决参考问题,并没有一个名字<code>@</code>阅读最新版本.<code>@</code>没有版本数量增加<code>ValueError</code>引用也是每个存储行中的关键,所以后填,在线商店和服务阅读都使用了固定定义.</p>
+<h3>步骤 2: 填写下载商店</h3>
+<pre><code class="language-python">def backfill(registry: FeatureRegistry, names: list[str], events: list[Event], days: list[int]) -&gt; list[FeatureRow]:
+    rows = []
+    for entity, entity_events in sorted(group_events(events).items()):
+        for day in days:
+            rows.append(FeatureRow(entity, day, registry.compute(names, entity_events, day)))
+    return rows
+</code></pre>
+<p>演示版在25天内为299用户提供了3个功能,</p>
+<h3>步骤3: 时间点合并</h3>
+<p>每天排序每一个实体的排行.<code>bisect_right</code>在标签日前或在标签日前找到最后一行.</p>
+<pre><code class="language-python">def point_in_time_join(labels: list[LabelRow], rows: list[FeatureRow], ttl_days: int | None = None) -&gt; list[JoinedRow]:
+    by_entity: dict[str, list[FeatureRow]] = defaultdict(list)
+    for row in rows:
+        by_entity[row.entity].append(row)
+    days_index = {}
+    for entity, entity_rows in by_entity.items():
+        entity_rows.sort(key=lambda r: r.day)
+        days_index[entity] = [r.day for r in entity_rows]
+    joined = []
+    for label in labels:
+        days = days_index.get(label.entity, [])
+        pos = bisect.bisect_right(days, label.day) - 1
+        match = by_entity[label.entity][pos] if pos &gt;= 0 else None
+        if match is not None and ttl_days is not None and label.day - match.day &gt; ttl_days:
+            match = None
+        joined.append(JoinedRow(
+            label.entity, label.day, label.label,
+            match.day if match else None, match.values if match else None,
+        ))
+    return joined
+</code></pre>
+<h3>步骤4:测量一个无明的结合的泄漏</h3>
+<p><code>naive_latest_join</code>演示程序在100,120和140天建立标签,并适用于每个训练集的单个功能规则.然后从145天开始,它对标签进行了测试,并具有点-in-time功能:</p>
+<pre><code class="language-console">  naive join used a snapshot from after the label day for 100% of rows
+  offline accuracy, naive join: 0.948 (rule: idle &gt; 53 days)
+  offline accuracy, PIT join:   0.893 (rule: idle &gt; 19 days)
+  accuracy on day 145, trained with naive join: 0.763
+  accuracy on day 145, trained with PIT join:   0.876
+</code></pre>
+<p>简单的结合在线看起来更好,0.948比0.893. 在新的数据上,情况更糟,0.763比0.876.</p>
+<h3>步骤5:在线商店和物质化</h3>
+<p>网上商店每一个实体都保留一个行,拒绝超过TL的行. <code>materialize</code>只有在工作时间或之前的行.</p>
+<pre><code class="language-python">class OnlineStore:
+    def __init__(self, ttl_days: int):
+        self.ttl_days = ttl_days
+        self._latest: dict[str, FeatureRow] = {}
+
+    def write(self, row: FeatureRow) -&gt; None:
+        current = self._latest.get(row.entity)
+        if current is None or row.day &gt;= current.day:
+            self._latest[row.entity] = row
+
+    def read(self, entity: str, now: int) -&gt; dict[str, float] | None:
+        row = self._latest.get(entity)
+        if row is None or row.day &gt; now or now - row.day &gt; self.ttl_days:
+            return None
+        return dict(row.values)
+</code></pre>
+<p>通过10天的TTL,145天的读取返回了140天的行. 160天的读取,没有新的物质化,返回了默认的,因为行已经20天了.</p>
+<h3>步骤 6: 偏向检查</h3>
+<p><code>detect_skew</code>分析了两种观点<code>(entity, day)</code>报告不匹配率和每个特征的平均绝对差异,并标记一个特征,当超过1%的值不同时.<code>ValueError</code>错失请求可以隐藏偏差,而没有请求的检查显示没有什么.</p>
+<pre><code class="language-python">def detect_skew(
+    training: dict[tuple[str, int], dict[str, float]],
+    serving: dict[tuple[str, int], dict[str, float]],
+    features: list[str],
+    tolerance: float = 1e-6,
+    max_mismatch_rate: float = 0.01,
+) -&gt; list[SkewReport]:
+    if set(training) != set(serving):
+        raise ValueError(f&quot;{len(set(training) ^ set(serving))} keys are in only one view: log and compare the same requests&quot;)
+    if not training:
+        raise ValueError(&quot;no requests to compare&quot;)
+    keys = sorted(training)
+    reports = []
+    for feature in features:
+        diffs = [abs(training[k][feature] - serving[k][feature]) for k in keys]
+        mismatches = sum(1 for d in diffs if d &gt; tolerance)
+        rate = mismatches / len(keys)
+        mean_diff = sum(diffs) / len(keys)
+        reports.append(SkewReport(feature, len(keys), rate, mean_diff, rate &gt; max_mismatch_rate))
+    return reports
+</code></pre>
+<p>演示记录141到150天的请求,并从概念部分进行三个比较. 请求库包括没有历史的20名新用户.</p>
+<pre><code class="language-bash">python3 code/main.py
+</code></pre>
+<pre><code class="language-console">=== Skew checks on 383 logged requests, days 141 to 150 ===
+  online store read  vs  training join (one definition, same snapshots)
+    ok   days_since_last_purchase   mismatch   0.0%  mean |diff|    0.00
+    ok   purchases_30d              mismatch   0.0%  mean |diff|    0.00
+    ok   spend_30d                  mismatch   0.0%  mean |diff|    0.00
+  fresh compute      vs  training join (staleness only)
+    SKEW days_since_last_purchase   mismatch  83.0%  mean |diff|    2.77
+    SKEW purchases_30d              mismatch  30.5%  mean |diff|    0.38
+    SKEW spend_30d                  mismatch  37.1%  mean |diff|   16.77
+  second code path   vs  fresh compute (code differences only)
+    SKEW days_since_last_purchase   mismatch   5.5%  mean |diff|   20.07
+    SKEW purchases_30d              mismatch  12.5%  mean |diff|    0.13
+    SKEW spend_30d                  mismatch  12.5%  mean |diff|    5.09
+</code></pre>
+<p>阅读三个块的顺序:</p>
+<ul>
+<li>**One definition, same snapshots.**网上商店和训练组合读出相同的物质化行,所以偏差是零.</li>
+<li>**Staleness.**更新数据在此并不自动更好,因为模型从6天以前的值中学习.</li>
+<li>**Code differences.**由于其窗口包括一个额外的天,第二个代码路径在12.5%的窗口数量上不同.<code>days_since_last_purchase</code>只有新用户,但大量:1对365.</li>
+</ul>
+<h2>用它</h2>
+<p>节日是一个开源功能商店.从零开始的每个代码都有节日对应:</p>
+<table>
+<thead>
+<tr>
+<th>From scratch</th>
+<th>Feast</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>FeatureDefinition</code>, <code>FeatureRegistry</code></td>
+<td><code>Entity</code>, <code>FeatureView</code>, and <code>Field</code> in a feature repository, registered with <code>feast apply</code></td>
+</tr>
+<tr>
+<td><code>FeatureRow</code> history</td>
+<td>An offline store, for example a <code>FileSource</code> over Parquet files or a warehouse table</td>
+</tr>
+<tr>
+<td><code>point_in_time_join</code> with a TTL</td>
+<td><code>store.get_historical_features(entity_df=..., features=[...])</code></td>
+</tr>
+<tr>
+<td><code>materialize</code></td>
+<td><code>feast materialize-incremental &lt;end time&gt;</code></td>
+</tr>
+<tr>
+<td><code>OnlineStore.read</code></td>
+<td><code>store.get_online_features(features=[...], entity_rows=[...])</code></td>
+</tr>
+<tr>
+<td>Created timestamp check</td>
+<td><code>created_timestamp_column</code> on the source and <code>filter_by_created_timestamp=True</code></td>
+</tr>
+</tbody>
+</table>
+<p>代码是按照节日快速启动的,</p>
+<pre><code class="language-python">from datetime import timedelta
+
+from feast import Entity, FeatureView, Field, FileSource
+from feast.types import Float32, Int64
+
+user = Entity(name=&quot;user&quot;, join_keys=[&quot;user_id&quot;])
+
+user_activity_source = FileSource(
+    name=&quot;user_activity_source&quot;,
+    path=&quot;data/user_activity.parquet&quot;,
+    timestamp_field=&quot;event_timestamp&quot;,
+    created_timestamp_column=&quot;created&quot;,
+)
+
+user_activity = FeatureView(
+    name=&quot;user_activity&quot;,
+    entities=[user],
+    ttl=timedelta(days=10),
+    schema=[
+        Field(name=&quot;purchases_30d&quot;, dtype=Int64),
+        Field(name=&quot;spend_30d&quot;, dtype=Float32),
+        Field(name=&quot;days_since_last_purchase&quot;, dtype=Int64),
+    ],
+    source=user_activity_source,
+)
+</code></pre>
+<p>训练和服务,然后读出相同的功能视图:</p>
+<pre><code class="language-python">from feast import FeatureStore
+
+store = FeatureStore(repo_path=&quot;.&quot;)
+
+training_df = store.get_historical_features(
+    entity_df=labels_df,
+    features=[&quot;user_activity:purchases_30d&quot;, &quot;user_activity:days_since_last_purchase&quot;],
+    filter_by_created_timestamp=True,
+).to_df()
+
+online = store.get_online_features(
+    features=[&quot;user_activity:purchases_30d&quot;, &quot;user_activity:days_since_last_purchase&quot;],
+    entity_rows=[{&quot;user_id&quot;: 42}],
+).to_dict()
+</code></pre>
+<p><code>labels_df</code>标签每行一个行<code>user_id</code>现在<code>event_timestamp</code>节日文档指出,TTL与实体数据框架中的每个时间相对,而不是查询时间. 这与TTL检查相匹配.<code>point_in_time_join</code>同一页描述了<code>filter_by_created_timestamp=True</code>没有任何离线商店都支持这种选项.一个没有支持的商店会导致错误,而不是忽略选项.</p>
+<p>对于偏差检查,Texon,Hopsworks和大型云ML平台的功能商店使用了离线和在线商店之间的相同分区.TensorFlow数据验证可以比较训练数据与服务数据来检测偏差.Break等描述了谷歌端到端ML平台的TFX数据验证系统,包括训练服务偏差.</p>
+<h2>运送它</h2>
+<p>这一课产生了<code>outputs/skill-feature-skew-audit.md</code>技能审计对时间旅行和训练服务的偏差的功能管道. 它通过连接,定义,默认,每个路径的新鲜性和偏差检查所需的记录.</p>
+<h2>运动</h2>
+<ol>
+<li>改变快照间隔从7天到1天,再进行延迟比较,并解释结果.</li>
+<li>设置TTL为3天, 计算失效的训练行列,</li>
+<li>添加一个创建日<code>FeatureRow</code>让连接忽略标签日后写的行.</li>
+<li>登记<code>spend_7d</code>作为版本2<code>spend_30d</code>填写后,打印出两种版本.</li>
+<li>修复<code>legacy_serving_features</code>在第三个偏差检查通过之前.</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Feature store</td>
+<td>&quot;A database for features&quot;</td>
+<td>A system that computes features from one set of definitions and serves them to training and to serving</td>
+</tr>
+<tr>
+<td>Offline store</td>
+<td>&quot;The training data&quot;</td>
+<td>Full feature history with event timestamps, read by training jobs and backfills</td>
+</tr>
+<tr>
+<td>Online store</td>
+<td>&quot;The feature cache&quot;</td>
+<td>The latest value per entity, read by the serving path in milliseconds</td>
+</tr>
+<tr>
+<td>Entity</td>
+<td>&quot;The ID&quot;</td>
+<td>The key that a feature describes, such as a user or a card</td>
+</tr>
+<tr>
+<td>Event timestamp</td>
+<td>&quot;When it happened&quot;</td>
+<td>The time at which a feature value became true</td>
+</tr>
+<tr>
+<td>Point-in-time join</td>
+<td>&quot;An as-of join&quot;</td>
+<td>A join that pairs each label with the latest feature row at or before the label time</td>
+</tr>
+<tr>
+<td>TTL</td>
+<td>&quot;Expiry&quot;</td>
+<td>The maximum age of a feature value before a reader treats it as missing</td>
+</tr>
+<tr>
+<td>Materialization</td>
+<td>&quot;Syncing to online&quot;</td>
+<td>The job that copies the latest feature values from the offline store to the online store</td>
+</tr>
+<tr>
+<td>Backfill</td>
+<td>&quot;Computing history&quot;</td>
+<td>Running a feature definition at past dates to create its history</td>
+</tr>
+<tr>
+<td>Training-serving skew</td>
+<td>&quot;It worked offline&quot;</td>
+<td>A difference between the features or behavior in training and in serving</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://docs.feast.dev/getting-started/concepts/point-in-time-joins" rel="noreferrer" data-network="true">Feast, Point-in-time joins <small>↗ 需要联网</small></a>: TTL语义和创建的时刻标签过器</li>
+<li><a href="https://docs.feast.dev/" rel="noreferrer" data-network="true">Feast documentation <small>↗ 需要联网</small></a>:功能查看,离线商店,在线商店,以及现实化</li>
+<li><a href="https://developers.google.com/machine-learning/guides/rules-of-ml" rel="noreferrer" data-network="true">Google, Rules of Machine Learning <small>↗ 需要联网</small></a>根据&quot;教育&quot;规则,从29条到37条</li>
+<li><a href="https://research.google/pubs/data-validation-for-machine-learning/" rel="noreferrer" data-network="true">Breck et al., Data Validation for Machine Learning (SysML 2019) <small>↗ 需要联网</small></a>:谷歌的数据验证,包括提供培训的偏差</li>
+<li><a href="https://www.tensorflow.org/tfx/guide/tfdv" rel="noreferrer" data-network="true">TensorFlow Data Validation guide <small>↗ 需要联网</small></a>: 方案检查,偏差检测和漂移检测</li>
+<li><a href="https://papers.nips.cc/paper/2015/hash/86df7dcfd896fcaf2674f757a2463eba-Abstract.html" rel="noreferrer" data-network="true">Sculley et al., Hidden Technical Debt in Machine Learning Systems (NeurIPS 2015) <small>↗ 需要联网</small></a>:数据依赖性和模型周围的管道债务</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Feature Stores and Training-Serving Skew</h1>
+<blockquote>
+<p>A feature has one definition and two readers. Training reads its history as of each label time, and serving reads its latest value. When the two readers disagree, the model sees inputs that it never trained on.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 2, Lessons 08 (Feature Engineering), 13 (ML Pipelines), 15 (Time Series), and 19 (ML System Design)
+<strong>Time:</strong> ~100 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Describe the offline store, the online store, entities, event timestamps, and TTLs, and the job of each one</li>
+<li>Implement a point-in-time correct join and show how a naive join copies future values into training data</li>
+<li>Name four causes of training-serving skew: two code paths, stale features, different defaults, and time travel</li>
+<li>Build a feature registry in which one definition feeds both the training path and the serving path</li>
+<li>Backfill a new feature over past dates without reading data from after each date</li>
+<li>Detect skew by comparing logged serving features with the training path for the same entity and time</li>
+</ul>
+<h2>The Problem</h2>
+<p>A team builds a churn model. Each label says whether a user made no purchase in the 30 days after a label day. The team joins the labels to the user feature table on <code>user_id</code> and trains a rule on <code>days_since_last_purchase</code>. Offline accuracy is 0.948.</p>
+<p>On live traffic, the model does worse than an older and simpler version. The feature table held the newest value for each user, from weeks after the label days. A user whose last purchase was on day 115 showed 60 idle days in the day 175 snapshot, so the feature contained the answer. Meanwhile, another team wrote the serving features again in a different service. Their 30-day window included one extra day, and their default for a new user was -1 instead of 365.</p>
+<p>Both defects have the same cause. Training and serving computed &quot;the same feature&quot; in two different ways. This lesson builds the pieces of a feature store from scratch. You write a registry, a backfill, a point-in-time join, an online store with a TTL, and a skew check. The demo reproduces both defects with numbers.</p>
+<h2>The Concept</h2>
+<h3>Two readers of the same feature</h3>
+<p>Training and serving ask for features in different shapes:</p>
+<table>
+<thead>
+<tr>
+<th>Property</th>
+<th>Training (offline)</th>
+<th>Serving (online)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Question</td>
+<td>&quot;What was the value for each of 10 million (entity, time) pairs?&quot;</td>
+<td>&quot;What is the value for this one entity now?&quot;</td>
+</tr>
+<tr>
+<td>Time</td>
+<td>Many points in the past</td>
+<td>The present</td>
+</tr>
+<tr>
+<td>Volume</td>
+<td>Millions of rows per job</td>
+<td>One row per request</td>
+</tr>
+<tr>
+<td>Latency</td>
+<td>Minutes are fine</td>
+<td>A few milliseconds</td>
+</tr>
+<tr>
+<td>Storage</td>
+<td>Offline store: full history with timestamps, in columnar files or a warehouse</td>
+<td>Online store: the latest value per entity, in a key-value database</td>
+</tr>
+</tbody>
+</table>
+<p>A feature store keeps both stores filled from one set of feature definitions. Materialization is the job that copies the latest values from the offline store to the online store.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-943702ccbf7b1f65e330.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>Entities, timestamps, and TTL</h3>
+<p>Four terms describe every feature row:</p>
+<ul>
+<li><strong>Entity.</strong> The key that a feature describes, such as <code>user_id</code> or <code>card_id</code>.</li>
+<li><strong>Event timestamp.</strong> The time at which the value became true. A purchase count &quot;as of day 14&quot; has the event timestamp day 14.</li>
+<li><strong>Created timestamp.</strong> The time at which the system wrote the row. A backfill that runs today writes rows with old event timestamps and a new created timestamp.</li>
+<li><strong>TTL (time to live).</strong> The maximum age of a value. A value older than the TTL counts as missing, so the reader uses the default.</li>
+</ul>
+<p>A group of features with the same entity, source, and TTL is often called a feature view.</p>
+<h3>Point-in-time correct joins</h3>
+<p>A training row pairs a label with the feature values that existed at the label time. The point-in-time join does this for each label:</p>
+<ol>
+<li>Find the feature rows of the same entity.</li>
+<li>Keep the rows whose event timestamp is at or before the label timestamp.</li>
+<li>Take the latest of those rows.</li>
+<li>Drop it if the label timestamp minus its event timestamp is more than the TTL.</li>
+</ol>
+<p>Here is one user, a label at day 16, and weekly feature rows:</p>
+<table>
+<thead>
+<tr>
+<th>Feature row day</th>
+<th><code>purchases_30d</code></th>
+<th>Point-in-time join</th>
+<th>Naive join on <code>user_id</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>7</td>
+<td>4</td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>14</td>
+<td>3</td>
+<td>Selected</td>
+<td></td>
+</tr>
+<tr>
+<td>21</td>
+<td>1</td>
+<td>Future</td>
+<td></td>
+</tr>
+<tr>
+<td>28</td>
+<td>0</td>
+<td>Future</td>
+<td>Selected</td>
+</tr>
+</tbody>
+</table>
+<p>The label asks whether the user buys anything in days 17 to 46. The day 28 row already counts the quiet days after the label day. It shows 0 purchases because the user stopped buying, which is the event that the label measures. The naive join copies the answer into the input.</p>
+<p>We split data by time in the time-series lesson for the same reason. A point-in-time join applies that rule to every row instead of to one split point.</p>
+<h3>Causes of training-serving skew</h3>
+<p>Google's Rules of Machine Learning define training-serving skew as a difference between performance during training and performance during serving. They name three causes: different data handling in the two pipelines, a change in the data between training and serving, and a feedback loop. In feature pipelines, four concrete causes appear again and again:</p>
+<table>
+<thead>
+<tr>
+<th>Cause</th>
+<th>What happens</th>
+<th>Example from the demo</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Two code paths</td>
+<td>Training and serving compute the feature with different code</td>
+<td>The serving window includes day <code>now - 30</code>, and the training window does not</td>
+</tr>
+<tr>
+<td>Stale features</td>
+<td>The value that serving reads has a different age from the value that training used</td>
+<td>Training reads weekly snapshots, and a new service computes fresh values</td>
+</tr>
+<tr>
+<td>Different defaults</td>
+<td>The two paths fill a missing value differently</td>
+<td>Training uses 365 for &quot;no purchase yet&quot;, and serving uses -1</td>
+</tr>
+<tr>
+<td>Time travel</td>
+<td>Training reads a value from after the label time</td>
+<td>The naive join reads the newest snapshot for every label</td>
+</tr>
+</tbody>
+</table>
+<p>Rule #32 of the same guide says to reuse code between the training pipeline and the serving pipeline whenever possible. A feature store follows that rule with one definition that both paths call.</p>
+<h3>A feature registry</h3>
+<p>The registry is the catalog of feature definitions. Each entry holds a name, an entity, a source, a transformation, a window, a default value, a TTL, an owner, a version, and a description.</p>
+<p>Two rules keep it safe:</p>
+<ul>
+<li>Both paths read the definition from the registry. No service keeps a private copy of the transformation.</li>
+<li>A change to a definition creates a new version. The old version stays, so old models keep the feature that they trained on.</li>
+</ul>
+<h3>Backfills</h3>
+<p>A new feature has no history, but training needs its value at every old label time. A backfill runs the definition at each past date and writes one row per entity and date. Each run reads only the events with timestamps at or before its date.</p>
+<p>Backfills cost compute that grows with the number of entities times the number of dates. They also bring a subtle leak. A backfill that runs today writes rows with old event timestamps, but it can read data that arrived late or was corrected later. A strict point-in-time join also checks that the created timestamp is at or before the label time.</p>
+<h3>Detecting skew</h3>
+<p>Rule #29 of the same guide says to log the features at serving time and use them in training. Even a small logged sample lets you check consistency. Compare each logged value with the value that the training path produces for the same entity and time. For each feature, report the share of mismatches and the mean absolute difference.</p>
+<p>To find the cause, compare three pairs:</p>
+<ol>
+<li>Online store read versus training join. This tests the whole system and should show zero skew.</li>
+<li>Fresh computation versus training join. This isolates staleness.</li>
+<li>Second code path versus fresh computation. This isolates code differences, such as windows and defaults.</li>
+</ol>
+<figure><img src="/learn/ai-from-scratch/figures/figure-e167921ff32a0b305e7c.png" alt="mlprod-pit-join 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<p>The code in <code>code/main.py</code> uses only the standard library. Time is a whole number of days. A weekly batch job writes feature snapshots on days 7, 14, and so on up to 175.</p>
+<h3>Step 1: Feature definitions and the registry</h3>
+<p>A <code>FeatureDefinition</code> holds the transformation as data: an aggregate, a window, and a default. Its <code>compute</code> method never reads events after <code>as_of</code>.</p>
+<pre><code class="language-python">@dataclass(frozen=True)
+class FeatureDefinition:
+    name: str
+    entity: str
+    aggregate: str
+    window_days: int | None
+    default: float
+    version: int = 1
+    owner: str = &quot;growth-team&quot;
+    description: str = &quot;&quot;
+
+    def compute(self, events: list[Event], as_of: int) -&gt; float:
+        visible = [e for e in events if e.day &lt;= as_of]
+        if self.window_days is not None:
+            visible = [e for e in visible if e.day &gt; as_of - self.window_days]
+        if self.aggregate == &quot;count&quot;:
+            return float(len(visible))
+        if self.aggregate == &quot;sum&quot;:
+            return round(sum(e.amount for e in visible), 2)
+        if self.aggregate == &quot;days_since_last&quot;:
+            return float(as_of - max(e.day for e in visible)) if visible else self.default
+        raise ValueError(f&quot;unknown aggregate {self.aggregate!r}&quot;)
+</code></pre>
+<p><code>FeatureRegistry.register</code> accepts the same definition twice, but it rejects a different definition with the same name and version. <code>fill_defaults</code> gives both paths the same default for a missing value.</p>
+<p>A model pins a definition with a reference such as <code>spend_30d@1</code>. <code>compute</code> and <code>fill_defaults</code> resolve the reference, and a name without <code>@</code> reads the latest version. A reference with <code>@</code> and no version number raises <code>ValueError</code>, so a typo cannot read the latest version without a warning. The reference is also the key in each stored row, so the backfill, the online store, and the serving read all use the pinned definition.</p>
+<h3>Step 2: Backfill the offline store</h3>
+<pre><code class="language-python">def backfill(registry: FeatureRegistry, names: list[str], events: list[Event], days: list[int]) -&gt; list[FeatureRow]:
+    rows = []
+    for entity, entity_events in sorted(group_events(events).items()):
+        for day in days:
+            rows.append(FeatureRow(entity, day, registry.compute(names, entity_events, day)))
+    return rows
+</code></pre>
+<p>The demo backfills three features for 299 users on 25 snapshot days, which gives 7475 rows.</p>
+<h3>Step 3: The point-in-time join</h3>
+<p>Sort each entity's rows by day once. For each label, <code>bisect_right</code> finds the last row at or before the label day. The TTL check drops a row that is too old.</p>
+<pre><code class="language-python">def point_in_time_join(labels: list[LabelRow], rows: list[FeatureRow], ttl_days: int | None = None) -&gt; list[JoinedRow]:
+    by_entity: dict[str, list[FeatureRow]] = defaultdict(list)
+    for row in rows:
+        by_entity[row.entity].append(row)
+    days_index = {}
+    for entity, entity_rows in by_entity.items():
+        entity_rows.sort(key=lambda r: r.day)
+        days_index[entity] = [r.day for r in entity_rows]
+    joined = []
+    for label in labels:
+        days = days_index.get(label.entity, [])
+        pos = bisect.bisect_right(days, label.day) - 1
+        match = by_entity[label.entity][pos] if pos &gt;= 0 else None
+        if match is not None and ttl_days is not None and label.day - match.day &gt; ttl_days:
+            match = None
+        joined.append(JoinedRow(
+            label.entity, label.day, label.label,
+            match.day if match else None, match.values if match else None,
+        ))
+    return joined
+</code></pre>
+<h3>Step 4: Measure the leak from a naive join</h3>
+<p><code>naive_latest_join</code> joins on the entity only, so it returns the newest row for every label. The demo builds labels on days 100, 120, and 140 and fits a one-feature rule on each training set. It then tests both rules on labels from day 145, with point-in-time features:</p>
+<pre><code class="language-console">  naive join used a snapshot from after the label day for 100% of rows
+  offline accuracy, naive join: 0.948 (rule: idle &gt; 53 days)
+  offline accuracy, PIT join:   0.893 (rule: idle &gt; 19 days)
+  accuracy on day 145, trained with naive join: 0.763
+  accuracy on day 145, trained with PIT join:   0.876
+</code></pre>
+<p>The naive join looks better offline, 0.948 against 0.893. On new data it is worse, 0.763 against 0.876. The leaked feature moved the fitted threshold from 19 to 53 idle days.</p>
+<h3>Step 5: The online store and materialization</h3>
+<p>The online store keeps one row per entity and refuses rows older than the TTL. <code>materialize</code> writes only rows whose day is at or before the job time.</p>
+<pre><code class="language-python">class OnlineStore:
+    def __init__(self, ttl_days: int):
+        self.ttl_days = ttl_days
+        self._latest: dict[str, FeatureRow] = {}
+
+    def write(self, row: FeatureRow) -&gt; None:
+        current = self._latest.get(row.entity)
+        if current is None or row.day &gt;= current.day:
+            self._latest[row.entity] = row
+
+    def read(self, entity: str, now: int) -&gt; dict[str, float] | None:
+        row = self._latest.get(entity)
+        if row is None or row.day &gt; now or now - row.day &gt; self.ttl_days:
+            return None
+        return dict(row.values)
+</code></pre>
+<p>With a TTL of 10 days, a read on day 145 returns the day 140 row. A read on day 160, with no new materialization, returns the defaults, because the row is 20 days old.</p>
+<h3>Step 6: The skew check</h3>
+<p><code>detect_skew</code> compares two views keyed by <code>(entity, day)</code>. It reports the mismatch rate and the mean absolute difference per feature and flags a feature when more than 1 percent of values differ. It raises <code>ValueError</code> when the two views have different keys or no keys. A missing request can hide skew, and a check with no requests shows nothing.</p>
+<pre><code class="language-python">def detect_skew(
+    training: dict[tuple[str, int], dict[str, float]],
+    serving: dict[tuple[str, int], dict[str, float]],
+    features: list[str],
+    tolerance: float = 1e-6,
+    max_mismatch_rate: float = 0.01,
+) -&gt; list[SkewReport]:
+    if set(training) != set(serving):
+        raise ValueError(f&quot;{len(set(training) ^ set(serving))} keys are in only one view: log and compare the same requests&quot;)
+    if not training:
+        raise ValueError(&quot;no requests to compare&quot;)
+    keys = sorted(training)
+    reports = []
+    for feature in features:
+        diffs = [abs(training[k][feature] - serving[k][feature]) for k in keys]
+        mismatches = sum(1 for d in diffs if d &gt; tolerance)
+        rate = mismatches / len(keys)
+        mean_diff = sum(diffs) / len(keys)
+        reports.append(SkewReport(feature, len(keys), rate, mean_diff, rate &gt; max_mismatch_rate))
+    return reports
+</code></pre>
+<p>The demo logs requests on days 141 to 150 and runs the three comparisons from the concept section. The request pool includes 20 new users with no history.</p>
+<pre><code class="language-bash">python3 code/main.py
+</code></pre>
+<pre><code class="language-console">=== Skew checks on 383 logged requests, days 141 to 150 ===
+  online store read  vs  training join (one definition, same snapshots)
+    ok   days_since_last_purchase   mismatch   0.0%  mean |diff|    0.00
+    ok   purchases_30d              mismatch   0.0%  mean |diff|    0.00
+    ok   spend_30d                  mismatch   0.0%  mean |diff|    0.00
+  fresh compute      vs  training join (staleness only)
+    SKEW days_since_last_purchase   mismatch  83.0%  mean |diff|    2.77
+    SKEW purchases_30d              mismatch  30.5%  mean |diff|    0.38
+    SKEW spend_30d                  mismatch  37.1%  mean |diff|   16.77
+  second code path   vs  fresh compute (code differences only)
+    SKEW days_since_last_purchase   mismatch   5.5%  mean |diff|   20.07
+    SKEW purchases_30d              mismatch  12.5%  mean |diff|    0.13
+    SKEW spend_30d                  mismatch  12.5%  mean |diff|    5.09
+</code></pre>
+<p>Read the three blocks in order:</p>
+<ul>
+<li><strong>One definition, same snapshots.</strong> The online store and the training join read the same materialized rows, so skew is zero.</li>
+<li><strong>Staleness.</strong> A fresh value differs from the weekly snapshot on most requests. Fresher data is not automatically better here, because the model learned from values up to six days old.</li>
+<li><strong>Code differences.</strong> The second code path differs on 12.5 percent of window counts, because its window includes one extra day. It differs on <code>days_since_last_purchase</code> for new users only, but by a large amount: -1 against 365.</li>
+</ul>
+<h2>Use It</h2>
+<p>Feast is an open-source feature store. Each piece of the from-scratch code has a Feast counterpart:</p>
+<table>
+<thead>
+<tr>
+<th>From scratch</th>
+<th>Feast</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>FeatureDefinition</code>, <code>FeatureRegistry</code></td>
+<td><code>Entity</code>, <code>FeatureView</code>, and <code>Field</code> in a feature repository, registered with <code>feast apply</code></td>
+</tr>
+<tr>
+<td><code>FeatureRow</code> history</td>
+<td>An offline store, for example a <code>FileSource</code> over Parquet files or a warehouse table</td>
+</tr>
+<tr>
+<td><code>point_in_time_join</code> with a TTL</td>
+<td><code>store.get_historical_features(entity_df=..., features=[...])</code></td>
+</tr>
+<tr>
+<td><code>materialize</code></td>
+<td><code>feast materialize-incremental &lt;end time&gt;</code></td>
+</tr>
+<tr>
+<td><code>OnlineStore.read</code></td>
+<td><code>store.get_online_features(features=[...], entity_rows=[...])</code></td>
+</tr>
+<tr>
+<td>Created timestamp check</td>
+<td><code>created_timestamp_column</code> on the source and <code>filter_by_created_timestamp=True</code></td>
+</tr>
+</tbody>
+</table>
+<p>The definitions look like this. The code follows the Feast quickstart and is not needed to run this lesson.</p>
+<pre><code class="language-python">from datetime import timedelta
+
+from feast import Entity, FeatureView, Field, FileSource
+from feast.types import Float32, Int64
+
+user = Entity(name=&quot;user&quot;, join_keys=[&quot;user_id&quot;])
+
+user_activity_source = FileSource(
+    name=&quot;user_activity_source&quot;,
+    path=&quot;data/user_activity.parquet&quot;,
+    timestamp_field=&quot;event_timestamp&quot;,
+    created_timestamp_column=&quot;created&quot;,
+)
+
+user_activity = FeatureView(
+    name=&quot;user_activity&quot;,
+    entities=[user],
+    ttl=timedelta(days=10),
+    schema=[
+        Field(name=&quot;purchases_30d&quot;, dtype=Int64),
+        Field(name=&quot;spend_30d&quot;, dtype=Float32),
+        Field(name=&quot;days_since_last_purchase&quot;, dtype=Int64),
+    ],
+    source=user_activity_source,
+)
+</code></pre>
+<p>Training and serving then read the same feature view:</p>
+<pre><code class="language-python">from feast import FeatureStore
+
+store = FeatureStore(repo_path=&quot;.&quot;)
+
+training_df = store.get_historical_features(
+    entity_df=labels_df,
+    features=[&quot;user_activity:purchases_30d&quot;, &quot;user_activity:days_since_last_purchase&quot;],
+    filter_by_created_timestamp=True,
+).to_df()
+
+online = store.get_online_features(
+    features=[&quot;user_activity:purchases_30d&quot;, &quot;user_activity:days_since_last_purchase&quot;],
+    entity_rows=[{&quot;user_id&quot;: 42}],
+).to_dict()
+</code></pre>
+<p><code>labels_df</code> holds one row per label with <code>user_id</code>, <code>event_timestamp</code>, and the label. The Feast documentation states that the TTL is relative to each timestamp in the entity dataframe, not to the time of the query. That matches the TTL check in <code>point_in_time_join</code>. The same page describes <code>filter_by_created_timestamp=True</code>, which keeps backfilled values from leaking into training data. Not every offline store supports this option. A store without support raises an error instead of ignoring the option.</p>
+<p>Tecton, Hopsworks, and the feature stores in the large cloud ML platforms use the same split between offline and online stores. For the skew check, TensorFlow Data Validation can compare training data with serving data to detect skew. Breck et al. describe the data validation system in TFX, Google's end-to-end ML platform, including training-serving skew.</p>
+<h2>Ship It</h2>
+<p>This lesson produces <code>outputs/skill-feature-skew-audit.md</code>. The skill audits a feature pipeline for time travel and training-serving skew. It walks through the join, the definitions, the defaults, the freshness of each path, and the logging that a skew check needs.</p>
+<h2>Exercises</h2>
+<ol>
+<li>Change the snapshot interval from 7 days to 1 day. Rerun the staleness comparison and explain the result.</li>
+<li>Set the TTL to 3 days. Count the training rows that lose their features and get defaults.</li>
+<li>Add a created day to <code>FeatureRow</code>. Make the join ignore rows written after the label day.</li>
+<li>Register <code>spend_7d</code> as version 2 of <code>spend_30d</code>. Backfill it and print both versions from the registry.</li>
+<li>Fix <code>legacy_serving_features</code> until the third skew check passes. List each change.</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Feature store</td>
+<td>&quot;A database for features&quot;</td>
+<td>A system that computes features from one set of definitions and serves them to training and to serving</td>
+</tr>
+<tr>
+<td>Offline store</td>
+<td>&quot;The training data&quot;</td>
+<td>Full feature history with event timestamps, read by training jobs and backfills</td>
+</tr>
+<tr>
+<td>Online store</td>
+<td>&quot;The feature cache&quot;</td>
+<td>The latest value per entity, read by the serving path in milliseconds</td>
+</tr>
+<tr>
+<td>Entity</td>
+<td>&quot;The ID&quot;</td>
+<td>The key that a feature describes, such as a user or a card</td>
+</tr>
+<tr>
+<td>Event timestamp</td>
+<td>&quot;When it happened&quot;</td>
+<td>The time at which a feature value became true</td>
+</tr>
+<tr>
+<td>Point-in-time join</td>
+<td>&quot;An as-of join&quot;</td>
+<td>A join that pairs each label with the latest feature row at or before the label time</td>
+</tr>
+<tr>
+<td>TTL</td>
+<td>&quot;Expiry&quot;</td>
+<td>The maximum age of a feature value before a reader treats it as missing</td>
+</tr>
+<tr>
+<td>Materialization</td>
+<td>&quot;Syncing to online&quot;</td>
+<td>The job that copies the latest feature values from the offline store to the online store</td>
+</tr>
+<tr>
+<td>Backfill</td>
+<td>&quot;Computing history&quot;</td>
+<td>Running a feature definition at past dates to create its history</td>
+</tr>
+<tr>
+<td>Training-serving skew</td>
+<td>&quot;It worked offline&quot;</td>
+<td>A difference between the features or behavior in training and in serving</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://docs.feast.dev/getting-started/concepts/point-in-time-joins" rel="noreferrer" data-network="true">Feast, Point-in-time joins <small>↗ 需要联网</small></a>: TTL semantics and the created timestamp filter</li>
+<li><a href="https://docs.feast.dev/" rel="noreferrer" data-network="true">Feast documentation <small>↗ 需要联网</small></a>: feature views, offline stores, online stores, and materialization</li>
+<li><a href="https://developers.google.com/machine-learning/guides/rules-of-ml" rel="noreferrer" data-network="true">Google, Rules of Machine Learning <small>↗ 需要联网</small></a>: the training-serving skew rules, from Rule #29 to Rule #37</li>
+<li><a href="https://research.google/pubs/data-validation-for-machine-learning/" rel="noreferrer" data-network="true">Breck et al., Data Validation for Machine Learning (SysML 2019) <small>↗ 需要联网</small></a>: data validation at Google, including training-serving skew</li>
+<li><a href="https://www.tensorflow.org/tfx/guide/tfdv" rel="noreferrer" data-network="true">TensorFlow Data Validation guide <small>↗ 需要联网</small></a>: schema checks, skew detection, and drift detection</li>
+<li><a href="https://papers.nips.cc/paper/2015/hash/86df7dcfd896fcaf2674f757a2463eba-Abstract.html" rel="noreferrer" data-network="true">Sculley et al., Hidden Technical Debt in Machine Learning Systems (NeurIPS 2015) <small>↗ 需要联网</small></a>: data dependencies and pipeline debt around a model</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-02-ml-fundamentals--21-feature-stores-and-training-serving-skew.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-02-ml-fundamentals--21-feature-stores-and-training-serving-skew.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/02-ml-fundamentals/21-feature-stores-and-training-serving-skew/code/main.py">phases/02-ml-fundamentals/21-feature-stores-and-training-serving-skew/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;A feature store from scratch: registry, backfill, point-in-time join, online store, skew check.
+
+Lesson: phases/02-ml-fundamentals/21-feature-stores-and-training-serving-skew/docs/en.md
+Time is a whole number of days. Snapshots run every 7 days, like a weekly batch job.
+The demo shows label leakage from a naive join and skew from a second serving code path.
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import bisect
+import random
+from collections import defaultdict
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class Event:
+    entity: str
+    day: int
+    amount: float
+
+
+@dataclass(frozen=True)
+class FeatureDefinition:
+    name: str
+    entity: str
+    aggregate: str
+    window_days: int | None
+    default: float
+    version: int = 1
+    owner: str = &quot;growth-team&quot;
+    description: str = &quot;&quot;
+
+    def compute(self, events: list[Event], as_of: int) -&gt; float:
+        visible = [e for e in events if e.day &lt;= as_of]
+        if self.window_days is not None:
+            visible = [e for e in visible if e.day &gt; as_of - self.window_days]
+        if self.aggregate == &quot;count&quot;:
+            return float(len(visible))
+        if self.aggregate == &quot;sum&quot;:
+            return round(sum(e.amount for e in visible), 2)
+        if self.aggregate == &quot;days_since_last&quot;:
+            return float(as_of - max(e.day for e in visible)) if visible else self.default
+        raise ValueError(f&quot;unknown aggregate {self.aggregate!r}&quot;)
+
+
+class FeatureRegistry:
+    def __init__(self) -&gt; None:
+        self._definitions: dict[tuple[str, int], FeatureDefinition] = {}
+
+    def register(self, definition: FeatureDefinition) -&gt; None:
+        key = (definition.name, definition.version)
+        existing = self._definitions.get(key)
+        if existing is not None and existing != definition:
+            raise ValueError(f&quot;{definition.name} v{definition.version} already exists: bump the version&quot;)
+        self._definitions[key] = definition
+
+    def get(self, name: str, version: int | None = None) -&gt; FeatureDefinition:
+        versions = [v for (n, v) in self._definitions if n == name]
+        if not versions:
+            raise KeyError(name)
+        return self._definitions[(name, version if version is not None else max(versions))]
+
+    def resolve(self, ref: str) -&gt; FeatureDefinition:
+        if &quot;@&quot; not in ref:
+            return self.get(ref)
+        name, _, version = ref.partition(&quot;@&quot;)
+        if not version.isdigit():
+            raise ValueError(f&quot;bad feature reference {ref!r}: use name@version, such as spend_30d@1&quot;)
+        return self.get(name, int(version))
+
+    def names(self) -&gt; list[str]:
+        return sorted({n for (n, _) in self._definitions})
+
+    def compute(self, names: list[str], events: list[Event], as_of: int) -&gt; dict[str, float]:
+        return {name: self.resolve(name).compute(events, as_of) for name in names}
+
+    def fill_defaults(self, names: list[str], values: dict[str, float] | None) -&gt; dict[str, float]:
+        values = values or {}
+        return {name: values.get(name, self.resolve(name).default) for name in names}
+
+
+@dataclass(frozen=True)
+class FeatureRow:
+    entity: str
+    day: int
+    values: dict[str, float]
+
+
+@dataclass(frozen=True)
+class LabelRow:
+    entity: str
+    day: int
+    label: int
+
+
+@dataclass(frozen=True)
+class JoinedRow:
+    entity: str
+    day: int
+    label: int
+    feature_day: int | None
+    values: dict[str, float] | None
+
+
+def group_events(events: list[Event]) -&gt; dict[str, list[Event]]:
+    grouped: dict[str, list[Event]] = defaultdict(list)
+    for event in events:
+        grouped[event.entity].append(event)
+    return grouped
+
+
+def backfill(registry: FeatureRegistry, names: list[str], events: list[Event], days: list[int]) -&gt; list[FeatureRow]:
+    rows = []
+    for entity, entity_events in sorted(group_events(events).items()):
+        for day in days:
+            rows.append(FeatureRow(entity, day, registry.compute(names, entity_events, day)))
+    return rows
+
+
+def point_in_time_join(labels: list[LabelRow], rows: list[FeatureRow], ttl_days: int | None = None) -&gt; list[JoinedRow]:
+    by_entity: dict[str, list[FeatureRow]] = defaultdict(list)
+    for row in rows:
+        by_entity[row.entity].append(row)
+    days_index = {}
+    for entity, entity_rows in by_entity.items():
+        entity_rows.sort(key=lambda r: r.day)
+        days_index[entity] = [r.day for r in entity_rows]
+    joined = []
+    for label in labels:
+        days = days_index.get(label.entity, [])
+        pos = bisect.bisect_right(days, label.day) - 1
+        match = by_entity[label.entity][pos] if pos &gt;= 0 else None
+        if match is not None and ttl_days is not None and label.day - match.day &gt; ttl_days:
+            match = None
+        joined.append(JoinedRow(
+            label.entity, label.day, label.label,
+            match.day if match else None, match.values if match else None,
+        ))
+    return joined
+
+
+def naive_latest_join(labels: list[LabelRow], rows: list[FeatureRow]) -&gt; list[JoinedRow]:
+    latest: dict[str, FeatureRow] = {}
+    for row in rows:
+        if row.entity not in latest or row.day &gt; latest[row.entity].day:
+            latest[row.entity] = row
+    joined = []
+    for label in labels:
+        match = latest.get(label.entity)
+        joined.append(JoinedRow(
+            label.entity, label.day, label.label,
+            match.day if match else None, match.values if match else None,
+        ))
+    return joined
+
+
+class OnlineStore:
+    def __init__(self, ttl_days: int):
+        self.ttl_days = ttl_days
+        self._latest: dict[str, FeatureRow] = {}
+
+    def write(self, row: FeatureRow) -&gt; None:
+        current = self._latest.get(row.entity)
+        if current is None or row.day &gt;= current.day:
+            self._latest[row.entity] = row
+
+    def read(self, entity: str, now: int) -&gt; dict[str, float] | None:
+        row = self._latest.get(entity)
+        if row is None or row.day &gt; now or now - row.day &gt; self.ttl_days:
+            return None
+        return dict(row.values)
+
+    def age(self, entity: str, now: int) -&gt; int | None:
+        row = self._latest.get(entity)
+        return None if row is None else now - row.day
+
+
+def materialize(rows: list[FeatureRow], store: OnlineStore, up_to_day: int) -&gt; int:
+    written = 0
+    for row in rows:
+        if row.day &lt;= up_to_day:
+            store.write(row)
+            written += 1
+    return written
+
+
+def training_features(registry: FeatureRegistry, names: list[str], joined: list[JoinedRow]) -&gt; list[dict[str, float]]:
+    return [registry.fill_defaults(names, row.values) for row in joined]
+
+
+def serving_features(registry: FeatureRegistry, names: list[str], store: OnlineStore, entity: str, now: int) -&gt; dict[str, float]:
+    return registry.fill_defaults(names, store.read(entity, now))
+
+
+def log_serving_requests(
+    registry: FeatureRegistry,
+    names: list[str],
+    offline: list[FeatureRow],
+    requests: list[tuple[str, int]],
+    ttl_days: int,
+) -&gt; dict[tuple[str, int], dict[str, float]]:
+    store = OnlineStore(ttl_days)
+    log = {}
+    for entity, day in sorted(requests, key=lambda r: r[1]):
+        materialize(offline, store, up_to_day=day)
+        log[(entity, day)] = serving_features(registry, names, store, entity, day)
+    return log
+
+
+def legacy_serving_features(events: list[Event], now: int) -&gt; dict[str, float]:
+    recent = [e for e in events if now - 30 &lt;= e.day &lt;= now]
+    past = [e.day for e in events if e.day &lt;= now]
+    return {
+        &quot;days_since_last_purchase&quot;: float(now - max(past)) if past else -1.0,
+        &quot;purchases_30d&quot;: float(len(recent)),
+        &quot;spend_30d&quot;: round(sum(e.amount for e in recent), 2),
+    }
+
+
+@dataclass(frozen=True)
+class SkewReport:
+    feature: str
+    compared: int
+    mismatch_rate: float
+    mean_abs_diff: float
+    flagged: bool
+
+
+def detect_skew(
+    training: dict[tuple[str, int], dict[str, float]],
+    serving: dict[tuple[str, int], dict[str, float]],
+    features: list[str],
+    tolerance: float = 1e-6,
+    max_mismatch_rate: float = 0.01,
+) -&gt; list[SkewReport]:
+    if set(training) != set(serving):
+        raise ValueError(f&quot;{len(set(training) ^ set(serving))} keys are in only one view: log and compare the same requests&quot;)
+    if not training:
+        raise ValueError(&quot;no requests to compare&quot;)
+    keys = sorted(training)
+    reports = []
+    for feature in features:
+        diffs = [abs(training[k][feature] - serving[k][feature]) for k in keys]
+        mismatches = sum(1 for d in diffs if d &gt; tolerance)
+        rate = mismatches / len(keys)
+        mean_diff = sum(diffs) / len(keys)
+        reports.append(SkewReport(feature, len(keys), rate, mean_diff, rate &gt; max_mismatch_rate))
+    return reports
+
+
+FEATURES = [&quot;days_since_last_purchase&quot;, &quot;purchases_30d&quot;, &quot;spend_30d&quot;]
+
+
+def build_registry() -&gt; FeatureRegistry:
+    registry = FeatureRegistry()
+    registry.register(FeatureDefinition(&quot;purchases_30d&quot;, &quot;user&quot;, &quot;count&quot;, 30, 0.0, description=&quot;purchases in the last 30 days&quot;))
+    registry.register(FeatureDefinition(&quot;spend_30d&quot;, &quot;user&quot;, &quot;sum&quot;, 30, 0.0, description=&quot;spend in the last 30 days&quot;))
+    registry.register(FeatureDefinition(&quot;days_since_last_purchase&quot;, &quot;user&quot;, &quot;days_since_last&quot;, None, 365.0, description=&quot;days since the last purchase&quot;))
+    return registry
+
+
+def make_events(n_users: int = 300, days: int = 180, seed: int = 11) -&gt; tuple[list[Event], dict[str, int | None]]:
+    rng = random.Random(seed)
+    events, churn_day = [], {}
+    for u in range(n_users):
+        user = f&quot;u{u:03d}&quot;
+        rate = rng.uniform(0.08, 0.35)
+        stop = rng.randint(40, 170) if rng.random() &lt; 0.5 else None
+        churn_day[user] = stop
+        for day in range(days):
+            if stop is not None and day &gt;= stop:
+                break
+            if rng.random() &lt; rate:
+                events.append(Event(user, day, round(rng.uniform(5, 80), 2)))
+    return events, churn_day
+
+
+def make_labels(events: list[Event], label_days: list[int], horizon: int = 30) -&gt; list[LabelRow]:
+    grouped = group_events(events)
+    labels = []
+    for user in sorted(grouped):
+        for day in label_days:
+            if not any(e.day &lt;= day for e in grouped[user]):
+                continue
+            future = any(day &lt; e.day &lt;= day + horizon for e in grouped[user])
+            labels.append(LabelRow(user, day, 0 if future else 1))
+    return labels
+
+
+def fit_idle_rule(features: list[dict[str, float]], labels: list[int]) -&gt; tuple[float, float]:
+    best_threshold, best_acc = 0.0, -1.0
+    for threshold in range(0, 120):
+        preds = [1 if f[&quot;days_since_last_purchase&quot;] &gt; threshold else 0 for f in features]
+        acc = sum(p == y for p, y in zip(preds, labels)) / len(labels)
+        if acc &gt; best_acc:
+            best_threshold, best_acc = float(threshold), acc
+    return best_threshold, best_acc
+
+
+def rule_accuracy(threshold: float, features: list[dict[str, float]], labels: list[int]) -&gt; float:
+    preds = [1 if f[&quot;days_since_last_purchase&quot;] &gt; threshold else 0 for f in features]
+    return sum(p == y for p, y in zip(preds, labels)) / len(labels)
+
+
+SNAPSHOT_DAYS = list(range(7, 176, 7))
+TTL_DAYS = 10
+
+
+def main() -&gt; None:
+    registry = build_registry()
+    events, _ = make_events()
+    offline = backfill(registry, FEATURES, events, SNAPSHOT_DAYS)
+    print(&quot;=== Feature registry ===&quot;)
+    for name in registry.names():
+        d = registry.get(name)
+        window = f&quot;{d.window_days}d&quot; if d.window_days else &quot;all&quot;
+        print(f&quot;  {d.name:26s} v{d.version}  entity={d.entity}  window={window:4s} default={d.default:g}  {d.description}&quot;)
+    print(f&quot;  backfilled {len(offline)} rows on {len(SNAPSHOT_DAYS)} weekly snapshot days&quot;)
+
+    print(&quot;\n=== Point-in-time join versus naive latest join ===&quot;)
+    train_labels = make_labels(events, [100, 120, 140])
+    y_train = [r.label for r in train_labels]
+    pit = point_in_time_join(train_labels, offline, TTL_DAYS)
+    naive = naive_latest_join(train_labels, offline)
+    future = sum(1 for r in naive if r.feature_day is not None and r.feature_day &gt; r.day)
+    print(f&quot;  {len(train_labels)} labels, churn rate {sum(y_train) / len(y_train):.2f}&quot;)
+    print(f&quot;  naive join used a snapshot from after the label day for {future / len(naive):.0%} of rows&quot;)
+    pit_threshold, pit_acc = fit_idle_rule(training_features(registry, FEATURES, pit), y_train)
+    naive_threshold, naive_acc = fit_idle_rule(training_features(registry, FEATURES, naive), y_train)
+    print(f&quot;  offline accuracy, naive join: {naive_acc:.3f} (rule: idle &gt; {naive_threshold:g} days)&quot;)
+    print(f&quot;  offline accuracy, PIT join:   {pit_acc:.3f} (rule: idle &gt; {pit_threshold:g} days)&quot;)
+    later_labels = make_labels(events, [145])
+    later = training_features(registry, FEATURES, point_in_time_join(later_labels, offline, TTL_DAYS))
+    y_later = [r.label for r in later_labels]
+    print(f&quot;  accuracy on day 145, trained with naive join: {rule_accuracy(naive_threshold, later, y_later):.3f}&quot;)
+    print(f&quot;  accuracy on day 145, trained with PIT join:   {rule_accuracy(pit_threshold, later, y_later):.3f}&quot;)
+
+    print(&quot;\n=== Online store with a TTL of 10 days ===&quot;)
+    store = OnlineStore(TTL_DAYS)
+    materialize(offline, store, up_to_day=145)
+    user = &quot;u001&quot;
+    print(f&quot;  day 145: {user} row age {store.age(user, 145)} days -&gt; {serving_features(registry, FEATURES, store, user, 145)}&quot;)
+    print(f&quot;  day 160: {user} row age {store.age(user, 160)} days -&gt; {serving_features(registry, FEATURES, store, user, 160)} (expired, defaults)&quot;)
+
+    grouped = group_events(events)
+    rng = random.Random(5)
+    users = sorted(grouped) + [f&quot;new{i:02d}&quot; for i in range(20)]
+    requests = sorted({(rng.choice(users), rng.randint(141, 150)) for _ in range(400)})
+    print(f&quot;\n=== Skew checks on {len(requests)} logged requests, days 141 to 150 ===&quot;)
+    joined = point_in_time_join([LabelRow(e, d, 0) for e, d in requests], offline, TTL_DAYS)
+    training_view = dict(zip(requests, training_features(registry, FEATURES, joined)))
+    store_log = log_serving_requests(registry, FEATURES, offline, requests, TTL_DAYS)
+    fresh_log = {(e, d): registry.compute(FEATURES, grouped.get(e, []), d) for e, d in requests}
+    legacy_log = {(e, d): legacy_serving_features(grouped.get(e, []), d) for e, d in requests}
+    checks = (
+        (&quot;online store read  vs  training join (one definition, same snapshots)&quot;, training_view, store_log),
+        (&quot;fresh compute      vs  training join (staleness only)&quot;, training_view, fresh_log),
+        (&quot;second code path   vs  fresh compute (code differences only)&quot;, fresh_log, legacy_log),
+    )
+    for title, expected, logged in checks:
+        print(f&quot;  {title}&quot;)
+        for report in detect_skew(expected, logged, FEATURES):
+            flag = &quot;SKEW&quot; if report.flagged else &quot;ok  &quot;
+            print(f&quot;    {flag} {report.feature:26s} mismatch {report.mismatch_rate:6.1%}  mean |diff| {report.mean_abs_diff:7.2f}&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/02-ml-fundamentals/21-feature-stores-and-training-serving-skew/code/tests/test_main.py">phases/02-ml-fundamentals/21-feature-stores-and-training-serving-skew/code/tests/test_main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Tests for the from-scratch feature store and skew checks.&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import os
+import sys
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(HERE))
+
+from main import (  # noqa: E402
+    FEATURES,
+    Event,
+    FeatureDefinition,
+    FeatureRegistry,
+    FeatureRow,
+    LabelRow,
+    OnlineStore,
+    backfill,
+    build_registry,
+    detect_skew,
+    legacy_serving_features,
+    log_serving_requests,
+    make_events,
+    make_labels,
+    materialize,
+    naive_latest_join,
+    point_in_time_join,
+    serving_features,
+    training_features,
+)
+
+
+def rows_for(entity: str, days_and_values: list[tuple[int, float]]) -&gt; list[FeatureRow]:
+    return [FeatureRow(entity, day, {&quot;x&quot;: value}) for day, value in days_and_values]
+
+
+class DefinitionTests(unittest.TestCase):
+    def setUp(self) -&gt; None:
+        self.events = [Event(&quot;u&quot;, 1, 10.0), Event(&quot;u&quot;, 5, 20.0), Event(&quot;u&quot;, 40, 5.0)]
+        self.registry = build_registry()
+
+    def test_window_excludes_the_future_and_the_left_edge(self) -&gt; None:
+        count = self.registry.get(&quot;purchases_30d&quot;)
+        self.assertEqual(count.compute(self.events, 31), 1.0)
+        self.assertEqual(count.compute(self.events, 30), 2.0)
+        self.assertEqual(count.compute(self.events, 39), 0.0)
+
+    def test_days_since_uses_default_without_history(self) -&gt; None:
+        days_since = self.registry.get(&quot;days_since_last_purchase&quot;)
+        self.assertEqual(days_since.compute(self.events, 0), 365.0)
+        self.assertEqual(days_since.compute(self.events, 12), 7.0)
+
+    def test_registry_rejects_a_silent_redefinition(self) -&gt; None:
+        registry = FeatureRegistry()
+        registry.register(FeatureDefinition(&quot;f&quot;, &quot;user&quot;, &quot;count&quot;, 7, 0.0))
+        registry.register(FeatureDefinition(&quot;f&quot;, &quot;user&quot;, &quot;count&quot;, 7, 0.0))
+        with self.assertRaises(ValueError):
+            registry.register(FeatureDefinition(&quot;f&quot;, &quot;user&quot;, &quot;count&quot;, 14, 0.0))
+        registry.register(FeatureDefinition(&quot;f&quot;, &quot;user&quot;, &quot;count&quot;, 14, 0.0, version=2))
+        self.assertEqual(registry.get(&quot;f&quot;).window_days, 14)
+        self.assertEqual(registry.get(&quot;f&quot;, version=1).window_days, 7)
+
+    def test_pinned_reference_keeps_the_old_definition(self) -&gt; None:
+        registry = FeatureRegistry()
+        registry.register(FeatureDefinition(&quot;f&quot;, &quot;user&quot;, &quot;count&quot;, 7, 0.0))
+        registry.register(FeatureDefinition(&quot;f&quot;, &quot;user&quot;, &quot;count&quot;, 30, -1.0, version=2))
+        events = [Event(&quot;u&quot;, 1, 1.0), Event(&quot;u&quot;, 20, 1.0)]
+        self.assertEqual(registry.compute([&quot;f@1&quot;, &quot;f&quot;], events, 21), {&quot;f@1&quot;: 1.0, &quot;f&quot;: 2.0})
+        rows = backfill(registry, [&quot;f@1&quot;], events, [21])
+        self.assertEqual(rows[0].values, {&quot;f@1&quot;: 1.0})
+        self.assertEqual(registry.fill_defaults([&quot;f@1&quot;, &quot;f&quot;], None), {&quot;f@1&quot;: 0.0, &quot;f&quot;: -1.0})
+        for ref in (&quot;f@&quot;, &quot;f@v1&quot;, &quot;f@1.0&quot;):
+            with self.subTest(ref=ref), self.assertRaises(ValueError):
+                registry.resolve(ref)
+
+    def test_backfill_writes_one_row_per_entity_and_day(self) -&gt; None:
+        rows = backfill(self.registry, FEATURES, self.events + [Event(&quot;v&quot;, 3, 1.0)], [7, 14])
+        self.assertEqual(len(rows), 4)
+        self.assertEqual({(r.entity, r.day) for r in rows}, {(&quot;u&quot;, 7), (&quot;u&quot;, 14), (&quot;v&quot;, 7), (&quot;v&quot;, 14)})
+
+
+class JoinTests(unittest.TestCase):
+    def test_point_in_time_join_takes_latest_row_at_or_before_label(self) -&gt; None:
+        rows = rows_for(&quot;u&quot;, [(1, 10.0), (5, 50.0), (9, 90.0)])
+        joined = point_in_time_join([LabelRow(&quot;u&quot;, 7, 1), LabelRow(&quot;u&quot;, 9, 0)], rows)
+        self.assertEqual(joined[0].values, {&quot;x&quot;: 50.0})
+        self.assertEqual(joined[0].feature_day, 5)
+        self.assertEqual(joined[1].feature_day, 9)
+
+    def test_point_in_time_join_returns_none_before_first_row(self) -&gt; None:
+        joined = point_in_time_join([LabelRow(&quot;u&quot;, 0, 1)], rows_for(&quot;u&quot;, [(1, 10.0)]))
+        self.assertIsNone(joined[0].values)
+
+    def test_ttl_drops_rows_that_are_too_old(self) -&gt; None:
+        rows = rows_for(&quot;u&quot;, [(1, 10.0)])
+        self.assertIsNone(point_in_time_join([LabelRow(&quot;u&quot;, 20, 1)], rows, ttl_days=10)[0].values)
+        self.assertIsNotNone(point_in_time_join([LabelRow(&quot;u&quot;, 11, 1)], rows, ttl_days=10)[0].values)
+
+    def test_naive_join_reads_the_future(self) -&gt; None:
+        rows = rows_for(&quot;u&quot;, [(1, 10.0), (9, 90.0)])
+        joined = naive_latest_join([LabelRow(&quot;u&quot;, 3, 1)], rows)
+        self.assertEqual(joined[0].feature_day, 9)
+        self.assertGreater(joined[0].feature_day, joined[0].day)
+
+    def test_missing_rows_get_registry_defaults(self) -&gt; None:
+        registry = build_registry()
+        joined = point_in_time_join([LabelRow(&quot;ghost&quot;, 50, 0)], [])
+        values = training_features(registry, FEATURES, joined)[0]
+        self.assertEqual(values[&quot;days_since_last_purchase&quot;], 365.0)
+        self.assertEqual(values[&quot;purchases_30d&quot;], 0.0)
+
+
+class OnlineStoreTests(unittest.TestCase):
+    def test_read_respects_ttl(self) -&gt; None:
+        store = OnlineStore(ttl_days=10)
+        store.write(FeatureRow(&quot;u&quot;, 100, {&quot;x&quot;: 1.0}))
+        self.assertEqual(store.read(&quot;u&quot;, 105), {&quot;x&quot;: 1.0})
+        self.assertIsNone(store.read(&quot;u&quot;, 111))
+        self.assertIsNone(store.read(&quot;nobody&quot;, 105))
+
+    def test_older_rows_do_not_overwrite_newer_rows(self) -&gt; None:
+        store = OnlineStore(ttl_days=30)
+        store.write(FeatureRow(&quot;u&quot;, 20, {&quot;x&quot;: 2.0}))
+        store.write(FeatureRow(&quot;u&quot;, 10, {&quot;x&quot;: 1.0}))
+        self.assertEqual(store.read(&quot;u&quot;, 21), {&quot;x&quot;: 2.0})
+
+    def test_materialize_never_writes_future_rows(self) -&gt; None:
+        store = OnlineStore(ttl_days=30)
+        written = materialize(rows_for(&quot;u&quot;, [(5, 1.0), (15, 2.0)]), store, up_to_day=10)
+        self.assertEqual(written, 1)
+        self.assertEqual(store.read(&quot;u&quot;, 10), {&quot;x&quot;: 1.0})
+
+    def test_expired_serving_features_fall_to_defaults(self) -&gt; None:
+        registry = build_registry()
+        store = OnlineStore(ttl_days=10)
+        store.write(FeatureRow(&quot;u&quot;, 100, {&quot;days_since_last_purchase&quot;: 3.0, &quot;purchases_30d&quot;: 4.0, &quot;spend_30d&quot;: 9.0}))
+        self.assertEqual(serving_features(registry, FEATURES, store, &quot;u&quot;, 130)[&quot;days_since_last_purchase&quot;], 365.0)
+
+
+class SkewTests(unittest.TestCase):
+    def test_identical_views_have_no_skew(self) -&gt; None:
+        view = {(&quot;u&quot;, 1): {&quot;x&quot;: 1.0}, (&quot;v&quot;, 1): {&quot;x&quot;: 2.0}}
+        report = detect_skew(view, dict(view), [&quot;x&quot;])[0]
+        self.assertEqual(report.compared, 2)
+        self.assertFalse(report.flagged)
+
+    def test_mismatch_is_flagged(self) -&gt; None:
+        training = {(&quot;u&quot;, 1): {&quot;x&quot;: 1.0}, (&quot;v&quot;, 1): {&quot;x&quot;: 2.0}}
+        serving = {(&quot;u&quot;, 1): {&quot;x&quot;: 1.0}, (&quot;v&quot;, 1): {&quot;x&quot;: 5.0}}
+        report = detect_skew(training, serving, [&quot;x&quot;])[0]
+        self.assertAlmostEqual(report.mismatch_rate, 0.5)
+        self.assertAlmostEqual(report.mean_abs_diff, 1.5)
+        self.assertTrue(report.flagged)
+
+    def test_views_with_different_keys_are_rejected(self) -&gt; None:
+        training = {(&quot;u&quot;, 1): {&quot;x&quot;: 1.0}, (&quot;v&quot;, 1): {&quot;x&quot;: 2.0}}
+        with self.assertRaises(ValueError):
+            detect_skew(training, {(&quot;u&quot;, 1): {&quot;x&quot;: 1.0}}, [&quot;x&quot;])
+        with self.assertRaises(ValueError):
+            detect_skew(training, {(&quot;w&quot;, 1): {&quot;x&quot;: 1.0}, (&quot;z&quot;, 1): {&quot;x&quot;: 2.0}}, [&quot;x&quot;])
+
+    def test_empty_views_are_rejected(self) -&gt; None:
+        with self.assertRaises(ValueError):
+            detect_skew({}, {}, [&quot;x&quot;])
+
+    def test_legacy_path_differs_on_window_edge_and_default(self) -&gt; None:
+        registry = build_registry()
+        events = [Event(&quot;u&quot;, 70, 10.0)]
+        self.assertEqual(legacy_serving_features(events, 100)[&quot;purchases_30d&quot;], 1.0)
+        self.assertEqual(registry.compute(FEATURES, events, 100)[&quot;purchases_30d&quot;], 0.0)
+        self.assertEqual(legacy_serving_features([], 100)[&quot;days_since_last_purchase&quot;], -1.0)
+
+    def test_shared_definition_has_zero_skew_end_to_end(self) -&gt; None:
+        registry = build_registry()
+        events, _ = make_events(n_users=40, seed=3)
+        offline = backfill(registry, FEATURES, events, list(range(7, 176, 7)))
+        requests = [(f&quot;u{i:03d}&quot;, 141 + i % 10) for i in range(40)]
+        joined = point_in_time_join([LabelRow(e, d, 0) for e, d in requests], offline, 10)
+        training = dict(zip(requests, training_features(registry, FEATURES, joined)))
+        logged = log_serving_requests(registry, FEATURES, offline, requests, 10)
+        self.assertTrue(all(not r.flagged for r in detect_skew(training, logged, FEATURES)))
+
+    def test_labels_look_forward_from_the_label_day(self) -&gt; None:
+        events = [Event(&quot;u&quot;, 10, 1.0), Event(&quot;u&quot;, 50, 1.0)]
+        labels = make_labels(events, [12, 60], horizon=30)
+        self.assertEqual([(l.day, l.label) for l in labels], [(12, 1), (60, 1)])
+        labels = make_labels(events, [25], horizon=30)
+        self.assertEqual(labels[0].label, 0)
+
+
+if __name__ == &quot;__main__&quot;:
+    unittest.main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/02-ml-fundamentals/21-feature-stores-and-training-serving-skew/outputs/skill-feature-skew-audit.md">phases/02-ml-fundamentals/21-feature-stores-and-training-serving-skew/outputs/skill-feature-skew-audit.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: skill-feature-skew-audit
+description: Audit a feature pipeline for time travel and training-serving skew
+version: 1.0.0
+phase: 2
+lesson: 21
+tags: [feature-store, point-in-time, training-serving-skew, leakage, backfill]
+---
+
+# Feature Skew Audit
+
+Use this skill when a model scores well offline and worse in production. Also use it when a team adds a feature store, and before a new feature goes live. Work through the steps in order and record each finding.
+
+## Step 1: Map both paths
+
+For every feature, write down two lines:
+
+```text
+training path: &lt;source table&gt; -&gt; &lt;transformation code&gt; -&gt; &lt;join to labels&gt;
+serving path:  &lt;source&gt; -&gt; &lt;transformation code&gt; -&gt; &lt;store or request-time compute&gt;
+```
+
+If the two lines name different transformation code, mark the feature &quot;two code paths&quot;. That is the first skew risk.
+
+## Step 2: Check the training join for time travel
+
+- The join uses the label timestamp, not only the entity key.
+- The join takes the latest row with event time at or before the label time.
+- The join drops rows older than the TTL.
+- Backfilled or corrected rows carry a created timestamp, and the join ignores rows created after the label time.
+- Aggregation windows end at the label time. A window such as &quot;the 30 days around the label&quot; leaks.
+
+Quick test: count the training rows whose feature row is later than the label. Any count above zero is a leak.
+
+## Step 3: Compare the definitions
+
+For each feature, compare the two paths on these points:
+
+| Point | Question |
+|---|---|
+| Window edges | Is each window edge inclusive or exclusive in both paths? |
+| Missing values | Do both paths use the same default for no history and for expired values? |
+| Units and types | Same currency, same time zone, same integer or float type? |
+| Rounding | Same rounding, at the same step? |
+| Category mapping | Same vocabulary, same handling of unknown values? |
+
+## Step 4: Compare freshness
+
+- How old is a training value at its label time, on average and at most?
+- How old is a serving value at request time, on average and at most?
+- What happens when materialization fails? The TTL must turn old values into defaults, not serve them silently.
+
+A model that trained on values up to a week old can behave differently on fresh values. Match the freshness, or retrain on values with the serving freshness.
+
+## Step 5: Measure skew
+
+1. Log the feature values that the serving path used, with the entity and the request time.
+2. Recompute the same keys with the training path.
+3. Per feature, report the mismatch rate and the mean absolute difference.
+4. Split the cause with three comparisons: store read versus training, fresh compute versus training, second path versus fresh compute.
+
+Flag a feature when more than 1 percent of values differ, unless the difference is a documented freshness gap.
+
+## Step 6: Write the audit result
+
+```text
+Feature: &lt;name, version&gt;
+Paths: shared definition | two code paths
+Time travel: none found | &lt;rows affected and cause&gt;
+Definition gaps: &lt;window edges, defaults, units, rounding&gt;
+Freshness: training &lt;age&gt;, serving &lt;age&gt;, TTL &lt;days&gt;
+Measured skew: &lt;mismatch rate, mean |diff|&gt;
+Fix: &lt;move both paths to one registry definition | fix join | align default | align TTL&gt;
+```
+
+Fix order: remove time travel first, then move both paths to one definition, then align freshness.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. A team joins churn labels to a user feature table on user_id only. The table holds each user&#39;s newest values. What goes wrong?</legend><label class="option"><input type="radio" name="q0" value="0"> The join drops every user who has more than one label in the set</label><label class="option"><input type="radio" name="q0" value="1"> Training rows get feature values from after the label time</label><label class="option"><input type="radio" name="q0" value="2"> Nothing, because the newest values are the most accurate ones</label><label class="option"><input type="radio" name="q0" value="3"> The model trains slower because the table has too many columns</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. A label is at day 20. Feature rows exist at days 6, 17, and 24, and the TTL is 7 days. Which row does a point-in-time join use?</legend><label class="option"><input type="radio" name="q1" value="0"> No row, so the default value is used</label><label class="option"><input type="radio" name="q1" value="1"> The day 6 row</label><label class="option"><input type="radio" name="q1" value="2"> The day 17 row</label><label class="option"><input type="radio" name="q1" value="3"> The day 24 row</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. Training fills a missing purchase history with 365 days. The serving service fills it with -1. What kind of skew is this?</legend><label class="option"><input type="radio" name="q2" value="0"> Different defaults between the two paths</label><label class="option"><input type="radio" name="q2" value="1"> Stale features from a failed materialization job</label><label class="option"><input type="radio" name="q2" value="2"> Concept drift in the relation between input and label</label><label class="option"><input type="radio" name="q2" value="3"> Time travel from a naive join on the user key</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. Why does a feature registry create a new version when a definition changes, instead of editing the old one?</legend><label class="option"><input type="radio" name="q3" value="0"> Editing a definition deletes the backfilled history in the offline store</label><label class="option"><input type="radio" name="q3" value="1"> Models trained on the old definition still need the old values</label><label class="option"><input type="radio" name="q3" value="2"> The online store can hold only one feature per entity at a time</label><label class="option"><input type="radio" name="q3" value="3"> Versions make the point-in-time join run faster on large tables</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. Logged serving values match the training join exactly, but values computed fresh on request differ on 83 percent of requests. What does this show?</legend><label class="option"><input type="radio" name="q4" value="0"> The online store is broken, because fresh values are always the correct values</label><label class="option"><input type="radio" name="q4" value="1"> The point-in-time join leaks the future, because snapshots are newer than requests</label><label class="option"><input type="radio" name="q4" value="2"> The model trained on snapshot values, so a fresh compute path would add skew</label><label class="option"><input type="radio" name="q4" value="3"> The registry has two versions of each feature, and serving reads the wrong one</label><p data-feedback="4"></p></fieldset><fieldset><legend>6. A backfill that runs today writes rows for last year&#39;s dates, using data that was corrected last month. How does a strict point-in-time join avoid the leak?</legend><label class="option"><input type="radio" name="q5" value="0"> It joins on the entity key only and takes the newest row for each label</label><label class="option"><input type="radio" name="q5" value="1"> It also requires the created timestamp to be at or before the label time</label><label class="option"><input type="radio" name="q5" value="2"> It shortens the TTL so that last year&#39;s rows expire before training starts</label><label class="option"><input type="radio" name="q5" value="3"> It runs the backfill again with the online store as its data source</label><p data-feedback="5"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/02-ml-fundamentals/20-model-monitoring-and-drift/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/03-deep-learning-core/01-the-perceptron/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/02-ml-fundamentals/21-feature-stores-and-training-serving-skew/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

@@ -1,0 +1,809 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>卡普斯通25课:验证门和观察预算 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-19-capstone-projects" data-lesson="19-capstone-projects/25-verification-gates-observation-budget" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/19-capstone-projects/">综合项目</a> / LESSON 25</p><h1 class="lesson-title">卡普斯通25课:验证门和观察预算</h1><p>Capstone Lesson 25: Verification Gates and the Observation Budget</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>卡普斯通25课:验证门和观察预算</h1>
+<blockquote>
+<p>没有验证层的代理带是一个在子里的愿望. 这一课构建了确定性门链,决定工具调用是否允许开火,代理被允许看到多少输出,以及该循环必须停止什么时候,因为代理读了太多. 链接是小门的函数,加上一个观察账本,</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python (stdlib)
+<strong>Prerequisites:</strong> Phase 19 · 20-24 (Track A1: agent loop, tool registry, message store, prompt builder, model router), Phase 14 · 33 (instructions as constraints), Phase 14 · 36 (scope contracts), Phase 14 · 38 (verification gates)
+<strong>Time:</strong> ~90 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>建立一个<code>VerificationGate</code>具有确定性的协议<code>evaluate(call)</code>方法.</li>
+<li>编译预算,最新,白名单和regex门,</li>
+<li>通过一个 <code>ObservationLedger</code>按工具键键,然后转动.</li>
+<li>拒绝在累计观察预算超过时进行工具调用.</li>
+<li>表面结构<code>GateDecision</code>记录下下游可观测性可以摄入.</li>
+</ul>
+<h2>问题</h2>
+<p>当一个代理带允许模型自由地调用工具时,在实际使用的第一小时内出现三个类型的错误.</p>
+<p>首先是无限的观察.一个200K线的回复投放了500万的输出代币.模型每千字节看到一个匹配,其余的文本是浪费的.代币账单很大,代理现在更糟糕,不是更好,在任务上.</p>
+<p>第二个是过时的近期.一个长期运行的任务积累了五十个工具调用.模型从第三节重新读取了第一个读_文件,好像它是现实状态.第四十七节的编辑从来没有出现,因为提示构建器首先串行了最早的观察.</p>
+<p>调查任务开始时,<code>web_search</code>后来,他最终就跑了.<code>shell</code>随着任何读取痕迹,一个垃圾文件已经坐在 /tmp,一个卷轴与一个私人API.</p>
+<p>验证门是说不的带件.它不是模型.它不是法官.它是确定性函数.<code>(call, history, ledger)</code>结果是,如果我们不需要一个模型,我们就会发现一个模型,然后我们会看到一个模型.</p>
+<h2>概念</h2>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-c7bec349c2b06c30c9a6.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>一个门是任何有一个<code>evaluate(call, ctx) -&gt; GateDecision</code>链条是一个有序的列表. 评估在第一个否定时短路. 秩序问题:廉价的结构门运行在昂贵的代币计数门之前.</p>
+<p>这一课有四个门:</p>
+<ul>
+<li><code>WhitelistGate</code>允许的工具名称是明确的集合.任何外面的东西都被拒绝了.这是最便宜的门,是第一.</li>
+<li><code>RegexGate</code>工具参数与regex相匹配. 对于拒绝 shell 电话使用有用<code>rm -rf</code>它们或 HTTP 调用到内部IP.</li>
+<li><code>RecencyGate</code>模型只能看到从最后的N转折的观测. 较早的观测被掩盖. 门拒绝使用工具调用,结果将延长已经过时的观测窗口.</li>
+<li><code>BudgetGate</code>模型在整个会议中读到的累计代币有限量. 当账本说到达了限量时,将拒绝每次进一步的工具调用.</li>
+</ul>
+<p>观察账本是会计.每次成功的工具调用都会写一个行:工具名称,轮回,发行的代币,累计.账本回答两个问题:模型已经看到多少的工具,以及它已经看到多少的工具X.预算门读了第一.每工具的预算门,你将写作练习,读了第二个.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-3d1e95fd835706cdae6e.png" alt="cg-gate-chain 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建筑</h2>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-9a47bca061eadf88a3c7.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>链接要求链接.链接要么点点点点点点点点点点点点点点点点点点,工具运行,账本点点点点,结果被添加到消息存储中.如果拒绝,模型将被交给拒绝作为系统消息,循环决定是否重新尝试或中止.</p>
+<h2>你会建造什么</h2>
+<p>实施是单一的<code>main.py</code>另外还有一些检查.</p>
+<ol>
+<li><code>Observation</code>其他<code>ToolCall</code>电线形状的定义是数据类.</li>
+<li><code>ObservationLedger</code>记录<code>(turn, tool, tokens)</code>排列和答案<code>cumulative()</code>其他<code>per_tool(name)</code>现在,我们要去.</li>
+<li><code>GateDecision</code>运载<code>(allow, reason, gate_name)</code>现在,我们要去.</li>
+<li><code>VerificationGate</code>每个门都执行了<code>evaluate(call, ctx)</code>现在,我们要去.</li>
+<li><code>GateChain</code>打电话给每一个门,返回第一个拒绝,或者返回允许如果每个门通过.</li>
+<li>演示程序运行一个小的合成代理循环. 三轮. 第三轮开启预算门,循环报告一个清洁的拒绝,</li>
+</ol>
+<p>代币计量器是故意的愚蠢<code>len(text) // 4</code>课程的重点是管道,而不是代币器.</p>
+<h2>为什么链条有所重要</h2>
+<p>否认比允许便宜.<code>WhitelistGate</code>在 O(1) 哈希搜索中运行. <code>RegexGate</code>在O(模式 * argv中运行. <code>RecencyGate</code>读到一个小片的消息商店.<code>BudgetGate</code>您将通过成本上升来订购,所以拒绝通话之前,就会做昂贵的工作.</p>
+<p>现在,我们需要一个新的方法来解决问题,我们需要一个新的方法来解决问题,我们需要一个新的方法来解决问题,我们需要一个新的方法来解决问题.</p>
+<h2>如何与A轨道的其他部分相结合</h2>
+<p>在前几堂课程中,你得到了循环,工具注册表,消息存储器,提示构建器和模型路由器. 这一课增加了模型和工具之间的层次. 课26将把工具调用到导航器的沙箱上,一旦门链说&quot;允许&quot;. 课27将记录拒绝的评价带作为质量信号. 课程28将门决策导向OpenTelemetry范围. 课29将所有东西入一个工作的编码代理中.</p>
+<h2>运行它</h2>
+<pre><code class="language-bash">cd phases/19-capstone-projects/25-verification-gates-observation-budget
+python3 code/main.py
+python3 -m pytest code/tests/ -v
+</code></pre>
+<p>测试将包括每一个门的决定,并从零出发.测试覆盖本书,每个门的隔离,链路短路,和合成循环端到端.</p>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Capstone Lesson 25: Verification Gates and the Observation Budget</h1>
+<blockquote>
+<p>An agent harness without a verification layer is a wish in a trenchcoat. This lesson builds the deterministic gate chain that decides whether a tool call is allowed to fire, how much of its output the agent is allowed to see, and when the loop has to stop because the agent has read too much. The chain is a function of small, named gates plus an observation ledger that tracks every token the model has been shown.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python (stdlib)
+<strong>Prerequisites:</strong> Phase 19 · 20-24 (Track A1: agent loop, tool registry, message store, prompt builder, model router), Phase 14 · 33 (instructions as constraints), Phase 14 · 36 (scope contracts), Phase 14 · 38 (verification gates)
+<strong>Time:</strong> ~90 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Build a <code>VerificationGate</code> protocol with a deterministic <code>evaluate(call)</code> method.</li>
+<li>Compose budget, recency, whitelist, and regex gates into a chain with short-circuit semantics.</li>
+<li>Track every observation through an <code>ObservationLedger</code> keyed by tool and turn.</li>
+<li>Refuse a tool call when the cumulative observation budget would be exceeded.</li>
+<li>Surface a structured <code>GateDecision</code> record that downstream observability can ingest.</li>
+</ul>
+<h2>The Problem</h2>
+<p>When an agent harness lets the model call tools freely, three classes of bug appear within the first hour of real use.</p>
+<p>The first is unbounded observation. A grep across a 200K-line repo dumps half a million tokens of output into the next turn. The model sees one match per kilobyte and the rest of the context is wasted. The token bill is large and the agent is now worse, not better, at the task.</p>
+<p>The second is stale recency. A long-running task accumulates fifty tool calls. The model rereads the first read_file from turn three as if it were live state. Edits made on turn forty-seven never show up because the prompt builder serialized the earliest observations first.</p>
+<p>The third is privilege creep. A research task starts by calling <code>web_search</code>, then somehow ends up running <code>shell</code> because the model invented a tool name and the harness defaulted to permissive. By the time anyone reads the trace, a junk file is sitting in /tmp and a curl ran against a private API.</p>
+<p>A verification gate is the harness component that says no. It is not a model. It is not a judge. It is a deterministic function of <code>(call, history, ledger)</code> that returns either ALLOW or DENY with a reason. The reason is logged. The model is told. The loop continues or aborts.</p>
+<h2>The Concept</h2>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-c7bec349c2b06c30c9a6.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>A gate is anything with an <code>evaluate(call, ctx) -&gt; GateDecision</code> method. The chain is an ordered list. Evaluation short-circuits on the first deny. Order matters: cheap structural gates run before expensive token-counting gates.</p>
+<p>This lesson ships four gates:</p>
+<ul>
+<li><code>WhitelistGate</code>. Allowed tool names are an explicit set. Anything outside is denied. This is the cheapest gate and runs first.</li>
+<li><code>RegexGate</code>. Tool arguments are matched against a regex. Useful for refusing shell calls with <code>rm -rf</code> in them, or HTTP calls to internal IPs. Pure on the call payload.</li>
+<li><code>RecencyGate</code>. The model only sees observations from the last N turns. Older observations are masked. The gate refuses a tool call whose result would extend an observation window that has already aged out.</li>
+<li><code>BudgetGate</code>. The cumulative tokens the model has read across the session has a ceiling. When the ledger says the ceiling is reached, every further tool call is denied.</li>
+</ul>
+<p>The observation ledger is the bookkeeping. Every successful tool call writes one row: tool name, turn, tokens emitted, cumulative. The ledger answers two questions: how much has the model seen total, and how much has it seen of tool X. The budget gate reads the first. A per-tool budget gate, which you will write as an exercise, reads the second.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-3d1e95fd835706cdae6e.png" alt="cg-gate-chain 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Architecture</h2>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-9a47bca061eadf88a3c7.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>The harness asks the chain. The chain either nods or refuses. If it nods, the tool runs, the ledger ticks, and the result is appended to the message store. If it refuses, the model is handed the refusal as a system message and the loop decides whether to retry or abort.</p>
+<h2>What you will build</h2>
+<p>The implementation is a single <code>main.py</code> plus tests.</p>
+<ol>
+<li><code>Observation</code> and <code>ToolCall</code> dataclasses define the wire shapes.</li>
+<li><code>ObservationLedger</code> records <code>(turn, tool, tokens)</code> rows and answers <code>cumulative()</code> and <code>per_tool(name)</code>.</li>
+<li><code>GateDecision</code> carries <code>(allow, reason, gate_name)</code>.</li>
+<li><code>VerificationGate</code> is the protocol. Each gate implements <code>evaluate(call, ctx)</code>.</li>
+<li><code>GateChain</code> wraps an ordered list. It calls each gate, returns the first deny, or returns allow if every gate passes.</li>
+<li>The demo runs a tiny synthetic agent loop. Three turns. The third turn trips the budget gate and the loop reports a clean refusal with a non-zero refusal count.</li>
+</ol>
+<p>The token counter is intentionally a stupid <code>len(text) // 4</code> heuristic. The point of this lesson is the gate plumbing, not the tokenizer. Drop in a real tokenizer in production.</p>
+<h2>Why the chain order matters</h2>
+<p>A deny is cheaper than an allow. <code>WhitelistGate</code> runs in O(1) hash lookup. <code>RegexGate</code> runs in O(pattern * argv). <code>RecencyGate</code> reads a small slice of the message store. <code>BudgetGate</code> reads the entire ledger. You order them by ascending cost so a denied call short-circuits before doing the expensive work.</p>
+<p>You also order them by blast radius. Whitelist is the strongest claim: this tool is not in the contract. The regex gate is next: this argument is not in the contract. Recency comes after: the harness still cares but the call is structurally legal. Budget is last because, by definition, it only fires when everything else passed.</p>
+<h2>How this composes with the rest of Track A</h2>
+<p>The previous lessons gave you the loop, the tool registry, the message store, the prompt builder, and the model router. This lesson adds the layer between the model and the tools. Lesson 26 ships the sandbox that the dispatcher hands the tool call to once the gate chain says ALLOW. Lesson 27 ships the eval harness that records refusal counts as a quality signal. Lesson 28 wires the gate decisions into OpenTelemetry spans. Lesson 29 stitches the lot into a working coding agent.</p>
+<h2>Running it</h2>
+<pre><code class="language-bash">cd phases/19-capstone-projects/25-verification-gates-observation-budget
+python3 code/main.py
+python3 -m pytest code/tests/ -v
+</code></pre>
+<p>The demo prints a turn-by-turn trace including every gate decision and exits zero. The tests cover the ledger, each gate in isolation, the chain short-circuit, and the synthetic loop end-to-end.</p>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-19-capstone-projects--25-verification-gates-observation-budget.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-19-capstone-projects--25-verification-gates-observation-budget.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/25-verification-gates-observation-budget/code/main.py">phases/19-capstone-projects/25-verification-gates-observation-budget/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;
+Verification gates and observation budget for an agent harness.
+
+See: phases/19-capstone-projects/25-verification-gates-observation-budget/docs/en.md
+Concept refs:
+  - Gate-chain pattern (cheapest deny first, allow last).
+  - Observation budget as a deterministic stopping criterion.
+The demo at the bottom runs a synthetic three-turn loop and exits zero.
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import json
+import re
+import sys
+from dataclasses import dataclass, field
+from typing import Callable, Iterable, Protocol
+
+
+# ---------------------------------------------------------------------------
+# Wire shapes
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ToolCall:
+    &quot;&quot;&quot;A request from the model to invoke a tool.&quot;&quot;&quot;
+
+    turn: int
+    tool: str
+    argv: tuple[str, ...]
+    payload: str = &quot;&quot;
+
+    def to_dict(self) -&gt; dict:
+        return {
+            &quot;turn&quot;: self.turn,
+            &quot;tool&quot;: self.tool,
+            &quot;argv&quot;: list(self.argv),
+            &quot;payload&quot;: self.payload,
+        }
+
+
+@dataclass(frozen=True)
+class Observation:
+    &quot;&quot;&quot;The text the model is shown after a tool call.&quot;&quot;&quot;
+
+    turn: int
+    tool: str
+    text: str
+    tokens: int
+
+    def to_dict(self) -&gt; dict:
+        return {
+            &quot;turn&quot;: self.turn,
+            &quot;tool&quot;: self.tool,
+            &quot;tokens&quot;: self.tokens,
+        }
+
+
+@dataclass(frozen=True)
+class GateDecision:
+    &quot;&quot;&quot;A single gate&#39;s verdict.&quot;&quot;&quot;
+
+    allow: bool
+    gate: str
+    reason: str
+
+    def to_dict(self) -&gt; dict:
+        return {&quot;allow&quot;: self.allow, &quot;gate&quot;: self.gate, &quot;reason&quot;: self.reason}
+
+
+# ---------------------------------------------------------------------------
+# Token estimator
+# ---------------------------------------------------------------------------
+
+
+def estimate_tokens(text: str) -&gt; int:
+    &quot;&quot;&quot;A deterministic, conservative stand-in for a real tokenizer.
+
+    Real harnesses plug in tiktoken or the model&#39;s own tokenizer.
+    The gate chain only cares that the counter is monotonic and deterministic.
+    &quot;&quot;&quot;
+
+    if not text:
+        return 0
+    return max(1, len(text) // 4)
+
+
+# ---------------------------------------------------------------------------
+# Observation ledger
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ObservationLedger:
+    &quot;&quot;&quot;Append-only ledger of every observation the model has been shown.&quot;&quot;&quot;
+
+    rows: list[Observation] = field(default_factory=list)
+
+    def record(self, obs: Observation) -&gt; None:
+        self.rows.append(obs)
+
+    def cumulative(self) -&gt; int:
+        return sum(row.tokens for row in self.rows)
+
+    def per_tool(self, name: str) -&gt; int:
+        return sum(row.tokens for row in self.rows if row.tool == name)
+
+    def turns_seen(self) -&gt; list[int]:
+        return sorted({row.turn for row in self.rows})
+
+    def latest_turn(self) -&gt; int:
+        return self.rows[-1].turn if self.rows else -1
+
+    def snapshot(self) -&gt; list[dict]:
+        return [row.to_dict() for row in self.rows]
+
+
+# ---------------------------------------------------------------------------
+# Gate protocol
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class GateContext:
+    &quot;&quot;&quot;Read-only context passed to every gate.&quot;&quot;&quot;
+
+    ledger: ObservationLedger
+    current_turn: int
+    history: tuple[ToolCall, ...] = ()
+
+
+class VerificationGate(Protocol):
+    name: str
+
+    def evaluate(self, call: ToolCall, ctx: GateContext) -&gt; GateDecision: ...
+
+
+# ---------------------------------------------------------------------------
+# Concrete gates
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class WhitelistGate:
+    &quot;&quot;&quot;Refuse any tool not in the explicit allow-set. Cheapest gate.&quot;&quot;&quot;
+
+    allowed: frozenset[str]
+    name: str = &quot;whitelist&quot;
+
+    def evaluate(self, call: ToolCall, ctx: GateContext) -&gt; GateDecision:
+        if call.tool in self.allowed:
+            return GateDecision(True, self.name, &quot;tool in allow-set&quot;)
+        return GateDecision(
+            False,
+            self.name,
+            f&quot;tool {call.tool!r} not in allow-set {sorted(self.allowed)}&quot;,
+        )
+
+
+@dataclass
+class RegexGate:
+    &quot;&quot;&quot;Refuse a call whose argv joins to a string matching any refuse pattern.&quot;&quot;&quot;
+
+    refuse_patterns: tuple[re.Pattern[str], ...]
+    name: str = &quot;regex&quot;
+
+    @classmethod
+    def from_strings(cls, patterns: Iterable[str], name: str = &quot;regex&quot;) -&gt; &quot;RegexGate&quot;:
+        compiled = tuple(re.compile(p) for p in patterns)
+        return cls(refuse_patterns=compiled, name=name)
+
+    def evaluate(self, call: ToolCall, ctx: GateContext) -&gt; GateDecision:
+        haystack = &quot; &quot;.join(call.argv) + &quot; &quot; + call.payload
+        for pat in self.refuse_patterns:
+            if pat.search(haystack):
+                return GateDecision(
+                    False, self.name, f&quot;argv matched refuse pattern {pat.pattern!r}&quot;
+                )
+        return GateDecision(True, self.name, &quot;no refuse pattern matched&quot;)
+
+
+@dataclass
+class RecencyGate:
+    &quot;&quot;&quot;Refuse a call if the last observation is more than window turns old.
+
+    The intent is to force a fresh read instead of relying on stale state.
+    The first call in a session always passes.
+    &quot;&quot;&quot;
+
+    window: int
+    name: str = &quot;recency&quot;
+
+    def evaluate(self, call: ToolCall, ctx: GateContext) -&gt; GateDecision:
+        last = ctx.ledger.latest_turn()
+        if last &lt; 0:
+            return GateDecision(True, self.name, &quot;no prior observations&quot;)
+        gap = call.turn - last
+        if gap &gt; self.window:
+            return GateDecision(
+                False,
+                self.name,
+                f&quot;observation gap {gap} turns exceeds window {self.window}&quot;,
+            )
+        return GateDecision(True, self.name, f&quot;gap {gap} within window {self.window}&quot;)
+
+
+@dataclass
+class BudgetGate:
+    &quot;&quot;&quot;Refuse a call once the cumulative observation budget is exhausted.
+
+    A single call cannot in advance know how many tokens its result will be.
+    The gate is therefore evaluated against the ledger as it stands before the
+    call, and the harness re-runs the cumulative check against the new ledger
+    state after recording the observation.
+    &quot;&quot;&quot;
+
+    max_tokens: int
+    name: str = &quot;budget&quot;
+
+    def evaluate(self, call: ToolCall, ctx: GateContext) -&gt; GateDecision:
+        used = ctx.ledger.cumulative()
+        if used &gt;= self.max_tokens:
+            return GateDecision(
+                False,
+                self.name,
+                f&quot;observation budget exhausted: {used}/{self.max_tokens} tokens&quot;,
+            )
+        remaining = self.max_tokens - used
+        return GateDecision(
+            True, self.name, f&quot;{remaining} tokens of budget remaining&quot;
+        )
+
+
+@dataclass
+class PerToolBudgetGate:
+    &quot;&quot;&quot;Optional gate: refuse if a single tool has consumed more than its share.&quot;&quot;&quot;
+
+    limits: dict[str, int]
+    name: str = &quot;per-tool-budget&quot;
+
+    def evaluate(self, call: ToolCall, ctx: GateContext) -&gt; GateDecision:
+        limit = self.limits.get(call.tool)
+        if limit is None:
+            return GateDecision(True, self.name, &quot;tool has no per-tool budget&quot;)
+        used = ctx.ledger.per_tool(call.tool)
+        if used &gt;= limit:
+            return GateDecision(
+                False,
+                self.name,
+                f&quot;per-tool budget for {call.tool} exhausted: {used}/{limit}&quot;,
+            )
+        return GateDecision(
+            True, self.name, f&quot;per-tool {call.tool}: {limit - used} tokens remaining&quot;
+        )
+
+
+# ---------------------------------------------------------------------------
+# Gate chain
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ChainOutcome:
+    &quot;&quot;&quot;The full result of a chain evaluation: the per-gate decisions plus a final verdict.&quot;&quot;&quot;
+
+    decisions: list[GateDecision]
+
+    @property
+    def allow(self) -&gt; bool:
+        return all(d.allow for d in self.decisions)
+
+    @property
+    def deny_reason(self) -&gt; str | None:
+        for d in self.decisions:
+            if not d.allow:
+                return f&quot;[{d.gate}] {d.reason}&quot;
+        return None
+
+    def to_dict(self) -&gt; dict:
+        return {
+            &quot;allow&quot;: self.allow,
+            &quot;deny_reason&quot;: self.deny_reason,
+            &quot;decisions&quot;: [d.to_dict() for d in self.decisions],
+        }
+
+
+@dataclass
+class GateChain:
+    &quot;&quot;&quot;Ordered list of gates evaluated with short-circuit on first deny.&quot;&quot;&quot;
+
+    gates: tuple[VerificationGate, ...]
+
+    def evaluate(self, call: ToolCall, ctx: GateContext) -&gt; ChainOutcome:
+        decisions: list[GateDecision] = []
+        for gate in self.gates:
+            decision = gate.evaluate(call, ctx)
+            decisions.append(decision)
+            if not decision.allow:
+                return ChainOutcome(decisions=decisions)
+        return ChainOutcome(decisions=decisions)
+
+
+# ---------------------------------------------------------------------------
+# Mini synthetic agent loop for the demo
+# ---------------------------------------------------------------------------
+
+
+ToolFn = Callable[[ToolCall], str]
+
+
+@dataclass
+class LoopReport:
+    &quot;&quot;&quot;Audit record of a synthetic loop run.&quot;&quot;&quot;
+
+    turns: int
+    allowed: int
+    refused: int
+    observations: list[Observation]
+    decisions: list[ChainOutcome]
+
+    def to_dict(self) -&gt; dict:
+        return {
+            &quot;turns&quot;: self.turns,
+            &quot;allowed&quot;: self.allowed,
+            &quot;refused&quot;: self.refused,
+            &quot;observations&quot;: [o.to_dict() for o in self.observations],
+            &quot;decisions&quot;: [d.to_dict() for d in self.decisions],
+        }
+
+
+def run_synthetic_loop(
+    calls: list[ToolCall],
+    chain: GateChain,
+    tool_fns: dict[str, ToolFn],
+) -&gt; LoopReport:
+    &quot;&quot;&quot;Run a fixed sequence of tool calls through the chain.
+
+    This is the harness skeleton in miniature. A real harness would consult
+    the model for the next tool call; the gate-chain contract is identical.
+    &quot;&quot;&quot;
+
+    ledger = ObservationLedger()
+    decisions: list[ChainOutcome] = []
+    observations: list[Observation] = []
+    allowed = 0
+    refused = 0
+
+    history: list[ToolCall] = []
+
+    for call in calls:
+        ctx = GateContext(
+            ledger=ledger, current_turn=call.turn, history=tuple(history)
+        )
+        outcome = chain.evaluate(call, ctx)
+        decisions.append(outcome)
+        history.append(call)
+        if not outcome.allow:
+            refused += 1
+            continue
+        fn = tool_fns.get(call.tool)
+        if fn is None:
+            refused += 1
+            continue
+        result = fn(call)
+        obs = Observation(
+            turn=call.turn,
+            tool=call.tool,
+            text=result,
+            tokens=estimate_tokens(result),
+        )
+        ledger.record(obs)
+        observations.append(obs)
+        allowed += 1
+
+    return LoopReport(
+        turns=len(calls),
+        allowed=allowed,
+        refused=refused,
+        observations=observations,
+        decisions=decisions,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Demo wiring
+# ---------------------------------------------------------------------------
+
+
+def _demo_tools() -&gt; dict[str, ToolFn]:
+    &quot;&quot;&quot;Three synthetic tools. read_file is verbose, list_dir is small, run_tests is structured.&quot;&quot;&quot;
+
+    def read_file(call: ToolCall) -&gt; str:
+        target = call.argv[0] if call.argv else &quot;&lt;missing&gt;&quot;
+        return (
+            f&quot;# fake contents of {target}\n&quot;
+            + (&quot;line of fake source code that is sixty bytes long &quot; * 12)
+        )
+
+    def list_dir(call: ToolCall) -&gt; str:
+        return &quot;main.py\nREADME.md\ntests/test_main.py\n&quot;
+
+    def run_tests(call: ToolCall) -&gt; str:
+        return json.dumps(
+            {&quot;status&quot;: &quot;passed&quot;, &quot;tests&quot;: 4, &quot;duration_ms&quot;: 42}, indent=2
+        )
+
+    return {&quot;read_file&quot;: read_file, &quot;list_dir&quot;: list_dir, &quot;run_tests&quot;: run_tests}
+
+
+def build_default_chain(budget: int = 200) -&gt; GateChain:
+    &quot;&quot;&quot;Wire the canonical four-gate chain in the order documented in en.md.&quot;&quot;&quot;
+
+    return GateChain(
+        gates=(
+            WhitelistGate(
+                allowed=frozenset({&quot;read_file&quot;, &quot;list_dir&quot;, &quot;run_tests&quot;})
+            ),
+            RegexGate.from_strings(
+                patterns=(
+                    r&quot;\brm\s+-rf\b&quot;,
+                    r&quot;\bsudo\b&quot;,
+                    r&quot;^/etc/&quot;,
+                )
+            ),
+            RecencyGate(window=3),
+            BudgetGate(max_tokens=budget),
+        )
+    )
+
+
+def run_demo() -&gt; int:
+    &quot;&quot;&quot;Self-terminating demo. Prints a JSON trace and exits zero.&quot;&quot;&quot;
+
+    chain = build_default_chain(budget=200)
+    tools = _demo_tools()
+
+    calls = [
+        ToolCall(turn=1, tool=&quot;list_dir&quot;, argv=(&quot;./&quot;,)),
+        ToolCall(turn=2, tool=&quot;read_file&quot;, argv=(&quot;main.py&quot;,)),
+        ToolCall(turn=3, tool=&quot;read_file&quot;, argv=(&quot;README.md&quot;,)),
+        ToolCall(turn=4, tool=&quot;run_tests&quot;, argv=(&quot;./&quot;,)),
+        ToolCall(turn=5, tool=&quot;shell&quot;, argv=(&quot;rm&quot;, &quot;-rf&quot;, &quot;/&quot;)),
+    ]
+
+    report = run_synthetic_loop(calls, chain, tools)
+
+    print(&quot;VERIFICATION GATE DEMO&quot;)
+    print(f&quot;turns={report.turns} allowed={report.allowed} refused={report.refused}&quot;)
+    print(&quot;&quot;)
+    for idx, (call, outcome) in enumerate(zip(calls, report.decisions)):
+        verdict = &quot;ALLOW&quot; if outcome.allow else &quot;DENY&quot;
+        print(f&quot;  [{idx}] turn={call.turn} tool={call.tool} -&gt; {verdict}&quot;)
+        if not outcome.allow:
+            print(f&quot;        reason: {outcome.deny_reason}&quot;)
+    print(&quot;&quot;)
+    print(f&quot;cumulative tokens observed: {sum(o.tokens for o in report.observations)}&quot;)
+    print(f&quot;observations recorded: {len(report.observations)}&quot;)
+
+    if report.refused &lt; 1:
+        print(&quot;ERROR: demo expected at least one refusal&quot;, file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == &quot;__main__&quot;:
+    sys.exit(run_demo())
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/25-verification-gates-observation-budget/code/tests/test_main.py">phases/19-capstone-projects/25-verification-gates-observation-budget/code/tests/test_main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Tests for the verification gate chain and observation ledger.&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import os
+import sys
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(HERE))
+
+from main import (  # noqa: E402
+    BudgetGate,
+    ChainOutcome,
+    GateChain,
+    GateContext,
+    Observation,
+    ObservationLedger,
+    PerToolBudgetGate,
+    RecencyGate,
+    RegexGate,
+    ToolCall,
+    WhitelistGate,
+    build_default_chain,
+    estimate_tokens,
+    run_demo,
+    run_synthetic_loop,
+)
+
+
+class LedgerTests(unittest.TestCase):
+    def test_empty_ledger_has_zero_cumulative(self) -&gt; None:
+        ledger = ObservationLedger()
+        self.assertEqual(ledger.cumulative(), 0)
+        self.assertEqual(ledger.per_tool(&quot;read_file&quot;), 0)
+        self.assertEqual(ledger.latest_turn(), -1)
+
+    def test_per_tool_accounting(self) -&gt; None:
+        ledger = ObservationLedger()
+        ledger.record(Observation(turn=1, tool=&quot;read_file&quot;, text=&quot;x&quot;, tokens=20))
+        ledger.record(Observation(turn=2, tool=&quot;read_file&quot;, text=&quot;y&quot;, tokens=30))
+        ledger.record(Observation(turn=3, tool=&quot;list_dir&quot;, text=&quot;z&quot;, tokens=10))
+        self.assertEqual(ledger.cumulative(), 60)
+        self.assertEqual(ledger.per_tool(&quot;read_file&quot;), 50)
+        self.assertEqual(ledger.per_tool(&quot;list_dir&quot;), 10)
+        self.assertEqual(ledger.latest_turn(), 3)
+        self.assertEqual(ledger.turns_seen(), [1, 2, 3])
+
+
+class TokenEstimatorTests(unittest.TestCase):
+    def test_estimator_is_monotonic(self) -&gt; None:
+        a = estimate_tokens(&quot;ab&quot;)
+        b = estimate_tokens(&quot;abcd&quot;)
+        c = estimate_tokens(&quot;abcd&quot; * 100)
+        self.assertLessEqual(a, b)
+        self.assertLess(b, c)
+
+    def test_estimator_zero_on_empty(self) -&gt; None:
+        self.assertEqual(estimate_tokens(&quot;&quot;), 0)
+
+
+class WhitelistGateTests(unittest.TestCase):
+    def setUp(self) -&gt; None:
+        self.gate = WhitelistGate(allowed=frozenset({&quot;read_file&quot;, &quot;list_dir&quot;}))
+        self.ctx = GateContext(ledger=ObservationLedger(), current_turn=1)
+
+    def test_allow_known_tool(self) -&gt; None:
+        decision = self.gate.evaluate(
+            ToolCall(turn=1, tool=&quot;read_file&quot;, argv=(&quot;x&quot;,)), self.ctx
+        )
+        self.assertTrue(decision.allow)
+        self.assertEqual(decision.gate, &quot;whitelist&quot;)
+
+    def test_deny_unknown_tool(self) -&gt; None:
+        decision = self.gate.evaluate(
+            ToolCall(turn=1, tool=&quot;shell&quot;, argv=(&quot;rm&quot;,)), self.ctx
+        )
+        self.assertFalse(decision.allow)
+        self.assertIn(&quot;not in allow-set&quot;, decision.reason)
+
+
+class RegexGateTests(unittest.TestCase):
+    def setUp(self) -&gt; None:
+        self.gate = RegexGate.from_strings(patterns=(r&quot;rm\s+-rf&quot;, r&quot;sudo&quot;))
+        self.ctx = GateContext(ledger=ObservationLedger(), current_turn=1)
+
+    def test_allow_clean_argv(self) -&gt; None:
+        decision = self.gate.evaluate(
+            ToolCall(turn=1, tool=&quot;shell&quot;, argv=(&quot;ls&quot;, &quot;-la&quot;)), self.ctx
+        )
+        self.assertTrue(decision.allow)
+
+    def test_deny_rm_rf(self) -&gt; None:
+        decision = self.gate.evaluate(
+            ToolCall(turn=1, tool=&quot;shell&quot;, argv=(&quot;rm&quot;, &quot;-rf&quot;, &quot;/&quot;)), self.ctx
+        )
+        self.assertFalse(decision.allow)
+        self.assertIn(&quot;rm&quot;, decision.reason)
+
+    def test_deny_sudo(self) -&gt; None:
+        decision = self.gate.evaluate(
+            ToolCall(turn=1, tool=&quot;shell&quot;, argv=(&quot;sudo&quot;, &quot;apt&quot;, &quot;install&quot;)), self.ctx
+        )
+        self.assertFalse(decision.allow)
+
+
+class RecencyGateTests(unittest.TestCase):
+    def test_first_call_always_allowed(self) -&gt; None:
+        gate = RecencyGate(window=3)
+        ctx = GateContext(ledger=ObservationLedger(), current_turn=1)
+        self.assertTrue(
+            gate.evaluate(ToolCall(turn=1, tool=&quot;x&quot;, argv=()), ctx).allow
+        )
+
+    def test_within_window(self) -&gt; None:
+        gate = RecencyGate(window=3)
+        ledger = ObservationLedger()
+        ledger.record(Observation(turn=5, tool=&quot;x&quot;, text=&quot;&quot;, tokens=1))
+        ctx = GateContext(ledger=ledger, current_turn=7)
+        decision = gate.evaluate(ToolCall(turn=7, tool=&quot;x&quot;, argv=()), ctx)
+        self.assertTrue(decision.allow)
+
+    def test_outside_window(self) -&gt; None:
+        gate = RecencyGate(window=3)
+        ledger = ObservationLedger()
+        ledger.record(Observation(turn=1, tool=&quot;x&quot;, text=&quot;&quot;, tokens=1))
+        ctx = GateContext(ledger=ledger, current_turn=10)
+        decision = gate.evaluate(ToolCall(turn=10, tool=&quot;x&quot;, argv=()), ctx)
+        self.assertFalse(decision.allow)
+        self.assertIn(&quot;gap&quot;, decision.reason)
+
+
+class BudgetGateTests(unittest.TestCase):
+    def test_under_budget_allows(self) -&gt; None:
+        gate = BudgetGate(max_tokens=100)
+        ledger = ObservationLedger()
+        ledger.record(Observation(turn=1, tool=&quot;x&quot;, text=&quot;&quot;, tokens=40))
+        ctx = GateContext(ledger=ledger, current_turn=2)
+        self.assertTrue(gate.evaluate(ToolCall(turn=2, tool=&quot;x&quot;, argv=()), ctx).allow)
+
+    def test_at_budget_denies(self) -&gt; None:
+        gate = BudgetGate(max_tokens=100)
+        ledger = ObservationLedger()
+        ledger.record(Observation(turn=1, tool=&quot;x&quot;, text=&quot;&quot;, tokens=100))
+        ctx = GateContext(ledger=ledger, current_turn=2)
+        decision = gate.evaluate(ToolCall(turn=2, tool=&quot;x&quot;, argv=()), ctx)
+        self.assertFalse(decision.allow)
+        self.assertIn(&quot;budget exhausted&quot;, decision.reason)
+
+    def test_over_budget_denies(self) -&gt; None:
+        gate = BudgetGate(max_tokens=100)
+        ledger = ObservationLedger()
+        ledger.record(Observation(turn=1, tool=&quot;x&quot;, text=&quot;&quot;, tokens=200))
+        ctx = GateContext(ledger=ledger, current_turn=2)
+        self.assertFalse(gate.evaluate(ToolCall(turn=2, tool=&quot;x&quot;, argv=()), ctx).allow)
+
+
+class PerToolBudgetGateTests(unittest.TestCase):
+    def test_unbudgeted_tool_passes(self) -&gt; None:
+        gate = PerToolBudgetGate(limits={&quot;read_file&quot;: 50})
+        ctx = GateContext(ledger=ObservationLedger(), current_turn=1)
+        decision = gate.evaluate(ToolCall(turn=1, tool=&quot;list_dir&quot;, argv=()), ctx)
+        self.assertTrue(decision.allow)
+
+    def test_over_per_tool_limit_denies(self) -&gt; None:
+        gate = PerToolBudgetGate(limits={&quot;read_file&quot;: 50})
+        ledger = ObservationLedger()
+        ledger.record(Observation(turn=1, tool=&quot;read_file&quot;, text=&quot;&quot;, tokens=60))
+        ctx = GateContext(ledger=ledger, current_turn=2)
+        decision = gate.evaluate(ToolCall(turn=2, tool=&quot;read_file&quot;, argv=()), ctx)
+        self.assertFalse(decision.allow)
+
+
+class ChainShortCircuitTests(unittest.TestCase):
+    def test_chain_short_circuits_on_first_deny(self) -&gt; None:
+        chain = GateChain(
+            gates=(
+                WhitelistGate(allowed=frozenset({&quot;only_this&quot;})),
+                RegexGate.from_strings(patterns=(r&quot;.*&quot;,)),
+            )
+        )
+        ctx = GateContext(ledger=ObservationLedger(), current_turn=1)
+        outcome = chain.evaluate(
+            ToolCall(turn=1, tool=&quot;other&quot;, argv=()), ctx
+        )
+        self.assertFalse(outcome.allow)
+        self.assertEqual(len(outcome.decisions), 1)
+        self.assertEqual(outcome.decisions[0].gate, &quot;whitelist&quot;)
+
+    def test_chain_allows_when_all_gates_pass(self) -&gt; None:
+        chain = build_default_chain(budget=500)
+        ctx = GateContext(ledger=ObservationLedger(), current_turn=1)
+        outcome = chain.evaluate(
+            ToolCall(turn=1, tool=&quot;read_file&quot;, argv=(&quot;main.py&quot;,)), ctx
+        )
+        self.assertTrue(outcome.allow)
+        self.assertEqual(len(outcome.decisions), 4)
+
+
+class SyntheticLoopTests(unittest.TestCase):
+    def test_loop_trips_budget_on_third_read(self) -&gt; None:
+        chain = build_default_chain(budget=80)
+
+        def big_tool(call: ToolCall) -&gt; str:
+            return &quot;x&quot; * 400
+
+        calls = [
+            ToolCall(turn=1, tool=&quot;list_dir&quot;, argv=()),
+            ToolCall(turn=2, tool=&quot;read_file&quot;, argv=(&quot;a&quot;,)),
+            ToolCall(turn=3, tool=&quot;read_file&quot;, argv=(&quot;b&quot;,)),
+        ]
+        report = run_synthetic_loop(
+            calls,
+            chain,
+            tool_fns={
+                &quot;list_dir&quot;: lambda c: &quot;tiny&quot;,
+                &quot;read_file&quot;: big_tool,
+                &quot;run_tests&quot;: lambda c: &quot;ok&quot;,
+            },
+        )
+        self.assertGreaterEqual(report.refused, 1)
+        self.assertGreaterEqual(report.allowed, 1)
+
+    def test_demo_main_exits_zero(self) -&gt; None:
+        self.assertEqual(run_demo(), 0)
+
+
+if __name__ == &quot;__main__&quot;:
+    unittest.main()
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. Before reading the lesson: which of these is the strongest reason a harness needs a deterministic gate chain rather than a model-as-judge?</legend><label class="option"><input type="radio" name="q0" value="0"> Models are too slow to act as judges in production.</label><label class="option"><input type="radio" name="q0" value="1"> Gate chains let the model write its own policy.</label><label class="option"><input type="radio" name="q0" value="2"> A model-as-judge always produces hallucinated allow decisions.</label><label class="option"><input type="radio" name="q0" value="3"> Determinism makes the deny reason auditable and the chain replayable.</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. Why does the lesson run WhitelistGate before BudgetGate in the chain?</legend><label class="option"><input type="radio" name="q1" value="0"> BudgetGate cannot run until at least one tool has been called.</label><label class="option"><input type="radio" name="q1" value="1"> Whitelist denials are cheaper, so short-circuiting them avoids the expensive ledger sum.</label><label class="option"><input type="radio" name="q1" value="2"> Whitelist must always be the last gate by convention.</label><label class="option"><input type="radio" name="q1" value="3"> Order does not matter because GateChain randomises evaluation order.</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. An ObservationLedger has recorded a 60-token observation from read_file. The harness then refuses a subsequent call. What does the ledger record about the refusal?</legend><label class="option"><input type="radio" name="q2" value="0"> Nothing. The ledger only records successful observations.</label><label class="option"><input type="radio" name="q2" value="1"> The refusal is appended as a synthetic Observation with the refuser&#39;s name.</label><label class="option"><input type="radio" name="q2" value="2"> A zero-token Observation row tagged refused.</label><label class="option"><input type="radio" name="q2" value="3"> A negative-token Observation row representing the refusal cost.</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. RecencyGate.window is set to 3. The ledger&#39;s latest_turn is 5. A new ToolCall arrives on turn 10. What happens?</legend><label class="option"><input type="radio" name="q3" value="0"> The gate denies: gap of 5 exceeds window of 3.</label><label class="option"><input type="radio" name="q3" value="1"> The gate allows: the call is on the latest turn.</label><label class="option"><input type="radio" name="q3" value="2"> The gate allows: window applies to ledger size, not turn gap.</label><label class="option"><input type="radio" name="q3" value="3"> The gate raises an exception because the ledger is stale.</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. You want to add a per-call output cap (no single observation may exceed 8000 tokens). Where does this gate logically belong in the chain?</legend><label class="option"><input type="radio" name="q4" value="0"> It cannot be a gate because the size is only known after the tool runs.</label><label class="option"><input type="radio" name="q4" value="1"> Before WhitelistGate, since size is the cheapest property to check.</label><label class="option"><input type="radio" name="q4" value="2"> Inside the BudgetGate so the limits compose.</label><label class="option"><input type="radio" name="q4" value="3"> After BudgetGate, since cumulative budget always dominates.</label><p data-feedback="4"></p></fieldset><fieldset><legend>6. A reviewer asks you to prove that the agent never fired a denied tool call during a session. Which artifact do you point them at?</legend><label class="option"><input type="radio" name="q5" value="0"> The ObservationLedger snapshot, which only contains successful observations.</label><label class="option"><input type="radio" name="q5" value="1"> The pytest output, which records test pass/fail.</label><label class="option"><input type="radio" name="q5" value="2"> The model&#39;s chat transcript, which contains its own self-report.</label><label class="option"><input type="radio" name="q5" value="3"> The list of ChainOutcome records, which contains every per-call decision with deny reasons.</label><p data-feedback="5"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/19-capstone-projects/24-plan-execute-control-flow/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/19-capstone-projects/26-sandbox-runner-denylist/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/19-capstone-projects/25-verification-gates-observation-budget/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

@@ -1,0 +1,1038 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>实时视觉 边缘部署 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-04-computer-vision" data-lesson="04-computer-vision/15-real-time-edge" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/04-computer-vision/">计算机视觉</a> / LESSON 15</p><h1 class="lesson-title">实时视觉 边缘部署</h1><p>Real-Time Vision — Edge Deployment</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>实时视觉 边缘部署</h1>
+<blockquote>
+<p>边缘推断是让90度精度模型在2GB内存的设备上以30fps运行的学科.每个精度百分点都与延迟毫秒进行交易.</p>
+</blockquote>
+<p><strong>Type:</strong> Learn + Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 4 Lesson 04 (Image Classification), Phase 10 Lesson 11 (Quantization)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>测量任何 PyTorch 模型的推理延迟,峰值内存和吞吐量,并阅读FLOPs / params /延迟交易</li>
+<li>通过 PyTorch 的训练后量化,将视觉模型量化为 INT8 并验证精度损失 &lt; 1%</li>
+<li>输出到 ONNX,并使用 ONNX Runtime或 TensorRT编译;列出出了最常见的输出故障和它们的修复</li>
+<li>解释当选择 MobileNetV3, EfficientNet-Lite, ConvNeXt-Tiny,或 MobileViT为边缘限制时</li>
+</ul>
+<h2>问题</h2>
+<p>训练时视觉模型是一个浮点怪物. 100M参数,每次前进传输10GFLOP,2GB的VRAM.这一切都不适合手机,汽车的信息娱乐装置,工业摄像头或无人机.运送视觉系统意味着将相同的预测纳入一个比较小的预算.</p>
+<p>基本上,这两个操作符都能通过三个按完成工作:模型选择 (一个相同的小架构),量化 (INT8而不是FP32) 和推断运行时间 (ONNX运行时间,TensorRT,Core ML,TFLite).</p>
+<p>首先,这个课程设置了测量纪律 (你不能优化你无法测量的东西),然后就行了三个按.目标不是学习每一个边缘运行时间,而是知道有哪些杆,以及如何验证每个杆都能按照你想象的情况.</p>
+<h2>概念</h2>
+<h3>预算的三个</h3>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-80e6d19f93d743815ad7.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><ul>
+<li><strong>Latency</strong>平均只有p50隐藏了对实时系统重要的尾巴行为.</li>
+<li><strong>Peak memory</strong>机器能看到的最大值,而不是稳定状态的平均值.</li>
+<li><strong>Power / energy</strong>电池驱动设备的推断量为每次毫. 通常由CPU/GPU使用时间*来代理.</li>
+</ul>
+<p>边缘决定是从一个表 (模型,延迟,内存,精度) 中进行的.每个细胞都在目标设备上测量,而不是工作站.</p>
+<h3>测量纪律</h3>
+<p>任何边缘配置文件都应该遵循的三个规则:</p>
+<ol>
+<li><strong>Warm up</strong>模特在测量之前通过5到10个模特前面.冷缓存和JIT编译产生非代表性的第一数字.</li>
+<li><strong>Synchronise</strong> GPU 工作负载<code>torch.cuda.synchronize()</code>没有它,你会测量内核发射,而不是内核执行.</li>
+<li><strong>Fix input sizes</strong>在224x224上的延迟不是512x512的延迟.</li>
+</ol>
+<h3>作为代理人</h3>
+<p>基于推理的浮点操作 (FLOPs) 是一个廉价,设备独立的延迟代理.对于架构比较有用,作为绝对的墙钟误导性.一个具有10%多的FLOP的模型在实践中可以快得两倍,因为它使用硬件友好的 ops (深度控制器编译良好,大型7x7控制器没有).</p>
+<p>规则:用于架构搜索使用FLOP,用于部署决策使用设备上的延迟.</p>
+<h3>在一个段落中定量化</h3>
+<p>替换FP32重量和激活器使用INT8.模型尺寸下降4倍,内存带宽下降4倍,计算器在具有INT8内核的硬件上下降2 - 4倍 (每个现代移动SoC,每个NVIDIA GPU带光芯).视觉任务的精度损失通常在训练后的静态定量化时为0.1-1百分点.</p>
+<p>类型:</p>
+<ul>
+<li><strong>Dynamic</strong>量子重量到INT8,在FP计算的激活.</li>
+<li>**Static (post-training)**量子权重+校准激活范围在小型校准组上. 比动态快得多.</li>
+<li>**Quantisation-aware training (QAT)**模拟训练期间的量化,使模型能够在训练中学习.</li>
+</ul>
+<p>视力,训练后的静态量化提供了 95%的效益,而努力的5%是可用的.</p>
+<h3>切割和蒸</h3>
+<ul>
+<li><strong>Pruning</strong>消除不重要的重量 (基于大小) 或道 (结构化).对过度参数模型很好,对于已经紧的架构则不太有用.</li>
+<li><strong>Distillation</strong>培训一个小学生模仿一个大老师的逻辑. 往往通过缩小模型恢复了大部分丢失的精度.</li>
+</ul>
+<h3>推断运行时间</h3>
+<ul>
+<li><strong>PyTorch eager</strong>慢,不用于部署,仅用于开发.</li>
+<li><strong>TorchScript</strong>继承者:<code>torch.compile</code>欧安的出口.</li>
+<li><strong>ONNX Runtime</strong>中性运行时间. CPU,CUDA,CoreML,TensorRT,OpenVINO都拥有ONNX供应商.从这里开始.</li>
+<li><strong>TensorRT</strong> NVIDIA 的编译器. NVIDIA GPU (工作站和Jetson) 上最好的延迟. 集成到 ONNX 运行时间或独立.</li>
+<li><strong>Core ML</strong>果公司的iOS/macOS运行时间.<code>.mlmodel</code>或<code>.mlpackage</code>现在,我们要去.</li>
+<li><strong>TFLite</strong>谷歌对Android/ARM的运行时间.<code>.tflite</code>现在,我们要去.</li>
+<li><strong>OpenVINO</strong>英特尔的CPU/VPU运行时间.<code>.xml</code>其他<code>.bin</code>现在,我们要去.</li>
+</ul>
+<p>实际上:出口PyTorch -&gt; ONNX -&gt;选择目标运行时间. ONNX是语言.</p>
+<h3>边缘建筑选手</h3>
+<table>
+<thead>
+<tr>
+<th>Budget</th>
+<th>Model</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>&lt; 3M params</td>
+<td>MobileNetV3-Small</td>
+<td>Compiles everywhere, good baseline</td>
+</tr>
+<tr>
+<td>3-10M</td>
+<td>EfficientNet-Lite-B0</td>
+<td>Best accuracy per param on TFLite</td>
+</tr>
+<tr>
+<td>10-20M</td>
+<td>ConvNeXt-Tiny</td>
+<td>Best accuracy-per-param, CPU-friendly</td>
+</tr>
+<tr>
+<td>20-30M</td>
+<td>MobileViT-S or EfficientViT</td>
+<td>Transformer with ImageNet accuracy</td>
+</tr>
+<tr>
+<td>30-80M</td>
+<td>Swin-V2-Tiny</td>
+<td>If stack supports window attention</td>
+</tr>
+</tbody>
+</table>
+<p>只有你有特定的理由不做.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-22d3f2994dd9cb0cd021.png" alt="cnn-param-count 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<h3>步骤1:正确测量延迟</h3>
+<pre><code class="language-python">import time
+import torch
+
+def measure_latency(model, input_shape, device=&quot;cpu&quot;, warmup=10, iters=50):
+    model = model.to(device).eval()
+    x = torch.randn(input_shape, device=device)
+    with torch.no_grad():
+        for _ in range(warmup):
+            model(x)
+        if device == &quot;cuda&quot;:
+            torch.cuda.synchronize()
+        times = []
+        for _ in range(iters):
+            if device == &quot;cuda&quot;:
+                torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            model(x)
+            if device == &quot;cuda&quot;:
+                torch.cuda.synchronize()
+            times.append((time.perf_counter() - t0) * 1000)
+    times.sort()
+    return {
+        &quot;p50_ms&quot;: times[len(times) // 2],
+        &quot;p95_ms&quot;: times[int(len(times) * 0.95)],
+        &quot;p99_ms&quot;: times[int(len(times) * 0.99)],
+        &quot;mean_ms&quot;: sum(times) / len(times),
+    }
+</code></pre>
+<p>热,同步,使用<code>time.perf_counter()</code>报告百分比,不仅仅是恶意.</p>
+<h3>步骤2:参数和FLOP数量</h3>
+<pre><code class="language-python">def parameter_count(model):
+    return sum(p.numel() for p in model.parameters())
+
+def flops_estimate(model, input_shape):
+    &quot;&quot;&quot;
+    Rough FLOP count for a conv/linear-only model. For production use `fvcore` or `ptflops`.
+    &quot;&quot;&quot;
+    total = 0
+    def conv_hook(m, inp, out):
+        nonlocal total
+        c_out, c_in, kh, kw = m.weight.shape
+        h, w = out.shape[-2:]
+        total += 2 * c_in * c_out * kh * kw * h * w
+    def linear_hook(m, inp, out):
+        nonlocal total
+        total += 2 * m.in_features * m.out_features
+    hooks = []
+    for m in model.modules():
+        if isinstance(m, torch.nn.Conv2d):
+            hooks.append(m.register_forward_hook(conv_hook))
+        elif isinstance(m, torch.nn.Linear):
+            hooks.append(m.register_forward_hook(linear_hook))
+    model.eval()
+    with torch.no_grad():
+        model(torch.randn(input_shape))
+    for h in hooks:
+        h.remove()
+    return total
+</code></pre>
+<p>用于实际项目使用<code>fvcore.nn.FlopCountAnalysis</code>或<code>ptflops</code>它们对每个模块类型进行正确处理.</p>
+<h3>步骤3:训练后的静态量化</h3>
+<pre><code class="language-python">def quantise_ptq(model, calibration_loader, backend=&quot;x86&quot;):
+    import torch.ao.quantization as tq
+    model = model.eval().cpu()
+    model.qconfig = tq.get_default_qconfig(backend)
+    tq.prepare(model, inplace=True)
+    with torch.no_grad():
+        for x, _ in calibration_loader:
+            model(x)
+    tq.convert(model, inplace=True)
+    return model
+</code></pre>
+<p>设置,准备 (插入观察器),与实际数据校准,转换 (结+量化).<code>Conv -&gt; BN -&gt; ReLU</code>其他<code>ConvBnReLU</code>), 哪些<code>torch.ao.quantization.fuse_modules</code>子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子</p>
+<h3>步骤4:出口到ONNX</h3>
+<pre><code class="language-python">def export_onnx(model, sample_input, path=&quot;model.onnx&quot;):
+    model = model.eval()
+    torch.onnx.export(
+        model,
+        sample_input,
+        path,
+        input_names=[&quot;input&quot;],
+        output_names=[&quot;output&quot;],
+        dynamic_axes={&quot;input&quot;: {0: &quot;batch&quot;}, &quot;output&quot;: {0: &quot;batch&quot;}},
+        opset_version=17,
+    )
+    return path
+</code></pre>
+<p><code>opset_version=17</code>作为2026年安全违约.<code>dynamic_axes</code>让你运行ONNX模型,随意批量.</p>
+<h3>步骤5:基准和比较方案</h3>
+<pre><code class="language-python">import torch.nn as nn
+from torchvision.models import mobilenet_v3_small
+
+def compare_regimes():
+    model = mobilenet_v3_small(weights=None, num_classes=10)
+    params = parameter_count(model)
+    flops = flops_estimate(model, (1, 3, 224, 224))
+    lat_fp32 = measure_latency(model, (1, 3, 224, 224), device=&quot;cpu&quot;)
+    print(f&quot;FP32 MobileNetV3-Small: {params:,} params  {flops/1e9:.2f} GFLOPs  &quot;
+          f&quot;p50={lat_fp32['p50_ms']:.2f}ms  p95={lat_fp32['p95_ms']:.2f}ms&quot;)
+</code></pre>
+<p>运行相同的函数<code>resnet50</code>现在<code>efficientnet_v2_s</code>其他<code>convnext_tiny</code>您需要的比较表,</p>
+<h2>用它</h2>
+<p>生产堆在三个路径之一上相汇聚:</p>
+<ul>
+<li><strong>Web / serverless</strong>简单,适合大多数人.</li>
+<li>**NVIDIA edge (Jetson, GPU server)**讯器RT,最好的延迟,最大的工程努力.</li>
+<li><strong>Mobile</strong>根据&quot;中文版&quot;的定义,在&quot;中文版&quot;中,</li>
+</ul>
+<p>用于测量<code>torch-tb-profiler</code>现在<code>nvprof</code>现在,<code>nsys</code>它们是基于 MacOS 的工具,<code>benchmark_app</code>果和果<code>trtexec</code>给出独立的CLI号码.</p>
+<h2>运送它</h2>
+<p>这一课产生了:</p>
+<ul>
+<li><code>outputs/prompt-edge-deployment-planner.md</code>一个提示,选择了脊柱,定量化策略和运行时间,给定了目标设备和延迟SLA.</li>
+<li><code>outputs/skill-latency-profiler.md</code>写完整的延迟标记脚本,加热,同步,百分比和记忆跟踪.</li>
+</ul>
+<h2>运动</h2>
+<ol>
+<li>**(Easy)**测量p50延迟<code>resnet18</code>现在<code>mobilenet_v3_small</code>现在<code>efficientnet_v2_s</code>其他<code>convnext_tiny</code>报告表,确定哪个架构具有最佳的准确度.</li>
+<li>**(Medium)**应对训练后的静态量化<code>mobilenet_v3_small</code>报告FP32对INT8延迟和准确性损失在CIFAR-10或类似的延迟子集中.</li>
+<li>**(Hard)**出口<code>convnext_tiny</code>运行到 ONNX <code>onnxruntime</code>随着<code>CPUExecutionProvider</code>确定ONNX运行时间更快的第一层,并解释为什么.</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Latency</td>
+<td>&quot;How fast&quot;</td>
+<td>Time from input to output; p50/p95/p99 percentiles, not mean</td>
+</tr>
+<tr>
+<td>FLOPs</td>
+<td>&quot;Model size&quot;</td>
+<td>Floating-point ops per forward pass; rough proxy for compute cost</td>
+</tr>
+<tr>
+<td>INT8 quantisation</td>
+<td>&quot;8-bit&quot;</td>
+<td>Replace FP32 weights/activations with 8-bit integers; ~4x smaller, 2-4x faster</td>
+</tr>
+<tr>
+<td>PTQ</td>
+<td>&quot;Post-training quantisation&quot;</td>
+<td>Quantise a trained model without retraining; easy, usually enough</td>
+</tr>
+<tr>
+<td>QAT</td>
+<td>&quot;Quantisation-aware training&quot;</td>
+<td>Simulate quantisation during training; best accuracy, requires labelled data</td>
+</tr>
+<tr>
+<td>ONNX</td>
+<td>&quot;The neutral format&quot;</td>
+<td>Model exchange format supported by every mainstream inference runtime</td>
+</tr>
+<tr>
+<td>TensorRT</td>
+<td>&quot;NVIDIA compiler&quot;</td>
+<td>Compiles ONNX into an optimised engine for NVIDIA GPUs</td>
+</tr>
+<tr>
+<td>Distillation</td>
+<td>&quot;Teacher -&gt; student&quot;</td>
+<td>Train a small model to mimic a big model's logits; recovers most lost accuracy</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/1905.11946" rel="noreferrer" data-network="true">EfficientNet (Tan &amp; Le, 2019) <small>↗ 需要联网</small></a>复合扩展,以实现高效的建筑</li>
+<li><a href="https://arxiv.org/abs/1905.02244" rel="noreferrer" data-network="true">MobileNetV3 (Howard et al., 2019) <small>↗ 需要联网</small></a>移动首选架构,具有h-swish和squeeze-excite</li>
+<li><a href="https://developer.nvidia.com/blog/accelerating-inference-up-to-6x-faster-in-pytorch-with-torch-tensorrt/" rel="noreferrer" data-network="true">Accelerating Inference Up to 6x Faster in PyTorch with Torch-TensorRT (NVIDIA) <small>↗ 需要联网</small></a>如何实际上在纸上获取吞吐量数字</li>
+<li><a href="https://onnxruntime.ai/docs/" rel="noreferrer" data-network="true">ONNX Runtime docs <small>↗ 需要联网</small></a>量化,图表优化,供应商选择</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Real-Time Vision — Edge Deployment</h1>
+<blockquote>
+<p>Edge inference is the discipline of getting a 90-accuracy model to run at 30 fps on a device with 2 GB of RAM. Every percentage point of accuracy is traded against milliseconds of latency.</p>
+</blockquote>
+<p><strong>Type:</strong> Learn + Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 4 Lesson 04 (Image Classification), Phase 10 Lesson 11 (Quantization)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Measure inference latency, peak memory, and throughput for any PyTorch model, and read the FLOPs / params / latency trade-off</li>
+<li>Quantise a vision model to INT8 using PyTorch's post-training quantisation and verify accuracy loss &lt; 1%</li>
+<li>Export to ONNX and compile with ONNX Runtime or TensorRT; name the three most common export failures and their fixes</li>
+<li>Explain when to pick MobileNetV3, EfficientNet-Lite, ConvNeXt-Tiny, or MobileViT for an edge constraint</li>
+</ul>
+<h2>The Problem</h2>
+<p>A training-time vision model is a floating-point monster. 100M parameters, 10 GFLOPs per forward pass, 2 GB of VRAM. None of that fits on a phone, a car's infotainment unit, an industrial camera, or a drone. Shipping a vision system means fitting the same predictions into a budget that is 100x smaller.</p>
+<p>Three knobs do most of the work: model choice (a smaller architecture with the same recipe), quantisation (INT8 instead of FP32), and the inference runtime (ONNX Runtime, TensorRT, Core ML, TFLite). Getting them right is the difference between a demo that runs on a workstation and a product that ships on a $30 camera module.</p>
+<p>This lesson sets up the measurement discipline first (you cannot optimise what you cannot measure), then walks the three knobs. The goal is not to learn every edge runtime but to know what levers exist and how to verify each one does what you think.</p>
+<h2>The Concept</h2>
+<h3>The three budgets</h3>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-80e6d19f93d743815ad7.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><ul>
+<li><strong>Latency</strong>: p50, p95, p99. Averaging only p50 hides tail behaviour that matters for real-time systems.</li>
+<li><strong>Peak memory</strong>: the maximum the device ever sees, not the steady-state average. Matters because OOMs are fatal on embedded targets.</li>
+<li><strong>Power / energy</strong>: millijoules per inference on a battery-powered device. Often proxied by CPU/GPU utilisation * time.</li>
+</ul>
+<p>A table of (model, latency, memory, accuracy) is what an edge decision is made from. Every cell is measured on the target device, not the workstation.</p>
+<h3>Measurement discipline</h3>
+<p>Three rules that every edge profile should follow:</p>
+<ol>
+<li><strong>Warm up</strong> the model with 5-10 dummy forward passes before measuring. Cold caches and JIT compilation produce unrepresentative first numbers.</li>
+<li><strong>Synchronise</strong> GPU workloads with <code>torch.cuda.synchronize()</code> before and after the timed block. Without this you measure kernel dispatch, not kernel execution.</li>
+<li><strong>Fix input sizes</strong> to the production resolution. Latency on 224x224 is not latency on 512x512.</li>
+</ol>
+<h3>FLOPs as a proxy</h3>
+<p>FLOPs (floating-point operations per inference) is a cheap, device-independent proxy for latency. Useful for architecture comparison, misleading as absolute wall-clock. A model with 10% more FLOPs can be 2x faster in practice because it uses hardware-friendly ops (depthwise convs compile well, large 7x7 convs do not).</p>
+<p>Rule: use FLOPs for architecture search, use on-device latency for deployment decisions.</p>
+<h3>Quantisation in one paragraph</h3>
+<p>Replace FP32 weights and activations with INT8. Model size drops 4x, memory bandwidth drops 4x, compute drops 2-4x on hardware that has INT8 kernels (every modern mobile SoC, every NVIDIA GPU with Tensor Cores). Accuracy loss on vision tasks is typically 0.1-1 percentage points with post-training static quantisation.</p>
+<p>Types:</p>
+<ul>
+<li><strong>Dynamic</strong> — quantise weights to INT8, activations computed in FP. Easy, small speedup.</li>
+<li><strong>Static (post-training)</strong> — quantise weights + calibrate activation ranges on a small calibration set. Much faster than dynamic.</li>
+<li><strong>Quantisation-aware training (QAT)</strong> — simulate quantisation during training so the model learns around it. Best accuracy, needs labelled data.</li>
+</ul>
+<p>For vision, post-training static quantisation gives 95% of the benefit with 5% of the effort. Use QAT only when accuracy loss from PTQ is unacceptable.</p>
+<h3>Pruning and distillation</h3>
+<ul>
+<li><strong>Pruning</strong> — remove unimportant weights (magnitude-based) or channels (structured). Works well on overparameterised models; less useful on already-compact architectures.</li>
+<li><strong>Distillation</strong> — train a small student to mimic a large teacher's logits. Often recovers most of the accuracy lost by shrinking the model. Standard for production edge models.</li>
+</ul>
+<h3>The inference runtimes</h3>
+<ul>
+<li><strong>PyTorch eager</strong> — slow, not for deployment. Use for development only.</li>
+<li><strong>TorchScript</strong> — legacy. Superseded by <code>torch.compile</code> and ONNX export.</li>
+<li><strong>ONNX Runtime</strong> — the neutral runtime. CPU, CUDA, CoreML, TensorRT, OpenVINO all have ONNX providers. Start here.</li>
+<li><strong>TensorRT</strong> — NVIDIA's compiler. Best latency on NVIDIA GPUs (workstation and Jetson). Integrates with ONNX Runtime or standalone.</li>
+<li><strong>Core ML</strong> — Apple's runtime for iOS/macOS. Needs <code>.mlmodel</code> or <code>.mlpackage</code>.</li>
+<li><strong>TFLite</strong> — Google's runtime for Android/ARM. Needs <code>.tflite</code>.</li>
+<li><strong>OpenVINO</strong> — Intel's runtime for CPU/VPU. Needs <code>.xml</code> + <code>.bin</code>.</li>
+</ul>
+<p>In practice: export PyTorch -&gt; ONNX -&gt; pick the runtime for the target. ONNX is the lingua franca.</p>
+<h3>Edge architecture picker</h3>
+<table>
+<thead>
+<tr>
+<th>Budget</th>
+<th>Model</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>&lt; 3M params</td>
+<td>MobileNetV3-Small</td>
+<td>Compiles everywhere, good baseline</td>
+</tr>
+<tr>
+<td>3-10M</td>
+<td>EfficientNet-Lite-B0</td>
+<td>Best accuracy per param on TFLite</td>
+</tr>
+<tr>
+<td>10-20M</td>
+<td>ConvNeXt-Tiny</td>
+<td>Best accuracy-per-param, CPU-friendly</td>
+</tr>
+<tr>
+<td>20-30M</td>
+<td>MobileViT-S or EfficientViT</td>
+<td>Transformer with ImageNet accuracy</td>
+</tr>
+<tr>
+<td>30-80M</td>
+<td>Swin-V2-Tiny</td>
+<td>If stack supports window attention</td>
+</tr>
+</tbody>
+</table>
+<p>Quantise all of these to INT8 unless you have a specific reason not to.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-22d3f2994dd9cb0cd021.png" alt="cnn-param-count 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<h3>Step 1: Measure latency correctly</h3>
+<pre><code class="language-python">import time
+import torch
+
+def measure_latency(model, input_shape, device=&quot;cpu&quot;, warmup=10, iters=50):
+    model = model.to(device).eval()
+    x = torch.randn(input_shape, device=device)
+    with torch.no_grad():
+        for _ in range(warmup):
+            model(x)
+        if device == &quot;cuda&quot;:
+            torch.cuda.synchronize()
+        times = []
+        for _ in range(iters):
+            if device == &quot;cuda&quot;:
+                torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            model(x)
+            if device == &quot;cuda&quot;:
+                torch.cuda.synchronize()
+            times.append((time.perf_counter() - t0) * 1000)
+    times.sort()
+    return {
+        &quot;p50_ms&quot;: times[len(times) // 2],
+        &quot;p95_ms&quot;: times[int(len(times) * 0.95)],
+        &quot;p99_ms&quot;: times[int(len(times) * 0.99)],
+        &quot;mean_ms&quot;: sum(times) / len(times),
+    }
+</code></pre>
+<p>Warm up, synchronise, use <code>time.perf_counter()</code>. Report percentiles, not just mean.</p>
+<h3>Step 2: Parameter and FLOP counts</h3>
+<pre><code class="language-python">def parameter_count(model):
+    return sum(p.numel() for p in model.parameters())
+
+def flops_estimate(model, input_shape):
+    &quot;&quot;&quot;
+    Rough FLOP count for a conv/linear-only model. For production use `fvcore` or `ptflops`.
+    &quot;&quot;&quot;
+    total = 0
+    def conv_hook(m, inp, out):
+        nonlocal total
+        c_out, c_in, kh, kw = m.weight.shape
+        h, w = out.shape[-2:]
+        total += 2 * c_in * c_out * kh * kw * h * w
+    def linear_hook(m, inp, out):
+        nonlocal total
+        total += 2 * m.in_features * m.out_features
+    hooks = []
+    for m in model.modules():
+        if isinstance(m, torch.nn.Conv2d):
+            hooks.append(m.register_forward_hook(conv_hook))
+        elif isinstance(m, torch.nn.Linear):
+            hooks.append(m.register_forward_hook(linear_hook))
+    model.eval()
+    with torch.no_grad():
+        model(torch.randn(input_shape))
+    for h in hooks:
+        h.remove()
+    return total
+</code></pre>
+<p>For real projects use <code>fvcore.nn.FlopCountAnalysis</code> or <code>ptflops</code>; they handle every module type correctly.</p>
+<h3>Step 3: Post-training static quantisation</h3>
+<pre><code class="language-python">def quantise_ptq(model, calibration_loader, backend=&quot;x86&quot;):
+    import torch.ao.quantization as tq
+    model = model.eval().cpu()
+    model.qconfig = tq.get_default_qconfig(backend)
+    tq.prepare(model, inplace=True)
+    with torch.no_grad():
+        for x, _ in calibration_loader:
+            model(x)
+    tq.convert(model, inplace=True)
+    return model
+</code></pre>
+<p>Three steps: configure, prepare (insert observers), calibrate with real data, convert (fuse + quantise). Requires the model to be fused (<code>Conv -&gt; BN -&gt; ReLU</code> -&gt; <code>ConvBnReLU</code>), which <code>torch.ao.quantization.fuse_modules</code> handles.</p>
+<h3>Step 4: Export to ONNX</h3>
+<pre><code class="language-python">def export_onnx(model, sample_input, path=&quot;model.onnx&quot;):
+    model = model.eval()
+    torch.onnx.export(
+        model,
+        sample_input,
+        path,
+        input_names=[&quot;input&quot;],
+        output_names=[&quot;output&quot;],
+        dynamic_axes={&quot;input&quot;: {0: &quot;batch&quot;}, &quot;output&quot;: {0: &quot;batch&quot;}},
+        opset_version=17,
+    )
+    return path
+</code></pre>
+<p><code>opset_version=17</code> is the safe default in 2026. <code>dynamic_axes</code> lets you run the ONNX model with arbitrary batch size.</p>
+<h3>Step 5: Benchmark and compare regimes</h3>
+<pre><code class="language-python">import torch.nn as nn
+from torchvision.models import mobilenet_v3_small
+
+def compare_regimes():
+    model = mobilenet_v3_small(weights=None, num_classes=10)
+    params = parameter_count(model)
+    flops = flops_estimate(model, (1, 3, 224, 224))
+    lat_fp32 = measure_latency(model, (1, 3, 224, 224), device=&quot;cpu&quot;)
+    print(f&quot;FP32 MobileNetV3-Small: {params:,} params  {flops/1e9:.2f} GFLOPs  &quot;
+          f&quot;p50={lat_fp32['p50_ms']:.2f}ms  p95={lat_fp32['p95_ms']:.2f}ms&quot;)
+</code></pre>
+<p>Run the same function for <code>resnet50</code>, <code>efficientnet_v2_s</code>, and <code>convnext_tiny</code> and you have the comparison table you need for a deployment decision.</p>
+<h2>Use It</h2>
+<p>Production stacks converge on one of three paths:</p>
+<ul>
+<li><strong>Web / serverless</strong>: PyTorch -&gt; ONNX -&gt; ONNX Runtime (CPU or CUDA provider). Easiest, good enough for most.</li>
+<li><strong>NVIDIA edge (Jetson, GPU server)</strong>: PyTorch -&gt; ONNX -&gt; TensorRT. Best latency, biggest engineering effort.</li>
+<li><strong>Mobile</strong>: PyTorch -&gt; ONNX -&gt; Core ML (iOS) or TFLite (Android). Quantise before export.</li>
+</ul>
+<p>For measurement, <code>torch-tb-profiler</code>, <code>nvprof</code> / <code>nsys</code>, and Instruments on macOS give layer-by-layer breakdowns. <code>benchmark_app</code> (OpenVINO) and <code>trtexec</code> (TensorRT) give standalone CLI numbers.</p>
+<h2>Ship It</h2>
+<p>This lesson produces:</p>
+<ul>
+<li><code>outputs/prompt-edge-deployment-planner.md</code> — a prompt that picks backbone, quantisation strategy, and runtime given target device and latency SLA.</li>
+<li><code>outputs/skill-latency-profiler.md</code> — a skill that writes a complete latency-benchmarking script with warmup, synchronisation, percentiles, and memory tracking.</li>
+</ul>
+<h2>Exercises</h2>
+<ol>
+<li><strong>(Easy)</strong> Measure p50 latency for <code>resnet18</code>, <code>mobilenet_v3_small</code>, <code>efficientnet_v2_s</code>, and <code>convnext_tiny</code> at 224x224 on CPU. Report the table and identify which architecture has the best accuracy-per-ms.</li>
+<li><strong>(Medium)</strong> Apply post-training static quantisation to <code>mobilenet_v3_small</code>. Report FP32 vs INT8 latency and accuracy loss on a held-out subset of CIFAR-10 or similar.</li>
+<li><strong>(Hard)</strong> Export <code>convnext_tiny</code> to ONNX, run it through <code>onnxruntime</code> with the <code>CPUExecutionProvider</code>, and compare latency to the PyTorch eager baseline. Identify the first layer where ONNX Runtime is faster and explain why.</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Latency</td>
+<td>&quot;How fast&quot;</td>
+<td>Time from input to output; p50/p95/p99 percentiles, not mean</td>
+</tr>
+<tr>
+<td>FLOPs</td>
+<td>&quot;Model size&quot;</td>
+<td>Floating-point ops per forward pass; rough proxy for compute cost</td>
+</tr>
+<tr>
+<td>INT8 quantisation</td>
+<td>&quot;8-bit&quot;</td>
+<td>Replace FP32 weights/activations with 8-bit integers; ~4x smaller, 2-4x faster</td>
+</tr>
+<tr>
+<td>PTQ</td>
+<td>&quot;Post-training quantisation&quot;</td>
+<td>Quantise a trained model without retraining; easy, usually enough</td>
+</tr>
+<tr>
+<td>QAT</td>
+<td>&quot;Quantisation-aware training&quot;</td>
+<td>Simulate quantisation during training; best accuracy, requires labelled data</td>
+</tr>
+<tr>
+<td>ONNX</td>
+<td>&quot;The neutral format&quot;</td>
+<td>Model exchange format supported by every mainstream inference runtime</td>
+</tr>
+<tr>
+<td>TensorRT</td>
+<td>&quot;NVIDIA compiler&quot;</td>
+<td>Compiles ONNX into an optimised engine for NVIDIA GPUs</td>
+</tr>
+<tr>
+<td>Distillation</td>
+<td>&quot;Teacher -&gt; student&quot;</td>
+<td>Train a small model to mimic a big model's logits; recovers most lost accuracy</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/1905.11946" rel="noreferrer" data-network="true">EfficientNet (Tan &amp; Le, 2019) <small>↗ 需要联网</small></a> — compound scaling for efficient architectures</li>
+<li><a href="https://arxiv.org/abs/1905.02244" rel="noreferrer" data-network="true">MobileNetV3 (Howard et al., 2019) <small>↗ 需要联网</small></a> — mobile-first architecture with h-swish and squeeze-excite</li>
+<li><a href="https://developer.nvidia.com/blog/accelerating-inference-up-to-6x-faster-in-pytorch-with-torch-tensorrt/" rel="noreferrer" data-network="true">Accelerating Inference Up to 6x Faster in PyTorch with Torch-TensorRT (NVIDIA) <small>↗ 需要联网</small></a> — how to actually get the throughput numbers in the paper</li>
+<li><a href="https://onnxruntime.ai/docs/" rel="noreferrer" data-network="true">ONNX Runtime docs <small>↗ 需要联网</small></a> — quantisation, graph optimisation, provider selection</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-04-computer-vision--15-real-time-edge.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-04-computer-vision--15-real-time-edge.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/04-computer-vision/15-real-time-edge/code/main.py">phases/04-computer-vision/15-real-time-edge/code/main.py</a><details><summary>查看原始文本</summary><pre><code>import time
+import torch
+import torch.nn as nn
+
+
+def measure_latency(model, input_shape, device=&quot;cpu&quot;, warmup=5, iters=20):
+    model = model.to(device).eval()
+    x = torch.randn(input_shape, device=device)
+    with torch.no_grad():
+        for _ in range(warmup):
+            model(x)
+        if device == &quot;cuda&quot;:
+            torch.cuda.synchronize()
+        times = []
+        for _ in range(iters):
+            if device == &quot;cuda&quot;:
+                torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            model(x)
+            if device == &quot;cuda&quot;:
+                torch.cuda.synchronize()
+            times.append((time.perf_counter() - t0) * 1000)
+    times.sort()
+    return {
+        &quot;p50_ms&quot;: times[len(times) // 2],
+        &quot;p95_ms&quot;: times[int(len(times) * 0.95)],
+        &quot;p99_ms&quot;: times[-1],
+        &quot;mean_ms&quot;: sum(times) / len(times),
+    }
+
+
+def parameter_count(model):
+    return sum(p.numel() for p in model.parameters())
+
+
+def flops_estimate(model, input_shape):
+    total = [0]
+
+    def conv_hook(m, inp, out):
+        c_out, c_in_per_group, kh, kw = m.weight.shape
+        h, w = out.shape[-2:]
+        # Groups account for depthwise / grouped convs: each output channel
+        # only touches c_in_per_group inputs, not all c_in.
+        total[0] += 2 * c_in_per_group * c_out * kh * kw * h * w
+
+    def linear_hook(m, inp, out):
+        total[0] += 2 * m.in_features * m.out_features
+
+    hooks = []
+    for m in model.modules():
+        if isinstance(m, nn.Conv2d):
+            hooks.append(m.register_forward_hook(conv_hook))
+        elif isinstance(m, nn.Linear):
+            hooks.append(m.register_forward_hook(linear_hook))
+
+    model.eval()
+    with torch.no_grad():
+        model(torch.randn(input_shape))
+    for h in hooks:
+        h.remove()
+    return total[0]
+
+
+def compare_backbones(resolution=160):
+    from torchvision.models import (
+        mobilenet_v3_small, resnet18, efficientnet_v2_s, convnext_tiny,
+    )
+    candidates = [
+        (&quot;mobilenet_v3_small&quot;, mobilenet_v3_small(weights=None, num_classes=10)),
+        (&quot;resnet18&quot;, resnet18(weights=None, num_classes=10)),
+        (&quot;efficientnet_v2_s&quot;, efficientnet_v2_s(weights=None, num_classes=10)),
+        (&quot;convnext_tiny&quot;, convnext_tiny(weights=None, num_classes=10)),
+    ]
+    shape = (1, 3, resolution, resolution)
+    results = []
+    for name, model in candidates:
+        params = parameter_count(model)
+        flops = flops_estimate(model, shape)
+        lat = measure_latency(model, shape, device=&quot;cpu&quot;)
+        results.append({
+            &quot;model&quot;: name, &quot;params_m&quot;: params / 1e6,
+            &quot;gflops&quot;: flops / 1e9,
+            &quot;p50_ms&quot;: lat[&quot;p50_ms&quot;],
+            &quot;p95_ms&quot;: lat[&quot;p95_ms&quot;],
+        })
+    return results
+
+
+def main():
+    torch.manual_seed(0)
+    print(&quot;Comparing edge backbones on CPU at 160x160:\n&quot;)
+    header = f&quot;{&#39;model&#39;:22s} {&#39;params(M)&#39;:&gt;10s} {&#39;GFLOPs&#39;:&gt;8s} {&#39;p50(ms)&#39;:&gt;9s} {&#39;p95(ms)&#39;:&gt;9s}&quot;
+    print(header)
+    print(&quot;-&quot; * len(header))
+    for r in compare_backbones(resolution=160):
+        print(f&quot;{r[&#39;model&#39;]:22s} {r[&#39;params_m&#39;]:&gt;10.2f} {r[&#39;gflops&#39;]:&gt;8.2f} &quot;
+              f&quot;{r[&#39;p50_ms&#39;]:&gt;9.1f} {r[&#39;p95_ms&#39;]:&gt;9.1f}&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/04-computer-vision/15-real-time-edge/code/main.rs">phases/04-computer-vision/15-real-time-edge/code/main.rs</a><details><summary>查看原始文本</summary><pre><code>// Lesson: Real-Time Vision Edge Deployment (phase 04 / lesson 15)
+// Topic: edge inference loop in Rust. Builds a tiny depthwise-separable conv block
+// (the MobileNet primitive), runs it over a 160x160x3 input tensor, and reports
+// p50/p95/p99 latency the way an on-device profiler would. Stdlib only.
+// Refs:
+//   https://doc.rust-lang.org/std/time/struct.Instant.html
+//   https://arxiv.org/abs/1704.04861  (MobileNetV1: depthwise separable convolutions)
+//   https://pytorch.org/docs/stable/quantization.html  (edge measurement discipline)
+// Build: rustc --edition 2021 -O code/main.rs -o /tmp/lesson_edge &amp;&amp; /tmp/lesson_edge
+
+use std::time::Instant;
+
+const H: usize = 160;
+const W: usize = 160;
+const C_IN: usize = 3;
+const C_OUT: usize = 16;
+const K: usize = 3;
+const WARMUP: usize = 3;
+const ITERS: usize = 20;
+
+#[derive(Clone)]
+struct Tensor {
+    data: Vec&lt;f32&gt;,
+    h: usize,
+    w: usize,
+    c: usize,
+}
+
+impl Tensor {
+    fn zeros(h: usize, w: usize, c: usize) -&gt; Self {
+        Self { data: vec![0.0; h * w * c], h, w, c }
+    }
+
+    fn idx(&amp;self, y: usize, x: usize, c: usize) -&gt; usize {
+        (y * self.w + x) * self.c + c
+    }
+}
+
+// Cheap deterministic PRNG. Avoids pulling in rand for a stdlib-only lesson.
+fn lcg(seed: &amp;mut u64) -&gt; f32 {
+    *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    let bits = (*seed &gt;&gt; 33) as u32;
+    (bits as f32 / u32::MAX as f32) * 2.0 - 1.0
+}
+
+fn fill_random(t: &amp;mut Tensor, seed: &amp;mut u64) {
+    for v in t.data.iter_mut() {
+        *v = lcg(seed) * 0.5;
+    }
+}
+
+// Depthwise conv: one 3x3 kernel per input channel, no cross-channel mixing.
+// This is the part MobileNet uses to cut FLOPs by ~9x vs a dense conv.
+fn depthwise_conv(input: &amp;Tensor, weights: &amp;[f32]) -&gt; Tensor {
+    let mut out = Tensor::zeros(input.h, input.w, input.c);
+    let pad = K / 2;
+    for y in 0..input.h {
+        for x in 0..input.w {
+            for c in 0..input.c {
+                let mut acc = 0.0;
+                for ky in 0..K {
+                    for kx in 0..K {
+                        let iy = y as isize + ky as isize - pad as isize;
+                        let ix = x as isize + kx as isize - pad as isize;
+                        if iy &lt; 0 || ix &lt; 0 || iy &gt;= input.h as isize || ix &gt;= input.w as isize {
+                            continue;
+                        }
+                        let pixel = input.data[input.idx(iy as usize, ix as usize, c)];
+                        let w_idx = c * K * K + ky * K + kx;
+                        acc += pixel * weights[w_idx];
+                    }
+                }
+                let oi = out.idx(y, x, c);
+                out.data[oi] = acc.max(0.0);
+            }
+        }
+    }
+    out
+}
+
+// Pointwise 1x1 conv: mixes channels. Together with the depthwise above this is
+// one MobileNet block: ~8-9x cheaper than a full HxWxC_in x C_out 3x3 dense conv.
+fn pointwise_conv(input: &amp;Tensor, weights: &amp;[f32], c_out: usize) -&gt; Tensor {
+    let mut out = Tensor::zeros(input.h, input.w, c_out);
+    for y in 0..input.h {
+        for x in 0..input.w {
+            for co in 0..c_out {
+                let mut acc = 0.0;
+                for ci in 0..input.c {
+                    let pixel = input.data[input.idx(y, x, ci)];
+                    let w_idx = co * input.c + ci;
+                    acc += pixel * weights[w_idx];
+                }
+                let oi = out.idx(y, x, co);
+                out.data[oi] = acc.max(0.0);
+            }
+        }
+    }
+    out
+}
+
+fn forward(input: &amp;Tensor, dw_w: &amp;[f32], pw_w: &amp;[f32]) -&gt; Tensor {
+    let dw = depthwise_conv(input, dw_w);
+    pointwise_conv(&amp;dw, pw_w, C_OUT)
+}
+
+fn flops_per_pass() -&gt; u64 {
+    let dw = (H * W * C_IN * K * K * 2) as u64;
+    let pw = (H * W * C_IN * C_OUT * 2) as u64;
+    dw + pw
+}
+
+fn percentile(sorted_ms: &amp;[f64], pct: f64) -&gt; f64 {
+    if sorted_ms.is_empty() {
+        return 0.0;
+    }
+    let idx = ((sorted_ms.len() as f64 - 1.0) * pct).round() as usize;
+    sorted_ms[idx]
+}
+
+fn main() {
+    let mut seed: u64 = 0xa1b2_c3d4_e5f6_0708;
+
+    let mut input = Tensor::zeros(H, W, C_IN);
+    fill_random(&amp;mut input, &amp;mut seed);
+
+    let mut dw_weights = vec![0.0f32; C_IN * K * K];
+    let mut pw_weights = vec![0.0f32; C_OUT * C_IN];
+    for w in dw_weights.iter_mut() { *w = lcg(&amp;mut seed) * 0.1; }
+    for w in pw_weights.iter_mut() { *w = lcg(&amp;mut seed) * 0.1; }
+
+    println!();
+    println!(&quot;=== Edge inference benchmark (Rust, single thread) ===&quot;);
+    println!();
+    println!(&quot;Model      : depthwise 3x3 + pointwise 1x1 (one MobileNet block)&quot;);
+    println!(&quot;Input shape: {}x{}x{}&quot;, H, W, C_IN);
+    println!(&quot;Output ch  : {}&quot;, C_OUT);
+    let flops = flops_per_pass();
+    println!(&quot;FLOPs/pass : {:.2} M&quot;, flops as f64 / 1e6);
+    println!();
+
+    println!(&quot;Warming up ({} iters, ignored)...&quot;, WARMUP);
+    for _ in 0..WARMUP {
+        let _ = forward(&amp;input, &amp;dw_weights, &amp;pw_weights);
+    }
+
+    println!(&quot;Measuring ({} iters)...&quot;, ITERS);
+    let mut times_ms = Vec::with_capacity(ITERS);
+    for _ in 0..ITERS {
+        let t0 = Instant::now();
+        let out = forward(&amp;input, &amp;dw_weights, &amp;pw_weights);
+        let dt = t0.elapsed().as_secs_f64() * 1000.0;
+        times_ms.push(dt);
+        std::hint::black_box(out);
+    }
+
+    let mut sorted = times_ms.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let p50 = percentile(&amp;sorted, 0.50);
+    let p95 = percentile(&amp;sorted, 0.95);
+    let p99 = percentile(&amp;sorted, 0.99);
+    let mean: f64 = times_ms.iter().sum::&lt;f64&gt;() / times_ms.len() as f64;
+    let min = sorted[0];
+    let max = *sorted.last().unwrap();
+
+    println!();
+    println!(&quot;Latency (ms):&quot;);
+    println!(&quot;  p50   {:&gt;8.2}&quot;, p50);
+    println!(&quot;  p95   {:&gt;8.2}&quot;, p95);
+    println!(&quot;  p99   {:&gt;8.2}&quot;, p99);
+    println!(&quot;  mean  {:&gt;8.2}&quot;, mean);
+    println!(&quot;  min   {:&gt;8.2}&quot;, min);
+    println!(&quot;  max   {:&gt;8.2}&quot;, max);
+
+    let throughput_fps = 1000.0 / p50;
+    let gflops_s = (flops as f64) / (p50 / 1000.0) / 1e9;
+    println!();
+    println!(&quot;Throughput (from p50):&quot;);
+    println!(&quot;  {:&gt;5.1} fps   {:&gt;5.2} GFLOPs/s&quot;, throughput_fps, gflops_s);
+
+    println!();
+    println!(&quot;Edge measurement discipline (also enforced here):&quot;);
+    println!(&quot;  - {} warmup passes ignored to avoid cold-cache bias&quot;, WARMUP);
+    println!(&quot;  - fixed input resolution (production resolution must match)&quot;);
+    println!(&quot;  - p50 reported alongside p99 so tail latency is visible&quot;);
+    println!();
+}
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/04-computer-vision/15-real-time-edge/outputs/prompt-edge-deployment-planner.md">phases/04-computer-vision/15-real-time-edge/outputs/prompt-edge-deployment-planner.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: prompt-edge-deployment-planner
+description: Pick backbone, quantisation strategy, and runtime given target device and latency SLA
+phase: 4
+lesson: 15
+---
+
+You are an edge-deployment planner.
+
+## Inputs
+
+- `device`: iphone | jetson_nano | jetson_orin | pixel | rpi5 | edge_tpu | laptop_cpu | cloud_gpu
+- `latency_target_ms`: p95 per image
+- `memory_budget_mb`: peak memory on device
+- `accuracy_floor`: lowest acceptable top-1 / mAP / IoU
+- `task`: classification | detection | segmentation | embedding
+
+## Decision
+
+### Model
+- `memory_budget_mb &lt;= 10` -&gt; **MobileNetV3-Small** or **EfficientNet-Lite-B0**.
+- `memory_budget_mb &lt;= 25` -&gt; **EfficientNet-V2-S** or **ConvNeXt-Nano**.
+- `memory_budget_mb &lt;= 50` -&gt; **ConvNeXt-Tiny** or **MobileViT-S**.
+- `memory_budget_mb &gt; 50` and `device == cloud_gpu` -&gt; **ConvNeXt-Base** or **ViT-B/16**.
+
+### Quantisation
+- All edge devices: **INT8 post-training static** (PyTorch AO or TFLite converter).
+- If accuracy floor is missed by PTQ: upgrade to **QAT** with 5-10% of training time for fine-tuning.
+- Cloud GPU: FP16 or BF16; INT8 only with TensorRT when latency is critical.
+
+### Runtime
+| Device | Runtime |
+|--------|---------|
+| `iphone` | Core ML via coremltools |
+| `pixel` | TFLite via GPU delegate |
+| `jetson_nano` / `jetson_orin` | TensorRT |
+| `rpi5` | ONNX Runtime with ARM NEON |
+| `edge_tpu` | Coral Edge TPU Compiler (TFLite) |
+| `laptop_cpu` | ONNX Runtime CPU provider |
+| `cloud_gpu` | TensorRT or PyTorch + `torch.compile` |
+
+## Output
+
+```
+[deployment plan]
+  backbone:   &lt;name + size&gt;
+  precision:  INT8 | FP16 | BF16
+  runtime:    &lt;name&gt;
+  expected latency: &lt;ms p95&gt;
+  memory:     &lt;mb&gt;
+
+[prep steps]
+  1. Fine-tune backbone on task dataset (if dataset-specific).
+  2. Apply chosen precision with calibration set of N=500 images.
+  3. Export to ONNX / Core ML / TFLite.
+  4. Compile with target runtime.
+  5. Benchmark p50/p95/p99 on device.
+
+[risks]
+  - &lt;precision loss warnings&gt;
+  - &lt;runtime op-support caveats&gt;
+  - &lt;memory headroom concerns&gt;
+```
+
+## Rules
+
+- Never recommend FP32 on any edge device.
+- If the accuracy floor is missed even with QAT, recommend distillation from a larger teacher before picking a smaller model.
+- If the memory budget is under 5MB, refuse to recommend any transformer-based backbone without explicit authorisation.
+- Always include expected latency; if unknown, say so and recommend benchmarking.
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/04-computer-vision/15-real-time-edge/outputs/skill-latency-profiler.md">phases/04-computer-vision/15-real-time-edge/outputs/skill-latency-profiler.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: skill-latency-profiler
+description: Write a complete latency-benchmarking script with warmup, synchronisation, percentiles, and memory tracking
+version: 1.0.0
+phase: 4
+lesson: 15
+tags: [edge, deployment, profiling, benchmarking]
+---
+
+# Latency Profiler
+
+Produce a disciplined latency benchmark for any PyTorch model. Reports that anyone downstream can actually trust.
+
+## When to use
+
+- Comparing multiple candidate backbones before picking one to deploy.
+- Before and after quantisation or pruning.
+- After a runtime change (eager vs ONNX vs TensorRT).
+- Generating a deployment-readiness report.
+
+## Inputs
+
+- `model`: PyTorch `nn.Module`.
+- `input_shape`: tuple like `(1, 3, 224, 224)`.
+- `device`: `cpu` | `cuda` | `mps`.
+- `warmup`: default 10.
+- `iters`: default 100.
+
+## Checks
+
+### 1. Warmup
+Run the model `warmup` times without timing. Catches first-forward JIT compilation and cold cache effects.
+
+### 2. Synchronisation
+For `cuda`, call `torch.cuda.synchronize()` before and after each timed forward pass.
+For `mps`, call `torch.mps.synchronize()`.
+
+### 3. Timer
+Use `time.perf_counter()` for wall-clock measurement. Convert to milliseconds.
+
+### 4. Percentiles
+Sort the full list of timings. Report `p50, p90, p95, p99, mean, std`.
+
+### 5. Memory
+For `cuda`, call `torch.cuda.max_memory_allocated()` after the run and subtract any baseline.
+For `cpu`, use `tracemalloc` or `psutil.Process().memory_info().rss` before and after.
+
+### 6. Batch-size sweep
+Optionally repeat the benchmark for `batch_size in [1, 4, 16, 32]` to reveal throughput vs latency tradeoffs.
+
+## Output template
+
+```python
+import time
+import torch
+import psutil, os
+
+def profile(model, input_shape, device=&quot;cpu&quot;, warmup=10, iters=100):
+    proc = psutil.Process(os.getpid())
+    baseline_rss = proc.memory_info().rss / 1e6
+
+    model = model.to(device).eval()
+    x = torch.randn(input_shape, device=device)
+
+    def sync():
+        if device == &quot;cuda&quot;:
+            torch.cuda.synchronize()
+        elif device == &quot;mps&quot;:
+            torch.mps.synchronize()
+
+    with torch.no_grad():
+        for _ in range(warmup):
+            model(x)
+        sync()
+        if device == &quot;cuda&quot;:
+            torch.cuda.reset_peak_memory_stats()
+
+        times = []
+        for _ in range(iters):
+            sync()
+            t0 = time.perf_counter()
+            model(x)
+            sync()
+            times.append((time.perf_counter() - t0) * 1000)
+
+    times.sort()
+    mean = sum(times) / len(times)
+    std  = (sum((t - mean) ** 2 for t in times) / len(times)) ** 0.5
+
+    def pct(p):
+        idx = max(0, min(len(times) - 1, int(len(times) * p) - 1))
+        return times[idx]
+
+    report = {
+        &quot;p50_ms&quot;:  pct(0.50),
+        &quot;p90_ms&quot;:  pct(0.90),
+        &quot;p95_ms&quot;:  pct(0.95),
+        &quot;p99_ms&quot;:  pct(0.99),
+        &quot;mean_ms&quot;: mean,
+        &quot;std_ms&quot;:  std,
+        &quot;rss_mb&quot;:  proc.memory_info().rss / 1e6 - baseline_rss,
+    }
+    if device == &quot;cuda&quot;:
+        report[&quot;peak_cuda_mb&quot;] = torch.cuda.max_memory_allocated() / 1e6
+
+    return report
+```
+
+## Rules
+
+- Always run warmup; never trust a first-forward timing.
+- Percentiles, not mean — a single outlier can double the mean but barely move p50.
+- Use the same input_shape as production; latency on 224x224 is not latency on 384x384.
+- For CUDA, never omit `torch.cuda.synchronize()`; the numbers are meaningless without it.
+- Log the torch version, CUDA version, and device name alongside the numbers — they stop being comparable otherwise.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. You benchmark a model and report &#39;average 12ms per image on a 4090&#39;. What is missing?</legend><label class="option"><input type="radio" name="q0" value="0"> The dataset name</label><label class="option"><input type="radio" name="q0" value="1"> The model size</label><label class="option"><input type="radio" name="q0" value="2"> Nothing; that is a complete benchmark</label><label class="option"><input type="radio" name="q0" value="3"> Percentiles (p50/p95/p99), warmup discipline, and CUDA synchronisation; a mean alone hides tail latency and may measure kernel dispatch instead of kernel execution</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. FLOPs and on-device latency do not correlate perfectly. Why?</legend><label class="option"><input type="radio" name="q1" value="0"> Different operations have different hardware friendliness; depthwise convolutions may have lower FLOPs but are memory-bound on GPUs, while dense convolutions use Tensor Cores efficiently. Memory bandwidth, kernel launch overhead, and cache behaviour also shape latency beyond raw FLOPs</label><label class="option"><input type="radio" name="q1" value="1"> FLOPs counters are broken</label><label class="option"><input type="radio" name="q1" value="2"> FLOPs ignore batch size</label><label class="option"><input type="radio" name="q1" value="3"> PyTorch counts FLOPs incorrectly</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. Post-training static INT8 quantisation typically loses how much accuracy on ImageNet-class vision models?</legend><label class="option"><input type="radio" name="q2" value="0"> Always 0; it is lossless</label><label class="option"><input type="radio" name="q2" value="1"> 20+ points; unusable</label><label class="option"><input type="radio" name="q2" value="2"> 5-10 percentage points</label><label class="option"><input type="radio" name="q2" value="3"> 0.1-1 percentage points when properly calibrated; batch-norm-fused conv models are particularly well-behaved under INT8</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. Your mobile app needs a vision model under 10MB with sub-10ms latency. Which backbone do you pick?</legend><label class="option"><input type="radio" name="q3" value="0"> ResNet-50</label><label class="option"><input type="radio" name="q3" value="1"> ConvNeXt-Large</label><label class="option"><input type="radio" name="q3" value="2"> ViT-Base</label><label class="option"><input type="radio" name="q3" value="3"> MobileNetV3-Small or EfficientNet-Lite-B0 quantised to INT8; both target this budget and compile cleanly to TFLite / Core ML</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. You export a PyTorch model to ONNX with opset 17 and it fails with &#39;Unsupported operator&#39;. What are the most likely causes?</legend><label class="option"><input type="radio" name="q4" value="0"> The model has too many parameters</label><label class="option"><input type="radio" name="q4" value="1"> The input shape is wrong</label><label class="option"><input type="radio" name="q4" value="2"> The ONNX library is outdated</label><label class="option"><input type="radio" name="q4" value="3"> (1) A custom op that has no ONNX mapping; (2) a non-deterministic control-flow path that tracing cannot capture; (3) a tensor-scalar interaction that is implicit in Python but has no ONNX equivalent. Fixes: replace the op, use `torch.jit.script` for control flow, or upgrade opset</label><p data-feedback="4"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/04-computer-vision/14-vision-transformers/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/04-computer-vision/16-vision-pipeline-capstone/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/04-computer-vision/15-real-time-edge/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

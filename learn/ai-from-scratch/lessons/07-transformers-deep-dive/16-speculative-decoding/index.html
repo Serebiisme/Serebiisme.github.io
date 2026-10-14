@@ -1,0 +1,703 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>预测解码 草稿,验证,重复 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-07-transformers-deep-dive" data-lesson="07-transformers-deep-dive/16-speculative-decoding" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/07-transformers-deep-dive/">深入 Transformer</a> / LESSON 16</p><h1 class="lesson-title">预测解码 草稿,验证,重复</h1><p>Speculative Decoding — Draft, Verify, Repeat</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>预测解码 草稿,验证,重复</h1>
+<blockquote>
+<p>推迟解码是序列的.每个代币等待上一个. 投机解码打破链条:一个廉价的模型在一个前进通行中验证所有N代币,而昂贵的模型在一个前进通行中验证所有N代币. 当草案正确时,你为N代代付出了一个大额的前进.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 7 · 07 (GPT Causal LM), Phase 7 · 12 (KV Cache &amp; Flash Attention)
+<strong>Time:</strong> ~60 minutes</p>
+<h2>问题</h2>
+<p>如果我们让3B草案5个代币前进,然后运行70B <em>一次</em>验证所有5,总数是<code>5×3 + 30 = 45 ms</code>对于最多5个被接受的代币<code>5×30 = 150 ms</code>这就是完全的投机解码比率:换取少量的额外的GPU内存 (草案模型) 为24x较低的解码延迟.</p>
+<p>投机性样本采集,由Leviathan等 (2023) 和陈等同时引入,确保输出序列是<strong>identically distributed</strong>没有质量妥协,只是更快.</p>
+<p>根据2026年推断,四个设计验证器对的家庭占据主导地位:</p>
+<ol>
+<li>**Vanilla speculative (Leviathan 2023).**单独的草案模型 (例如,Llama 3 1B) +验证器 (例如,Llama 3 70B).</li>
+<li>**Medusa (Cai 2024).**验证器上的多个解码头预测位置<code>t+1..t+k</code>没有单独的模型草案.</li>
+<li>**EAGLE family (Li 2024, 2025).**轻量级的草稿,重复验证器隐藏状态;比尼拉更接近接受率;典型的34×.</li>
+<li>**Lookahead decoding (Fu 2024).**简单的,但没有依赖.</li>
+</ol>
+<p>在2026年,每一个生产推断堆都会默认地发送投机解码. vLLM,TensorRT-LLM,SGLang和 llama.cpp都支持至少尼 + EAGLE-2.</p>
+<h2>概念</h2>
+<h3>核心算法</h3>
+<p>鉴于验证器<code>M_q</code>并且更便宜的草稿<code>M_p</code>其他:</p>
+<ol>
+<li>让我们<code>x_1..x_k</code>已解码的前.</li>
+<li><strong>Draft</strong>:使用 <code>M_p</code>推出自动推移<code>d_{k+1}, d_{k+2}, ..., d_{k+N}</code>具有草案概率<code>p_1..p_N</code>现在,我们要去.</li>
+<li><strong>Verify in parallel</strong>运行<code>M_q</code>一次就这样了<code>x_1..x_k, d_{k+1}, ..., d_{k+N}</code>获得验证器概率<code>q_1..q_{N+1}</code>对于职位<code>k+1..k+N+1</code>现在,我们要去.</li>
+<li><strong>Accept/reject each draft token left to right</strong>对于每一个<code>i</code>接受一个可能的<code>min(1, q_i(d_i) / p_i(d_i))</code>现在,我们要去.</li>
+<li>在第一次拒绝位置<code>j</code>: 样本<code>t_j</code>由于&quot;残留&quot;分布而导致的<code>(q_j - p_j)_+</code>之后的所有草案都正常化了.<code>j</code>它们被丢弃.</li>
+<li>接受一切<code>N</code>: 样本一个额外的代币<code>t_{N+1}</code>其他<code>q_{N+1}</code>(免费奖金代币)</li>
+</ol>
+<p>剩余分布技巧是保持输出分布的数学洞察力<code>M_q</code>没有任何东西.</p>
+<h3>什么决定了加速</h3>
+<p>让我们<code>α</code>预期的每项项目代币的接受率.<code>c</code>项目/验证人成本比例.</p>
+<ul>
+<li>无辜的世代每代币都会做一个大型号.</li>
+<li>投机者每次打一个大型号电话<code>(1 - α^{N+1}) / (1 - α) ≈ 1/(1-α)</code>什么时候的代币<code>α</code>了.</li>
+</ul>
+<p>典型的指南<code>α = 0.75</code>其他<code>N = 5</code>现在,我们在线观看,我们在线观看,我们在线观看,我们在线观看,我们在线观看,我们在线观看,我们在线观看,我们在线观看,我们在线观看,我们在线观看,我们在线观看,我们在线观看,我们在线观看,我们在线观看,我们在线观看,我们在线观看,我们在线观看,我们在线观看,我们在线观看,我们在线观看,我们在线观看,我们在线观看,我们在线观看,我们在线观看,我们在线观看,我们在线观看,我们在线观看,我们在线观看,我们在线观看,我们在线观看,我们在线观看,我们在线观看,我们在线观看,我们在线观看,我们在线观看,我们在线观看,我们在线观看,我们在线观看,我们在线观看,我们在线观看,我们在线观看,我们在线观看,我们在线观看,我们在线观看,我们在线观看,我们在线观看,我们在线观看.</p>
+<p><strong>α depends on:</strong></p>
+<ul>
+<li>如何接近验证器的草案.同一个家庭/同一个培训数据显著增强α.</li>
+<li>解码策略:贪的草案与贪的验证器:高 α.温度采样:难以匹配;接受度下降.</li>
+<li>任务类型:代码和结构化输出接受更多 (可预测);自由形式的创意写作接受少.</li>
+</ul>
+<h3>梅杜萨  草案没有草案模型</h3>
+<p>梅杜萨将草案模型取代,在验证器上加上输出头.<code>t</code>其他:</p>
+<pre><code>shared trunk → hidden h_t
+    ├── head_0: predict token at t+1  (standard LM head)
+    ├── head_1: predict token at t+2
+    ├── head_2: predict token at t+3
+    ├── head_3: predict token at t+4
+</code></pre>
+<p>每个头都输出了自己的 logits. 在推断时,你从每个头进行样本来获得候选人序列,然后通过使用树注意方案验证一个前进通过,同时考虑所有候选人延续.</p>
+<p>优势:没有第二个模型. 缺点:添加可训练的参数;需要监督的细节调整阶段 (~1B代币);接受率略低于良好的草稿的尼拉投机.</p>
+<h3>通过重复使用隐藏状态来更好地绘制</h3>
+<p>由于该草案看到验证器的特征表示,它的预测与验证器的输出分布密切相关.接受率从0.6 (瓦尼拉) 升至0.85+.</p>
+<p>3 (2025) 增加了对候选延续的树搜索. vLLM和SGLang 作为Llama 3/4和Qwen 3的默认规范路径,将Eagle-2/3作为3/3的预定规范路径.</p>
+<h3>的舞蹈</h3>
+<p>验证数据<code>N</code>通过一个前进传输,将验证器的KV缓存扩大到 <code>N</code>如果一些草案被拒绝,则必须将缓存重新滚动到接受的预写长度.</p>
+<p>生产实施 (vLLM 项目)<code>--speculative-config</code>首先写一下,承诺接受.这不是概念上很难,但它很难.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-ae2b964870ff00dfcc7b.png" alt="draft-verify-tokens 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<p>看到<code>code/main.py</code>我们实施了核心投机性样本采集算法 (拒绝步骤+残余分布)</p>
+<ul>
+<li>一个&quot;大模型&quot;,是指指数定性软最大值,而不是指数编码的分布 (所以我们可以分析验证接受数学的结果).</li>
+<li>它们是对大模型的颠覆.</li>
+<li>接受/拒绝循环,产生与直接采样相同的边际分布.</li>
+</ul>
+<h3>步骤1:拒绝步骤</h3>
+<pre><code class="language-python">def accept_or_reject(q_prob, p_prob, draft_token, u):
+    ratio = q_prob / p_prob if p_prob &gt; 0 else float(&quot;inf&quot;)
+    return u &lt; min(1.0, ratio)
+</code></pre>
+<p><code>u</code>是一个统一的随机数字.<code>q_prob</code>是验证者对拟定的代币的概率. <code>p_prob</code>利维雅坦定理是,这个伯诺利决定,然后是从废弃的残留样本中抽取样本,</p>
+<h3>步骤2:残余分布</h3>
+<pre><code class="language-python">def residual_dist(q, p):
+    raw = [max(0.0, qi - pi) for qi, pi in zip(q, p)]
+    s = sum(raw)
+    return [r / s for r in raw]
+</code></pre>
+<p>减去<code>p</code>其他<code>q</code>根据元素,将负值压缩到零,重新正常化.</p>
+<h3>步骤3:一个投机步骤</h3>
+<pre><code class="language-python">def spec_step(prefix, q_model, p_model, N, rng):
+    drafts = []
+    p_probs = []
+    ctx = list(prefix)
+    for _ in range(N):
+        p_dist = p_model(ctx)
+        d = sample(p_dist, rng)
+        drafts.append(d)
+        p_probs.append(p_dist[d])
+        ctx.append(d)
+
+    q_dists = [q_model(prefix + drafts[:i]) for i in range(N + 1)]
+
+    for i, d in enumerate(drafts):
+        u = rng.random()
+        q_prob = q_dists[i][d]
+        p_prob = p_probs[i]
+        if u &lt; min(1.0, q_prob / p_prob if p_prob &gt; 0 else float(&quot;inf&quot;)):
+            prefix = prefix + [d]
+        else:
+            res = residual_dist(q_dists[i], p_model(prefix))
+            prefix = prefix + [sample(res, rng)]
+            return prefix
+    prefix = prefix + [sample(q_dists[N], rng)]
+    return prefix
+</code></pre>
+<p>五个接受的 → 一个奖金 → 一个验证器通行中产生的六个代币.</p>
+<h3>步骤4:测量接受率</h3>
+<p>运行1万个投机步骤,在不同的草案质量水平.图片接受率与草案和验证器分布之间的KL差异.你应该看到一个清洁的单调关系.</p>
+<h3>步骤5:验证分布等效</h3>
+<p>经验:投机循环产生的代币的历史图应与直接从验证器中采样生成的历史图相匹配.这是实践中的利维亚坦定理.一个奇方体测试在采样错误中确认.</p>
+<h2>用它</h2>
+<p>产量:</p>
+<pre><code class="language-bash"># vLLM with EAGLE
+vllm serve meta-llama/Llama-3.1-70B-Instruct \
+    --speculative-config '{&quot;method&quot;: &quot;eagle&quot;, &quot;model&quot;: &quot;/models/llama-3.1-eagle-70b&quot;, &quot;draft_tensor_parallel_size&quot;: 1, &quot;num_speculative_tokens&quot;: 5}'
+
+# vLLM with vanilla draft model
+vllm serve meta-llama/Llama-3.1-70B-Instruct \
+    --speculative-config '{&quot;method&quot;: &quot;draft_model&quot;, &quot;model&quot;: &quot;meta-llama/Llama-3.2-1B-Instruct&quot;, &quot;num_speculative_tokens&quot;: 5}'
+</code></pre>
+<p>据悉,在2026年中旬,TensorRT-LLM将拥有最快的梅杜萨路径.<code>faster-whisper</code>语大的猜测解码用一个小的草稿.</p>
+<p><strong>Picking a draft:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Strategy</th>
+<th>When to pick</th>
+<th>Speedup</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Vanilla draft (1B/3B Llama family)</td>
+<td>Fast prototype, no training</td>
+<td>1.8–2.3×</td>
+</tr>
+<tr>
+<td>Medusa heads</td>
+<td>You can fine-tune the verifier</td>
+<td>2–3×</td>
+</tr>
+<tr>
+<td>EAGLE-2 / 3</td>
+<td>Production, max speed</td>
+<td>3–4×</td>
+</tr>
+<tr>
+<td>Lookahead</td>
+<td>No draft, no training, no extra params</td>
+<td>1.3–1.6×</td>
+</tr>
+</tbody>
+</table>
+<p><strong>When NOT to spec-decode:</strong></p>
+<ul>
+<li>单次序列生成15个代币.</li>
+<li>极具创意/高温采样 (α滴).</li>
+<li>存储量限制的部署 (草案模型添加VRAM).</li>
+</ul>
+<h2>运送它</h2>
+<p>看到<code>outputs/skill-spec-decode-picker.md</code>技能选择一个投机式解码策略 (尼拉/梅杜萨/鱼/头) 和调节参数 (N,草稿温度) 进行新的推断工作负载.</p>
+<h2>运动</h2>
+<ol>
+<li>**Easy.**跑步<code>code/main.py</code>确认投机代币分布与验证人在50万代币中直接样本分布相匹配,在平平面 p &gt;0.05内.</li>
+<li>**Medium.**作为一个函数的图片加速 (每大模型前进的代币)<code>N</code>为了<code>α = 0.5, 0.7, 0.85</code>确定最佳的方法<code>N</code>对于每一个 α. (提示:每次验证调用预期的代币 = <code>(1 - α^{N+1}) / (1 - α)</code>)</li>
+<li>**Hard.**执行一个小的梅杜萨:从14课中取下顶石GPT,添加3个额外的LM头,预测位置t+2,t+3,t+4. 训练小克斯佩尔,并进行多头损失.比较接受率与尼拉草图,通过缩小相同模型.</li>
+<li>**Hard.**实现反弹:从10代标前标KV缓存开始,输入5个草案代标,模拟在3位的拒绝.在下一次回复时,检查缓存读数正确匹配&quot;前标+第2个接受草案&quot;.</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Draft model</td>
+<td>&quot;The cheap one&quot;</td>
+<td>A smaller model that proposes candidate tokens; usually 10–50× cheaper than the verifier.</td>
+</tr>
+<tr>
+<td>Verifier</td>
+<td>&quot;The big one&quot;</td>
+<td>The target model whose distribution we preserve; runs once per speculative step.</td>
+</tr>
+<tr>
+<td>Acceptance rate (α)</td>
+<td>&quot;How often the draft is right&quot;</td>
+<td>Per-token probability that the verifier accepts the draft. 0.7–0.9 typical.</td>
+</tr>
+<tr>
+<td>Residual distribution</td>
+<td>&quot;The rejection fallback&quot;</td>
+<td><code>(q - p)_+</code> normalized; sampling from this on rejection preserves the verifier's distribution.</td>
+</tr>
+<tr>
+<td>Bonus token</td>
+<td>&quot;The free one&quot;</td>
+<td>When all N drafts accepted, sample one more from the verifier's next-step distribution.</td>
+</tr>
+<tr>
+<td>Medusa</td>
+<td>&quot;Draft-less speculative&quot;</td>
+<td>Multiple LM heads on the verifier predict positions t+1..t+k in parallel.</td>
+</tr>
+<tr>
+<td>EAGLE</td>
+<td>&quot;Hidden-state draft&quot;</td>
+<td>Tiny transformer draft conditioned on the verifier's last-layer hidden states.</td>
+</tr>
+<tr>
+<td>Lookahead decoding</td>
+<td>&quot;Jacobi iteration&quot;</td>
+<td>Self-speculation using a fixed-point iteration; no draft model.</td>
+</tr>
+<tr>
+<td>Tree attention</td>
+<td>&quot;Verify many candidates at once&quot;</td>
+<td>Branching verification that considers several draft continuations simultaneously.</td>
+</tr>
+<tr>
+<td>KV rollback</td>
+<td>&quot;Undo rejected drafts&quot;</td>
+<td>Scratch KV buffer; commit on acceptance, discard on reject.</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2211.17192" rel="noreferrer" data-network="true">Leviathan, Kalman, Matias (2023). Fast Inference from Transformers via Speculative Decoding <small>↗ 需要联网</small></a>核心算法和等效定理.</li>
+<li><a href="https://arxiv.org/abs/2302.01318" rel="noreferrer" data-network="true">Chen et al. (2023). Accelerating Large Language Model Decoding with Speculative Sampling <small>↗ 需要联网</small></a>同时引入;清洁的伯诺利拒绝证明.</li>
+<li><a href="https://arxiv.org/abs/2401.10774" rel="noreferrer" data-network="true">Cai et al. (2024). Medusa: Simple LLM Inference Acceleration Framework with Multiple Decoding Heads <small>↗ 需要联网</small></a>梅杜萨纸;树木注意力验证.</li>
+<li><a href="https://arxiv.org/abs/2401.15077" rel="noreferrer" data-network="true">Li et al. (2024). EAGLE: Speculative Sampling Requires Rethinking Feature Uncertainty <small>↗ 需要联网</small></a>-1;隐藏状态的预案.</li>
+<li><a href="https://arxiv.org/abs/2406.16858" rel="noreferrer" data-network="true">Li et al. (2024). EAGLE-2: Faster Inference of Language Models with Dynamic Draft Trees <small>↗ 需要联网</small></a>-2;动态树深度.</li>
+<li><a href="https://arxiv.org/abs/2503.01840" rel="noreferrer" data-network="true">Li et al. (2025). EAGLE-3: Scaling up Inference Acceleration of Large Language Models via Training-Time Test <small>↗ 需要联网</small></a>3号.</li>
+<li><a href="https://arxiv.org/abs/2402.02057" rel="noreferrer" data-network="true">Fu et al. (2024). Break the Sequential Dependency of LLM Inference Using Lookahead Decoding <small>↗ 需要联网</small></a>看着,没有草稿的方法.</li>
+<li><a href="https://docs.vllm.ai/en/latest/features/spec_decode.html" rel="noreferrer" data-network="true">vLLM docs — Speculative Decoding <small>↗ 需要联网</small></a>可信生产参考,四个战略都连接在一起.</li>
+<li><a href="https://github.com/SafeAILab/EAGLE" rel="noreferrer" data-network="true">SafeAILab / EAGLE reference implementation <small>↗ 需要联网</small></a> EAGLE-1/2/3的参考代码.</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Speculative Decoding — Draft, Verify, Repeat</h1>
+<blockquote>
+<p>Autoregressive decoding is serial. Each token waits for the previous one. Speculative decoding breaks the chain: a cheap model drafts N tokens, the expensive model verifies all N in one forward pass. When the draft is right you paid one big forward for N generations.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 7 · 07 (GPT Causal LM), Phase 7 · 12 (KV Cache &amp; Flash Attention)
+<strong>Time:</strong> ~60 minutes</p>
+<h2>The Problem</h2>
+<p>A 70B LLM sampling one token takes ~30 ms on an H100. A 3B draft model takes ~3 ms. If we let the 3B draft 5 tokens ahead, then run the 70B <em>once</em> to verify all 5, the total is <code>5×3 + 30 = 45 ms</code> for up to 5 accepted tokens — versus <code>5×30 = 150 ms</code> for straight-line generation. That is the full speculative-decoding pitch: trade a small amount of extra GPU memory (draft model) for 2–4× lower decode latency.</p>
+<p>The trick has to preserve the distribution. Speculative sampling, introduced by Leviathan et al. (2023) and by Chen et al. concurrently, guarantees that the output sequence is <strong>identically distributed</strong> to what the big model would have produced on its own. No quality tradeoff. Just faster.</p>
+<p>Four families of draft-verifier pairs dominate 2026 inference:</p>
+<ol>
+<li><strong>Vanilla speculative (Leviathan 2023).</strong> Separate draft model (e.g., Llama 3 1B) + verifier (e.g., Llama 3 70B).</li>
+<li><strong>Medusa (Cai 2024).</strong> Multiple decoding heads on the verifier predict positions <code>t+1..t+k</code> in parallel. No separate draft model.</li>
+<li><strong>EAGLE family (Li 2024, 2025).</strong> Lightweight draft that reuses the verifier's hidden states; closer acceptance rate than vanilla; 3–4× typical.</li>
+<li><strong>Lookahead decoding (Fu 2024).</strong> Jacobi iteration; no draft model required at all. Self-speculation. Niche but dependency-free.</li>
+</ol>
+<p>Every production inference stack in 2026 ships speculative decoding by default. vLLM, TensorRT-LLM, SGLang, and llama.cpp all support at least vanilla + EAGLE-2.</p>
+<h2>The Concept</h2>
+<h3>The core algorithm</h3>
+<p>Given a verifier <code>M_q</code> and a cheaper draft <code>M_p</code>:</p>
+<ol>
+<li>Let <code>x_1..x_k</code> be the prefix already decoded.</li>
+<li><strong>Draft</strong>: use <code>M_p</code> to autoregressively propose <code>d_{k+1}, d_{k+2}, ..., d_{k+N}</code> with draft probabilities <code>p_1..p_N</code>.</li>
+<li><strong>Verify in parallel</strong>: run <code>M_q</code> once on <code>x_1..x_k, d_{k+1}, ..., d_{k+N}</code>, getting verifier probabilities <code>q_1..q_{N+1}</code> for positions <code>k+1..k+N+1</code>.</li>
+<li><strong>Accept/reject each draft token left to right</strong>: for each <code>i</code>, accept with probability <code>min(1, q_i(d_i) / p_i(d_i))</code>.</li>
+<li>On first rejection at position <code>j</code>: sample <code>t_j</code> from the &quot;residual&quot; distribution <code>(q_j - p_j)_+</code> normalized. All drafts after <code>j</code> are discarded.</li>
+<li>On accepting all <code>N</code>: sample one extra token <code>t_{N+1}</code> from <code>q_{N+1}</code> (the free bonus token).</li>
+</ol>
+<p>The residual distribution trick is the mathematical insight that keeps the output distributed exactly as if <code>M_q</code> had sampled from scratch.</p>
+<h3>What determines speedup</h3>
+<p>Let <code>α</code> = expected acceptance rate per draft token. Let <code>c</code> = draft-to-verifier cost ratio. Per step:</p>
+<ul>
+<li>Naive generation makes 1 big-model call per token.</li>
+<li>Speculative makes 1 big-model call per <code>(1 - α^{N+1}) / (1 - α) ≈ 1/(1-α)</code> tokens when <code>α</code> is high.</li>
+</ul>
+<p>Typical rule of thumb at <code>α = 0.75</code> and <code>N = 5</code>: 3× fewer big-model calls. Draft cost is 5× cheap. Total wall-clock drops ~2.5×.</p>
+<p><strong>α depends on:</strong></p>
+<ul>
+<li>How well the draft approximates the verifier. Same family / same training data boosts α significantly.</li>
+<li>Decoding strategy. Greedy draft against greedy verifier: high α. Temperature sampling: harder to match; acceptance drops.</li>
+<li>Task type. Code and structured output accept more (predictable); free-form creative writing accepts less.</li>
+</ul>
+<h3>Medusa — drafts without a draft model</h3>
+<p>Medusa replaces the draft model with extra output heads on the verifier. At position <code>t</code>:</p>
+<pre><code>shared trunk → hidden h_t
+    ├── head_0: predict token at t+1  (standard LM head)
+    ├── head_1: predict token at t+2
+    ├── head_2: predict token at t+3
+    ├── head_3: predict token at t+4
+</code></pre>
+<p>Each head outputs its own logits. At inference you sample from each head to get a candidate sequence, then verify with one forward pass using a tree-attention scheme that considers all candidate continuations at once.</p>
+<p>Pros: no second model. Cons: adds trainable parameters; needs a supervised fine-tuning stage (~1B tokens); acceptance rate is a bit lower than vanilla speculative with a good draft.</p>
+<h3>EAGLE — better draft by reusing hidden states</h3>
+<p>EAGLE-1/2/3 (Li et al., 2024–2025) makes the draft model a tiny transformer (typically 1 layer) that ingests the verifier's last-layer hidden states. Because the draft sees the verifier's feature representation, its predictions correlate strongly with the verifier's output distribution. Acceptance rates climb from ~0.6 (vanilla) to 0.85+.</p>
+<p>EAGLE-3 (2025) added tree search over candidate continuations. vLLM and SGLang ship EAGLE-2/3 as the default spec pathway for Llama 3/4 and Qwen 3.</p>
+<h3>The KV cache dance</h3>
+<p>Verification feeds <code>N</code> draft tokens into the verifier in one forward pass. This extends the verifier's KV cache by <code>N</code> entries. If some drafts are rejected, you must roll the cache back to the accepted prefix length.</p>
+<p>Production implementations (vLLM's <code>--speculative-config</code>, TensorRT-LLM's LookaheadDecoder) handle this with scratch KV buffers. Write first, commit on acceptance. It's not conceptually hard, but it is fiddly.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-ae2b964870ff00dfcc7b.png" alt="draft-verify-tokens 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<p>See <code>code/main.py</code>. We implement the core speculative-sampling algorithm (rejection step + residual distribution) with:</p>
+<ul>
+<li>A &quot;big model&quot; that is a deterministic-softmax over a hand-coded distribution (so we can verify acceptance math analytically).</li>
+<li>A &quot;draft model&quot; that is a perturbation of the big model.</li>
+<li>An acceptance / rejection loop that produces the same marginal distribution as direct sampling.</li>
+</ul>
+<h3>Step 1: the rejection step</h3>
+<pre><code class="language-python">def accept_or_reject(q_prob, p_prob, draft_token, u):
+    ratio = q_prob / p_prob if p_prob &gt; 0 else float(&quot;inf&quot;)
+    return u &lt; min(1.0, ratio)
+</code></pre>
+<p><code>u</code> is a uniform random number. <code>q_prob</code> is the verifier's probability for the drafted token. <code>p_prob</code> is the draft model's probability. The Leviathan theorem is that this Bernoulli decision, followed by sampling from the residual on rejection, preserves the verifier's distribution exactly.</p>
+<h3>Step 2: residual distribution</h3>
+<pre><code class="language-python">def residual_dist(q, p):
+    raw = [max(0.0, qi - pi) for qi, pi in zip(q, p)]
+    s = sum(raw)
+    return [r / s for r in raw]
+</code></pre>
+<p>Subtract <code>p</code> from <code>q</code> element-wise, clamp negative values to zero, renormalize. Sample from this on any rejection.</p>
+<h3>Step 3: one speculative step</h3>
+<pre><code class="language-python">def spec_step(prefix, q_model, p_model, N, rng):
+    drafts = []
+    p_probs = []
+    ctx = list(prefix)
+    for _ in range(N):
+        p_dist = p_model(ctx)
+        d = sample(p_dist, rng)
+        drafts.append(d)
+        p_probs.append(p_dist[d])
+        ctx.append(d)
+
+    q_dists = [q_model(prefix + drafts[:i]) for i in range(N + 1)]
+
+    for i, d in enumerate(drafts):
+        u = rng.random()
+        q_prob = q_dists[i][d]
+        p_prob = p_probs[i]
+        if u &lt; min(1.0, q_prob / p_prob if p_prob &gt; 0 else float(&quot;inf&quot;)):
+            prefix = prefix + [d]
+        else:
+            res = residual_dist(q_dists[i], p_model(prefix))
+            prefix = prefix + [sample(res, rng)]
+            return prefix
+    prefix = prefix + [sample(q_dists[N], rng)]
+    return prefix
+</code></pre>
+<p>Five accepted → one bonus → six tokens produced in one verifier pass.</p>
+<h3>Step 4: measure acceptance rate</h3>
+<p>Run 10,000 speculative steps at varying draft-quality levels. Plot acceptance rate vs. KL divergence between draft and verifier distributions. You should see a clean monotone relationship.</p>
+<h3>Step 5: verify distribution equivalence</h3>
+<p>Empirically: the histogram of tokens produced by the speculative loop should match the histogram produced by sampling directly from the verifier. This is the Leviathan theorem in practice. A chi-square test confirms within sampling error.</p>
+<h2>Use It</h2>
+<p>Production:</p>
+<pre><code class="language-bash"># vLLM with EAGLE
+vllm serve meta-llama/Llama-3.1-70B-Instruct \
+    --speculative-config '{&quot;method&quot;: &quot;eagle&quot;, &quot;model&quot;: &quot;/models/llama-3.1-eagle-70b&quot;, &quot;draft_tensor_parallel_size&quot;: 1, &quot;num_speculative_tokens&quot;: 5}'
+
+# vLLM with vanilla draft model
+vllm serve meta-llama/Llama-3.1-70B-Instruct \
+    --speculative-config '{&quot;method&quot;: &quot;draft_model&quot;, &quot;model&quot;: &quot;meta-llama/Llama-3.2-1B-Instruct&quot;, &quot;num_speculative_tokens&quot;: 5}'
+</code></pre>
+<p>TensorRT-LLM has the fastest Medusa path as of mid-2026. <code>faster-whisper</code> wraps speculative decoding for Whisper-large with a small draft.</p>
+<p><strong>Picking a draft:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Strategy</th>
+<th>When to pick</th>
+<th>Speedup</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Vanilla draft (1B/3B Llama family)</td>
+<td>Fast prototype, no training</td>
+<td>1.8–2.3×</td>
+</tr>
+<tr>
+<td>Medusa heads</td>
+<td>You can fine-tune the verifier</td>
+<td>2–3×</td>
+</tr>
+<tr>
+<td>EAGLE-2 / 3</td>
+<td>Production, max speed</td>
+<td>3–4×</td>
+</tr>
+<tr>
+<td>Lookahead</td>
+<td>No draft, no training, no extra params</td>
+<td>1.3–1.6×</td>
+</tr>
+</tbody>
+</table>
+<p><strong>When NOT to spec-decode:</strong></p>
+<ul>
+<li>Single-sequence generation of 1–5 tokens. Overhead dominates.</li>
+<li>Wildly creative / high-temperature sampling (α drops).</li>
+<li>Memory-constrained deployments (draft model adds VRAM).</li>
+</ul>
+<h2>Ship It</h2>
+<p>See <code>outputs/skill-spec-decode-picker.md</code>. The skill picks a speculative decoding strategy (vanilla / Medusa / EAGLE / lookahead) and tuning parameters (N, draft temperature) for a new inference workload.</p>
+<h2>Exercises</h2>
+<ol>
+<li><strong>Easy.</strong> Run <code>code/main.py</code>. Confirm the speculative token distribution matches the verifier's direct-sample distribution on 50,000 tokens within chi-square p &gt; 0.05.</li>
+<li><strong>Medium.</strong> Plot speedup (tokens per big-model forward) as a function of <code>N</code> for <code>α = 0.5, 0.7, 0.85</code>. Identify the optimal <code>N</code> for each α. (Hint: expected tokens per verify call = <code>(1 - α^{N+1}) / (1 - α)</code>.)</li>
+<li><strong>Hard.</strong> Implement a tiny Medusa: take the capstone GPT from Lesson 14, add 3 extra LM heads that predict positions t+2, t+3, t+4. Train on tinyshakespeare with a joint multi-head loss. Compare acceptance rates vs a vanilla draft made by truncating the same model.</li>
+<li><strong>Hard.</strong> Implement rollback: start with a 10-token prefix KV cache, feed 5 draft tokens, simulate a rejection at position 3. Verify your cache reads correctly match &quot;prefix + first 2 accepted drafts&quot; at the next iteration.</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Draft model</td>
+<td>&quot;The cheap one&quot;</td>
+<td>A smaller model that proposes candidate tokens; usually 10–50× cheaper than the verifier.</td>
+</tr>
+<tr>
+<td>Verifier</td>
+<td>&quot;The big one&quot;</td>
+<td>The target model whose distribution we preserve; runs once per speculative step.</td>
+</tr>
+<tr>
+<td>Acceptance rate (α)</td>
+<td>&quot;How often the draft is right&quot;</td>
+<td>Per-token probability that the verifier accepts the draft. 0.7–0.9 typical.</td>
+</tr>
+<tr>
+<td>Residual distribution</td>
+<td>&quot;The rejection fallback&quot;</td>
+<td><code>(q - p)_+</code> normalized; sampling from this on rejection preserves the verifier's distribution.</td>
+</tr>
+<tr>
+<td>Bonus token</td>
+<td>&quot;The free one&quot;</td>
+<td>When all N drafts accepted, sample one more from the verifier's next-step distribution.</td>
+</tr>
+<tr>
+<td>Medusa</td>
+<td>&quot;Draft-less speculative&quot;</td>
+<td>Multiple LM heads on the verifier predict positions t+1..t+k in parallel.</td>
+</tr>
+<tr>
+<td>EAGLE</td>
+<td>&quot;Hidden-state draft&quot;</td>
+<td>Tiny transformer draft conditioned on the verifier's last-layer hidden states.</td>
+</tr>
+<tr>
+<td>Lookahead decoding</td>
+<td>&quot;Jacobi iteration&quot;</td>
+<td>Self-speculation using a fixed-point iteration; no draft model.</td>
+</tr>
+<tr>
+<td>Tree attention</td>
+<td>&quot;Verify many candidates at once&quot;</td>
+<td>Branching verification that considers several draft continuations simultaneously.</td>
+</tr>
+<tr>
+<td>KV rollback</td>
+<td>&quot;Undo rejected drafts&quot;</td>
+<td>Scratch KV buffer; commit on acceptance, discard on reject.</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2211.17192" rel="noreferrer" data-network="true">Leviathan, Kalman, Matias (2023). Fast Inference from Transformers via Speculative Decoding <small>↗ 需要联网</small></a> — the core algorithm and the equivalence theorem.</li>
+<li><a href="https://arxiv.org/abs/2302.01318" rel="noreferrer" data-network="true">Chen et al. (2023). Accelerating Large Language Model Decoding with Speculative Sampling <small>↗ 需要联网</small></a> — concurrent introduction; clean Bernoulli-rejection proof.</li>
+<li><a href="https://arxiv.org/abs/2401.10774" rel="noreferrer" data-network="true">Cai et al. (2024). Medusa: Simple LLM Inference Acceleration Framework with Multiple Decoding Heads <small>↗ 需要联网</small></a> — Medusa paper; tree-attention verification.</li>
+<li><a href="https://arxiv.org/abs/2401.15077" rel="noreferrer" data-network="true">Li et al. (2024). EAGLE: Speculative Sampling Requires Rethinking Feature Uncertainty <small>↗ 需要联网</small></a> — EAGLE-1; hidden-state-conditioned draft.</li>
+<li><a href="https://arxiv.org/abs/2406.16858" rel="noreferrer" data-network="true">Li et al. (2024). EAGLE-2: Faster Inference of Language Models with Dynamic Draft Trees <small>↗ 需要联网</small></a> — EAGLE-2; dynamic tree depth.</li>
+<li><a href="https://arxiv.org/abs/2503.01840" rel="noreferrer" data-network="true">Li et al. (2025). EAGLE-3: Scaling up Inference Acceleration of Large Language Models via Training-Time Test <small>↗ 需要联网</small></a> — EAGLE-3.</li>
+<li><a href="https://arxiv.org/abs/2402.02057" rel="noreferrer" data-network="true">Fu et al. (2024). Break the Sequential Dependency of LLM Inference Using Lookahead Decoding <small>↗ 需要联网</small></a> — lookahead, no-draft approach.</li>
+<li><a href="https://docs.vllm.ai/en/latest/features/spec_decode.html" rel="noreferrer" data-network="true">vLLM docs — Speculative Decoding <small>↗ 需要联网</small></a> — canonical production reference with all four strategies wired up.</li>
+<li><a href="https://github.com/SafeAILab/EAGLE" rel="noreferrer" data-network="true">SafeAILab / EAGLE reference implementation <small>↗ 需要联网</small></a> — the reference code for EAGLE-1/2/3.</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-07-transformers-deep-dive--16-speculative-decoding.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-07-transformers-deep-dive--16-speculative-decoding.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/07-transformers-deep-dive/16-speculative-decoding/code/main.py">phases/07-transformers-deep-dive/16-speculative-decoding/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Speculative decoding: core algorithm and distribution equivalence.
+
+Implements:
+- Bernoulli accept / reject using min(1, q/p)
+- Residual distribution (q - p)_+ for rejection fallback
+- Bonus token on full acceptance
+- Empirical check that the marginal distribution matches direct sampling
+- Acceptance rate vs KL divergence sweep
+&quot;&quot;&quot;
+
+import math
+import random
+
+
+def sample(probs, rng):
+    u = rng.random()
+    c = 0.0
+    for i, p in enumerate(probs):
+        c += p
+        if u &lt; c:
+            return i
+    return len(probs) - 1
+
+
+def residual(q, p):
+    raw = [max(0.0, qi - pi) for qi, pi in zip(q, p)]
+    s = sum(raw)
+    if s == 0.0:
+        return list(q)
+    return [r / s for r in raw]
+
+
+def kl(q, p):
+    total = 0.0
+    for qi, pi in zip(q, p):
+        if qi &gt; 0 and pi &gt; 0:
+            total += qi * math.log(qi / pi)
+    return total
+
+
+def spec_step_one_token(q, p, rng):
+    &quot;&quot;&quot;Draft 1 token from p, verify with q. Returns (accepted_token, was_accepted).&quot;&quot;&quot;
+    d = sample(p, rng)
+    p_prob = p[d]
+    q_prob = q[d]
+    u = rng.random()
+    if u &lt; min(1.0, q_prob / p_prob if p_prob &gt; 0 else float(&quot;inf&quot;)):
+        return d, True
+    return sample(residual(q, p), rng), False
+
+
+def spec_step_n(q, p, N, rng):
+    &quot;&quot;&quot;Draft N tokens (same context), then verify in one pass.
+    Returns (final_token, n_accepted). Simplified: q and p are fixed per call.
+    &quot;&quot;&quot;
+    accepted = 0
+    for _ in range(N):
+        d = sample(p, rng)
+        p_prob = p[d]
+        q_prob = q[d]
+        u = rng.random()
+        if u &lt; min(1.0, q_prob / p_prob if p_prob &gt; 0 else float(&quot;inf&quot;)):
+            accepted += 1
+        else:
+            return sample(residual(q, p), rng), accepted
+    bonus = sample(q, rng)
+    return bonus, accepted + 1
+
+
+def run_distribution_check(q, p, n_samples, rng):
+    spec_counts = [0] * len(q)
+    direct_counts = [0] * len(q)
+    for _ in range(n_samples):
+        d, _ = spec_step_one_token(q, p, rng)
+        spec_counts[d] += 1
+        direct_counts[sample(q, rng)] += 1
+    return spec_counts, direct_counts
+
+
+def chi_square(observed, expected):
+    total_obs = sum(observed)
+    total_exp = sum(expected)
+    if total_obs == 0 or total_exp == 0:
+        return 0.0
+    result = 0.0
+    for o, e in zip(observed, expected):
+        e_norm = e * total_obs / total_exp
+        if e_norm &gt; 0:
+            result += (o - e_norm) ** 2 / e_norm
+    return result
+
+
+def acceptance_rate(q, p, n_samples, rng):
+    hits = 0
+    for _ in range(n_samples):
+        _, was = spec_step_one_token(q, p, rng)
+        if was:
+            hits += 1
+    return hits / n_samples
+
+
+def perturb(q, amount, rng):
+    p = [max(1e-6, qi + amount * rng.gauss(0, 1)) for qi in q]
+    s = sum(p)
+    return [pi / s for pi in p]
+
+
+def expected_tokens_per_verify(alpha, N):
+    if alpha &gt;= 1.0:
+        return N + 1
+    if alpha == 0:
+        return 1
+    return (1 - alpha ** (N + 1)) / (1 - alpha)
+
+
+def main():
+    rng = random.Random(7)
+    V = 8
+    q = [0.35, 0.20, 0.15, 0.10, 0.08, 0.06, 0.04, 0.02]
+    p_good = perturb(q, amount=0.02, rng=rng)
+    p_bad = perturb(q, amount=0.25, rng=rng)
+
+    print(&quot;=== verifier distribution ===&quot;)
+    print(&quot;  q: &quot; + &quot; &quot;.join(f&quot;{qi:.3f}&quot; for qi in q))
+    print()
+
+    print(&quot;=== speculative vs direct sampling (distribution equivalence) ===&quot;)
+    spec_c, direct_c = run_distribution_check(q, p_good, 50000, rng)
+    chi = chi_square(spec_c, direct_c)
+    print(f&quot;  spec   counts (50000 samples): {spec_c}&quot;)
+    print(f&quot;  direct counts (50000 samples): {direct_c}&quot;)
+    print(f&quot;  chi^2 = {chi:.2f}   (V-1 = {V-1} df; large means distributions differ)&quot;)
+    print(f&quot;  {&#39;PASS&#39; if chi &lt; 30 else &#39;FAIL&#39;}: spec-decoded tokens match verifier distribution&quot;)
+    print()
+
+    print(&quot;=== acceptance rate vs KL(q || p) ===&quot;)
+    print(f&quot;  {&#39;KL(q||p)&#39;:&gt;10}  {&#39;acceptance α&#39;:&gt;14}&quot;)
+    for noise in (0.005, 0.02, 0.05, 0.10, 0.25, 0.5):
+        p = perturb(q, amount=noise, rng=random.Random(noise * 1000))
+        alpha = acceptance_rate(q, p, 5000, rng)
+        print(f&quot;  {kl(q, p):&gt;10.4f}  {alpha:&gt;14.3f}&quot;)
+    print()
+
+    print(&quot;=== expected tokens per verifier call (theory) ===&quot;)
+    print(f&quot;  {&#39;α&#39;:&gt;5} &quot; + &quot;&quot;.join(f&quot;  N={N:&gt;2}&quot; for N in (1, 3, 5, 7, 10)))
+    for alpha in (0.3, 0.5, 0.7, 0.85, 0.95):
+        row = f&quot;  {alpha:&gt;5.2f} &quot; + &quot;&quot;.join(
+            f&quot;  {expected_tokens_per_verify(alpha, N):&gt;4.2f}&quot; for N in (1, 3, 5, 7, 10)
+        )
+        print(row)
+    print()
+
+    print(&quot;takeaway: Leviathan&#39;s theorem holds — spec-decoded distribution = verifier&#39;s.&quot;)
+    print(&quot;          At α=0.85 and N=5: ~4.1 tokens per verifier call ≈ 4x fewer big-model&quot;)
+    print(&quot;          forwards (minus draft-model overhead).&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/07-transformers-deep-dive/16-speculative-decoding/outputs/skill-spec-decode-picker.md">phases/07-transformers-deep-dive/16-speculative-decoding/outputs/skill-spec-decode-picker.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: spec-decode-picker
+description: Pick a speculative decoding strategy (vanilla / Medusa / EAGLE / lookahead) and tuning parameters for a new LLM inference workload.
+version: 1.0.0
+phase: 7
+lesson: 16
+tags: [inference, decoding, latency, speculative, optimization]
+---
+
+# Speculative Decoding Picker
+
+Help an engineer choose between vanilla speculative, Medusa, EAGLE, or lookahead decoding, and tune `N` (draft length) for a specific workload.
+
+## Inputs to gather
+
+1. **Verifier model** — which LLM produces final output. Size matters (draft cost must be &lt; verifier cost for speedup).
+2. **Workload type** — code, chat, structured output, summarization. Determines acceptance rate.
+3. **Sampling strategy** — greedy, low-T, high-T, beam. High-T sampling degrades acceptance.
+4. **Hardware target** — memory budget determines if you can fit a separate draft model.
+5. **Engineering budget** — Medusa and EAGLE need fine-tuning; vanilla and lookahead don&#39;t.
+6. **Latency target** — interactive chat (&lt;500ms TTFT, &lt;50ms per token) vs batch (throughput-first).
+
+## Decision rules
+
+- **Quick start, no training**: vanilla draft with a same-family 1B–3B model. 2× typical.
+- **You can fine-tune**: EAGLE-2 or EAGLE-3 using the verifier&#39;s hidden states. 3–4× typical.
+- **You can fine-tune but can&#39;t run two models**: Medusa (extra heads on verifier). 2–3×.
+- **No training budget, no draft model available**: lookahead decoding. 1.3–1.6×.
+- **Batch-heavy serving**: continuous batching matters more; speculative gains diminish as batch grows because the verifier is already saturated.
+- **High temperature or stochastic sampling**: acceptance drops sharply. Consider lower N (2–3) or disabling.
+- **Structured output (JSON, code)**: acceptance is high. Push N to 7+ for max speedup.
+
+## Tuning
+
+- **N (draft length)**: start at 5. Measure acceptance. If α &gt; 0.9, push to 7. If α &lt; 0.6, drop to 3.
+- **Draft temperature**: match the verifier&#39;s temperature. Mismatched draft sampling loses α.
+- **Tree depth (EAGLE-2 / Medusa)**: 3–5 branches; wider trees help only at α &gt; 0.8.
+- **Draft model size**: smallest that hits α &gt; 0.7. A 1B draft for a 70B verifier is typical; don&#39;t go below the verifier&#39;s tokenizer / embedding compatibility.
+
+## Always flag
+
+- Check that draft and verifier share the tokenizer. Different BPE splits break speculative guarantees.
+- Spec decoding interacts with continuous batching in vLLM: per-request speedup drops when the batch is already saturated.
+- EAGLE&#39;s hidden-state input requires verifier internals; not always exposed through HF APIs. Prefer vLLM or SGLang runtimes.
+- Medusa heads need a supervised fine-tune on the verifier&#39;s own outputs. Data-gathering step is often the dominant cost.
+
+## Output format
+
+Return:
+
+1. **Recommendation** — one strategy name and tuning parameters (e.g. &quot;EAGLE-2, N=5, tree_depth=4&quot;).
+2. **Expected speedup** — with explicit α assumption.
+3. **Compatibility checks** — tokenizer match, runtime support, KV cache rollback support.
+4. **Fallback plan** — if the primary strategy underperforms, what to try next.
+5. **Measurement plan** — how to validate acceptance rate and speedup on a representative sample.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原课程未提供测验。</p></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/07-transformers-deep-dive/15-attention-variants/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/08-generative-ai/01-generative-models-taxonomy-history/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/07-transformers-deep-dive/16-speculative-decoding/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

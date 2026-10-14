@@ -1,0 +1,477 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>序列到序列模型 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-05-nlp-foundations-to-advanced" data-lesson="05-nlp-foundations-to-advanced/09-sequence-to-sequence" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/05-nlp-foundations-to-advanced/">自然语言处理</a> / LESSON 09</p><h1 class="lesson-title">序列到序列模型</h1><p>Sequence-to-Sequence Models</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>序列到序列模型</h1>
+<blockquote>
+<p>两名RNN假装是翻译者. 他们遇到的瓶是人们的关注的原因.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 5 · 08 (CNNs + RNNs for Text), Phase 3 · 11 (PyTorch Intro)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>问题</h2>
+<p>类别将变量长度序列映射到单个标签上. 翻译将变量长度序列映射到另一个变量长度序列上. 输入和输出在不同的词汇库中,可能是不同的语言,没有保证长度平衡.</p>
+<p>后2seq架构 (Sutskever,Vinyals,Le,2014) 用一个简单的食谱来解解开这个问题.两个RNN.一个读取源句子并产生一个固体尺寸的语境向量.另一个读取该向量并生成目标句子代币.同一个代码你为08课写的,粘合在一起以不同的方式.</p>
+<p>首先,文本向量瓶是NLP中最具教学效益的失败.它激励了注意力和变压器擅长的一切.第二,培训配方 (教师强迫,计划采样,线束搜索在推断) 仍然适用于包括LLM在内的每个现代生成系统.</p>
+<h2>概念</h2>
+<p><strong>Encoder.<strong>读取源句子的RNN. 它的最后隐藏状态是</strong>context vector</strong>总结整个输入的总结. 据说除了源头之外,没有什么丢失.</p>
+<p>**Decoder.**另一个RNN从文本向量初始化.在每个步骤中,它将先前生成的代币作为输入,并产生目标词汇中的分布. 样本或 argmax来选择下一个代币. 输入它.重复直到一个<code>&lt;EOS&gt;</code>标志产生的或最大长度被击中.</p>
+<p>**Training:**通过两个网络,通过时间进行标准的背后支持.</p>
+<p><strong>Teacher forcing.<strong>在训练过程中,解码器的输入步骤<code>t</code>是位置上的<em>真实地图</em>符号<code>t-1</code>没有它,早期错误会发生,模型永远不会学习.在推断时,你必须使用模型的预测,所以总是存在火车/推理分布差距.这个差距被称为</strong>exposure bias</strong>现在,我们要去.</p>
+<p>**The bottleneck.**编码器学到关于源的所有信息都必须挤进一个文本向量中.长短句子会失去细节.罕见的词语会模糊.重排 (聊天黑与黑猫) 必须记忆,而不是计算.</p>
+<p>注意力 (课 10) 通过让解码器查看 <em>每一个</em>编码器的隐藏状态,而不仅仅是最后一个.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-a177025b0a1b5599ad42.png" alt="lstm-gates 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<h3>步骤1:编码器</h3>
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+
+class Encoder(nn.Module):
+    def __init__(self, src_vocab_size, embed_dim, hidden_dim):
+        super().__init__()
+        self.embed = nn.Embedding(src_vocab_size, embed_dim, padding_idx=0)
+        self.gru = nn.GRU(embed_dim, hidden_dim, batch_first=True)
+
+    def forward(self, src):
+        e = self.embed(src)
+        outputs, hidden = self.gru(e)
+        return outputs, hidden
+</code></pre>
+<p><code>outputs</code>具有形状<code>[batch, seq_len, hidden_dim]</code>每一个输入位置一个隐藏状态.<code>hidden</code>具有形状<code>[1, batch, hidden_dim]</code>最后一步. 第08课说&quot;分类输出&quot;.在这里我们将最后一个隐藏状态作为文本向量,并忽略每一步输出.</p>
+<h3>步骤 2: 解码器</h3>
+<pre><code class="language-python">class Decoder(nn.Module):
+    def __init__(self, tgt_vocab_size, embed_dim, hidden_dim):
+        super().__init__()
+        self.embed = nn.Embedding(tgt_vocab_size, embed_dim, padding_idx=0)
+        self.gru = nn.GRU(embed_dim, hidden_dim, batch_first=True)
+        self.fc = nn.Linear(hidden_dim, tgt_vocab_size)
+
+    def forward(self, token, hidden):
+        e = self.embed(token)
+        out, hidden = self.gru(e, hidden)
+        logits = self.fc(out)
+        return logits, hidden
+</code></pre>
+<p>输入:单个代币的批量和当前隐藏状态.输出:下一个代币和更新的隐藏状态的词汇记录.</p>
+<h3>步骤3:教师强迫的训练循环</h3>
+<pre><code class="language-python">def train_batch(encoder, decoder, src, tgt, bos_id, optimizer, teacher_forcing_ratio=0.9):
+    optimizer.zero_grad()
+    _, hidden = encoder(src)
+    batch_size, tgt_len = tgt.shape
+    input_token = torch.full((batch_size, 1), bos_id, dtype=torch.long)
+    loss = 0.0
+    loss_fn = nn.CrossEntropyLoss(ignore_index=0)
+
+    for t in range(tgt_len):
+        logits, hidden = decoder(input_token, hidden)
+        step_loss = loss_fn(logits.squeeze(1), tgt[:, t])
+        loss += step_loss
+        use_teacher = torch.rand(1).item() &lt; teacher_forcing_ratio
+        if use_teacher:
+            input_token = tgt[:, t].unsqueeze(1)
+        else:
+            input_token = logits.argmax(dim=-1)
+
+    loss.backward()
+    optimizer.step()
+    return loss.item() / tgt_len
+</code></pre>
+<p>两个值得命名的.<code>ignore_index=0</code>置代币的损失.<code>teacher_forcing_ratio</code>根据模型的预测,在每一步使用真符号的概率.从1.0开始 (完全强迫教师) 并在训练中降至0.5以缩小暴露偏差.</p>
+<h3>步骤4:推断循环 (贪)</h3>
+<pre><code class="language-python">@torch.no_grad()
+def greedy_decode(encoder, decoder, src, bos_id, eos_id, max_len=50):
+    _, hidden = encoder(src)
+    batch_size = src.shape[0]
+    input_token = torch.full((batch_size, 1), bos_id, dtype=torch.long)
+    output_ids = []
+    for _ in range(max_len):
+        logits, hidden = decoder(input_token, hidden)
+        next_token = logits.argmax(dim=-1)
+        output_ids.append(next_token)
+        input_token = next_token
+        if (next_token == eos_id).all():
+            break
+    return torch.cat(output_ids, dim=1)
+</code></pre>
+<p>贪的解码会在每一步都选择最有可能的代币. 它可以走开:一旦你承诺一个代币,<strong>Beam search</strong>保持了顶部...<code>k</code>部分序列活着,最后选择最高分的完整序列.</p>
+<h3>步骤5:瓶,已证明</h3>
+<p>训练模型做玩具复制任务:来源 <code>[a, b, c, d, e]</code>目标<code>[a, b, c, d, e]</code>增加序列长度,观察准确性.</p>
+<pre><code>seq_len=5   copy accuracy: 98%
+seq_len=10  copy accuracy: 91%
+seq_len=20  copy accuracy: 62%
+seq_len=40  copy accuracy: 23%
+</code></pre>
+<p>单个GRU隐藏状态不能无损地记住40代码输入.信息在每个编码器步骤上都存在,但解码器只能看到最后一个状态.注意力直接解决这一问题.</p>
+<h2>用它</h2>
+<p>皮托奇已经<code>nn.Transformer</code>其他<code>nn.LSTM</code>基于&quot;接着&quot;的模板.<code>transformers</code>库运输了大量的代码器和解码器模型 (BART,T5, mBART,NLLB),</p>
+<pre><code class="language-python">from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+
+tok = AutoTokenizer.from_pretrained(&quot;facebook/bart-base&quot;)
+model = AutoModelForSeq2SeqLM.from_pretrained(&quot;facebook/bart-base&quot;)
+
+src = tok(&quot;Translate this to French: Hello, how are you?&quot;, return_tensors=&quot;pt&quot;)
+out = model.generate(**src, max_new_tokens=50, num_beams=4)
+print(tok.decode(out[0], skip_special_tokens=True))
+</code></pre>
+<p>现代编码解码器将RNN用于变压器.高层形状 (编码器,解码器,生成代币-按代币) 与2014年 seq2seq纸相同.每个区块内部的机制是不同的.</p>
+<h3>什么时候还可以找到基于RNN的seq2seq</h3>
+<p>对于新项目来说,几乎从来没有.</p>
+<ul>
+<li>流媒体翻译,其中你一次输入一个代币,</li>
+<li>在设备上发送文字,变压器内存成本是极高的.</li>
+<li>了解编码和解码瓶是最快的方法来了解变压器为什么赢了.</li>
+</ul>
+<h3>暴露偏见及其减轻</h3>
+<ul>
+<li>**Scheduled sampling.**训练期间的教师强迫比率,使得模型学会从自己的错误中恢复.</li>
+<li>**Minimum risk training.**训练用语句级蓝色分数而不是代币级交叉,更接近你真正想要的.</li>
+<li>**Reinforcement learning fine-tuning.**奖励序列生成器用一个指标.</li>
+</ul>
+<p>它们都适用于变压器发电.</p>
+<h2>运送它</h2>
+<p>保存如<code>outputs/prompt-seq2seq-design.md</code>其他:</p>
+<pre><code class="language-markdown">---
+name: seq2seq-design
+description: Design a sequence-to-sequence pipeline for a given task.
+phase: 5
+lesson: 09
+---
+
+Given a task (translation, summarization, paraphrase, question rewrite), output:
+
+1. Architecture. Pretrained transformer encoder-decoder (BART, T5, mBART, NLLB) is the default. RNN-based seq2seq only for specific constraints.
+2. Starting checkpoint. Name it (`facebook/bart-base`, `google/flan-t5-base`, `facebook/nllb-200-distilled-600M`). Match the checkpoint to task and language coverage.
+3. Decoding strategy. Greedy for deterministic output, beam search (width 4-5) for quality, sampling with temperature for diversity. One sentence justification.
+4. One failure mode to verify before shipping. Exposure bias manifests as generation drift on longer outputs; sample 20 outputs at the 90th-percentile length and eyeball.
+
+Refuse to recommend training a seq2seq from scratch for under a million parallel examples. Flag any pipeline that uses greedy decoding for user-facing content as fragile (greedy repeats and loops).
+</code></pre>
+<h2>运动</h2>
+<ol>
+<li>**Easy.**执行玩具复制任务. 训练一个GRU seq2seq在输出输入对等目标的源. 测量精度在长度 5, 10, 20. 复制瓶.</li>
+<li>**Medium.**添加光束搜索解码. 3. 测量蓝色在一个小平行体上,以抵制贪. 光束搜索获胜的文件 (通常是最后的代币),并且它没有区别.</li>
+<li>**Hard.**精细调节<code>facebook/bart-base</code>根据10k对对对法拉斯数据集,比较细调模型的光束-4输出与基本模型的持久输入.报告BLEU,选择10个质量例子.</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Encoder</td>
+<td>Input RNN</td>
+<td>Reads source. Produces per-step hidden states and a final context vector.</td>
+</tr>
+<tr>
+<td>Decoder</td>
+<td>Output RNN</td>
+<td>Initialized from context vector. Generates target tokens one at a time.</td>
+</tr>
+<tr>
+<td>Context vector</td>
+<td>The summary</td>
+<td>Final encoder hidden state. Fixed size. The bottleneck attention solves.</td>
+</tr>
+<tr>
+<td>Teacher forcing</td>
+<td>Use true tokens</td>
+<td>Feed the ground-truth previous token at training time. Stabilizes learning.</td>
+</tr>
+<tr>
+<td>Exposure bias</td>
+<td>Train/test gap</td>
+<td>Model trained on true tokens never practiced recovering from its own mistakes.</td>
+</tr>
+<tr>
+<td>Beam search</td>
+<td>Better decoding</td>
+<td>Keep top-k partial sequences alive at each step instead of committing greedily.</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/1409.3215" rel="noreferrer" data-network="true">Sutskever, Vinyals, Le (2014). Sequence to Sequence Learning with Neural Networks <small>↗ 需要联网</small></a>原始的&quot;后二后二&quot;纸.</li>
+<li><a href="https://arxiv.org/abs/1406.1078" rel="noreferrer" data-network="true">Cho et al. (2014). Learning Phrase Representations using RNN Encoder-Decoder for Statistical Machine Translation <small>↗ 需要联网</small></a>引入了GRU和编码器-解码器框架.</li>
+<li><a href="https://arxiv.org/abs/1409.0473" rel="noreferrer" data-network="true">Bahdanau, Cho, Bengio (2014). Neural Machine Translation by Jointly Learning to Align and Translate <small>↗ 需要联网</small></a>注意力论文. 课后立即阅读.</li>
+<li><a href="https://pytorch.org/tutorials/intermediate/seq2seq_translation_tutorial.html" rel="noreferrer" data-network="true">PyTorch NLP from Scratch tutorial <small>↗ 需要联网</small></a>可构建的seq2seq+注意码.</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Sequence-to-Sequence Models</h1>
+<blockquote>
+<p>Two RNNs pretending to be a translator. The bottleneck they hit is the reason attention exists.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 5 · 08 (CNNs + RNNs for Text), Phase 3 · 11 (PyTorch Intro)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>The Problem</h2>
+<p>Classification maps a variable-length sequence to a single label. Translation maps a variable-length sequence to another variable-length sequence. The input and output live in different vocabularies, possibly different languages, with no guarantee of length parity.</p>
+<p>The seq2seq architecture (Sutskever, Vinyals, Le, 2014) cracked this with a deliberately simple recipe. Two RNNs. One reads the source sentence and produces a fixed-size context vector. The other reads that vector and generates the target sentence token by token. Same code you wrote for lesson 08, glued together differently.</p>
+<p>This is worth studying for two reasons. First, the context-vector bottleneck is the most pedagogically useful failure in NLP. It motivates everything attention and transformers are good at. Second, the training recipe (teacher forcing, scheduled sampling, beam search at inference) still applies to every modern generation system including LLMs.</p>
+<h2>The Concept</h2>
+<p><strong>Encoder.</strong> An RNN that reads the source sentence. Its final hidden state is the <strong>context vector</strong> — a fixed-size summary of the entire input. Lose nothing but the source, supposedly.</p>
+<p><strong>Decoder.</strong> Another RNN initialized from the context vector. At each step it takes the previously generated token as input and produces a distribution over the target vocabulary. Sample or argmax to pick the next token. Feed it back in. Repeat until an <code>&lt;EOS&gt;</code> token is produced or max length is hit.</p>
+<p><strong>Training:</strong> Cross-entropy loss at each decoder step, summed over the sequence. Standard backprop through time through both networks.</p>
+<p><strong>Teacher forcing.</strong> During training, the decoder's input at step <code>t</code> is the <em>ground-truth</em> token at position <code>t-1</code>, not the decoder's own previous prediction. This stabilizes training; without it, early mistakes cascade and the model never learns. At inference, you have to use the model's own predictions, so there is always a train/inference distribution gap. That gap is called <strong>exposure bias</strong>.</p>
+<p><strong>The bottleneck.</strong> Everything the encoder learned about the source must be squeezed into that one context vector. Long sentences lose detail. Rare words get blurred. Reordering (chat noir vs. black cat) has to be memorized, not computed.</p>
+<p>Attention (lesson 10) fixes this by letting the decoder look at <em>every</em> encoder hidden state, not just the last one. That is the whole pitch.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-a177025b0a1b5599ad42.png" alt="lstm-gates 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<h3>Step 1: an encoder</h3>
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+
+class Encoder(nn.Module):
+    def __init__(self, src_vocab_size, embed_dim, hidden_dim):
+        super().__init__()
+        self.embed = nn.Embedding(src_vocab_size, embed_dim, padding_idx=0)
+        self.gru = nn.GRU(embed_dim, hidden_dim, batch_first=True)
+
+    def forward(self, src):
+        e = self.embed(src)
+        outputs, hidden = self.gru(e)
+        return outputs, hidden
+</code></pre>
+<p><code>outputs</code> has shape <code>[batch, seq_len, hidden_dim]</code> — one hidden state per input position. <code>hidden</code> has shape <code>[1, batch, hidden_dim]</code> — the final step. Lesson 08 said &quot;pool over outputs for classification.&quot; Here we keep the last hidden state as the context vector, and ignore the per-step outputs.</p>
+<h3>Step 2: a decoder</h3>
+<pre><code class="language-python">class Decoder(nn.Module):
+    def __init__(self, tgt_vocab_size, embed_dim, hidden_dim):
+        super().__init__()
+        self.embed = nn.Embedding(tgt_vocab_size, embed_dim, padding_idx=0)
+        self.gru = nn.GRU(embed_dim, hidden_dim, batch_first=True)
+        self.fc = nn.Linear(hidden_dim, tgt_vocab_size)
+
+    def forward(self, token, hidden):
+        e = self.embed(token)
+        out, hidden = self.gru(e, hidden)
+        logits = self.fc(out)
+        return logits, hidden
+</code></pre>
+<p>Decoder is called one step at a time. Input: a batch of single tokens and the current hidden state. Output: vocabulary logits for the next token and the updated hidden state.</p>
+<h3>Step 3: training loop with teacher forcing</h3>
+<pre><code class="language-python">def train_batch(encoder, decoder, src, tgt, bos_id, optimizer, teacher_forcing_ratio=0.9):
+    optimizer.zero_grad()
+    _, hidden = encoder(src)
+    batch_size, tgt_len = tgt.shape
+    input_token = torch.full((batch_size, 1), bos_id, dtype=torch.long)
+    loss = 0.0
+    loss_fn = nn.CrossEntropyLoss(ignore_index=0)
+
+    for t in range(tgt_len):
+        logits, hidden = decoder(input_token, hidden)
+        step_loss = loss_fn(logits.squeeze(1), tgt[:, t])
+        loss += step_loss
+        use_teacher = torch.rand(1).item() &lt; teacher_forcing_ratio
+        if use_teacher:
+            input_token = tgt[:, t].unsqueeze(1)
+        else:
+            input_token = logits.argmax(dim=-1)
+
+    loss.backward()
+    optimizer.step()
+    return loss.item() / tgt_len
+</code></pre>
+<p>Two knobs worth naming. <code>ignore_index=0</code> skips loss on padding tokens. <code>teacher_forcing_ratio</code> is the probability of using the true token vs. the model's prediction at each step. Start at 1.0 (full teacher forcing) and anneal down to ~0.5 over training to close the exposure-bias gap.</p>
+<h3>Step 4: inference loop (greedy)</h3>
+<pre><code class="language-python">@torch.no_grad()
+def greedy_decode(encoder, decoder, src, bos_id, eos_id, max_len=50):
+    _, hidden = encoder(src)
+    batch_size = src.shape[0]
+    input_token = torch.full((batch_size, 1), bos_id, dtype=torch.long)
+    output_ids = []
+    for _ in range(max_len):
+        logits, hidden = decoder(input_token, hidden)
+        next_token = logits.argmax(dim=-1)
+        output_ids.append(next_token)
+        input_token = next_token
+        if (next_token == eos_id).all():
+            break
+    return torch.cat(output_ids, dim=1)
+</code></pre>
+<p>Greedy decoding picks the highest-probability token at every step. It can wander off: once you commit to a token, you cannot unsay it. <strong>Beam search</strong> keeps the top-<code>k</code> partial sequences alive and picks the highest-scoring complete one at the end. Beam width 3-5 is standard.</p>
+<h3>Step 5: the bottleneck, demonstrated</h3>
+<p>Train the model on a toy copy task: source <code>[a, b, c, d, e]</code>, target <code>[a, b, c, d, e]</code>. Increase sequence length. Observe accuracy.</p>
+<pre><code>seq_len=5   copy accuracy: 98%
+seq_len=10  copy accuracy: 91%
+seq_len=20  copy accuracy: 62%
+seq_len=40  copy accuracy: 23%
+</code></pre>
+<p>A single GRU hidden state cannot losslessly memorize a 40-token input. The information is there at every encoder step, but the decoder only sees the last state. Attention fixes this directly.</p>
+<h2>Use It</h2>
+<p>PyTorch has <code>nn.Transformer</code> and <code>nn.LSTM</code>-based seq2seq templates. Hugging Face's <code>transformers</code> library ships full encoder-decoder models (BART, T5, mBART, NLLB) trained on billions of tokens.</p>
+<pre><code class="language-python">from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+
+tok = AutoTokenizer.from_pretrained(&quot;facebook/bart-base&quot;)
+model = AutoModelForSeq2SeqLM.from_pretrained(&quot;facebook/bart-base&quot;)
+
+src = tok(&quot;Translate this to French: Hello, how are you?&quot;, return_tensors=&quot;pt&quot;)
+out = model.generate(**src, max_new_tokens=50, num_beams=4)
+print(tok.decode(out[0], skip_special_tokens=True))
+</code></pre>
+<p>Modern encoder-decoders dropped RNNs for transformers. The high-level shape (encoder, decoder, generate-token-by-token) is identical to the 2014 seq2seq paper. The mechanism inside each block is different.</p>
+<h3>When to still reach for RNN-based seq2seq</h3>
+<p>Almost never, for new projects. Specific exceptions:</p>
+<ul>
+<li>Streaming translation where you consume input one token at a time with bounded memory.</li>
+<li>On-device text generation where transformer memory cost is prohibitive.</li>
+<li>Pedagogy. Understanding the encoder-decoder bottleneck is the fastest path to understanding why transformers won.</li>
+</ul>
+<h3>Exposure bias and its mitigations</h3>
+<ul>
+<li><strong>Scheduled sampling.</strong> Anneal teacher forcing ratio during training so the model learns to recover from its own mistakes.</li>
+<li><strong>Minimum risk training.</strong> Train on sentence-level BLEU score instead of token-level cross-entropy. Closer to what you actually want.</li>
+<li><strong>Reinforcement learning fine-tuning.</strong> Reward the sequence generator with a metric. Used in modern LLM RLHF.</li>
+</ul>
+<p>All three still apply to transformer-based generation.</p>
+<h2>Ship It</h2>
+<p>Save as <code>outputs/prompt-seq2seq-design.md</code>:</p>
+<pre><code class="language-markdown">---
+name: seq2seq-design
+description: Design a sequence-to-sequence pipeline for a given task.
+phase: 5
+lesson: 09
+---
+
+Given a task (translation, summarization, paraphrase, question rewrite), output:
+
+1. Architecture. Pretrained transformer encoder-decoder (BART, T5, mBART, NLLB) is the default. RNN-based seq2seq only for specific constraints.
+2. Starting checkpoint. Name it (`facebook/bart-base`, `google/flan-t5-base`, `facebook/nllb-200-distilled-600M`). Match the checkpoint to task and language coverage.
+3. Decoding strategy. Greedy for deterministic output, beam search (width 4-5) for quality, sampling with temperature for diversity. One sentence justification.
+4. One failure mode to verify before shipping. Exposure bias manifests as generation drift on longer outputs; sample 20 outputs at the 90th-percentile length and eyeball.
+
+Refuse to recommend training a seq2seq from scratch for under a million parallel examples. Flag any pipeline that uses greedy decoding for user-facing content as fragile (greedy repeats and loops).
+</code></pre>
+<h2>Exercises</h2>
+<ol>
+<li><strong>Easy.</strong> Implement the toy copy task. Train a GRU seq2seq on input-output pairs where the target equals the source. Measure accuracy at lengths 5, 10, 20. Reproduce the bottleneck.</li>
+<li><strong>Medium.</strong> Add beam search decoding with beam width 3. Measure BLEU on a small parallel corpus against greedy. Document where beam search wins (usually last tokens) and where it makes no difference.</li>
+<li><strong>Hard.</strong> Fine-tune <code>facebook/bart-base</code> on a 10k-pair paraphrase dataset. Compare the fine-tuned model's beam-4 output to the base model's on held-out inputs. Report BLEU and pick 10 qualitative examples.</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Encoder</td>
+<td>Input RNN</td>
+<td>Reads source. Produces per-step hidden states and a final context vector.</td>
+</tr>
+<tr>
+<td>Decoder</td>
+<td>Output RNN</td>
+<td>Initialized from context vector. Generates target tokens one at a time.</td>
+</tr>
+<tr>
+<td>Context vector</td>
+<td>The summary</td>
+<td>Final encoder hidden state. Fixed size. The bottleneck attention solves.</td>
+</tr>
+<tr>
+<td>Teacher forcing</td>
+<td>Use true tokens</td>
+<td>Feed the ground-truth previous token at training time. Stabilizes learning.</td>
+</tr>
+<tr>
+<td>Exposure bias</td>
+<td>Train/test gap</td>
+<td>Model trained on true tokens never practiced recovering from its own mistakes.</td>
+</tr>
+<tr>
+<td>Beam search</td>
+<td>Better decoding</td>
+<td>Keep top-k partial sequences alive at each step instead of committing greedily.</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/1409.3215" rel="noreferrer" data-network="true">Sutskever, Vinyals, Le (2014). Sequence to Sequence Learning with Neural Networks <small>↗ 需要联网</small></a> — the original seq2seq paper. Four pages.</li>
+<li><a href="https://arxiv.org/abs/1406.1078" rel="noreferrer" data-network="true">Cho et al. (2014). Learning Phrase Representations using RNN Encoder-Decoder for Statistical Machine Translation <small>↗ 需要联网</small></a> — introduced the GRU and the encoder-decoder framing.</li>
+<li><a href="https://arxiv.org/abs/1409.0473" rel="noreferrer" data-network="true">Bahdanau, Cho, Bengio (2014). Neural Machine Translation by Jointly Learning to Align and Translate <small>↗ 需要联网</small></a> — the attention paper. Read immediately after this lesson.</li>
+<li><a href="https://pytorch.org/tutorials/intermediate/seq2seq_translation_tutorial.html" rel="noreferrer" data-network="true">PyTorch NLP from Scratch tutorial <small>↗ 需要联网</small></a> — buildable seq2seq + attention code.</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-05-nlp-foundations-to-advanced--09-sequence-to-sequence.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-05-nlp-foundations-to-advanced--09-sequence-to-sequence.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/05-nlp-foundations-to-advanced/09-sequence-to-sequence/code/main.py">phases/05-nlp-foundations-to-advanced/09-sequence-to-sequence/code/main.py</a><details><summary>查看原始文本</summary><pre><code>import math
+import random
+
+
+def simulate_copy_accuracy(seq_len, context_dim=8, epochs=200, n_train=300, seed=0):
+    rng = random.Random(seed)
+    vocab = list(&quot;abcdefghij&quot;)
+    vocab_size = len(vocab)
+
+    embed = [[rng.gauss(0, 0.3) for _ in range(context_dim)] for _ in range(vocab_size)]
+    context = [0.0] * context_dim
+
+    def encode(sequence):
+        c = [0.0] * context_dim
+        decay = 0.85
+        for token in sequence:
+            idx = vocab.index(token)
+            for d in range(context_dim):
+                c[d] = c[d] * decay + embed[idx][d]
+        return c
+
+    def decode_score(context, target):
+        total = 0.0
+        recovery = 1.0
+        for token in target:
+            idx = vocab.index(token)
+            score = sum(context[d] * embed[idx][d] for d in range(context_dim))
+            normed = math.tanh(score) * recovery
+            total += max(0.0, normed)
+            recovery *= 0.9
+        return total / max(1, len(target))
+
+    hits = 0
+    trials = 100
+    for _ in range(trials):
+        seq = [rng.choice(vocab) for _ in range(seq_len)]
+        c = encode(seq)
+        target_score = decode_score(c, seq)
+
+        noise_score = decode_score(c, [rng.choice(vocab) for _ in range(seq_len)])
+        if target_score &gt; noise_score:
+            hits += 1
+    return hits / trials
+
+
+def main():
+    print(&quot;toy simulation of encoder-decoder bottleneck&quot;)
+    print(&quot;context vector has fixed size = 8 floats&quot;)
+    print(&quot;encoder decays state at rate 0.85 per step (simulates forgetting)&quot;)
+    print()
+    print(f&quot;{&#39;seq_len&#39;:&gt;8}  {&#39;accuracy&#39;:&gt;10}&quot;)
+    for length in [5, 10, 20, 40, 80]:
+        acc = simulate_copy_accuracy(length)
+        print(f&quot;{length:&gt;8}  {acc:&gt;9.0%}&quot;)
+    print()
+    print(&quot;real LSTMs decay more gracefully but hit the same ceiling.&quot;)
+    print(&quot;attention (lesson 10) removes the fixed-size constraint.&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/05-nlp-foundations-to-advanced/09-sequence-to-sequence/outputs/.gitkeep">phases/05-nlp-foundations-to-advanced/09-sequence-to-sequence/outputs/.gitkeep</a><details><summary>查看原始文本</summary><pre><code></code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/05-nlp-foundations-to-advanced/09-sequence-to-sequence/outputs/prompt-seq2seq-design.md">phases/05-nlp-foundations-to-advanced/09-sequence-to-sequence/outputs/prompt-seq2seq-design.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: seq2seq-design
+description: Design a sequence-to-sequence pipeline for a given task.
+phase: 5
+lesson: 09
+---
+
+Given a task (translation, summarization, paraphrase, question rewrite), output:
+
+1. Architecture. Pretrained transformer encoder-decoder (BART, T5, mBART, NLLB) is the default. RNN-based seq2seq only for specific constraints (streaming, edge inference, pedagogy).
+2. Starting checkpoint. Name it (`facebook/bart-base`, `google/flan-t5-base`, `facebook/nllb-200-distilled-600M`). Match checkpoint to task and language coverage.
+3. Decoding strategy. Greedy for deterministic output, beam search (width 4-5) for quality, sampling with temperature for diversity. One sentence justification.
+4. One failure mode to verify before shipping. Exposure bias manifests as generation drift on longer outputs; sample 20 outputs at 90th-percentile length and eyeball.
+
+Refuse to recommend training a seq2seq from scratch for under ~1M parallel examples. Flag any pipeline using greedy decoding for user-facing content as fragile (greedy repeats and loops).
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. What is the role of the encoder in a 2014-style seq2seq model?</legend><label class="option"><input type="radio" name="q0" value="0"> Generates target tokens</label><label class="option"><input type="radio" name="q0" value="1"> Performs beam search</label><label class="option"><input type="radio" name="q0" value="2"> Computes attention weights</label><label class="option"><input type="radio" name="q0" value="3"> Reads the source and produces a fixed-size context vector summarizing it</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. What is teacher forcing during seq2seq training?</legend><label class="option"><input type="radio" name="q1" value="0"> Manually labeling each decoder step</label><label class="option"><input type="radio" name="q1" value="1"> Adding a teacher network during inference</label><label class="option"><input type="radio" name="q1" value="2"> Doubling the batch size</label><label class="option"><input type="radio" name="q1" value="3"> Feeding the ground-truth previous token (instead of the model&#39;s prediction) as decoder input</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. Why does fixed context-vector seq2seq accuracy fall as input length grows?</legend><label class="option"><input type="radio" name="q2" value="0"> Cross-entropy diverges</label><label class="option"><input type="radio" name="q2" value="1"> Padding tokens accumulate</label><label class="option"><input type="radio" name="q2" value="2"> Vocabulary becomes too large</label><label class="option"><input type="radio" name="q2" value="3"> All information about the source must fit in a single fixed-size encoder hidden state, which loses detail on long inputs</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. What is exposure bias?</legend><label class="option"><input type="radio" name="q3" value="0"> Bias from class imbalance</label><label class="option"><input type="radio" name="q3" value="1"> Bias in encoder embeddings</label><label class="option"><input type="radio" name="q3" value="2"> Annotator disagreement</label><label class="option"><input type="radio" name="q3" value="3"> The train/inference gap from training on ground-truth tokens but generating from the model&#39;s own predictions at inference</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. Why does beam search often outperform greedy decoding for generation?</legend><label class="option"><input type="radio" name="q4" value="0"> Beam search is faster</label><label class="option"><input type="radio" name="q4" value="1"> Beam search keeps the top-k partial sequences alive at each step instead of irrevocably committing to one token</label><label class="option"><input type="radio" name="q4" value="2"> Beam search avoids exposure bias</label><label class="option"><input type="radio" name="q4" value="3"> Beam search lowers the loss</label><p data-feedback="4"></p></fieldset><fieldset><legend>6. Which architectural family replaced RNN seq2seq for general generation tasks?</legend><label class="option"><input type="radio" name="q5" value="0"> Naive Bayes</label><label class="option"><input type="radio" name="q5" value="1"> Graph neural networks</label><label class="option"><input type="radio" name="q5" value="2"> 1D CNNs</label><label class="option"><input type="radio" name="q5" value="3"> Transformer encoder-decoder models (BART, T5, mBART, NLLB)</label><p data-feedback="5"></p></fieldset><fieldset><legend>7. What does scheduled sampling do?</legend><label class="option"><input type="radio" name="q6" value="0"> Adds random noise to embeddings</label><label class="option"><input type="radio" name="q6" value="1"> Anneals the teacher-forcing ratio downward during training so the model learns to recover from its own predictions</label><label class="option"><input type="radio" name="q6" value="2"> Reorders the training set</label><label class="option"><input type="radio" name="q6" value="3"> Schedules learning-rate decay</label><p data-feedback="6"></p></fieldset><fieldset><legend>8. Why does greedy decoding alone often fail for user-facing generation?</legend><label class="option"><input type="radio" name="q7" value="0"> It always picks &lt;EOS&gt; first</label><label class="option"><input type="radio" name="q7" value="1"> It cannot use embeddings</label><label class="option"><input type="radio" name="q7" value="2"> Greedy can repeat or loop and cannot backtrack from a locally good but globally poor token choice</label><label class="option"><input type="radio" name="q7" value="3"> It requires more memory</label><p data-feedback="7"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/05-nlp-foundations-to-advanced/08-cnns-rnns-for-text/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/05-nlp-foundations-to-advanced/10-attention-mechanism/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/05-nlp-foundations-to-advanced/09-sequence-to-sequence/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

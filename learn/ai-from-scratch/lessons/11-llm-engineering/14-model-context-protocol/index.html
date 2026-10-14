@@ -1,0 +1,1134 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>模型文本协议 (MCP) · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-11-llm-engineering" data-lesson="11-llm-engineering/14-model-context-protocol" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/11-llm-engineering/">大语言模型工程</a> / LESSON 14</p><h1 class="lesson-title">模型文本协议 (MCP)</h1><p>Model Context Protocol (MCP)</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>模型文本协议 (MCP)</h1>
+<blockquote>
+<p>2026-07-28的修订使该协议无状态:功能和版本文本与每个请求都随着,而不是连接的握手.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 11 · 09 (Function Calling), Phase 11 · 03 (Structured Outputs)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>区分一个MCP主机,客户端,服务器,运输和服务器原始.</li>
+<li>建立一个JSON-RPC请求,使用MCP 2026-07-28所要求的元数据.</li>
+<li>使用<code>server/discover</code>检查版本,身份和功能.</li>
+<li>返回输入和缓存的结果来自工具,资源和提示.</li>
+<li>解释现代无国无国 MCP 与握手时代的服务器如何互动.</li>
+<li>选择安全状态,运输和许可限制.</li>
+</ul>
+<h2>问题</h2>
+<p>没有共享协议,每个AI主机都需要自定义发现,调用,错误,运输和授权粘合剂,</p>
+<p>服务器发布标准的JSON-RPC表面.一个符合要求的客户端可以发现表面,向模型或用户展示它,调用它,并没有服务器特定的适配器解释结果.</p>
+<p>重要界限很容易被错过.MCP标准化通信.它不决定模型应该调用哪个工具,使不值得信赖的内容安全,或将无状态请求变成持久的应用状态.你的主机和服务器仍然拥有这些决定.</p>
+<h2>概念</h2>
+<p><img src="/learn/ai-from-scratch/files/phases/11-llm-engineering/14-model-context-protocol/assets/mcp-architecture.svg" alt="MCP host, stateless request, and server primitives" loading="lazy"></p>
+<h3>服务器的三个原始</h3>
+<ol>
+<li><strong>Tools</strong>每个工具都有一个名称,描述,JSON Schema输入和处理器.</li>
+<li><strong>Resources</strong>客户可以阅读的 URI 地址的内容.</li>
+<li><strong>Prompts</strong>它们是主机可以向用户展示的可重复使用模板.</li>
+</ol>
+<p>机器人是AI应用程序.机器人内部的MCP客户端与一个服务器交谈.运输器在它们之间传输JSON-RPC消息.</p>
+<h3>无国籍申请取代握手</h3>
+<p>移除MCP 2026-07-28 <code>initialize</code>其他<code>notifications/initialized</code>任何请求都包含需要解释的文本.<code>params._meta</code>其他:</p>
+<pre><code class="language-json">{
+  &quot;jsonrpc&quot;: &quot;2.0&quot;,
+  &quot;id&quot;: 1,
+  &quot;method&quot;: &quot;tools/list&quot;,
+  &quot;params&quot;: {
+    &quot;_meta&quot;: {
+      &quot;io.modelcontextprotocol/protocolVersion&quot;: &quot;2026-07-28&quot;,
+      &quot;io.modelcontextprotocol/clientCapabilities&quot;: {},
+      &quot;io.modelcontextprotocol/clientInfo&quot;: {
+        &quot;name&quot;: &quot;lesson-client&quot;,
+        &quot;version&quot;: &quot;1.0.0&quot;
+      }
+    }
+  }
+}
+</code></pre>
+<p>需要协议版本和客户端功能. 客户端身份是建议的. 缺失一个<code>_meta</code>错误类型的要求字段是错误的,返回不有效的参数 (<code>-32602</code>服务器不支持的完整版本字符串返回<code>UnsupportedProtocolVersionError</code>(<code>-32022</code>服务器可以处理有效的请求,而不需要恢复之前的谈判记录.</p>
+<p>无国籍并不意味着应用程序永远无法保持状态.<code>Mcp-Session-Id</code>如果工作流需要连续性,服务器会打造一个不透明的手柄,客户端将该手柄作为后来的调用工具的普通参数.</p>
+<h3>发现和版本选择</h3>
+<p>每个现代服务器都实现了<code>server/discover</code>结果宣传支持的版本,功能和服务器身份:</p>
+<pre><code class="language-json">{
+  &quot;jsonrpc&quot;: &quot;2.0&quot;,
+  &quot;id&quot;: 1,
+  &quot;result&quot;: {
+    &quot;resultType&quot;: &quot;complete&quot;,
+    &quot;supportedVersions&quot;: [&quot;2026-07-28&quot;],
+    &quot;capabilities&quot;: {
+      &quot;tools&quot;: {},
+      &quot;resources&quot;: {},
+      &quot;prompts&quot;: {}
+    },
+    &quot;ttlMs&quot;: 3600000,
+    &quot;cacheScope&quot;: &quot;public&quot;,
+    &quot;_meta&quot;: {
+      &quot;io.modelcontextprotocol/serverInfo&quot;: {
+        &quot;name&quot;: &quot;demo-server&quot;,
+        &quot;version&quot;: &quot;1.0.0&quot;
+      }
+    }
+  }
+}
+</code></pre>
+<p>客户端可能直接调用另一种方法并处理版本错误,但发现使功能显示和版本选择明确.一个不支持的版本返回.<code>UnsupportedProtocolVersionError</code>具有代码<code>-32022</code>它的数据包含<code>supported</code>服务器修改的数组,<code>requested</code>拒绝的修订.</p>
+<p>在工作室,一个双代客户探测<code>server/discover</code>发现结果或已认可的现代错误,例如<code>UnsupportedProtocolVersionError</code>任何错误或截止时间都不能被认为是现代的,<code>initialize</code>传统的行为是兼容性代码,而不是现代的默认代码.</p>
+<h3>结果是明确的</h3>
+<p>每个核心2026-07-28的结果都有<code>resultType</code>其他:</p>
+<ul>
+<li><code>complete</code>代表行动结束.</li>
+<li><code>input_required</code>服务器需要通过多次回路请求模式进行一次回复访问.<code>tools/call</code>现在<code>resources/read</code>其他<code>prompts/get</code>现在,我们要去.</li>
+</ul>
+<p>客户必须处理遗留结果,<code>resultType</code>完全的.</p>
+<p>服务器应包括<code>io.modelcontextprotocol/serverInfo</code>在每一个结果中<code>_meta</code>个人身份是自主报告的,用于显示,记录和调试,而不是用于安全决策.</p>
+<p>列表和阅读结果也包含<code>ttlMs</code>其他<code>cacheScope</code>确定性<code>tools/list</code>随着订单加上新鲜度提示,客户可以安全地缓存发现,并提高快速缓存稳定性. <code>cacheScope: public</code>允许共享缓存;<code>private</code>只有在调用环境下才能重复使用.</p>
+<h3>电线格式和运输</h3>
+<p>通过 stdio 或 Streamable HTTP,MCP 使用JSON-RPC 2.0.</p>
+<ul>
+<li>要求有<code>jsonrpc</code>现在<code>id</code>现在<code>method</code>其他<code>params</code>现在,我们要去.</li>
+<li>答案是相匹配的<code>id</code>任何一个<code>result</code>或<code>error</code>现在,我们要去.</li>
+<li>没有通知<code>id</code>他没有预期任何回应.</li>
+</ul>
+<p>现代流向HTTP暴露一个接收 POST 的终端点.每个JSON-RPC消息都获得了自己的 POST.一个请求 POST 接收了一个 JSON 对象或一个请求范围的服务器发送事件流,最终的响应结束.一个接受的通知 POST 接收了 HTTP 202 没有响应体;本核心修订定义了没有客户端到服务器的通知.</p>
+<p>没有独立的MCP GET流, DELETE会议终点,<code>Mcp-Session-Id</code>其他<code>Last-Event-ID</code>长期变化通知使用一个<code>subscriptions/listen</code>作为一个SSE流的响应仍然是开放的.</p>
+<h3>客户端输入,没有服务器启动的请求</h3>
+<p>旧版本允许服务器发送如 <code>sampling/createMessage</code>现在<code>roots/list</code>其他<code>elicitation/create</code>现在的协议使用多次回路请求.一个符合条件的工具调用,资源阅读或提示获取回报.<code>resultType: input_required</code>具有至少一个<code>inputRequests</code>或<code>requestState</code>客户端收集任何请求的输入,使用新的JSON-RPCID和相应的方法重新尝试.<code>inputResponses</code>它们是完全的.<code>requestState</code>如果没有,<code>inputRequests</code>没有人回来,再试.<code>inputResponses</code>现在,我们要去.</p>
+<p>根,样本和登记仍然功能,但已经过时,因此新实现不应该采用它们.现有根或样本请求在MRTR内运行<code>inputRequests</code>服务器的配置,服务器配置和直接模型提供商集成. 对于工作室诊断使用 stderr 和生产远程测量使用 OpenTelemetry.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-fbcc45106cc591e38c20.png" alt="mcp-nxm-collapse 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<h3>步骤1:注册服务器表面</h3>
+<p>尽管申请合同发生了变化,但仍保持简单的注册:</p>
+<pre><code class="language-python">server = MCPServer(&quot;demo-server&quot;)
+
+@server.tool(
+    &quot;add&quot;,
+    &quot;Add two integers.&quot;,
+    {
+        &quot;type&quot;: &quot;object&quot;,
+        &quot;properties&quot;: {
+            &quot;a&quot;: {&quot;type&quot;: &quot;integer&quot;},
+            &quot;b&quot;: {&quot;type&quot;: &quot;integer&quot;}
+        },
+        &quot;required&quot;: [&quot;a&quot;, &quot;b&quot;]
+    }
+)
+def add(a: int, b: int) -&gt; dict:
+    return {&quot;sum&quot;: a + b}
+</code></pre>
+<p>运输的实施<code>code/main.py</code>它故意使用标准库,以便您可以看到每个封面,而不是将协议委托到SDK.</p>
+<h3>步骤2:将元数据添加到每个请求</h3>
+<pre><code class="language-python">def request(method, params=None):
+    body_params = dict(params or {})
+    body_params[&quot;_meta&quot;] = {
+        &quot;io.modelcontextprotocol/protocolVersion&quot;: &quot;2026-07-28&quot;,
+        &quot;io.modelcontextprotocol/clientCapabilities&quot;: {},
+        &quot;io.modelcontextprotocol/clientInfo&quot;: {
+            &quot;name&quot;: &quot;demo-client&quot;,
+            &quot;version&quot;: &quot;1.0.0&quot;
+        }
+    }
+    return {
+        &quot;jsonrpc&quot;: &quot;2.0&quot;,
+        &quot;id&quot;: 1,
+        &quot;method&quot;: method,
+        &quot;params&quot;: body_params
+    }
+</code></pre>
+<p>只有在连接对象中,不要将此元数据存储在缓存中.服务器在每个请求上验证它.</p>
+<h3>步骤3:在上市之前,选择发现</h3>
+<p>电话<code>server/discover</code>选择支持版本,然后打电话<code>tools/list</code>直接的<code>tools/list</code>您已经知道版本,并且可以处理<code>-32022</code>现在,我们要去.</p>
+<p>演示显示工具列表以名称顺序返回,并附加<code>ttlMs</code>现在<code>cacheScope</code>现在<code>resultType</code>工具调用会返回一个完整的,不可缓存的结果,因为其输出可能取决于当前状态.</p>
+<h3>步骤4:将相同的请求映射到HTTP</h3>
+<p>一个遥控器<code>tools/call</code>POST包含反映JSON-RPC体的标题:</p>
+<pre><code class="language-http">POST /mcp HTTP/1.1
+Content-Type: application/json
+Accept: application/json, text/event-stream
+MCP-Protocol-Version: 2026-07-28
+Mcp-Method: tools/call
+Mcp-Name: add
+</code></pre>
+<p>其他<code>MCP-Protocol-Version</code>标题必须与该版本相匹配<code>_meta</code>现在,我们要去.<code>Mcp-Method</code>需要在每个JSON-RPC请求中,必须匹配<code>method</code>现在,我们要去.<code>Mcp-Name</code>仅需要<code>tools/call</code>现在<code>resources/read</code>其他<code>prompts/get</code>需要一个缺失的标题或不匹配返回 HTTP 400 <code>HeaderMismatch</code>代码<code>-32020</code>现在,我们要去.</p>
+<h3>步骤5: 执行协议状态之外的安全</h3>
+<ul>
+<li>验证每个HTTP请求的授权和观众.</li>
+<li>将本地服务器与本地主机连接并验证<code>Origin</code>在流式HTTP上.</li>
+<li>标记突变工具<code>destructiveHint: true</code>需要主机批准.</li>
+<li>通过目录和文件范围,而不是依赖于过时的根.</li>
+<li>处理资源和工具输出数据是不可信的数据.</li>
+<li>保持在stdio下保留的 stdout为JSON-RPC;写诊断到stderr.</li>
+</ul>
+<h2>用它</h2>
+<p>运行课程从它的目录:</p>
+<pre><code class="language-bash">python3 code/main.py
+cd code
+python3 -m unittest discover tests -v
+</code></pre>
+<p>首先,应该报告发现<code>demo-server</code>在协议中<code>2026-07-28</code>然后检查<code>MCPClient.request</code>它们重建了<code>_meta</code>删除一个请求的元数据,并观察服务器拒绝它.</p>
+<h2>运送它</h2>
+<p><code>outputs/skill-mcp-server-designer.md</code>域名将域名转化为无状态的MCP设计.其接受门需要一个发现结果,每次请求的元数据政策,确定性缓存意识列表,明确的状态处理,运输标题,授权和批准规则.</p>
+<h2>继续MCP深度潜水</h2>
+<p>阶段13将四个生产界限变成单独的构建和验证课程:</p>
+<ol>
+<li><a href="/learn/ai-from-scratch/lessons/13-tools-and-protocols/28-mcp-tool-contracts-and-content/">MCP Tool Contracts and Content</a>涵盖封闭输入方案,结构化内容,路由元数据,不透明的页面化,完成授权以及协议和工具域错误之间的区别.</li>
+<li><a href="/learn/ai-from-scratch/lessons/13-tools-and-protocols/29-mcp-reliability-cancellation-and-flow-control/">MCP Reliability, Cancellation, and Flow Control</a>覆盖请求取消,持久任务取消,截止日期,无效,压力,代理缓冲和重新连接行为.</li>
+<li><a href="/learn/ai-from-scratch/lessons/13-tools-and-protocols/30-mcp-registry-supply-chain-and-drift/">MCP Registry Supply Chain, Admission, Drift, and Rollback</a>包含名称空间证明,文物来源,不可变的,直播漂移,注册表状态,录取证据和反弹.</li>
+<li><a href="/learn/ai-from-scratch/lessons/13-tools-and-protocols/31-mcp-conformance-versioning-and-operations/">MCP Conformance Engineering</a>涵盖金色和负线转录,严格版本时代,SDK差异,代理证据,编辑,健康门和释放回放.</li>
+</ol>
+<p>随着服务器将跨越团队或信任边界时,随着它们的顺序进行下载. 它们一起从方法工作到合同仍然安全,通过部署可诊断.</p>
+<h2>运动</h2>
+<ol>
+<li>添加一个<code>subtract</code>工具和确认<code>tools/list</code>它们是字母顺序的.</li>
+<li>删除协议版本键,并验证不有效参数 (<code>-32602</code>接着发送一个有形的,但没有支持的版本.<code>2025-11-25</code>检查<code>-32022</code>确认<code>requested</code>根据此次修订,<code>supported</code>现在,我们要去.</li>
+<li>添加一个服务器编译<code>draftId</code>解释为什么这是应用状态而不是协议会议.</li>
+<li>返回<code>input_required</code>通过一个新的ID,重新尝试原来的电话,<code>inputResponses</code>报名,以及<code>requestState</code>而不是发明一个服务器到客户端的JSON-RPC请求.</li>
+<li>描绘一个双代工作室客户端. 处理结果或被承认的现代错误为现代,并允许倒退.<code>initialize</code>只有未知错误或截止日期.</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>MCP</td>
+<td>&quot;Tool protocol for LLMs&quot;</td>
+<td>JSON-RPC protocol for server discovery, tools, resources, prompts, and extensions</td>
+</tr>
+<tr>
+<td>Host</td>
+<td>&quot;The AI app&quot;</td>
+<td>Owns the model and UI and mounts one or more MCP clients</td>
+</tr>
+<tr>
+<td>Client</td>
+<td>&quot;The connector&quot;</td>
+<td>Speaks MCP to one server on behalf of a host</td>
+</tr>
+<tr>
+<td>Stateless MCP</td>
+<td>&quot;No session&quot;</td>
+<td>Every request carries version and capabilities; no protocol state is keyed by a connection</td>
+</tr>
+<tr>
+<td><code>server/discover</code></td>
+<td>&quot;Capability probe&quot;</td>
+<td>Required server method advertising versions, capabilities, and identity</td>
+</tr>
+<tr>
+<td><code>resultType</code></td>
+<td>&quot;Result state&quot;</td>
+<td>Marks a result as <code>complete</code> or <code>input_required</code></td>
+</tr>
+<tr>
+<td>State handle</td>
+<td>&quot;Workflow id&quot;</td>
+<td>Server-minted application identifier passed as an ordinary argument</td>
+</tr>
+<tr>
+<td>Streamable HTTP</td>
+<td>&quot;Remote transport&quot;</td>
+<td>One POST endpoint with JSON or request-scoped SSE responses</td>
+</tr>
+<tr>
+<td>MRTR</td>
+<td>&quot;Ask and retry&quot;</td>
+<td>Input request embedded in a result, followed by a retry of the original operation</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://modelcontextprotocol.io/specification/2026-07-28/changelog" rel="noreferrer" data-network="true">MCP 2026-07-28 key changes <small>↗ 需要联网</small></a></li>
+<li><a href="https://modelcontextprotocol.io/specification/2026-07-28/server/discover" rel="noreferrer" data-network="true">MCP server discovery <small>↗ 需要联网</small></a></li>
+<li><a href="https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http" rel="noreferrer" data-network="true">MCP Streamable HTTP <small>↗ 需要联网</small></a></li>
+<li><a href="https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/mrtr" rel="noreferrer" data-network="true">MCP Multi Round-Trip Requests <small>↗ 需要联网</small></a></li>
+<li><a href="https://modelcontextprotocol.io/specification/2026-07-28/deprecated" rel="noreferrer" data-network="true">MCP deprecated features <small>↗ 需要联网</small></a></li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Model Context Protocol (MCP)</h1>
+<blockquote>
+<p>MCP gives an AI host one protocol for discovering and invoking tools, resources, and prompts. The 2026-07-28 revision makes that protocol stateless: capability and version context travels with every request, not in a connection-bound handshake.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 11 · 09 (Function Calling), Phase 11 · 03 (Structured Outputs)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Distinguish an MCP host, client, server, transport, and server primitive.</li>
+<li>Build a JSON-RPC request with the metadata required by MCP 2026-07-28.</li>
+<li>Use <code>server/discover</code> to inspect versions, identity, and capabilities.</li>
+<li>Return typed and cache-aware results from tools, resources, and prompts.</li>
+<li>Explain how modern stateless MCP interoperates with handshake-era servers.</li>
+<li>Choose safe state, transport, and approval boundaries for a server.</li>
+</ul>
+<h2>The Problem</h2>
+<p>Your application needs a database query, a calendar operation, and a file reader. Without a shared protocol, every AI host needs custom discovery, invocation, errors, transport, and authorization glue for those same capabilities.</p>
+<p>MCP reduces that integration matrix. A server publishes a standard JSON-RPC surface. A compliant client can discover the surface, present it to a model or user, invoke it, and interpret the result without a server-specific adapter.</p>
+<p>The important boundary is easy to miss. MCP standardizes communication. It does not decide which tool the model should call, make untrusted content safe, or turn a stateless request into durable application state. Your host and server still own those decisions.</p>
+<h2>The Concept</h2>
+<p><img src="/learn/ai-from-scratch/files/phases/11-llm-engineering/14-model-context-protocol/assets/mcp-architecture.svg" alt="MCP host, stateless request, and server primitives" loading="lazy"></p>
+<h3>The three server primitives</h3>
+<ol>
+<li><strong>Tools</strong> are callable actions. Each tool has a name, description, JSON Schema input, and handler.</li>
+<li><strong>Resources</strong> are named, URI-addressed content that a client can read.</li>
+<li><strong>Prompts</strong> are reusable templates that a host can expose to a user.</li>
+</ol>
+<p>The host is the AI application. An MCP client inside that host speaks to one server. The transport carries JSON-RPC messages between them.</p>
+<h3>Stateless requests replace the handshake</h3>
+<p>MCP 2026-07-28 removes <code>initialize</code> and <code>notifications/initialized</code>. It also removes protocol-level sessions. Every request carries the context needed to interpret it in <code>params._meta</code>:</p>
+<pre><code class="language-json">{
+  &quot;jsonrpc&quot;: &quot;2.0&quot;,
+  &quot;id&quot;: 1,
+  &quot;method&quot;: &quot;tools/list&quot;,
+  &quot;params&quot;: {
+    &quot;_meta&quot;: {
+      &quot;io.modelcontextprotocol/protocolVersion&quot;: &quot;2026-07-28&quot;,
+      &quot;io.modelcontextprotocol/clientCapabilities&quot;: {},
+      &quot;io.modelcontextprotocol/clientInfo&quot;: {
+        &quot;name&quot;: &quot;lesson-client&quot;,
+        &quot;version&quot;: &quot;1.0.0&quot;
+      }
+    }
+  }
+}
+</code></pre>
+<p>The protocol version and client capabilities are required. Client identity is recommended. A missing <code>_meta</code>, a missing required field, or a required field with the wrong type is malformed and returns Invalid Params (<code>-32602</code>). A well-formed version string that the server does not support returns <code>UnsupportedProtocolVersionError</code> (<code>-32022</code>). A server can process a valid request without recovering a prior negotiation record.</p>
+<p>Stateless does not mean an application can never maintain state. It means that state is not hidden behind an MCP connection or <code>Mcp-Session-Id</code>. If a workflow needs continuity, the server mints an opaque handle and the client passes that handle as an ordinary tool argument on later calls. Authorization must still be checked on every request.</p>
+<h3>Discovery and version selection</h3>
+<p>Every modern server implements <code>server/discover</code>. The result advertises supported versions, capabilities, and server identity:</p>
+<pre><code class="language-json">{
+  &quot;jsonrpc&quot;: &quot;2.0&quot;,
+  &quot;id&quot;: 1,
+  &quot;result&quot;: {
+    &quot;resultType&quot;: &quot;complete&quot;,
+    &quot;supportedVersions&quot;: [&quot;2026-07-28&quot;],
+    &quot;capabilities&quot;: {
+      &quot;tools&quot;: {},
+      &quot;resources&quot;: {},
+      &quot;prompts&quot;: {}
+    },
+    &quot;ttlMs&quot;: 3600000,
+    &quot;cacheScope&quot;: &quot;public&quot;,
+    &quot;_meta&quot;: {
+      &quot;io.modelcontextprotocol/serverInfo&quot;: {
+        &quot;name&quot;: &quot;demo-server&quot;,
+        &quot;version&quot;: &quot;1.0.0&quot;
+      }
+    }
+  }
+}
+</code></pre>
+<p>A client may call another method directly and handle a version error, but discovery makes capability display and version selection explicit. An unsupported version returns <code>UnsupportedProtocolVersionError</code> with code <code>-32022</code>. Its data contains <code>supported</code>, an array of server revisions, and <code>requested</code>, the rejected revision.</p>
+<p>On stdio, a dual-era client probes with <code>server/discover</code>. A discovery result or a recognized modern error such as <code>UnsupportedProtocolVersionError</code> identifies a modern server. Any error or timeout that is not recognized as modern permits fallback to the 2025-11-25 <code>initialize</code> flow. Legacy behavior is compatibility code, not the modern default.</p>
+<h3>Results are explicit</h3>
+<p>Every core 2026-07-28 result has <code>resultType</code>:</p>
+<ul>
+<li><code>complete</code> means the operation finished.</li>
+<li><code>input_required</code> means the server needs another round trip through the Multi Round-Trip Requests pattern. Core servers may return it only from <code>tools/call</code>, <code>resources/read</code>, or <code>prompts/get</code>.</li>
+</ul>
+<p>Clients must treat a legacy result that omits <code>resultType</code> as complete.</p>
+<p>Servers should include <code>io.modelcontextprotocol/serverInfo</code> in every result's <code>_meta</code>. This identity is self-reported and is for display, logging, and debugging, not for security decisions.</p>
+<p>List and read results also carry <code>ttlMs</code> and <code>cacheScope</code>. A deterministic <code>tools/list</code> order plus a freshness hint lets clients cache discovery safely and improves prompt-cache stability. <code>cacheScope: public</code> permits shared caching; <code>private</code> confines reuse to the calling context.</p>
+<h3>The wire format and transport</h3>
+<p>MCP uses JSON-RPC 2.0 over stdio or Streamable HTTP.</p>
+<ul>
+<li>A request has <code>jsonrpc</code>, <code>id</code>, <code>method</code>, and <code>params</code>.</li>
+<li>A response has the matching <code>id</code> and either <code>result</code> or <code>error</code>.</li>
+<li>A notification has no <code>id</code> and expects no response.</li>
+</ul>
+<p>Modern Streamable HTTP exposes one endpoint that accepts POST. Each JSON-RPC message gets its own POST. A request POST receives either one JSON object or a request-scoped Server-Sent Events stream that ends with the final response. An accepted notification POST receives HTTP 202 with no response body; this core revision defines no client-to-server notifications over Streamable HTTP.</p>
+<p>There is no standalone MCP GET stream, DELETE session endpoint, <code>Mcp-Session-Id</code>, or <code>Last-Event-ID</code> replay in 2026-07-28. Long-lived change notifications use a <code>subscriptions/listen</code> POST whose response remains open as an SSE stream.</p>
+<h3>Client input without server-initiated requests</h3>
+<p>Older revisions let a server send requests such as <code>sampling/createMessage</code>, <code>roots/list</code>, or <code>elicitation/create</code> over a stream. The current protocol uses Multi Round-Trip Requests instead. An eligible tool call, resource read, or prompt get returns <code>resultType: input_required</code> with at least one of <code>inputRequests</code> or <code>requestState</code>. The client gathers any requested input, retries the original method with a new JSON-RPC ID and the corresponding <code>inputResponses</code>, and echoes the exact <code>requestState</code> when one was provided. If no <code>inputRequests</code> were present, the retry omits <code>inputResponses</code>.</p>
+<p>Roots, Sampling, and Logging remain functional but are deprecated, so new implementations should not adopt them. Existing Roots or Sampling requests travel inside MRTR <code>inputRequests</code>, never as independent server-to-client JSON-RPC requests. Prefer explicit file or directory parameters, resource URIs, server configuration, and direct model-provider integration. Use stderr for stdio diagnostics and OpenTelemetry for production telemetry.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-fbcc45106cc591e38c20.png" alt="mcp-nxm-collapse 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<h3>Step 1: register a server surface</h3>
+<p>Registration stays simple even though the request contract changed:</p>
+<pre><code class="language-python">server = MCPServer(&quot;demo-server&quot;)
+
+@server.tool(
+    &quot;add&quot;,
+    &quot;Add two integers.&quot;,
+    {
+        &quot;type&quot;: &quot;object&quot;,
+        &quot;properties&quot;: {
+            &quot;a&quot;: {&quot;type&quot;: &quot;integer&quot;},
+            &quot;b&quot;: {&quot;type&quot;: &quot;integer&quot;}
+        },
+        &quot;required&quot;: [&quot;a&quot;, &quot;b&quot;]
+    }
+)
+def add(a: int, b: int) -&gt; dict:
+    return {&quot;sum&quot;: a + b}
+</code></pre>
+<p>The shipped implementation in <code>code/main.py</code> also registers a resource and prompt. It deliberately uses the standard library so you can see each envelope rather than delegating the protocol to an SDK.</p>
+<h3>Step 2: attach metadata to every request</h3>
+<pre><code class="language-python">def request(method, params=None):
+    body_params = dict(params or {})
+    body_params[&quot;_meta&quot;] = {
+        &quot;io.modelcontextprotocol/protocolVersion&quot;: &quot;2026-07-28&quot;,
+        &quot;io.modelcontextprotocol/clientCapabilities&quot;: {},
+        &quot;io.modelcontextprotocol/clientInfo&quot;: {
+            &quot;name&quot;: &quot;demo-client&quot;,
+            &quot;version&quot;: &quot;1.0.0&quot;
+        }
+    }
+    return {
+        &quot;jsonrpc&quot;: &quot;2.0&quot;,
+        &quot;id&quot;: 1,
+        &quot;method&quot;: method,
+        &quot;params&quot;: body_params
+    }
+</code></pre>
+<p>Do not cache this metadata only in a connection object. The server validates it on each request.</p>
+<h3>Step 3: optionally discover before listing</h3>
+<p>Call <code>server/discover</code>, choose a supported version, then call <code>tools/list</code>. A direct <code>tools/list</code> is also valid if you already know the version and can handle <code>-32022</code>.</p>
+<p>The demo returns tool lists in name order and attaches <code>ttlMs</code>, <code>cacheScope</code>, <code>resultType</code>, and server identity. A tool call returns a complete, non-cacheable result because its output can depend on current state.</p>
+<h3>Step 4: map the same request to HTTP</h3>
+<p>A remote <code>tools/call</code> POST includes headers that mirror the JSON-RPC body:</p>
+<pre><code class="language-http">POST /mcp HTTP/1.1
+Content-Type: application/json
+Accept: application/json, text/event-stream
+MCP-Protocol-Version: 2026-07-28
+Mcp-Method: tools/call
+Mcp-Name: add
+</code></pre>
+<p>The <code>MCP-Protocol-Version</code> header must match the version in <code>_meta</code>. <code>Mcp-Method</code> is required on every JSON-RPC request and must match <code>method</code>. <code>Mcp-Name</code> is required only for <code>tools/call</code>, <code>resources/read</code>, and <code>prompts/get</code>, where it must match the tool name, resource URI, or prompt name. A missing required header or mismatch returns HTTP 400 with <code>HeaderMismatch</code> code <code>-32020</code>.</p>
+<h3>Step 5: enforce safety outside protocol state</h3>
+<ul>
+<li>Validate authorization and audience on every HTTP request.</li>
+<li>Bind local servers to localhost and validate <code>Origin</code> on Streamable HTTP.</li>
+<li>Mark mutating tools with <code>destructiveHint: true</code> and require host approval.</li>
+<li>Pass directory and file scope explicitly instead of depending on deprecated Roots.</li>
+<li>Treat resources and tool output as untrusted data.</li>
+<li>Keep stdout reserved for JSON-RPC under stdio; write diagnostics to stderr.</li>
+</ul>
+<h2>Use It</h2>
+<p>Run the lesson from its directory:</p>
+<pre><code class="language-bash">python3 code/main.py
+cd code
+python3 -m unittest discover tests -v
+</code></pre>
+<p>The first line should report discovery of <code>demo-server</code> at protocol <code>2026-07-28</code>. Then inspect <code>MCPClient.request</code>: it reconstructs <code>_meta</code> for every call. Remove the metadata from one request and observe the server reject it.</p>
+<h2>Ship It</h2>
+<p><code>outputs/skill-mcp-server-designer.md</code> turns a domain into a stateless MCP design. Its acceptance gate requires a discovery result, per-request metadata policy, deterministic cache-aware lists, explicit state handles, transport headers, authorization, and approval rules.</p>
+<h2>Continue the MCP Deep Dive</h2>
+<p>This lesson gives you the protocol model. Phase 13 turns four production boundaries into separate build-and-verify lessons:</p>
+<ol>
+<li><a href="/learn/ai-from-scratch/lessons/13-tools-and-protocols/28-mcp-tool-contracts-and-content/">MCP Tool Contracts and Content</a> covers closed input schemas, structured content, routing metadata, opaque pagination, completion authorization, and the difference between protocol and tool-domain errors.</li>
+<li><a href="/learn/ai-from-scratch/lessons/13-tools-and-protocols/29-mcp-reliability-cancellation-and-flow-control/">MCP Reliability, Cancellation, and Flow Control</a> covers request cancellation, durable task cancellation, deadlines, idempotency, backpressure, proxy buffering, and reconnect behavior.</li>
+<li><a href="/learn/ai-from-scratch/lessons/13-tools-and-protocols/30-mcp-registry-supply-chain-and-drift/">MCP Registry Supply Chain, Admission, Drift, and Rollback</a> covers namespace proof, artifact provenance, immutable pins, live drift, Registry status, admission evidence, and rollback.</li>
+<li><a href="/learn/ai-from-scratch/lessons/13-tools-and-protocols/31-mcp-conformance-versioning-and-operations/">MCP Conformance Engineering</a> covers golden and negative wire transcripts, strict version eras, SDK differentials, proxy evidence, redaction, health gates, and release rollback.</li>
+</ol>
+<p>Follow them in order when the server will cross a team or trust boundary. Together they move from “the method works” to “the contract remains safe and diagnosable through deployment.”</p>
+<h2>Exercises</h2>
+<ol>
+<li>Add a <code>subtract</code> tool and confirm <code>tools/list</code> remains alphabetically ordered.</li>
+<li>Remove the protocol-version key and verify Invalid Params (<code>-32602</code>). Then send the well-formed but unsupported version <code>2025-11-25</code>, verify <code>-32022</code>, confirm <code>requested</code> echoes that revision, and choose from <code>supported</code>.</li>
+<li>Add a server-minted <code>draftId</code> to a create operation, then require it as an argument to update. Explain why that is application state rather than a protocol session.</li>
+<li>Return <code>input_required</code> from a tool that needs user confirmation. Retry the original call with a new ID, an <code>inputResponses</code> entry, and the exact <code>requestState</code> instead of inventing a server-to-client JSON-RPC request.</li>
+<li>Sketch a dual-era stdio client. Treat a result or recognized modern error as modern, and permit fallback to <code>initialize</code> only for an unrecognized error or timeout.</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>MCP</td>
+<td>&quot;Tool protocol for LLMs&quot;</td>
+<td>JSON-RPC protocol for server discovery, tools, resources, prompts, and extensions</td>
+</tr>
+<tr>
+<td>Host</td>
+<td>&quot;The AI app&quot;</td>
+<td>Owns the model and UI and mounts one or more MCP clients</td>
+</tr>
+<tr>
+<td>Client</td>
+<td>&quot;The connector&quot;</td>
+<td>Speaks MCP to one server on behalf of a host</td>
+</tr>
+<tr>
+<td>Stateless MCP</td>
+<td>&quot;No session&quot;</td>
+<td>Every request carries version and capabilities; no protocol state is keyed by a connection</td>
+</tr>
+<tr>
+<td><code>server/discover</code></td>
+<td>&quot;Capability probe&quot;</td>
+<td>Required server method advertising versions, capabilities, and identity</td>
+</tr>
+<tr>
+<td><code>resultType</code></td>
+<td>&quot;Result state&quot;</td>
+<td>Marks a result as <code>complete</code> or <code>input_required</code></td>
+</tr>
+<tr>
+<td>State handle</td>
+<td>&quot;Workflow id&quot;</td>
+<td>Server-minted application identifier passed as an ordinary argument</td>
+</tr>
+<tr>
+<td>Streamable HTTP</td>
+<td>&quot;Remote transport&quot;</td>
+<td>One POST endpoint with JSON or request-scoped SSE responses</td>
+</tr>
+<tr>
+<td>MRTR</td>
+<td>&quot;Ask and retry&quot;</td>
+<td>Input request embedded in a result, followed by a retry of the original operation</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://modelcontextprotocol.io/specification/2026-07-28/changelog" rel="noreferrer" data-network="true">MCP 2026-07-28 key changes <small>↗ 需要联网</small></a></li>
+<li><a href="https://modelcontextprotocol.io/specification/2026-07-28/server/discover" rel="noreferrer" data-network="true">MCP server discovery <small>↗ 需要联网</small></a></li>
+<li><a href="https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http" rel="noreferrer" data-network="true">MCP Streamable HTTP <small>↗ 需要联网</small></a></li>
+<li><a href="https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/mrtr" rel="noreferrer" data-network="true">MCP Multi Round-Trip Requests <small>↗ 需要联网</small></a></li>
+<li><a href="https://modelcontextprotocol.io/specification/2026-07-28/deprecated" rel="noreferrer" data-network="true">MCP deprecated features <small>↗ 需要联网</small></a></li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-11-llm-engineering--14-model-context-protocol.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-11-llm-engineering--14-model-context-protocol.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/11-llm-engineering/14-model-context-protocol/code/main.py">phases/11-llm-engineering/14-model-context-protocol/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Phase 11 Lesson 14: a stateless MCP server and in-process client.
+
+Implements the 2026-07-28 request contract with per-request metadata,
+server/discover, typed results, and the three server primitives. The transport
+is in memory so the protocol remains visible and the demo stays stdlib-only.
+Spec: https://modelcontextprotocol.io/specification/2026-07-28
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from typing import Any, Callable
+
+
+PROTOCOL_VERSION = &quot;2026-07-28&quot;
+SUPPORTED_VERSIONS = (PROTOCOL_VERSION,)
+PROTOCOL_KEY = &quot;io.modelcontextprotocol/protocolVersion&quot;
+CLIENT_CAPABILITIES_KEY = &quot;io.modelcontextprotocol/clientCapabilities&quot;
+CLIENT_INFO_KEY = &quot;io.modelcontextprotocol/clientInfo&quot;
+SERVER_INFO_KEY = &quot;io.modelcontextprotocol/serverInfo&quot;
+
+
+@dataclass
+class Tool:
+    name: str
+    description: str
+    input_schema: dict[str, Any]
+    handler: Callable[..., Any]
+    destructive: bool = False
+
+
+@dataclass
+class Resource:
+    uri: str
+    name: str
+    description: str
+    handler: Callable[[], str]
+
+
+@dataclass
+class Prompt:
+    name: str
+    description: str
+    arguments: list[str]
+    handler: Callable[..., str]
+
+
+def request_metadata(
+    *,
+    client_name: str = &quot;demo-client&quot;,
+    client_version: str = &quot;1.0.0&quot;,
+    capabilities: dict[str, Any] | None = None,
+    protocol_version: str = PROTOCOL_VERSION,
+) -&gt; dict[str, Any]:
+    return {
+        PROTOCOL_KEY: protocol_version,
+        CLIENT_CAPABILITIES_KEY: capabilities or {},
+        CLIENT_INFO_KEY: {&quot;name&quot;: client_name, &quot;version&quot;: client_version},
+    }
+
+
+class MCPServer:
+    def __init__(self, name: str) -&gt; None:
+        self.name = name
+        self.server_info = {&quot;name&quot;: name, &quot;version&quot;: &quot;0.2.0&quot;}
+        self.tools: dict[str, Tool] = {}
+        self.resources: dict[str, Resource] = {}
+        self.prompts: dict[str, Prompt] = {}
+
+    def tool(
+        self,
+        name: str,
+        description: str,
+        schema: dict[str, Any],
+        *,
+        destructive: bool = False,
+    ):
+        def decorator(fn: Callable[..., Any]) -&gt; Callable[..., Any]:
+            self.tools[name] = Tool(name, description, schema, fn, destructive)
+            return fn
+
+        return decorator
+
+    def resource(self, uri: str, name: str, description: str):
+        def decorator(fn: Callable[[], str]) -&gt; Callable[[], str]:
+            self.resources[uri] = Resource(uri, name, description, fn)
+            return fn
+
+        return decorator
+
+    def prompt(self, name: str, description: str, arguments: list[str]):
+        def decorator(fn: Callable[..., str]) -&gt; Callable[..., str]:
+            self.prompts[name] = Prompt(name, description, arguments, fn)
+            return fn
+
+        return decorator
+
+    def _capabilities(self) -&gt; dict[str, Any]:
+        return {&quot;tools&quot;: {}, &quot;resources&quot;: {}, &quot;prompts&quot;: {}}
+
+    def _complete(self, payload: dict[str, Any], *, cacheable: bool = False) -&gt; dict[str, Any]:
+        result = {
+            &quot;resultType&quot;: &quot;complete&quot;,
+            **payload,
+            &quot;_meta&quot;: {SERVER_INFO_KEY: self.server_info},
+        }
+        if cacheable:
+            result.update({&quot;ttlMs&quot;: 30_000, &quot;cacheScope&quot;: &quot;private&quot;})
+        return result
+
+    @staticmethod
+    def _error(request_id: Any, code: int, message: str, data: Any = None) -&gt; dict[str, Any]:
+        error: dict[str, Any] = {&quot;code&quot;: code, &quot;message&quot;: message}
+        if data is not None:
+            error[&quot;data&quot;] = data
+        return {&quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;id&quot;: request_id, &quot;error&quot;: error}
+
+    def _validate_metadata(self, params: dict[str, Any], request_id: Any) -&gt; dict[str, Any] | None:
+        metadata = params.get(&quot;_meta&quot;)
+        if not isinstance(metadata, dict):
+            return self._error(request_id, -32602, &quot;params._meta is required&quot;)
+        if PROTOCOL_KEY not in metadata:
+            return self._error(request_id, -32602, f&quot;{PROTOCOL_KEY} is required&quot;)
+        version = metadata[PROTOCOL_KEY]
+        if not isinstance(version, str):
+            return self._error(request_id, -32602, f&quot;{PROTOCOL_KEY} must be a string&quot;)
+        if version not in SUPPORTED_VERSIONS:
+            return self._error(
+                request_id,
+                -32022,
+                &quot;Unsupported protocol version&quot;,
+                {&quot;supported&quot;: list(SUPPORTED_VERSIONS), &quot;requested&quot;: version},
+            )
+        if not isinstance(metadata.get(CLIENT_CAPABILITIES_KEY), dict):
+            return self._error(request_id, -32602, &quot;clientCapabilities must be an object&quot;)
+        client_info = metadata.get(CLIENT_INFO_KEY)
+        if client_info is not None and (
+            not isinstance(client_info, dict)
+            or not isinstance(client_info.get(&quot;name&quot;), str)
+            or not isinstance(client_info.get(&quot;version&quot;), str)
+        ):
+            return self._error(request_id, -32602, &quot;clientInfo must contain name and version&quot;)
+        return None
+
+    def handle(self, message: Any) -&gt; dict[str, Any] | None:
+        if not isinstance(message, dict):
+            return self._error(None, -32600, &quot;request must be an object&quot;)
+
+        request_id = message.get(&quot;id&quot;)
+        if &quot;id&quot; not in message:
+            return None
+        if message.get(&quot;jsonrpc&quot;) != &quot;2.0&quot; or not isinstance(message.get(&quot;method&quot;), str):
+            error_id = request_id if type(request_id) in (str, int) else None
+            return self._error(error_id, -32600, &quot;invalid JSON-RPC request&quot;)
+        if type(request_id) not in (str, int):
+            return self._error(None, -32600, &quot;id must be a string or integer&quot;)
+
+        method = message[&quot;method&quot;]
+        params = message.get(&quot;params&quot;, {})
+        if not isinstance(params, dict):
+            return self._error(request_id, -32602, &quot;params must be an object&quot;)
+
+        metadata_error = self._validate_metadata(params, request_id)
+        if metadata_error:
+            return metadata_error
+
+        if method == &quot;server/discover&quot;:
+            result = self._complete(
+                {
+                    &quot;supportedVersions&quot;: list(SUPPORTED_VERSIONS),
+                    &quot;capabilities&quot;: self._capabilities(),
+                    &quot;instructions&quot;: &quot;Use add for arithmetic and request approval before delete_user.&quot;,
+                },
+                cacheable=True,
+            )
+        elif method == &quot;tools/list&quot;:
+            result = self._complete(
+                {
+                    &quot;tools&quot;: [
+                        {
+                            &quot;name&quot;: tool.name,
+                            &quot;description&quot;: tool.description,
+                            &quot;inputSchema&quot;: tool.input_schema,
+                            &quot;annotations&quot;: (
+                                {&quot;destructiveHint&quot;: True} if tool.destructive else {}
+                            ),
+                        }
+                        for tool in sorted(self.tools.values(), key=lambda item: item.name)
+                    ]
+                },
+                cacheable=True,
+            )
+        elif method == &quot;tools/call&quot;:
+            name = params.get(&quot;name&quot;)
+            if not isinstance(name, str) or name not in self.tools:
+                return self._error(request_id, -32602, &quot;missing or unknown tool name&quot;)
+            arguments = params.get(&quot;arguments&quot;, {})
+            if not isinstance(arguments, dict):
+                return self._error(request_id, -32602, &quot;arguments must be an object&quot;)
+            tool = self.tools[name]
+            try:
+                output = json.dumps(tool.handler(**arguments))
+            except Exception:
+                return self._error(request_id, -32603, &quot;tool handler failed&quot;)
+            result = self._complete(
+                {&quot;content&quot;: [{&quot;type&quot;: &quot;text&quot;, &quot;text&quot;: output}], &quot;isError&quot;: False}
+            )
+        elif method == &quot;resources/list&quot;:
+            result = self._complete(
+                {
+                    &quot;resources&quot;: [
+                        {
+                            &quot;uri&quot;: item.uri,
+                            &quot;name&quot;: item.name,
+                            &quot;description&quot;: item.description,
+                        }
+                        for item in sorted(self.resources.values(), key=lambda item: item.uri)
+                    ]
+                },
+                cacheable=True,
+            )
+        elif method == &quot;resources/read&quot;:
+            uri = params.get(&quot;uri&quot;)
+            if not isinstance(uri, str) or uri not in self.resources:
+                return self._error(request_id, -32602, &quot;missing or unknown resource URI&quot;)
+            resource = self.resources[uri]
+            try:
+                text = resource.handler()
+                if not isinstance(text, str):
+                    raise TypeError(&quot;resource handler must return text&quot;)
+            except Exception:
+                return self._error(request_id, -32603, &quot;resource handler failed&quot;)
+            result = self._complete(
+                {
+                    &quot;contents&quot;: [
+                        {
+                            &quot;uri&quot;: resource.uri,
+                            &quot;mimeType&quot;: &quot;text/plain&quot;,
+                            &quot;text&quot;: text,
+                        }
+                    ]
+                },
+                cacheable=True,
+            )
+        elif method == &quot;prompts/list&quot;:
+            result = self._complete(
+                {
+                    &quot;prompts&quot;: [
+                        {
+                            &quot;name&quot;: item.name,
+                            &quot;description&quot;: item.description,
+                            &quot;arguments&quot;: [
+                                {&quot;name&quot;: argument, &quot;required&quot;: True}
+                                for argument in item.arguments
+                            ],
+                        }
+                        for item in sorted(self.prompts.values(), key=lambda item: item.name)
+                    ]
+                },
+                cacheable=True,
+            )
+        elif method == &quot;prompts/get&quot;:
+            name = params.get(&quot;name&quot;)
+            if not isinstance(name, str) or name not in self.prompts:
+                return self._error(request_id, -32602, &quot;missing or unknown prompt name&quot;)
+            arguments = params.get(&quot;arguments&quot;, {})
+            if not isinstance(arguments, dict):
+                return self._error(request_id, -32602, &quot;arguments must be an object&quot;)
+            prompt = self.prompts[name]
+            try:
+                rendered = prompt.handler(**arguments)
+                if not isinstance(rendered, str):
+                    raise TypeError(&quot;prompt handler must return text&quot;)
+            except Exception:
+                return self._error(request_id, -32603, &quot;prompt handler failed&quot;)
+            result = self._complete(
+                {
+                    &quot;messages&quot;: [
+                        {
+                            &quot;role&quot;: &quot;user&quot;,
+                            &quot;content&quot;: {&quot;type&quot;: &quot;text&quot;, &quot;text&quot;: rendered},
+                        }
+                    ]
+                }
+            )
+        else:
+            return self._error(request_id, -32601, f&quot;unknown method: {method}&quot;)
+
+        return {&quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;id&quot;: request_id, &quot;result&quot;: result}
+
+
+class MCPClient:
+    def __init__(self, server: MCPServer) -&gt; None:
+        self.server = server
+        self._id = 0
+
+    def request(self, method: str, params: dict[str, Any] | None = None) -&gt; dict[str, Any]:
+        self._id += 1
+        request_params = dict(params or {})
+        request_params[&quot;_meta&quot;] = request_metadata()
+        response = self.server.handle(
+            {&quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;id&quot;: self._id, &quot;method&quot;: method, &quot;params&quot;: request_params}
+        )
+        if response is None:
+            raise RuntimeError(&quot;request did not receive a response&quot;)
+        if &quot;error&quot; in response:
+            raise RuntimeError(response[&quot;error&quot;][&quot;message&quot;])
+        return response[&quot;result&quot;]
+
+
+server = MCPServer(&quot;demo-server&quot;)
+
+
+@server.tool(
+    &quot;add&quot;,
+    &quot;Add two integers and return the sum.&quot;,
+    {
+        &quot;type&quot;: &quot;object&quot;,
+        &quot;properties&quot;: {&quot;a&quot;: {&quot;type&quot;: &quot;integer&quot;}, &quot;b&quot;: {&quot;type&quot;: &quot;integer&quot;}},
+        &quot;required&quot;: [&quot;a&quot;, &quot;b&quot;],
+    },
+)
+def add(a: int, b: int) -&gt; dict[str, int]:
+    return {&quot;sum&quot;: a + b}
+
+
+@server.tool(
+    &quot;delete_user&quot;,
+    &quot;Delete a user by id. Mutating; requires approval.&quot;,
+    {
+        &quot;type&quot;: &quot;object&quot;,
+        &quot;properties&quot;: {&quot;user_id&quot;: {&quot;type&quot;: &quot;integer&quot;}},
+        &quot;required&quot;: [&quot;user_id&quot;],
+    },
+    destructive=True,
+)
+def delete_user(user_id: int) -&gt; dict[str, Any]:
+    return {&quot;deleted&quot;: user_id, &quot;note&quot;: &quot;simulated&quot;}
+
+
+@server.resource(&quot;config://app&quot;, &quot;app-config&quot;, &quot;Application config as JSON text.&quot;)
+def app_config() -&gt; str:
+    return json.dumps({&quot;env&quot;: &quot;prod&quot;, &quot;region&quot;: &quot;us-east-1&quot;})
+
+
+@server.prompt(&quot;code_review&quot;, &quot;Review code in a language.&quot;, [&quot;language&quot;, &quot;code&quot;])
+def code_review(language: str, code: str) -&gt; str:
+    return f&quot;You are a senior {language} reviewer. Review for correctness and style:\n\n{code}&quot;
+
+
+def main() -&gt; None:
+    client = MCPClient(server)
+    discovery = client.request(&quot;server/discover&quot;)
+    info = discovery[&quot;_meta&quot;][SERVER_INFO_KEY]
+    print(f&quot;Discovered {info[&#39;name&#39;]} (protocol {discovery[&#39;supportedVersions&#39;][0]})&quot;)
+
+    tools = client.request(&quot;tools/list&quot;)[&quot;tools&quot;]
+    print(f&quot;\n{len(tools)} tool(s) discovered:&quot;)
+    for tool in tools:
+        flag = &quot; [destructive]&quot; if tool.get(&quot;annotations&quot;, {}).get(&quot;destructiveHint&quot;) else &quot;&quot;
+        print(f&quot;  - {tool[&#39;name&#39;]}{flag}: {tool[&#39;description&#39;]}&quot;)
+
+    add_result = client.request(&quot;tools/call&quot;, {&quot;name&quot;: &quot;add&quot;, &quot;arguments&quot;: {&quot;a&quot;: 40, &quot;b&quot;: 2}})
+    print(&quot;\nCall add(40, 2) -&gt;&quot;, add_result[&quot;content&quot;][0][&quot;text&quot;])
+
+    resources = client.request(&quot;resources/list&quot;)[&quot;resources&quot;]
+    print(f&quot;\n{len(resources)} resource(s): {resources[0][&#39;uri&#39;]}&quot;)
+    config = client.request(&quot;resources/read&quot;, {&quot;uri&quot;: &quot;config://app&quot;})
+    print(&quot;Read config://app -&gt;&quot;, config[&quot;contents&quot;][0][&quot;text&quot;])
+
+    prompt = client.request(
+        &quot;prompts/get&quot;,
+        {&quot;name&quot;: &quot;code_review&quot;, &quot;arguments&quot;: {&quot;language&quot;: &quot;Python&quot;, &quot;code&quot;: &quot;x = 1\n&quot;}},
+    )
+    print(&quot;\nRender code_review prompt -&gt;&quot;, prompt[&quot;messages&quot;][0][&quot;content&quot;][&quot;text&quot;][:80])
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/11-llm-engineering/14-model-context-protocol/code/tests/test_main.py">phases/11-llm-engineering/14-model-context-protocol/code/tests/test_main.py</a><details><summary>查看原始文本</summary><pre><code>import unittest
+import sys
+from pathlib import Path
+
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from main import (
+    CLIENT_CAPABILITIES_KEY,
+    CLIENT_INFO_KEY,
+    PROTOCOL_KEY,
+    PROTOCOL_VERSION,
+    SERVER_INFO_KEY,
+    SUPPORTED_VERSIONS,
+    MCPClient,
+    MCPServer,
+    request_metadata,
+    server,
+)
+
+
+def envelope(method, params=None, request_id=1):
+    return {
+        &quot;jsonrpc&quot;: &quot;2.0&quot;,
+        &quot;id&quot;: request_id,
+        &quot;method&quot;: method,
+        &quot;params&quot;: params or {},
+    }
+
+
+class StatelessMCPTests(unittest.TestCase):
+    def test_request_metadata_carries_version_capabilities_and_identity(self):
+        metadata = request_metadata()
+        self.assertEqual(PROTOCOL_VERSION, metadata[PROTOCOL_KEY])
+        self.assertEqual({}, metadata[CLIENT_CAPABILITIES_KEY])
+        self.assertEqual(&quot;demo-client&quot;, metadata[CLIENT_INFO_KEY][&quot;name&quot;])
+
+    def test_discover_returns_identity_capabilities_and_cache_policy(self):
+        client = MCPClient(server)
+        result = client.request(&quot;server/discover&quot;)
+        self.assertEqual(&quot;complete&quot;, result[&quot;resultType&quot;])
+        self.assertEqual(list(SUPPORTED_VERSIONS), result[&quot;supportedVersions&quot;])
+        self.assertEqual(&quot;demo-server&quot;, result[&quot;_meta&quot;][SERVER_INFO_KEY][&quot;name&quot;])
+        self.assertGreater(result[&quot;ttlMs&quot;], 0)
+        self.assertIn(result[&quot;cacheScope&quot;], {&quot;public&quot;, &quot;private&quot;})
+
+    def test_missing_metadata_is_rejected(self):
+        response = server.handle(envelope(&quot;tools/list&quot;))
+        self.assertEqual(-32602, response[&quot;error&quot;][&quot;code&quot;])
+
+    def test_missing_protocol_version_is_invalid_params(self):
+        metadata = request_metadata()
+        del metadata[PROTOCOL_KEY]
+        response = server.handle(envelope(&quot;tools/list&quot;, {&quot;_meta&quot;: metadata}))
+        self.assertEqual(-32602, response[&quot;error&quot;][&quot;code&quot;])
+        self.assertNotIn(&quot;data&quot;, response[&quot;error&quot;])
+
+    def test_non_string_protocol_version_is_invalid_params(self):
+        metadata = request_metadata()
+        metadata[PROTOCOL_KEY] = 20260728
+        response = server.handle(envelope(&quot;tools/list&quot;, {&quot;_meta&quot;: metadata}))
+        self.assertEqual(-32602, response[&quot;error&quot;][&quot;code&quot;])
+
+    def test_missing_client_capabilities_is_invalid_params(self):
+        metadata = request_metadata()
+        del metadata[CLIENT_CAPABILITIES_KEY]
+        response = server.handle(envelope(&quot;tools/list&quot;, {&quot;_meta&quot;: metadata}))
+        self.assertEqual(-32602, response[&quot;error&quot;][&quot;code&quot;])
+
+    def test_unsupported_protocol_version_returns_spec_error(self):
+        metadata = request_metadata(protocol_version=&quot;2025-11-25&quot;)
+        response = server.handle(envelope(&quot;tools/list&quot;, {&quot;_meta&quot;: metadata}))
+        self.assertEqual(-32022, response[&quot;error&quot;][&quot;code&quot;])
+        self.assertEqual(list(SUPPORTED_VERSIONS), response[&quot;error&quot;][&quot;data&quot;][&quot;supported&quot;])
+        self.assertEqual(&quot;2025-11-25&quot;, response[&quot;error&quot;][&quot;data&quot;][&quot;requested&quot;])
+
+    def test_tool_list_is_deterministic_and_cacheable(self):
+        result = MCPClient(server).request(&quot;tools/list&quot;)
+        self.assertEqual([&quot;add&quot;, &quot;delete_user&quot;], [tool[&quot;name&quot;] for tool in result[&quot;tools&quot;]])
+        self.assertEqual(&quot;private&quot;, result[&quot;cacheScope&quot;])
+
+    def test_tool_call_returns_typed_complete_result(self):
+        result = MCPClient(server).request(
+            &quot;tools/call&quot;, {&quot;name&quot;: &quot;add&quot;, &quot;arguments&quot;: {&quot;a&quot;: 20, &quot;b&quot;: 22}}
+        )
+        self.assertEqual(&quot;complete&quot;, result[&quot;resultType&quot;])
+        self.assertEqual(&#39;{&quot;sum&quot;: 42}&#39;, result[&quot;content&quot;][0][&quot;text&quot;])
+        self.assertIn(SERVER_INFO_KEY, result[&quot;_meta&quot;])
+
+    def test_resource_read_is_cacheable(self):
+        result = MCPClient(server).request(&quot;resources/read&quot;, {&quot;uri&quot;: &quot;config://app&quot;})
+        self.assertEqual(&quot;complete&quot;, result[&quot;resultType&quot;])
+        self.assertEqual(&quot;private&quot;, result[&quot;cacheScope&quot;])
+
+    def test_resource_list_includes_required_name(self):
+        result = MCPClient(server).request(&quot;resources/list&quot;)
+        self.assertEqual(&quot;app-config&quot;, result[&quot;resources&quot;][0][&quot;name&quot;])
+
+    def test_every_success_result_is_typed_and_identifies_server(self):
+        calls = [
+            (&quot;server/discover&quot;, None),
+            (&quot;tools/list&quot;, None),
+            (&quot;tools/call&quot;, {&quot;name&quot;: &quot;add&quot;, &quot;arguments&quot;: {&quot;a&quot;: 1, &quot;b&quot;: 2}}),
+            (&quot;resources/list&quot;, None),
+            (&quot;resources/read&quot;, {&quot;uri&quot;: &quot;config://app&quot;}),
+            (&quot;prompts/list&quot;, None),
+            (
+                &quot;prompts/get&quot;,
+                {&quot;name&quot;: &quot;code_review&quot;, &quot;arguments&quot;: {&quot;language&quot;: &quot;Python&quot;, &quot;code&quot;: &quot;x=1&quot;}},
+            ),
+        ]
+        client = MCPClient(server)
+        for method, params in calls:
+            with self.subTest(method=method):
+                result = client.request(method, params)
+                self.assertEqual(&quot;complete&quot;, result[&quot;resultType&quot;])
+                self.assertEqual(&quot;demo-server&quot;, result[&quot;_meta&quot;][SERVER_INFO_KEY][&quot;name&quot;])
+
+    def test_notification_is_ignored_without_a_json_rpc_response(self):
+        response = server.handle(
+            {
+                &quot;jsonrpc&quot;: &quot;2.0&quot;,
+                &quot;method&quot;: &quot;notifications/cancelled&quot;,
+                &quot;params&quot;: {&quot;requestId&quot;: 1},
+            }
+        )
+        self.assertIsNone(response)
+
+    def test_idless_invalid_envelopes_receive_no_response(self):
+        for message in (
+            {&quot;jsonrpc&quot;: &quot;1.0&quot;, &quot;method&quot;: &quot;tools/list&quot;},
+            {&quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;params&quot;: {}},
+        ):
+            with self.subTest(message=message):
+                self.assertIsNone(server.handle(message))
+
+    def test_handler_key_and_type_errors_are_internal_errors(self):
+        local = MCPServer(&quot;handler-errors&quot;)
+
+        @local.tool(&quot;broken&quot;, &quot;Raise a key error.&quot;, {&quot;type&quot;: &quot;object&quot;})
+        def broken():
+            return {}[&quot;missing&quot;]
+
+        metadata = {&quot;_meta&quot;: request_metadata()}
+        key_error = local.handle(
+            envelope(&quot;tools/call&quot;, {**metadata, &quot;name&quot;: &quot;broken&quot;})
+        )
+        type_error = server.handle(
+            envelope(
+                &quot;tools/call&quot;,
+                {**metadata, &quot;name&quot;: &quot;add&quot;, &quot;arguments&quot;: {&quot;a&quot;: 1}},
+            )
+        )
+        self.assertEqual(-32603, key_error[&quot;error&quot;][&quot;code&quot;])
+        self.assertEqual(-32603, type_error[&quot;error&quot;][&quot;code&quot;])
+
+    def test_non_serializable_tool_result_is_an_internal_error(self):
+        local = MCPServer(&quot;serialization-errors&quot;)
+
+        @local.tool(&quot;broken&quot;, &quot;Return a non-JSON value.&quot;, {&quot;type&quot;: &quot;object&quot;})
+        def broken():
+            return {&quot;values&quot;: {1}}
+
+        response = local.handle(
+            envelope(
+                &quot;tools/call&quot;,
+                {
+                    &quot;_meta&quot;: request_metadata(),
+                    &quot;name&quot;: &quot;broken&quot;,
+                    &quot;arguments&quot;: {},
+                },
+            )
+        )
+        self.assertEqual(-32603, response[&quot;error&quot;][&quot;code&quot;])
+        self.assertEqual(&quot;tool handler failed&quot;, response[&quot;error&quot;][&quot;message&quot;])
+
+    def test_non_text_resource_and_prompt_results_are_internal_errors(self):
+        local = MCPServer(&quot;serialization-errors&quot;)
+
+        @local.resource(&quot;broken://resource&quot;, &quot;broken&quot;, &quot;Return a non-JSON value.&quot;)
+        def broken_resource():
+            return {&quot;not-json&quot;}
+
+        @local.prompt(&quot;broken&quot;, &quot;Return a non-JSON value.&quot;, [])
+        def broken_prompt():
+            return {&quot;not-json&quot;}
+
+        metadata = {&quot;_meta&quot;: request_metadata()}
+        resource_response = local.handle(
+            envelope(
+                &quot;resources/read&quot;,
+                {**metadata, &quot;uri&quot;: &quot;broken://resource&quot;},
+            )
+        )
+        prompt_response = local.handle(
+            envelope(
+                &quot;prompts/get&quot;,
+                {**metadata, &quot;name&quot;: &quot;broken&quot;, &quot;arguments&quot;: {}},
+            )
+        )
+
+        self.assertEqual(-32603, resource_response[&quot;error&quot;][&quot;code&quot;])
+        self.assertEqual(&quot;resource handler failed&quot;, resource_response[&quot;error&quot;][&quot;message&quot;])
+        self.assertEqual(-32603, prompt_response[&quot;error&quot;][&quot;code&quot;])
+        self.assertEqual(&quot;prompt handler failed&quot;, prompt_response[&quot;error&quot;][&quot;message&quot;])
+
+    def test_null_request_id_is_invalid(self):
+        response = server.handle(
+            envelope(&quot;tools/list&quot;, {&quot;_meta&quot;: request_metadata()}, request_id=None)
+        )
+        self.assertEqual(-32600, response[&quot;error&quot;][&quot;code&quot;])
+        self.assertIsNone(response[&quot;id&quot;])
+
+    def test_wrong_json_rpc_version_is_invalid(self):
+        message = envelope(&quot;tools/list&quot;, {&quot;_meta&quot;: request_metadata()}, request_id=12)
+        message[&quot;jsonrpc&quot;] = &quot;1.0&quot;
+        response = server.handle(message)
+        self.assertEqual(12, response[&quot;id&quot;])
+        self.assertEqual(-32600, response[&quot;error&quot;][&quot;code&quot;])
+
+    def test_unknown_method_uses_json_rpc_method_not_found(self):
+        response = server.handle(
+            envelope(&quot;unknown/method&quot;, {&quot;_meta&quot;: request_metadata()}, request_id=9)
+        )
+        self.assertEqual(9, response[&quot;id&quot;])
+        self.assertEqual(-32601, response[&quot;error&quot;][&quot;code&quot;])
+
+
+if __name__ == &quot;__main__&quot;:
+    unittest.main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/11-llm-engineering/14-model-context-protocol/outputs/skill-mcp-server-designer.md">phases/11-llm-engineering/14-model-context-protocol/outputs/skill-mcp-server-designer.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: mcp-server-designer
+description: Design a stateless MCP 2026-07-28 server with explicit discovery, state, transport, and safety contracts.
+version: 2.0.0
+phase: 11
+lesson: 14
+tags: [llm-engineering, mcp, stateless, tool-use]
+---
+
+Given a domain (internal API, database, file source) and the hosts that will mount the server, output:
+
+1. Primitive map. Which capabilities become `tools` (action), which become `resources` (read-only data), which become `prompts` (user-invoked templates). One line per primitive.
+2. Discovery contract. Draft `server/discover` with the exact versions the implementation supports, capabilities, server identity, instructions, `ttlMs`, and `cacheScope`.
+3. Request contract. Require a string protocol version and object client capabilities in `params._meta` on every request. Recommend client identity. Return Invalid Params (`-32602`) for missing or ill-typed required metadata. Return `UnsupportedProtocolVersionError` (`-32022`) with `data.supported` and `data.requested` only for a supplied version string the server does not implement.
+4. Result contract. Add `resultType`, server identity metadata, deterministic list ordering, and cache policy to every applicable result.
+5. MRTR plan. Use `input_required` only for `tools/call`, `resources/read`, or `prompts/get`. Include at least one of `inputRequests` or opaque `requestState`; retry the original method with a new JSON-RPC ID, corresponding input responses when requested, and the exact state value when present.
+6. State plan. For every multi-call workflow, define a server-minted opaque handle passed as an ordinary tool argument. Do not hide state behind a connection or protocol session.
+7. Transport and auth plan. Choose stdio or the 2026-07-28 Streamable HTTP POST endpoint. For HTTP, define Origin validation and per-request authorization. Require `MCP-Protocol-Version` on POST requests, `Mcp-Method` on JSON-RPC requests, and `Mcp-Name` only for `tools/call`, `resources/read`, and `prompts/get`. An accepted notification POST returns HTTP 202 with no body.
+8. Schema draft. Write JSON Schema for every tool parameter, with descriptions tuned for model selection and explicit bounds for untrusted input.
+9. Destructive-action list. Mark every mutating tool with `destructiveHint: true` and require human approval.
+10. Verification plan. Cover notifications producing no JSON-RPC response, malformed envelopes and request IDs, metadata rejection, discovery, deterministic lists, version mismatch, cache fields, header-to-body mismatch, authorization, approval, and one prompt-injection case.
+
+Reject a design that uses `initialize`, `notifications/initialized`, `Mcp-Session-Id`, standalone HTTP GET, HTTP DELETE, or `Last-Event-ID` as its modern path. Permit those mechanisms only inside a clearly isolated adapter for protocol versions through 2025-11-25. Do not add deprecated Roots, Sampling, or Logging to a new implementation; compatibility support must be labeled and Roots or Sampling input must use MRTR. Refuse a server that writes to disk or calls an external API without authorization, validation, and an approval path.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. In MCP 2026-07-28, where does a client send its protocol version and capabilities?</legend><label class="option"><input type="radio" name="q0" value="0"> Only in the HTTP cookie</label><label class="option"><input type="radio" name="q0" value="1"> Only in an initialize request</label><label class="option"><input type="radio" name="q0" value="2"> In params._meta on every request</label><label class="option"><input type="radio" name="q0" value="3"> In a server-side session record</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. What must every modern MCP server implement for up-front version and capability discovery?</legend><label class="option"><input type="radio" name="q1" value="0"> server/discover</label><label class="option"><input type="radio" name="q1" value="1"> sessions/create</label><label class="option"><input type="radio" name="q1" value="2"> logging/setLevel</label><label class="option"><input type="radio" name="q1" value="3"> initialize</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. Which Streamable HTTP shape is current in MCP 2026-07-28?</legend><label class="option"><input type="radio" name="q2" value="0"> A DELETE request after every tool call</label><label class="option"><input type="radio" name="q2" value="1"> A WebSocket session identified by Mcp-Session-Id</label><label class="option"><input type="radio" name="q2" value="2"> One POST per JSON-RPC message; request POSTs receive JSON or request-scoped SSE</label><label class="option"><input type="radio" name="q2" value="3"> A GET stream plus a separate POST endpoint</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. How should a server distinguish missing protocol-version metadata from a well-formed but unsupported version?</legend><label class="option"><input type="radio" name="q3" value="0"> Return -32022 for both cases</label><label class="option"><input type="radio" name="q3" value="1"> Return HTTP 301 for a missing version and mint Mcp-Session-Id for an unsupported version</label><label class="option"><input type="radio" name="q3" value="2"> Return -32602 for missing or non-string metadata and -32022 with supported/requested for an unsupported string</label><label class="option"><input type="radio" name="q3" value="3"> Accept a missing version and return -32601 for an unsupported version</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. A multi-step tool needs continuity across calls. What is the modern MCP design?</legend><label class="option"><input type="radio" name="q4" value="0"> Put mutable state in clientInfo</label><label class="option"><input type="radio" name="q4" value="1"> Restore Mcp-Session-Id for this tool only</label><label class="option"><input type="radio" name="q4" value="2"> Mint an opaque handle and require it as a later tool argument</label><label class="option"><input type="radio" name="q4" value="3"> Store state behind the TCP connection</label><p data-feedback="4"></p></fieldset><fieldset><legend>6. How does a modern server ask for user, model, or root input during a tool operation?</legend><label class="option"><input type="radio" name="q5" value="0"> It writes the question to stderr</label><label class="option"><input type="radio" name="q5" value="1"> It opens a second SSE connection</label><label class="option"><input type="radio" name="q5" value="2"> It returns input_required and the client retries with inputResponses</label><label class="option"><input type="radio" name="q5" value="3"> It sends an independent server-to-client JSON-RPC request</label><p data-feedback="5"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/11-llm-engineering/13-production-app/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/11-llm-engineering/15-prompt-caching/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/11-llm-engineering/14-model-context-protocol/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

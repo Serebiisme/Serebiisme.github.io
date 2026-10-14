@@ -1,0 +1,751 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>快速缓存和文本缓存 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-11-llm-engineering" data-lesson="11-llm-engineering/15-prompt-caching" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/11-llm-engineering/">大语言模型工程</a> / LESSON 15</p><h1 class="lesson-title">快速缓存和文本缓存</h1><p>Prompt Caching and Context Caching</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>快速缓存和文本缓存</h1>
+<blockquote>
+<p>您的系统提示是4000个代币.您的RAG文本是20,000个代币.您每次请求都会发送两种代币.您每次都会支付两种代币.快速缓存允许提供商将该预先端放在其侧面,并将正常使用率的10%收费.如果正确使用,它将推断成本减少5090%和第一次代币延迟4085%.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 11 · 01 (Prompt Engineering), Phase 11 · 05 (Context Engineering), Phase 11 · 11 (Caching and Cost)
+<strong>Time:</strong> ~60 minutes</p>
+<h2>问题</h2>
+<p>编码代理在每次对话中都会向克劳德发送相同的15000代币系统提示.<span class="katex"><span class="katex-mathml"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>3</mn><mi mathvariant="normal">/</mi><mi>M</mi><mi>i</mi><mi>n</mi><mi>p</mi><mi>u</mi><mi>t</mi><mi>t</mi><mi>o</mi><mi>k</mi><mi>e</mi><mi>n</mi><mi>s</mi><mi>i</mi><mi>s</mi></mrow><annotation encoding="application/x-tex">3/M input tokens is </annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="katex-base"><span class="katex-strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">3/</span><span class="mord mathnormal" style="margin-right:0.109em;">M</span><span class="mord mathnormal">in</span><span class="mord mathnormal">p</span><span class="mord mathnormal">u</span><span class="mord mathnormal">tt</span><span class="mord mathnormal">o</span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mord mathnormal">e</span><span class="mord mathnormal">n</span><span class="mord mathnormal">s</span><span class="mord mathnormal">i</span><span class="mord mathnormal">s</span></span></span></span>只有 0.90 美元的输入成本, 之前用户的任何实际消息.乘以每天的10,000次对话,账单达到9,000美元/天,</p>
+<p>您不能减少提示,而不会损害质量.您不能避免发送它. 模型需要它在每一个转折.唯一的举动是停止支付完整的价格为供应商已经看到的预写.</p>
+<p>这一举动是快速缓存.安特罗皮克在2024年8月发布 (在2025年推出1小时的延长TTL变体),OpenAI自动化了该年晚些时候,谷歌在双子座1.5号的同时发布了明确的语境缓存,现在这三个都将其作为其边界模型的一流功能.</p>
+<h2>概念</h2>
+<p><img src="/learn/ai-from-scratch/files/phases/11-llm-engineering/15-prompt-caching/assets/prompt-caching.svg" alt="Prompt caching: write once, read cheap" loading="lazy"></p>
+<p>**The mechanic.**当请求的前与最近请求的前相匹配时,提供商将从前运行中提供KV缓存,而不是重新编码代币.你第一次支付小写费,每次都会收取大阅读折扣.</p>
+<p><strong>Three provider flavors in 2026.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Provider</th>
+<th>API style</th>
+<th>Hit discount</th>
+<th>Write premium</th>
+<th>Default TTL</th>
+<th>Min cacheable</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Anthropic</td>
+<td>Explicit <code>cache_control</code> markers on content blocks</td>
+<td>90% off input</td>
+<td>25% surcharge</td>
+<td>5 min (extendable to 1 hour)</td>
+<td>1,024 tokens (Sonnet/Opus), 2,048 (Haiku)</td>
+</tr>
+<tr>
+<td>OpenAI</td>
+<td>Automatic prefix detection</td>
+<td>50% off input</td>
+<td>none</td>
+<td>Up to 1 hour (best-effort)</td>
+<td>1,024 tokens</td>
+</tr>
+<tr>
+<td>Google (Gemini)</td>
+<td>Explicit <code>CachedContent</code> API</td>
+<td>Storage-billed; read at ~25% of normal</td>
+<td>Storage fee per token·hour</td>
+<td>User-set (default 1 hour)</td>
+<td>4,096 tokens (Flash), 32,768 (Pro)</td>
+</tr>
+</tbody>
+</table>
+<p>**The invariant.**如果任何代币在请求之间不同,则在第一个不同代币之后的一切都是错误. 放在顶部的 <em>稳定</em> 部分,下面的 <em>变量</em> 部分.</p>
+<h3>缓存友好的布局</h3>
+<pre><code>[system prompt]          &lt;-- cache this
+[tool definitions]       &lt;-- cache this
+[few-shot examples]      &lt;-- cache this
+[retrieved documents]    &lt;-- cache if reused, else don't
+[conversation history]   &lt;-- cache up to last turn
+[current user message]   &lt;-- never cache (different every time)
+</code></pre>
+<p>违反命令 将用户消息放在系统提示上面, 间接几次截图之间动态检索 和缓存永远不会打.</p>
+<h3>破产平衡计算</h3>
+<p>为了节省净资金,预存区块必须至少读到两次. 1 写 + 1 读平均每次请求成本 0.675x (节省 32%); 1 写 + 10 读平均 0.205x (节省 80%). 指规则:预计在 TTL 中至少 3 次重复使用任何预存.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-ac1f6d0017c6e812dcb0.png" alt="prompt-cache-hit 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<h3>步骤1: 通过明确标记进行人类提示缓存</h3>
+<pre><code class="language-python">import anthropic
+
+client = anthropic.Anthropic()
+
+SYSTEM = [
+    {
+        &quot;type&quot;: &quot;text&quot;,
+        &quot;text&quot;: &quot;You are a senior Python reviewer. Follow the rubric exactly.\n\n&quot; + RUBRIC_15K_TOKENS,
+        &quot;cache_control&quot;: {&quot;type&quot;: &quot;ephemeral&quot;},
+    }
+]
+
+def review(code: str):
+    return client.messages.create(
+        model=&quot;claude-opus-4-7&quot;,
+        max_tokens=1024,
+        system=SYSTEM,
+        messages=[{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: code}],
+    )
+</code></pre>
+<p>其他<code>cache_control</code>标记告诉人类存储区块5分钟. 在窗口中重复使用; 过期后重复使用,然后再写.</p>
+<p><strong>Response usage fields:</strong></p>
+<pre><code class="language-python">response = review(code_a)
+response.usage
+# InputTokensUsage(
+#     input_tokens=120,
+#     cache_creation_input_tokens=15023,   # paid at 1.25x
+#     cache_read_input_tokens=0,
+#     output_tokens=340,
+# )
+
+response_b = review(code_b)
+response_b.usage
+# cache_creation_input_tokens=0
+# cache_read_input_tokens=15023           # paid at 0.1x
+</code></pre>
+<p>检查IC 中的两个字段,如果 <code>cache_read_input_tokens</code>在请求中保持零,你的缓存密钥漂移.</p>
+<h3>步骤2:延长1小时的TTL</h3>
+<p>对于长期的批次工作,工作间的5分钟违约期会到期.<code>ttl</code>其他:</p>
+<pre><code class="language-python">{&quot;type&quot;: &quot;text&quot;, &quot;text&quot;: RUBRIC, &quot;cache_control&quot;: {&quot;type&quot;: &quot;ephemeral&quot;, &quot;ttl&quot;: &quot;1h&quot;}}
+</code></pre>
+<p>一小时的TTL成本是写费的两倍 (50%比基线而不是25%),但在任何批次中重复使用前的时间超过5次时,会很快回报.</p>
+<h3>步骤3:OpenAI自动缓存</h3>
+<p>任何与最近的请求相匹配的1024个代币以上的预写符都会自动获得50%折扣.</p>
+<pre><code class="language-python">from openai import OpenAI
+client = OpenAI()
+
+resp = client.chat.completions.create(
+    model=&quot;gpt-5&quot;,
+    messages=[
+        {&quot;role&quot;: &quot;system&quot;, &quot;content&quot;: SYSTEM_PROMPT},   # long and stable
+        {&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: user_msg},
+    ],
+)
+resp.usage.prompt_tokens_details.cached_tokens  # the discounted portion
+</code></pre>
+<p>两个因素会杀死OpenAI的缓存,而不是杀死Anthropic的:改变 <code>user</code>字段 (作为缓存密钥组件使用) 和重新排序工具.</p>
+<h3>步骤4:双子座明确的语境缓存</h3>
+<p>双子座将缓存视为你创建的第一类对象,</p>
+<pre><code class="language-python">from google import genai
+from google.genai import types
+
+client = genai.Client()
+
+cache = client.caches.create(
+    model=&quot;gemini-3.8-flash&quot;,
+    config=types.CreateCachedContentConfig(
+        display_name=&quot;rubric-v3&quot;,
+        system_instruction=RUBRIC,
+        contents=[FEW_SHOT_EXAMPLES],
+        ttl=&quot;3600s&quot;,
+    ),
+)
+
+resp = client.models.generate_content(
+    model=&quot;gemini-3.8-flash&quot;,
+    contents=[&quot;Review this code:\n&quot; + code],
+    config=types.GenerateContentConfig(cached_content=cache.name),
+)
+</code></pre>
+<p>双子座每一个代币·小时的存储费用是缓存存存储存存存存存存存存存存存存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存存储存存存存存存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存储存存存储存存储存存储存存储存存存存储存存存储存存储存存存存存储存储存存存存存储存存存存存储存存存存存存储存存存存存储存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存存</p>
+<h3>步骤5:测量生产中撞击率</h3>
+<p>看到<code>code/main.py</code>对于一个模拟的三供应商会计师,该会追踪写/阅读/错过计算和计算每1K请求的混合成本. 门部署在目标的成功率大多数生产的人类设置应看到&gt;80%的读数分数在加热后.</p>
+<h2>陷在2026年仍存在</h2>
+<ul>
+<li><strong>Dynamic timestamps at the top.</strong> <code>&quot;Current time: 2026-04-22 15:30:02&quot;</code>系统提示的顶部,每个请求都错过了. 移动时间标签在缓存破点以下.</li>
+<li>**Tool reordering.**系统化工具稳定顺序 部署之间的命令调整,</li>
+<li><strong>Free-text near-duplicates.</strong>&quot;你是有帮助的. &quot;vs&quot;你是有帮助的助手. &quot;一个字节差异 = 完全错过.</li>
+<li>**Too-small blocks.**哈伊库的小块默默不存储.</li>
+<li>**Blind cost dashboards.**输入代码分为缓存与未缓存.否则流量下降看起来像缓存获利.</li>
+</ul>
+<h2>用它</h2>
+<p>预备备库2026:</p>
+<table>
+<thead>
+<tr>
+<th>Situation</th>
+<th>Pick</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Agent with stable 10k+ system prompt, many turns</td>
+<td>Anthropic <code>cache_control</code> with 5-min TTL</td>
+</tr>
+<tr>
+<td>Batch job reusing a prefix for 30+ minutes</td>
+<td>Anthropic with <code>ttl: &quot;1h&quot;</code></td>
+</tr>
+<tr>
+<td>Serverless endpoints on GPT-5, no custom infra</td>
+<td>OpenAI automatic (just make your prefix stable and long)</td>
+</tr>
+<tr>
+<td>Multi-day reuse of a giant code/doc corpus</td>
+<td>Gemini explicit <code>CachedContent</code></td>
+</tr>
+<tr>
+<td>Cross-provider fallback</td>
+<td>Keep the cacheable prefix layout identical across providers so any hit works</td>
+</tr>
+</tbody>
+</table>
+<p>结合用户信息层的语义缓存 (阶段11 · 11):提示缓存处理 <em>代币相同</em>重复使用,语义缓存处理 <em>意义相同</em>重复使用.</p>
+<h2>运送它</h2>
+<p>保存<code>outputs/skill-prompt-caching-planner.md</code>其他:</p>
+<pre><code class="language-markdown">---
+name: prompt-caching-planner
+description: Design a cache-friendly prompt layout and pick the right provider caching mode.
+version: 1.0.0
+phase: 11
+lesson: 15
+tags: [llm-engineering, caching, cost]
+---
+
+Given a prompt (system + tools + few-shot + retrieval + history + user) and a usage profile (requests per hour, TTL needed, provider), output:
+
+1. Layout. Reordered sections with a single cache breakpoint marked; explain which sections are stable, which are volatile.
+2. Provider mode. Anthropic cache_control, OpenAI automatic, or Gemini CachedContent. Justify from TTL and reuse pattern.
+3. Break-even. Expected reads per write within TTL; net cost vs no-cache with math.
+4. Verification plan. CI assertion that cache_read_input_tokens &gt; 0 on the second identical request; dashboard split by cached vs uncached tokens.
+5. Failure modes. List the three most likely reasons the cache will miss in this setup (dynamic timestamp, tool reorder, near-duplicate text) and how you will prevent each.
+
+Refuse to ship a cache plan that places a dynamic field above the breakpoint. Refuse to enable 1h TTL without a reuse count that makes the 2x write premium pay back.
+</code></pre>
+<h2>运动</h2>
+<ol>
+<li>**Easy.**通过5000个代币系统来对抗克劳德进行10轮对话.<code>cache_control</code>报告每个输入代码的账单.</li>
+<li>**Medium.**写一个测试,根据提示模板和请求日志,计算每个提供商的预期成功率和美元节省 (Anthropic 5m,Anthropic 1h,OpenAI自动,Twin explicit).</li>
+<li>**Hard.**创建布局优化器:给出提示和标记的字段列表 <code>stable=True/False</code>通过一个简单的缓存,将一个缓存破解点放在最大的缓存友好的位置,而不输掉信息.</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Prompt caching</td>
+<td>&quot;Makes long prompts cheap&quot;</td>
+<td>Reusing a provider-side KV-cache for matching prefixes; 50-90% discount on repeated input tokens.</td>
+</tr>
+<tr>
+<td><code>cache_control</code></td>
+<td>&quot;The Anthropic marker&quot;</td>
+<td>Content-block attribute that declares &quot;everything up to here is cacheable&quot;; <code>{&quot;type&quot;: &quot;ephemeral&quot;}</code>.</td>
+</tr>
+<tr>
+<td>Cache write</td>
+<td>&quot;Paying the premium&quot;</td>
+<td>The first request that populates the cache; billed at ~1.25x input rate on Anthropic, free on OpenAI.</td>
+</tr>
+<tr>
+<td>Cache read</td>
+<td>&quot;The discount&quot;</td>
+<td>Subsequent requests matching the prefix; billed at 10% (Anthropic), 50% (OpenAI), ~25% (Gemini).</td>
+</tr>
+<tr>
+<td>TTL</td>
+<td>&quot;How long it lives&quot;</td>
+<td>Seconds the cache stays warm; Anthropic 5m default (extendable 1h), OpenAI best-effort up to 1h, Gemini user-set.</td>
+</tr>
+<tr>
+<td>Extended TTL</td>
+<td>&quot;1-hour Anthropic cache&quot;</td>
+<td><code>{&quot;type&quot;: &quot;ephemeral&quot;, &quot;ttl&quot;: &quot;1h&quot;}</code>; 2x write premium but worth it for batch reuse.</td>
+</tr>
+<tr>
+<td>Prefix match</td>
+<td>&quot;Why my cache missed&quot;</td>
+<td>Caches only hit when every token from the start up to the breakpoint is byte-identical.</td>
+</tr>
+<tr>
+<td>Context caching (Gemini)</td>
+<td>&quot;The explicit one&quot;</td>
+<td>Google's named, storage-billed cache object; best for multi-day reuse of large corpora.</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching" rel="noreferrer" data-network="true">Anthropic — Prompt caching <small>↗ 需要联网</small></a> <code>cache_control</code>时间1小时,平衡表.</li>
+<li><a href="https://platform.openai.com/docs/guides/prompt-caching" rel="noreferrer" data-network="true">OpenAI — Prompt caching <small>↗ 需要联网</small></a>自动前匹配.</li>
+<li><a href="https://ai.google.dev/gemini-api/docs/caching" rel="noreferrer" data-network="true">Google — Context caching <small>↗ 需要联网</small></a> <code>CachedContent</code>存储器和存储器的价格.</li>
+<li><a href="https://www.anthropic.com/news/prompt-caching" rel="noreferrer" data-network="true">Anthropic engineering — Prompt caching for long-context workloads <small>↗ 需要联网</small></a>原始发射站,延迟号码.</li>
+<li>阶段11 · 05 (文本工程)  如何切断提示器,以便缓存可登陆.</li>
+<li>对应缓存与用户消息的语义缓存.</li>
+<li><a href="https://arxiv.org/abs/2211.05102" rel="noreferrer" data-network="true">Pope et al., &quot;Efficiently Scaling Transformer Inference&quot; (2022) <small>↗ 需要联网</small></a> KV缓存存储器模型,提示缓存将用户暴露在缓存中;解释为什么缓存前置器的重读比重新计算便宜10x.</li>
+<li><a href="https://arxiv.org/abs/2308.16369" rel="noreferrer" data-network="true">Agrawal et al., &quot;SARATHI: Efficient LLM Inference by Piggybacking Decodes with Chunked Prefills&quot; (2023) <small>↗ 需要联网</small></a>预填是阶段提示缓存快捷方式;本文解释了为什么TTFT在缓存中大幅下降,而TPOT不受影响.</li>
+<li><a href="https://arxiv.org/abs/2211.17192" rel="noreferrer" data-network="true">Leviathan et al., &quot;Fast Inference from Transformers via Speculative Decoding&quot; (2023) <small>↗ 需要联网</small></a>快速缓存与投机解码,闪光注意力和MQA/GQA作为曲线的杆,</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Prompt Caching and Context Caching</h1>
+<blockquote>
+<p>Your system prompt is 4,000 tokens. Your RAG context is 20,000 tokens. You send both with every request. You also pay for both — every time. Prompt caching lets the provider keep that prefix warm on their side and bill you 10% of the normal rate on reuse. Used correctly, it cuts inference cost by 50–90% and first-token latency by 40–85%.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 11 · 01 (Prompt Engineering), Phase 11 · 05 (Context Engineering), Phase 11 · 11 (Caching and Cost)
+<strong>Time:</strong> ~60 minutes</p>
+<h2>The Problem</h2>
+<p>A coding agent sends the same 15,000-token system prompt to Claude on every turn of a conversation. Twenty turns at <span class="katex"><span class="katex-mathml"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>3</mn><mi mathvariant="normal">/</mi><mi>M</mi><mi>i</mi><mi>n</mi><mi>p</mi><mi>u</mi><mi>t</mi><mi>t</mi><mi>o</mi><mi>k</mi><mi>e</mi><mi>n</mi><mi>s</mi><mi>i</mi><mi>s</mi></mrow><annotation encoding="application/x-tex">3/M input tokens is </annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="katex-base"><span class="katex-strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">3/</span><span class="mord mathnormal" style="margin-right:0.109em;">M</span><span class="mord mathnormal">in</span><span class="mord mathnormal">p</span><span class="mord mathnormal">u</span><span class="mord mathnormal">tt</span><span class="mord mathnormal">o</span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mord mathnormal">e</span><span class="mord mathnormal">n</span><span class="mord mathnormal">s</span><span class="mord mathnormal">i</span><span class="mord mathnormal">s</span></span></span></span>0.90 in input cost alone — before any of the user's actual messages. Multiply by 10,000 daily conversations and the bill hits $9,000/day for text that never changes.</p>
+<p>You cannot shrink the prompt without hurting quality. You cannot avoid sending it — the model needs it on every turn. The only move is to stop paying full price for a prefix the provider has already seen.</p>
+<p>That move is prompt caching. Anthropic shipped it in August 2024 (with a 1-hour extended-TTL variant in 2025), OpenAI automated it later that year, Google shipped explicit context caching alongside Gemini 1.5, and all three now offer it as a first-class feature on their frontier models.</p>
+<h2>The Concept</h2>
+<p><img src="/learn/ai-from-scratch/files/phases/11-llm-engineering/15-prompt-caching/assets/prompt-caching.svg" alt="Prompt caching: write once, read cheap" loading="lazy"></p>
+<p><strong>The mechanic.</strong> When a request's prefix matches one from a recent request, the provider serves the KV-cache from the previous run instead of re-encoding the tokens. You pay a small write premium the first time and a large read discount every time after.</p>
+<p><strong>Three provider flavors in 2026.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Provider</th>
+<th>API style</th>
+<th>Hit discount</th>
+<th>Write premium</th>
+<th>Default TTL</th>
+<th>Min cacheable</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Anthropic</td>
+<td>Explicit <code>cache_control</code> markers on content blocks</td>
+<td>90% off input</td>
+<td>25% surcharge</td>
+<td>5 min (extendable to 1 hour)</td>
+<td>1,024 tokens (Sonnet/Opus), 2,048 (Haiku)</td>
+</tr>
+<tr>
+<td>OpenAI</td>
+<td>Automatic prefix detection</td>
+<td>50% off input</td>
+<td>none</td>
+<td>Up to 1 hour (best-effort)</td>
+<td>1,024 tokens</td>
+</tr>
+<tr>
+<td>Google (Gemini)</td>
+<td>Explicit <code>CachedContent</code> API</td>
+<td>Storage-billed; read at ~25% of normal</td>
+<td>Storage fee per token·hour</td>
+<td>User-set (default 1 hour)</td>
+<td>4,096 tokens (Flash), 32,768 (Pro)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>The invariant.</strong> All three cache prefixes only. If any token differs between requests, everything after the first differing token is a miss. Put the <em>stable</em> parts at the top, the <em>variable</em> parts at the bottom.</p>
+<h3>The cache-friendly layout</h3>
+<pre><code>[system prompt]          &lt;-- cache this
+[tool definitions]       &lt;-- cache this
+[few-shot examples]      &lt;-- cache this
+[retrieved documents]    &lt;-- cache if reused, else don't
+[conversation history]   &lt;-- cache up to last turn
+[current user message]   &lt;-- never cache (different every time)
+</code></pre>
+<p>Violate the order — put the user message above the system prompt, interleave dynamic retrievals between few-shots — and the cache never hits.</p>
+<h3>The break-even calculation</h3>
+<p>Anthropic's 25% write premium means a cached block has to be read at least twice to net-save money. 1 write + 1 read averages 0.675x cost per request (saves 32%); 1 write + 10 reads averages 0.205x (saves 80%). Rule of thumb: cache anything you expect to reuse at least 3 times within the TTL.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-ac1f6d0017c6e812dcb0.png" alt="prompt-cache-hit 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<h3>Step 1: Anthropic prompt caching with explicit markers</h3>
+<pre><code class="language-python">import anthropic
+
+client = anthropic.Anthropic()
+
+SYSTEM = [
+    {
+        &quot;type&quot;: &quot;text&quot;,
+        &quot;text&quot;: &quot;You are a senior Python reviewer. Follow the rubric exactly.\n\n&quot; + RUBRIC_15K_TOKENS,
+        &quot;cache_control&quot;: {&quot;type&quot;: &quot;ephemeral&quot;},
+    }
+]
+
+def review(code: str):
+    return client.messages.create(
+        model=&quot;claude-opus-4-7&quot;,
+        max_tokens=1024,
+        system=SYSTEM,
+        messages=[{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: code}],
+    )
+</code></pre>
+<p>The <code>cache_control</code> marker tells Anthropic to store the block for 5 minutes. Reuse within that window hits; reuse after expires and writes again.</p>
+<p><strong>Response usage fields:</strong></p>
+<pre><code class="language-python">response = review(code_a)
+response.usage
+# InputTokensUsage(
+#     input_tokens=120,
+#     cache_creation_input_tokens=15023,   # paid at 1.25x
+#     cache_read_input_tokens=0,
+#     output_tokens=340,
+# )
+
+response_b = review(code_b)
+response_b.usage
+# cache_creation_input_tokens=0
+# cache_read_input_tokens=15023           # paid at 0.1x
+</code></pre>
+<p>Check both fields in CI — if <code>cache_read_input_tokens</code> stays at zero across requests, your cache keys are drifting.</p>
+<h3>Step 2: one-hour extended TTL</h3>
+<p>For long-running batch jobs, the 5-minute default expires between jobs. Set <code>ttl</code>:</p>
+<pre><code class="language-python">{&quot;type&quot;: &quot;text&quot;, &quot;text&quot;: RUBRIC, &quot;cache_control&quot;: {&quot;type&quot;: &quot;ephemeral&quot;, &quot;ttl&quot;: &quot;1h&quot;}}
+</code></pre>
+<p>1-hour TTL costs 2x the write premium (50% over baseline instead of 25%) but pays back fast on any batch reusing the prefix more than 5 times.</p>
+<h3>Step 3: OpenAI automatic caching</h3>
+<p>OpenAI gives you nothing to configure. Any prefix over 1,024 tokens that matches a recent request gets a 50% discount automatically.</p>
+<pre><code class="language-python">from openai import OpenAI
+client = OpenAI()
+
+resp = client.chat.completions.create(
+    model=&quot;gpt-5&quot;,
+    messages=[
+        {&quot;role&quot;: &quot;system&quot;, &quot;content&quot;: SYSTEM_PROMPT},   # long and stable
+        {&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: user_msg},
+    ],
+)
+resp.usage.prompt_tokens_details.cached_tokens  # the discounted portion
+</code></pre>
+<p>Same cache-friendly layout rule applies. Two things kill OpenAI's cache that don't kill Anthropic's: changing the <code>user</code> field (used as a cache key component) and reordering tools.</p>
+<h3>Step 4: Gemini explicit context caching</h3>
+<p>Gemini treats the cache as a first-class object you create and name:</p>
+<pre><code class="language-python">from google import genai
+from google.genai import types
+
+client = genai.Client()
+
+cache = client.caches.create(
+    model=&quot;gemini-3.8-flash&quot;,
+    config=types.CreateCachedContentConfig(
+        display_name=&quot;rubric-v3&quot;,
+        system_instruction=RUBRIC,
+        contents=[FEW_SHOT_EXAMPLES],
+        ttl=&quot;3600s&quot;,
+    ),
+)
+
+resp = client.models.generate_content(
+    model=&quot;gemini-3.8-flash&quot;,
+    contents=[&quot;Review this code:\n&quot; + code],
+    config=types.GenerateContentConfig(cached_content=cache.name),
+)
+</code></pre>
+<p>Gemini charges storage per token·hour for as long as the cache lives, and reads at ~25% of normal input rate. This is the right shape when you reuse the same giant prompt across many sessions over days.</p>
+<h3>Step 5: measuring hit rate in production</h3>
+<p>See <code>code/main.py</code> for a simulated three-provider accountant that tracks write/read/miss counts and computes blended cost per 1K requests. Gate deploys on a target hit rate — most production Anthropic setups should see &gt;80% read fraction after warmup.</p>
+<h2>Pitfalls that still ship in 2026</h2>
+<ul>
+<li><strong>Dynamic timestamps at the top.</strong> <code>&quot;Current time: 2026-04-22 15:30:02&quot;</code> at the top of the system prompt. Every request misses. Move timestamps below the cache breakpoint.</li>
+<li><strong>Tool reordering.</strong> Serialize tools in a stable order — a dict reshuffle between deploys breaks every hit.</li>
+<li><strong>Free-text near-duplicates.</strong> &quot;You are helpful.&quot; vs &quot;You are a helpful assistant.&quot; — one byte difference = full miss.</li>
+<li><strong>Too-small blocks.</strong> Anthropic enforces a 1,024-token floor (2,048 for Haiku). Smaller blocks silently do not cache.</li>
+<li><strong>Blind cost dashboards.</strong> Split &quot;input tokens&quot; into cached vs uncached. Otherwise a traffic drop looks like a cache win.</li>
+</ul>
+<h2>Use It</h2>
+<p>The 2026 caching stack:</p>
+<table>
+<thead>
+<tr>
+<th>Situation</th>
+<th>Pick</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Agent with stable 10k+ system prompt, many turns</td>
+<td>Anthropic <code>cache_control</code> with 5-min TTL</td>
+</tr>
+<tr>
+<td>Batch job reusing a prefix for 30+ minutes</td>
+<td>Anthropic with <code>ttl: &quot;1h&quot;</code></td>
+</tr>
+<tr>
+<td>Serverless endpoints on GPT-5, no custom infra</td>
+<td>OpenAI automatic (just make your prefix stable and long)</td>
+</tr>
+<tr>
+<td>Multi-day reuse of a giant code/doc corpus</td>
+<td>Gemini explicit <code>CachedContent</code></td>
+</tr>
+<tr>
+<td>Cross-provider fallback</td>
+<td>Keep the cacheable prefix layout identical across providers so any hit works</td>
+</tr>
+</tbody>
+</table>
+<p>Combine with semantic caching (Phase 11 · 11) for the user-message layer: prompt caching handles <em>token-identical</em> reuse, semantic caching handles <em>meaning-identical</em> reuse.</p>
+<h2>Ship It</h2>
+<p>Save <code>outputs/skill-prompt-caching-planner.md</code>:</p>
+<pre><code class="language-markdown">---
+name: prompt-caching-planner
+description: Design a cache-friendly prompt layout and pick the right provider caching mode.
+version: 1.0.0
+phase: 11
+lesson: 15
+tags: [llm-engineering, caching, cost]
+---
+
+Given a prompt (system + tools + few-shot + retrieval + history + user) and a usage profile (requests per hour, TTL needed, provider), output:
+
+1. Layout. Reordered sections with a single cache breakpoint marked; explain which sections are stable, which are volatile.
+2. Provider mode. Anthropic cache_control, OpenAI automatic, or Gemini CachedContent. Justify from TTL and reuse pattern.
+3. Break-even. Expected reads per write within TTL; net cost vs no-cache with math.
+4. Verification plan. CI assertion that cache_read_input_tokens &gt; 0 on the second identical request; dashboard split by cached vs uncached tokens.
+5. Failure modes. List the three most likely reasons the cache will miss in this setup (dynamic timestamp, tool reorder, near-duplicate text) and how you will prevent each.
+
+Refuse to ship a cache plan that places a dynamic field above the breakpoint. Refuse to enable 1h TTL without a reuse count that makes the 2x write premium pay back.
+</code></pre>
+<h2>Exercises</h2>
+<ol>
+<li><strong>Easy.</strong> Take a 10-turn conversation with a 5,000-token system prompt against Claude. Run it without <code>cache_control</code> and then with. Report the input-token bill for each.</li>
+<li><strong>Medium.</strong> Write a test harness that, given a prompt template and a request log, computes the expected hit rate and dollar savings per provider (Anthropic 5m, Anthropic 1h, OpenAI automatic, Gemini explicit).</li>
+<li><strong>Hard.</strong> Build a layout optimizer: given a prompt and a list of fields marked <code>stable=True/False</code>, rewrite the prompt to put a single cache breakpoint at the maximum cache-friendly position without losing information. Verify on a real Anthropic endpoint.</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Prompt caching</td>
+<td>&quot;Makes long prompts cheap&quot;</td>
+<td>Reusing a provider-side KV-cache for matching prefixes; 50-90% discount on repeated input tokens.</td>
+</tr>
+<tr>
+<td><code>cache_control</code></td>
+<td>&quot;The Anthropic marker&quot;</td>
+<td>Content-block attribute that declares &quot;everything up to here is cacheable&quot;; <code>{&quot;type&quot;: &quot;ephemeral&quot;}</code>.</td>
+</tr>
+<tr>
+<td>Cache write</td>
+<td>&quot;Paying the premium&quot;</td>
+<td>The first request that populates the cache; billed at ~1.25x input rate on Anthropic, free on OpenAI.</td>
+</tr>
+<tr>
+<td>Cache read</td>
+<td>&quot;The discount&quot;</td>
+<td>Subsequent requests matching the prefix; billed at 10% (Anthropic), 50% (OpenAI), ~25% (Gemini).</td>
+</tr>
+<tr>
+<td>TTL</td>
+<td>&quot;How long it lives&quot;</td>
+<td>Seconds the cache stays warm; Anthropic 5m default (extendable 1h), OpenAI best-effort up to 1h, Gemini user-set.</td>
+</tr>
+<tr>
+<td>Extended TTL</td>
+<td>&quot;1-hour Anthropic cache&quot;</td>
+<td><code>{&quot;type&quot;: &quot;ephemeral&quot;, &quot;ttl&quot;: &quot;1h&quot;}</code>; 2x write premium but worth it for batch reuse.</td>
+</tr>
+<tr>
+<td>Prefix match</td>
+<td>&quot;Why my cache missed&quot;</td>
+<td>Caches only hit when every token from the start up to the breakpoint is byte-identical.</td>
+</tr>
+<tr>
+<td>Context caching (Gemini)</td>
+<td>&quot;The explicit one&quot;</td>
+<td>Google's named, storage-billed cache object; best for multi-day reuse of large corpora.</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching" rel="noreferrer" data-network="true">Anthropic — Prompt caching <small>↗ 需要联网</small></a> — <code>cache_control</code>, 1h TTL, break-even tables.</li>
+<li><a href="https://platform.openai.com/docs/guides/prompt-caching" rel="noreferrer" data-network="true">OpenAI — Prompt caching <small>↗ 需要联网</small></a> — automatic prefix matching.</li>
+<li><a href="https://ai.google.dev/gemini-api/docs/caching" rel="noreferrer" data-network="true">Google — Context caching <small>↗ 需要联网</small></a> — <code>CachedContent</code> API and storage pricing.</li>
+<li><a href="https://www.anthropic.com/news/prompt-caching" rel="noreferrer" data-network="true">Anthropic engineering — Prompt caching for long-context workloads <small>↗ 需要联网</small></a> — original launch post with latency numbers.</li>
+<li>Phase 11 · 05 (Context Engineering) — where to slice the prompt so the cache can land.</li>
+<li>Phase 11 · 11 (Caching and Cost) — pair prompt caching with a semantic cache on user messages.</li>
+<li><a href="https://arxiv.org/abs/2211.05102" rel="noreferrer" data-network="true">Pope et al., &quot;Efficiently Scaling Transformer Inference&quot; (2022) <small>↗ 需要联网</small></a> — the KV-cache memory model that prompt caching exposes to users; explains why a cached prefix is ~10× cheaper to reread than to recompute.</li>
+<li><a href="https://arxiv.org/abs/2308.16369" rel="noreferrer" data-network="true">Agrawal et al., &quot;SARATHI: Efficient LLM Inference by Piggybacking Decodes with Chunked Prefills&quot; (2023) <small>↗ 需要联网</small></a> — prefill is the phase prompt caching shortcuts; this paper explains why TTFT drops dramatically on cache hit while TPOT is unaffected.</li>
+<li><a href="https://arxiv.org/abs/2211.17192" rel="noreferrer" data-network="true">Leviathan et al., &quot;Fast Inference from Transformers via Speculative Decoding&quot; (2023) <small>↗ 需要联网</small></a> — prompt caching sits alongside speculative decoding, Flash Attention, and MQA/GQA as levers that bend the inference cost curve; read this for the other three.</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-11-llm-engineering--15-prompt-caching.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-11-llm-engineering--15-prompt-caching.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/11-llm-engineering/15-prompt-caching/code/main.py">phases/11-llm-engineering/15-prompt-caching/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Prompt caching accountant.
+
+Simulates three provider caching regimes (Anthropic ephemeral 5m, Anthropic 1h,
+OpenAI automatic, Gemini explicit) against a stream of requests and reports
+write/read/miss counts plus blended cost per 1K requests.
+
+Prices below are the April 2026 published rates for input tokens on the
+provider&#39;s frontier model. Override by editing PRICES.
+
+Run with:
+    python main.py
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Iterable
+
+
+# Input-token prices, USD per 1K tokens --------------------------------------
+
+PRICES = {
+    &quot;anthropic_claude_opus_4_7&quot;: {&quot;base&quot;: 0.015, &quot;cache_write_5m&quot;: 0.01875, &quot;cache_write_1h&quot;: 0.030, &quot;cache_read&quot;: 0.0015},
+    &quot;openai_gpt_5&quot;: {&quot;base&quot;: 0.005, &quot;cache_write&quot;: 0.005, &quot;cache_read&quot;: 0.0025},
+    &quot;gemini_3_pro&quot;: {&quot;base&quot;: 0.00125, &quot;cache_write&quot;: 0.00125, &quot;cache_read&quot;: 0.0003125, &quot;storage_per_1k_per_hour&quot;: 0.0000125},
+}
+
+
+@dataclass
+class Request:
+    &quot;&quot;&quot;A single request. `prefix_tokens` is the cacheable prefix; `suffix_tokens` is user input.&quot;&quot;&quot;
+
+    prefix_tokens: int
+    suffix_tokens: int
+    prefix_key: str
+
+
+@dataclass
+class CacheEntry:
+    tokens: int
+    written_at: int  # request index
+    ttl_seconds: int
+
+
+@dataclass
+class ProviderStats:
+    writes: int = 0
+    reads: int = 0
+    misses: int = 0
+    input_cost: float = 0.0
+    storage_cost: float = 0.0
+
+    @property
+    def total_cost(self) -&gt; float:
+        return self.input_cost + self.storage_cost
+
+
+def simulate_anthropic(requests: Iterable[Request], ttl_seconds: int, seconds_between: int) -&gt; ProviderStats:
+    p = PRICES[&quot;anthropic_claude_opus_4_7&quot;]
+    write_rate = p[&quot;cache_write_1h&quot;] if ttl_seconds &gt; 300 else p[&quot;cache_write_5m&quot;]
+    stats = ProviderStats()
+    cache: dict[str, CacheEntry] = {}
+    for i, r in enumerate(requests):
+        now_seconds = i * seconds_between
+        entry = cache.get(r.prefix_key)
+        expired = entry is None or (now_seconds - entry.written_at) &gt;= entry.ttl_seconds
+        if expired:
+            stats.writes += 1
+            stats.input_cost += (r.prefix_tokens / 1000) * write_rate
+            cache[r.prefix_key] = CacheEntry(tokens=r.prefix_tokens, written_at=now_seconds, ttl_seconds=ttl_seconds)
+        else:
+            stats.reads += 1
+            stats.input_cost += (r.prefix_tokens / 1000) * p[&quot;cache_read&quot;]
+        stats.input_cost += (r.suffix_tokens / 1000) * p[&quot;base&quot;]
+    return stats
+
+
+def simulate_openai(requests: Iterable[Request], seconds_between: int) -&gt; ProviderStats:
+    &quot;&quot;&quot;OpenAI&#39;s cache is automatic; we model it as always-on with 1h best-effort TTL.&quot;&quot;&quot;
+    p = PRICES[&quot;openai_gpt_5&quot;]
+    stats = ProviderStats()
+    cache: dict[str, CacheEntry] = {}
+    for i, r in enumerate(requests):
+        now_seconds = i * seconds_between
+        entry = cache.get(r.prefix_key)
+        expired = entry is None or (now_seconds - entry.written_at) &gt;= 3600
+        if expired:
+            stats.writes += 1
+            stats.input_cost += (r.prefix_tokens / 1000) * p[&quot;cache_write&quot;]
+            cache[r.prefix_key] = CacheEntry(tokens=r.prefix_tokens, written_at=now_seconds, ttl_seconds=3600)
+        else:
+            stats.reads += 1
+            stats.input_cost += (r.prefix_tokens / 1000) * p[&quot;cache_read&quot;]
+        stats.input_cost += (r.suffix_tokens / 1000) * p[&quot;base&quot;]
+    return stats
+
+
+def simulate_gemini(requests: Iterable[Request], ttl_seconds: int, seconds_between: int) -&gt; ProviderStats:
+    p = PRICES[&quot;gemini_3_pro&quot;]
+    stats = ProviderStats()
+    cache: dict[str, CacheEntry] = {}
+    for i, r in enumerate(requests):
+        now_seconds = i * seconds_between
+        entry = cache.get(r.prefix_key)
+        expired = entry is None or (now_seconds - entry.written_at) &gt;= entry.ttl_seconds
+        if expired:
+            stats.writes += 1
+            stats.input_cost += (r.prefix_tokens / 1000) * p[&quot;cache_write&quot;]
+            cache[r.prefix_key] = CacheEntry(tokens=r.prefix_tokens, written_at=now_seconds, ttl_seconds=ttl_seconds)
+        else:
+            stats.reads += 1
+            stats.input_cost += (r.prefix_tokens / 1000) * p[&quot;cache_read&quot;]
+        stats.input_cost += (r.suffix_tokens / 1000) * p[&quot;base&quot;]
+    # Storage cost: each entry lives for ttl, billed per token-hour
+    for entry in cache.values():
+        hours = entry.ttl_seconds / 3600
+        stats.storage_cost += (entry.tokens / 1000) * p[&quot;storage_per_1k_per_hour&quot;] * hours
+    return stats
+
+
+def baseline_cost(requests: list[Request], provider: str) -&gt; float:
+    p = PRICES[provider]
+    return sum((r.prefix_tokens + r.suffix_tokens) / 1000 * p[&quot;base&quot;] for r in requests)
+
+
+def make_traffic(n_requests: int, n_prefixes: int, prefix_size: int, suffix_size: int) -&gt; list[Request]:
+    return [
+        Request(
+            prefix_tokens=prefix_size,
+            suffix_tokens=suffix_size,
+            prefix_key=f&quot;prefix_{i % n_prefixes}&quot;,
+        )
+        for i in range(n_requests)
+    ]
+
+
+def print_report(name: str, stats: ProviderStats, baseline: float, n: int) -&gt; None:
+    savings = 1 - (stats.total_cost / baseline) if baseline &gt; 0 else 0
+    print(f&quot;\n{name}&quot;)
+    print(f&quot;  writes {stats.writes:&gt;5}  reads {stats.reads:&gt;5}  misses {stats.misses:&gt;5}&quot;)
+    print(f&quot;  input cost  ${stats.input_cost:&gt;7.4f}&quot;)
+    if stats.storage_cost:
+        print(f&quot;  storage     ${stats.storage_cost:&gt;7.4f}&quot;)
+    print(f&quot;  vs no-cache ${baseline:&gt;7.4f}  -&gt;  saves {savings*100:&gt;5.1f}%&quot;)
+    print(f&quot;  per 1K req  ${stats.total_cost * 1000 / n:&gt;7.4f}&quot;)
+
+
+def main() -&gt; None:
+    traffic = make_traffic(n_requests=500, n_prefixes=3, prefix_size=15000, suffix_size=400)
+    seconds_between = 4  # one request every 4 seconds
+
+    anthro_5m = simulate_anthropic(traffic, ttl_seconds=300, seconds_between=seconds_between)
+    anthro_1h = simulate_anthropic(traffic, ttl_seconds=3600, seconds_between=seconds_between)
+    openai = simulate_openai(traffic, seconds_between=seconds_between)
+    gemini = simulate_gemini(traffic, ttl_seconds=3600, seconds_between=seconds_between)
+
+    print(f&quot;Scenario: 500 requests, 3 rotating prefixes (15K tok each), 4s apart\n&quot;)
+
+    print_report(&quot;Anthropic Claude Opus 4.7 (5-min TTL)&quot;, anthro_5m, baseline_cost(traffic, &quot;anthropic_claude_opus_4_7&quot;), len(traffic))
+    print_report(&quot;Anthropic Claude Opus 4.7 (1-hour TTL)&quot;, anthro_1h, baseline_cost(traffic, &quot;anthropic_claude_opus_4_7&quot;), len(traffic))
+    print_report(&quot;OpenAI GPT-5 (automatic)&quot;, openai, baseline_cost(traffic, &quot;openai_gpt_5&quot;), len(traffic))
+    print_report(&quot;Gemini 3 Pro (explicit, 1-hour)&quot;, gemini, baseline_cost(traffic, &quot;gemini_3_pro&quot;), len(traffic))
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/11-llm-engineering/15-prompt-caching/outputs/skill-prompt-caching-planner.md">phases/11-llm-engineering/15-prompt-caching/outputs/skill-prompt-caching-planner.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: prompt-caching-planner
+description: Design a cache-friendly prompt layout and pick the right provider caching mode.
+version: 1.0.0
+phase: 11
+lesson: 15
+tags: [llm-engineering, caching, cost]
+---
+
+Given a prompt (system + tools + few-shot + retrieval + history + user) and a usage profile (requests per hour, TTL needed, provider), output:
+
+1. Layout. Reordered sections with a single cache breakpoint marked; explain which sections are stable, which are volatile.
+2. Provider mode. Anthropic cache_control, OpenAI automatic, or Gemini CachedContent. Justify from TTL and reuse pattern.
+3. Break-even. Expected reads per write within TTL; net cost vs no-cache with math.
+4. Verification plan. CI assertion that cache_read_input_tokens &gt; 0 on the second identical request; dashboard split by cached vs uncached tokens.
+5. Failure modes. List the three most likely reasons the cache will miss in this setup (dynamic timestamp, tool reorder, near-duplicate text) and how you will prevent each.
+
+Refuse to ship a cache plan that places a dynamic field above the breakpoint. Refuse to enable 1h TTL without a reuse count that makes the 2x write premium pay back.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. What discount does Anthropic apply to cache reads versus the base input rate?</legend><label class="option"><input type="radio" name="q0" value="0"> 25% off</label><label class="option"><input type="radio" name="q0" value="1"> 90% off</label><label class="option"><input type="radio" name="q0" value="2"> 75% off</label><label class="option"><input type="radio" name="q0" value="3"> 50% off</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. Why must dynamic timestamps go below the cache breakpoint, not above it?</legend><label class="option"><input type="radio" name="q1" value="0"> Anthropic explicitly rejects timestamps in cached blocks</label><label class="option"><input type="radio" name="q1" value="1"> Timestamps confuse the tokenizer</label><label class="option"><input type="radio" name="q1" value="2"> They cost more tokens than static text</label><label class="option"><input type="radio" name="q1" value="3"> Caches only hit when the prefix is byte-identical; a changing timestamp breaks the match for everything after it</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. OpenAI&#39;s prompt caching is configured how?</legend><label class="option"><input type="radio" name="q2" value="0"> A system-level flag you toggle per project</label><label class="option"><input type="radio" name="q2" value="1"> Automatic prefix matching with no configuration</label><label class="option"><input type="radio" name="q2" value="2"> A CachedContent API you create and reference</label><label class="option"><input type="radio" name="q2" value="3"> Explicit cache_control markers</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. For Anthropic, what write premium does the 1-hour extended TTL cost vs the 5-minute default?</legend><label class="option"><input type="radio" name="q3" value="0"> 4x the write premium</label><label class="option"><input type="radio" name="q3" value="1"> 2x the write premium (50% over baseline)</label><label class="option"><input type="radio" name="q3" value="2"> No write premium</label><label class="option"><input type="radio" name="q3" value="3"> Same</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. How many reuses are needed to break even on Anthropic&#39;s 25% write premium?</legend><label class="option"><input type="radio" name="q4" value="0"> 5</label><label class="option"><input type="radio" name="q4" value="1"> 10</label><label class="option"><input type="radio" name="q4" value="2"> 1</label><label class="option"><input type="radio" name="q4" value="3"> 2</label><p data-feedback="4"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/11-llm-engineering/14-model-context-protocol/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/11-llm-engineering/16-langgraph-state-machines/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/11-llm-engineering/15-prompt-caching/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

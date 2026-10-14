@@ -1,0 +1,998 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>标记化体 HDF5 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-19-capstone-projects" data-lesson="19-capstone-projects/43-hdf5-tokenized-corpus" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/19-capstone-projects/">综合项目</a> / LESSON 43</p><h1 class="lesson-title">标记化体 HDF5</h1><p>HDF5 Tokenized Corpus</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>标记化体 HDF5</h1>
+<blockquote>
+<p>导演可以以线路速度流动. 磁盘上的JSONL不能存活16个数据加载器工作者. 具有可变化,成片整数数据集的 HDF5确实是这样的. 这一课将流通标记化构建成可变大小的 HDF5 数据集,在多个文件中分断写,在训练时间内内存地图读取,以及一个滑动窗口数据加载器,以正确包装生成固定长度的序列.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 19 lessons 30-37
+<strong>Time:</strong> ~90 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>通过确定性分量,将文件流入可变化HDF5整数数据集.</li>
+<li>通过多个 HDF5 文件将写作分成碎片,使故障局限,并行性是可能的.</li>
+<li>通过HDF5的页面缓存支持的分块布局来读取代码,以便数据加载器只在批量时间复制到批量缓冲器中.</li>
+<li>执行一个滑窗数据加载器,以明确的包装规则发出固定长度的训练序列.</li>
+</ul>
+<h2>问题</h2>
+<p>现代语言模型训练课程每秒数以万计的样本阅读代币, 磁盘上的JSONL在第一个冷缓存页面故障时死亡:JSON解析器缓慢,文档界限无法地址,寻求&quot;样本4.217.884&quot;需要扫描文件. 即使是压缩得很好,Parquet也不适合,因为教练不想要列,它想要一个平坦的代币流,</p>
+<p>HDF5是合适的,因为它提供了一个零碎,可变化,仅整数的数据集,其零件在读取时是页面缓存友好的.<code>tokens[3,200,000 : 3,200,8192]</code>根据 HDF5 的数据,该文件的数据库将被转换为一个新分配的 NumPy 阵列.</p>
+<p>构建问题是让写作方诚实. 易于滥用可变化数据集:一次写一份文件,HDF5文件被碎片化到无法使用. 写出所有文件,一个尺寸,一个过程死亡会失去整个碎片. 适当的纪律是缓冲,然后扩展, 缓冲尺寸与块尺寸相匹配,</p>
+<h2>概念</h2>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-643344eae8d4ab3fd0ce.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>适量化 HDF5 完成正确</h3>
+<p>创建标记数据集<code>maxshape=(None,)</code>并且是固定的<code>chunks=(chunk_size,)</code>通过在长度数Py阵列中缓冲代币来编写收入<code>chunk_size</code>当缓冲器填充时,数据集的尺寸将变为精确的<code>chunk_size</code>在最后的部分范围中,残余缓冲被写入最后的部分范围.除了最后一个,除了读者被要求在记录的时间中切断的,每个写作都是连接的和分别的.<code>token_count</code>在碎片的HDF5属性中.</p>
+<h3>碎片的写字</h3>
+<p>管道并行写分片:从19期课42中的每个输入分片产生一个HDF5输出分片.<code>shards.json</code>根据指标的数据,每个分片,文件路径,代币数量,文件数量,以及代币的 sha256.<code>shards.json</code>计算全球抵消和验证数据库.</p>
+<h3>记忆图阅读</h3>
+<p>在培训期间,每个员工在 <code>swmr=True</code>模式和要求<code>tokens[start:stop]</code>HDF5 的零件布局使得当零件热时,该页面被缓存支持. 工作者从来没有实现整个文件:该片段被复制到数据加载器的批量缓冲器中,然后数据加载器在批量时间复制到固定内存训练子中. 热路每零件过渡时有一个系统调用;其余的一切都是RAM访问.</p>
+<h3>滑窗数据加载器</h3>
+<p>数据加载器是唯一知道训练序列长度的阶段. 它在全球代币流中选择一个随机启动指数,读<code>window_size + 1</code>代币和回报<code>(input, target) = (tokens[:-1], tokens[1:])</code>文件界限不被强制执行:一个窗口可以跨越两个文件,<code>boundary_token_id</code>模型学习使用分隔器.这是标准的包装规则;也是初学者忘记的规则,最终有一个8%,训练边界代币和92%自然文本的体积.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-fab9f55e0f093bf2f2bd.png" alt="cc-hdf5-corpus 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<p><code>code/main.py</code>执行:</p>
+<ul>
+<li><code>Tokenizer</code>对于演示,一个足够好的字节级确定性代币.<code>encode(text) -&gt; list[int]</code>其他<code>vocab_size</code>现在,我们要去.</li>
+<li><code>HDF5ShardWriter</code>- 打开可变量整数数据集,缓冲代币到分片大小,重新大小并以固定大小的步骤写,记录<code>token_count</code>其他<code>sha256</code>像HDF5属性在接近.</li>
+<li><code>ShardedTokenizationPipeline</code>- 代输入文件,将它们转向编写器,并发出一个<code>shards.json</code>标记</li>
+<li><code>MmapTokenStore</code>- 打开碎片文件用于内存映射的读取,计算全球偏移,暴露一个单个<code>get_slice(start, stop)</code>果.</li>
+<li><code>SlidingWindowDataloader</code>- 从全球流量中随机选择窗户,并产生收益<code>(input_ids, target_ids)</code>编号阵列.</li>
+</ul>
+<p>文件底部的演示程序构建了一个小的内存体,将其分成两个片段,通过内存地图打开它们,运行数据加载器10批次,</p>
+<p>运行它:</p>
+<pre><code class="language-bash">python3 code/main.py
+</code></pre>
+<p>脚本从零开始,打印批量检查.</p>
+<h2>生产模式</h2>
+<p>经过四个模式,我们将这门课程变成一个真正的训练.</p>
+<p>**Chunk size equals the typical read.**训练师说<code>window_size + 1</code>设置HDF5部分为倍数<code>window_size</code>错误的块将吞吐量减半,因为每个样本都触及了两个块.</p>
+<p>**Token count in attributes, not in the dataset.**数据集的后部部分可能部分满,因为部分尺寸不划分文档边界.<code>token_count</code>没有这样的读者走出了结尾,进入零加密代币,模型学会了预测零.</p>
+<p>**Sharded sha256 with parallel verification.**每个碎片都在代币字节上有自己的 sha256. 训练师可以在训练开始之前并行验证所有碎片. 一个错误的 sha256 失败于早跑,不是在16小时后的时代3</p>
+<p>**<code>swmr=True</code> on both sides, with <code>libver=&quot;latest&quot;</code> on the writer.**单字母多读器模式要求字母开启<code>libver=&quot;latest&quot;</code>创建每一个数据集,然后设置<code>file.swmr_mode = True</code>之后,作家必须打电话.<code>dataset.flush()</code>读者工作者 (开启<code>swmr=True</code>) 查看一致的数据.<code>libver=&quot;latest&quot;</code>结构变化后启用SWMR是&quot;文件锁定&quot;故障的常见来源.</p>
+<h2>用它</h2>
+<p>生产模式:</p>
+<ul>
+<li>**One HDF5 per source shard.**下载器 (课 42) 每个URL发出一个片段;标记 (本课) 每个源片段发出一个 HDF5. 1:1映射使恢复和部分故障恢复很无关.</li>
+<li>**Boundary token id.**边界令牌是代码符号词汇的一部分,是数据加载器注入的唯一令牌.如果模型应该忽略该令牌,训练损失会掩盖边界令牌;否则它会学习使用它作为序列分离器.</li>
+<li>**<code>shards.json</code> as the source of truth.**添加一个新的分片意味着写出HDF5,计算其sha256,并添加一个输入. 训练师在启动时读取文件,从来没有触及目录列表.</li>
+</ul>
+<h2>运送它</h2>
+<p><code>outputs/skill-hdf5-tokenized-corpus.md</code>如何描述哪个代币器供应管道,哪个块尺寸匹配训练师的窗口,<code>shards.json</code>如何将数据加载人员分为文件. 这一课将引擎转载.</p>
+<h2>运动</h2>
+<ol>
+<li>添加一个<code>--compression gzip</code>标记到 HDF5 写字器,并测量在演示表上的吞吐量成本. 捍卫所选择的默认.</li>
+<li>加入一个确定性种子到滑动窗口数据加载器,并验证两个运行相同的种子产生的相同批量.</li>
+<li>添加一个<code>--validate</code>通过阅读每个碎片,重新计算 sha256 的代币,<code>shards.json</code>CI应该在训练开始之前检查这个.</li>
+<li>进行数据加载量比较, 按分量等于窗口大小的, 半个, 两倍. 报告页面缓存效果.</li>
+<li>添加一个<code>--max-document-tokens</code>为了避免在读取时决定, 应该采取行动.</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Resizable dataset</td>
+<td>&quot;Append-only&quot;</td>
+<td>An HDF5 dataset with <code>maxshape=(None,)</code> that grows via <code>resize</code> calls in chunk-sized strides</td>
+</tr>
+<tr>
+<td>Chunked layout</td>
+<td>&quot;How HDF5 stores it&quot;</td>
+<td>Fixed-size on-disk pages that the kernel can memory-map and the dataloader can read contiguously</td>
+</tr>
+<tr>
+<td><code>swmr</code> mode</td>
+<td>&quot;Read-while-write&quot;</td>
+<td>Single-Writer-Multiple-Reader mode that lets dataloader workers share the file safely</td>
+</tr>
+<tr>
+<td>Shard index</td>
+<td>&quot;shards.json&quot;</td>
+<td>The durable index of all token shards with offsets and content hashes</td>
+</tr>
+<tr>
+<td>Sliding window</td>
+<td>&quot;Training sample&quot;</td>
+<td>A fixed-length slice of the global token stream that the trainer pairs with its shift-by-one target</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://support.hdfgroup.org/documentation/hdf5/latest/hdf5_chunking.html" rel="noreferrer" data-network="true">HDF5 chunking documentation <small>↗ 需要联网</small></a>- 这一课使用的数据集的零碎,可变量格式布局</li>
+<li><a href="https://docs.h5py.org/en/stable/" rel="noreferrer" data-network="true">h5py user guide <small>↗ 需要联网</small></a>- 对于 HDF5 的Python绑定</li>
+<li><a href="https://numpy.org/doc/stable/reference/generated/numpy.memmap.html" rel="noreferrer" data-network="true">NumPy memory mapping <small>↗ 需要联网</small></a>- 读取侧原始的HDF5通过h5py暴露</li>
+<li>阶段19 · 42 - 输出本课标示的下载器</li>
+<li>阶段19 · 44 - 消耗这个数据加载器的可西斯时间表</li>
+<li>19 · 45 阶段 - 完成训练阶段的AMP循环</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>HDF5 Tokenized Corpus</h1>
+<blockquote>
+<p>The downloaded corpus has to land in a layout the trainer can stream from at line speed. JSONL on disk does not survive 16 dataloader workers. HDF5 with a resizable, chunked integer dataset does. This lesson builds streaming tokenization into a resizable HDF5 dataset, sharded write across multiple files, memory-mapped read at training time, and a sliding-window dataloader that produces fixed-length sequences with the right packing.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 19 lessons 30-37
+<strong>Time:</strong> ~90 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Stream documents into a resizable HDF5 integer dataset with deterministic chunking.</li>
+<li>Shard the write across multiple HDF5 files so failure is bounded and parallelism is possible.</li>
+<li>Read tokens back through HDF5's page-cache-backed chunked layout so the dataloader copies into batch buffers only at batch time.</li>
+<li>Implement a sliding-window dataloader that emits fixed-length training sequences with explicit packing rules.</li>
+</ul>
+<h2>The Problem</h2>
+<p>A modern language-model training run reads tokens at hundreds of thousands of samples per second across dozens of workers. JSONL on disk dies at the first cold-cache page fault: the JSON parser is slow, the document boundaries are not addressable, and seeking to &quot;sample 4,217,884&quot; requires scanning the file. Even Parquet, which compresses well, is a poor fit because the trainer does not want columns; it wants a flat token stream with O(1) random access.</p>
+<p>HDF5 fits because it offers a chunked, resizable, integer-only dataset whose chunks are page-cache friendly at read time. The trainer asks for a slice of <code>tokens[3,200,000 : 3,200,8192]</code> and HDF5 copies the requested hyperslab from the page cache into a freshly allocated NumPy array. The cost is one open file handle and a chunk-sized page-cache footprint per worker, which is negligible compared to the cost of decoding JSONL.</p>
+<p>The build problem is making the write side honest. Resizable datasets are easy to misuse: write one document at a time and the HDF5 file is fragmented to the point of unusable. Write all documents in one resize and a process death loses the whole shard. The right discipline is buffer-then-extend, with a buffer size that matches the chunk size, and a sharded write that splits the workload across files so a crash loses at most one shard.</p>
+<h2>The Concept</h2>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-643344eae8d4ab3fd0ce.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>Resizable HDF5 done right</h3>
+<p>The token dataset is created with <code>maxshape=(None,)</code> and a fixed <code>chunks=(chunk_size,)</code>. Writing proceeds by buffering tokens in a NumPy array of length <code>chunk_size</code>. When the buffer fills, the dataset is resized by exactly <code>chunk_size</code> and the buffer is written into the new range. At end-of-shard the residual buffer is written into a final partial range. Every write is contiguous and chunk-aligned except the last one, which the reader is told to truncate at the recorded <code>token_count</code> in the shard's HDF5 attributes.</p>
+<h3>Sharded write</h3>
+<p>A single HDF5 file is a single point of failure. The pipeline writes shards in parallel: each input shard from Phase 19 lesson 42 produces one HDF5 output shard. A <code>shards.json</code> index records, per shard, the file path, the token count, the document count, and a sha256 over the tokens. The trainer reads <code>shards.json</code> to compute global offsets and to validate the corpus.</p>
+<h3>Memory-mapped read</h3>
+<p>At training time each worker opens its share of HDF5 files in <code>swmr=True</code> mode and asks for <code>tokens[start:stop]</code>. HDF5's chunk layout makes this a page-cache-backed read once the chunk is hot. The worker never materialises the whole file: the slice is copied into the dataloader's batch buffer, which the dataloader then copies into a pinned-memory training tensor at batch time. The hot path has one syscall per chunk transition; everything else is RAM access.</p>
+<h3>Sliding-window dataloader</h3>
+<p>The dataloader is the only stage that knows about training-sequence length. It picks a random start index in the global token stream, reads <code>window_size + 1</code> tokens, and returns <code>(input, target) = (tokens[:-1], tokens[1:])</code>. Document boundaries are not enforced: a window may straddle two documents, with an explicit <code>boundary_token_id</code> between them so the model learns to use the separator. This is the standard packing rule; it is also the rule a beginner forgets, ending up with a corpus that is 8 percent training boundary tokens and 92 percent natural text.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-fab9f55e0f093bf2f2bd.png" alt="cc-hdf5-corpus 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<p><code>code/main.py</code> implements:</p>
+<ul>
+<li><code>Tokenizer</code> - a byte-level deterministic tokenizer good enough for the demo. The interface is <code>encode(text) -&gt; list[int]</code> and <code>vocab_size</code>.</li>
+<li><code>HDF5ShardWriter</code> - opens a resizable integer dataset, buffers tokens to chunk size, resizes and writes in fixed-size strides, records <code>token_count</code> and <code>sha256</code> as HDF5 attributes on close.</li>
+<li><code>ShardedTokenizationPipeline</code> - iterates input documents, routes them to a writer, and emits a <code>shards.json</code> index.</li>
+<li><code>MmapTokenStore</code> - opens shard files for memory-mapped reads, computes global offsets, exposes a single <code>get_slice(start, stop)</code> API.</li>
+<li><code>SlidingWindowDataloader</code> - picks random windows from the global stream and yields <code>(input_ids, target_ids)</code> NumPy arrays.</li>
+</ul>
+<p>A demo at the bottom of the file builds a tiny in-memory corpus, tokenizes into two shards, opens them via memory map, runs the dataloader for 10 batches, and prints the per-batch shape and a checksum.</p>
+<p>Run it:</p>
+<pre><code class="language-bash">python3 code/main.py
+</code></pre>
+<p>The script exits zero and prints batch checksums.</p>
+<h2>Production Patterns</h2>
+<p>Four patterns scale this lesson to a real training run.</p>
+<p><strong>Chunk size equals the typical read.</strong> The trainer reads <code>window_size + 1</code> tokens per sample. Set the HDF5 chunk to a multiple of <code>window_size</code> and reads are page-cache aligned. Mismatched chunks halve the throughput because every sample touches two chunks.</p>
+<p><strong>Token count in attributes, not in the dataset.</strong> The trailing slice of the dataset may be partially full because the chunk size does not divide the document boundary. Store the real <code>token_count</code> as an HDF5 attribute on the dataset and have the reader truncate at that value. Without this the reader walks off the end into zero-padded tokens and the model learns to predict zero.</p>
+<p><strong>Sharded sha256 with parallel verification.</strong> Each shard has its own sha256 over the token bytes. The trainer can verify all shards in parallel before training starts. A wrong sha256 fails the run early, not on epoch three after sixteen hours.</p>
+<p><strong><code>swmr=True</code> on both sides, with <code>libver=&quot;latest&quot;</code> on the writer.</strong> Single-Writer-Multiple-Reader mode requires the writer to open with <code>libver=&quot;latest&quot;</code>, create every dataset up front, then set <code>file.swmr_mode = True</code>. After that the writer must call <code>dataset.flush()</code> after each resize so reader workers (opened with <code>swmr=True</code>) see consistent data. Skipping <code>libver=&quot;latest&quot;</code> or enabling SWMR after structural changes is a common source of &quot;file is locked&quot; failures.</p>
+<h2>Use It</h2>
+<p>Production patterns:</p>
+<ul>
+<li><strong>One HDF5 per source shard.</strong> The downloader (lesson 42) emits one shard per URL; tokenization (this lesson) emits one HDF5 per source shard. The 1:1 mapping makes resume and partial-failure recovery trivial.</li>
+<li><strong>Boundary token id.</strong> The boundary token is part of the tokenizer vocab and is the only token the dataloader injects. The training loss masks the boundary token if the model is supposed to ignore it; otherwise it learns to use it as a sequence separator.</li>
+<li><strong><code>shards.json</code> as the source of truth.</strong> Adding a new shard means writing the HDF5, computing its sha256, and appending an entry. The trainer reads the file once at startup and never touches the directory listing.</li>
+</ul>
+<h2>Ship It</h2>
+<p><code>outputs/skill-hdf5-tokenized-corpus.md</code> would, on a real project, describe which tokenizer feeds the pipeline, what chunk size matches the trainer's window, where <code>shards.json</code> lives in version control, and how dataloader workers are sharded across files. This lesson ships the engine.</p>
+<h2>Exercises</h2>
+<ol>
+<li>Add a <code>--compression gzip</code> flag to the HDF5 writer and measure the throughput cost on the demo corpus. Defend the chosen default.</li>
+<li>Add a deterministic seed to the sliding-window dataloader and verify two runs with the same seed produce identical batches.</li>
+<li>Add a <code>--validate</code> mode that reads every shard, recomputes the sha256 over its tokens, and compares against <code>shards.json</code>. CI should run this before training starts.</li>
+<li>Compare the dataloader throughput at chunk sizes equal to, half of, and twice the window size. Report the page-cache effect.</li>
+<li>Add a <code>--max-document-tokens</code> flag that truncates very long documents at write time. Defend the trade-off against deciding at read time.</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Resizable dataset</td>
+<td>&quot;Append-only&quot;</td>
+<td>An HDF5 dataset with <code>maxshape=(None,)</code> that grows via <code>resize</code> calls in chunk-sized strides</td>
+</tr>
+<tr>
+<td>Chunked layout</td>
+<td>&quot;How HDF5 stores it&quot;</td>
+<td>Fixed-size on-disk pages that the kernel can memory-map and the dataloader can read contiguously</td>
+</tr>
+<tr>
+<td><code>swmr</code> mode</td>
+<td>&quot;Read-while-write&quot;</td>
+<td>Single-Writer-Multiple-Reader mode that lets dataloader workers share the file safely</td>
+</tr>
+<tr>
+<td>Shard index</td>
+<td>&quot;shards.json&quot;</td>
+<td>The durable index of all token shards with offsets and content hashes</td>
+</tr>
+<tr>
+<td>Sliding window</td>
+<td>&quot;Training sample&quot;</td>
+<td>A fixed-length slice of the global token stream that the trainer pairs with its shift-by-one target</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://support.hdfgroup.org/documentation/hdf5/latest/hdf5_chunking.html" rel="noreferrer" data-network="true">HDF5 chunking documentation <small>↗ 需要联网</small></a> - the chunked, resizable dataset layout this lesson uses</li>
+<li><a href="https://docs.h5py.org/en/stable/" rel="noreferrer" data-network="true">h5py user guide <small>↗ 需要联网</small></a> - Python bindings for HDF5</li>
+<li><a href="https://numpy.org/doc/stable/reference/generated/numpy.memmap.html" rel="noreferrer" data-network="true">NumPy memory mapping <small>↗ 需要联网</small></a> - the read-side primitive HDF5 exposes through h5py</li>
+<li>Phase 19 · 42 - the downloader whose output this lesson tokenizes</li>
+<li>Phase 19 · 44 - the cosine schedule that consumes this dataloader</li>
+<li>Phase 19 · 45 - the AMP loop that wraps the training step</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-19-capstone-projects--43-hdf5-tokenized-corpus.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-19-capstone-projects--43-hdf5-tokenized-corpus.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/43-hdf5-tokenized-corpus/code/main.py">phases/19-capstone-projects/43-hdf5-tokenized-corpus/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Streaming tokenization into resizable, sharded HDF5 datasets with mmap reads.
+
+Implements:
+- A byte-level deterministic Tokenizer.
+- An HDF5ShardWriter that buffers tokens to chunk size and resizes the dataset
+  in fixed-size strides, recording token_count and sha256 as dataset attributes.
+- A ShardedTokenizationPipeline that emits one HDF5 per source shard and writes
+  a shards.json index.
+- An MmapTokenStore that opens shard files in swmr mode for read access.
+- A SlidingWindowDataloader that yields fixed-length (input, target) pairs.
+
+The demo at the bottom builds an in-memory corpus, tokenizes into shards, opens
+them via memory map, runs the dataloader for a few batches, and prints the
+per-batch shape and a checksum. Run: python3 code/main.py
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import hashlib
+import json
+import random
+import struct
+import sys
+import tempfile
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Iterable, Iterator
+
+import numpy as np
+
+try:
+    import h5py
+except ImportError as exc:
+    raise SystemExit(
+        &quot;h5py is required for this lesson. Install with: pip install h5py&quot;
+    ) from exc
+
+
+DEFAULT_CHUNK_SIZE = 8192
+DEFAULT_WINDOW_SIZE = 64
+BOUNDARY_TOKEN_ID = 0
+TOKEN_DTYPE = np.uint16
+
+
+@dataclass
+class ShardWriteResult:
+    &quot;&quot;&quot;Per-shard write outcome.&quot;&quot;&quot;
+
+    shard_id: str
+    path: str
+    token_count: int
+    document_count: int
+    chunk_size: int
+    sha256: str
+
+    def to_dict(self) -&gt; dict[str, object]:
+        return asdict(self)
+
+
+@dataclass
+class ShardIndexEntry:
+    &quot;&quot;&quot;Index row used by readers to locate a shard.&quot;&quot;&quot;
+
+    shard_id: str
+    path: str
+    token_count: int
+    document_count: int
+    sha256: str
+    global_start: int
+
+    def to_dict(self) -&gt; dict[str, object]:
+        return asdict(self)
+
+
+class Tokenizer:
+    &quot;&quot;&quot;Byte-level deterministic tokenizer.
+
+    Vocabulary:
+        0      boundary token (separator injected by the dataloader)
+        1..256 raw byte tokens (offset by one so 0 is reserved)
+
+    Real tokenizers use BPE or SentencePiece; this implementation is enough to
+    drive the streaming-write story without pulling a third-party tokenizer.
+    &quot;&quot;&quot;
+
+    BOUNDARY_TOKEN = BOUNDARY_TOKEN_ID
+    BYTE_OFFSET = 1
+
+    def __init__(self) -&gt; None:
+        self.vocab_size = 257
+
+    def encode(self, text: str) -&gt; list[int]:
+        if not text:
+            return []
+        data = text.encode(&quot;utf-8&quot;)
+        return [self.BYTE_OFFSET + b for b in data]
+
+    def decode(self, ids: Iterable[int]) -&gt; str:
+        byte_ids = [int(i) - self.BYTE_OFFSET for i in ids if int(i) &gt;= self.BYTE_OFFSET]
+        return bytes(byte_ids).decode(&quot;utf-8&quot;, errors=&quot;replace&quot;)
+
+
+class HDF5ShardWriter:
+    &quot;&quot;&quot;Stream tokens into a resizable HDF5 dataset with chunk-sized buffering.
+
+    Open in a `with` block to guarantee the residual buffer is flushed and the
+    closing attributes (token_count, sha256) are written.
+    &quot;&quot;&quot;
+
+    def __init__(
+        self,
+        path: Path,
+        chunk_size: int = DEFAULT_CHUNK_SIZE,
+        dataset_name: str = &quot;tokens&quot;,
+    ) -&gt; None:
+        if chunk_size &lt;= 0:
+            raise ValueError(&quot;chunk_size must be positive&quot;)
+        self.path = Path(path)
+        self.chunk_size = chunk_size
+        self.dataset_name = dataset_name
+        self._buffer: list[int] = []
+        self._token_count = 0
+        self._document_count = 0
+        self._hasher = hashlib.sha256()
+        self._file: h5py.File | None = None
+        self._dataset: h5py.Dataset | None = None
+
+    def __enter__(self) -&gt; &quot;HDF5ShardWriter&quot;:
+        self._file = h5py.File(self.path, &quot;w&quot;, libver=&quot;latest&quot;)
+        self._dataset = self._file.create_dataset(
+            self.dataset_name,
+            shape=(0,),
+            maxshape=(None,),
+            chunks=(self.chunk_size,),
+            dtype=TOKEN_DTYPE,
+        )
+        self._file.swmr_mode = True
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -&gt; None:
+        try:
+            if self._dataset is not None and self._file is not None:
+                if self._buffer:
+                    self._flush_buffer(final=True)
+                self._dataset.attrs[&quot;token_count&quot;] = self._token_count
+                self._dataset.attrs[&quot;document_count&quot;] = self._document_count
+                self._dataset.attrs[&quot;sha256&quot;] = self._hasher.hexdigest()
+        finally:
+            if self._file is not None:
+                self._file.close()
+                self._file = None
+                self._dataset = None
+
+    def add_document(self, token_ids: Iterable[int]) -&gt; None:
+        self._document_count += 1
+        for token in token_ids:
+            self._buffer.append(int(token))
+            if len(self._buffer) &gt;= self.chunk_size:
+                self._flush_buffer(final=False)
+
+    def add_boundary(self) -&gt; None:
+        &quot;&quot;&quot;Inject the separator token between documents.&quot;&quot;&quot;
+
+        self._buffer.append(BOUNDARY_TOKEN_ID)
+        if len(self._buffer) &gt;= self.chunk_size:
+            self._flush_buffer(final=False)
+
+    def _flush_buffer(self, final: bool) -&gt; None:
+        if self._dataset is None:
+            raise RuntimeError(&quot;writer is not open&quot;)
+        if not self._buffer:
+            return
+        size = len(self._buffer) if final else self.chunk_size
+        chunk = np.asarray(self._buffer[:size], dtype=TOKEN_DTYPE)
+        new_total = self._token_count + size
+        self._dataset.resize((new_total,))
+        self._dataset[self._token_count : new_total] = chunk
+        self._dataset.flush()
+        self._hasher.update(chunk.tobytes())
+        self._token_count = new_total
+        self._buffer = self._buffer[size:]
+        if not final and len(self._buffer) &gt;= self.chunk_size:
+            self._flush_buffer(final=False)
+
+    @property
+    def token_count(self) -&gt; int:
+        return self._token_count
+
+    @property
+    def document_count(self) -&gt; int:
+        return self._document_count
+
+    def result(self, shard_id: str) -&gt; ShardWriteResult:
+        return ShardWriteResult(
+            shard_id=shard_id,
+            path=str(self.path),
+            token_count=self._token_count,
+            document_count=self._document_count,
+            chunk_size=self.chunk_size,
+            sha256=self._hasher.hexdigest(),
+        )
+
+
+class ShardedTokenizationPipeline:
+    &quot;&quot;&quot;Tokenize iterable shard inputs into HDF5 files and write a shards.json.&quot;&quot;&quot;
+
+    def __init__(
+        self,
+        tokenizer: Tokenizer,
+        output_dir: Path,
+        chunk_size: int = DEFAULT_CHUNK_SIZE,
+    ) -&gt; None:
+        self.tokenizer = tokenizer
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.chunk_size = chunk_size
+
+    def write_shard(self, shard_id: str, documents: Iterable[str]) -&gt; ShardWriteResult:
+        shard_path = self.output_dir / f&quot;{shard_id}.h5&quot;
+        writer = HDF5ShardWriter(shard_path, chunk_size=self.chunk_size)
+        with writer:
+            for text in documents:
+                writer.add_document(self.tokenizer.encode(text))
+                writer.add_boundary()
+        return writer.result(shard_id)
+
+    def write_corpus(self, shards: dict[str, Iterable[str]]) -&gt; list[ShardIndexEntry]:
+        entries: list[ShardIndexEntry] = []
+        running_offset = 0
+        for shard_id, documents in shards.items():
+            result = self.write_shard(shard_id, documents)
+            entries.append(
+                ShardIndexEntry(
+                    shard_id=result.shard_id,
+                    path=result.path,
+                    token_count=result.token_count,
+                    document_count=result.document_count,
+                    sha256=result.sha256,
+                    global_start=running_offset,
+                )
+            )
+            running_offset += result.token_count
+        index_path = self.output_dir / &quot;shards.json&quot;
+        body = {
+            &quot;version&quot;: 1,
+            &quot;chunk_size&quot;: self.chunk_size,
+            &quot;total_tokens&quot;: running_offset,
+            &quot;shards&quot;: [entry.to_dict() for entry in entries],
+        }
+        index_path.write_text(json.dumps(body, sort_keys=True, indent=2), encoding=&quot;utf-8&quot;)
+        return entries
+
+
+class MmapTokenStore:
+    &quot;&quot;&quot;Memory-mapped read access to a sharded HDF5 token corpus.
+
+    The store opens each shard file once in SWMR mode. A request for
+    `get_slice(start, stop)` is routed across shards and the result is returned
+    as a flat NumPy uint16 array. Reads land in the page cache; the dataloader
+    pays one copy when it crosses into a training tensor.
+    &quot;&quot;&quot;
+
+    def __init__(self, shard_entries: list[ShardIndexEntry]) -&gt; None:
+        if not shard_entries:
+            raise ValueError(&quot;at least one shard entry is required&quot;)
+        self._entries = shard_entries
+        self._files: list[h5py.File] = []
+        self._datasets: list[h5py.Dataset] = []
+        try:
+            for entry in shard_entries:
+                self._files.append(h5py.File(entry.path, &quot;r&quot;, swmr=True))
+            self._datasets = [f[&quot;tokens&quot;] for f in self._files]
+        except Exception:
+            for opened in self._files:
+                try:
+                    opened.close()
+                except Exception:
+                    pass
+            self._files = []
+            self._datasets = []
+            raise
+        self._total_tokens = sum(entry.token_count for entry in shard_entries)
+
+    @property
+    def total_tokens(self) -&gt; int:
+        return self._total_tokens
+
+    def close(self) -&gt; None:
+        for file in self._files:
+            try:
+                file.close()
+            except Exception:
+                pass
+        self._files = []
+        self._datasets = []
+
+    def __enter__(self) -&gt; &quot;MmapTokenStore&quot;:
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -&gt; None:
+        self.close()
+
+    def get_slice(self, start: int, stop: int) -&gt; np.ndarray:
+        if start &lt; 0 or stop &lt; 0 or stop &lt; start:
+            raise ValueError(f&quot;bad slice: start={start} stop={stop}&quot;)
+        if stop &gt; self._total_tokens:
+            raise ValueError(f&quot;stop ({stop}) exceeds total tokens ({self._total_tokens})&quot;)
+        if stop == start:
+            return np.empty((0,), dtype=TOKEN_DTYPE)
+        out = np.empty((stop - start,), dtype=TOKEN_DTYPE)
+        cursor = 0
+        for entry, dataset in zip(self._entries, self._datasets):
+            shard_start = entry.global_start
+            shard_stop = shard_start + entry.token_count
+            if stop &lt;= shard_start:
+                break
+            if start &gt;= shard_stop:
+                continue
+            local_start = max(0, start - shard_start)
+            local_stop = min(entry.token_count, stop - shard_start)
+            length = local_stop - local_start
+            if length &lt;= 0:
+                continue
+            out[cursor : cursor + length] = dataset[local_start:local_stop]
+            cursor += length
+        if cursor != stop - start:
+            raise RuntimeError(
+                f&quot;slice read produced {cursor} tokens, expected {stop - start}&quot;
+            )
+        return out
+
+
+class SlidingWindowDataloader:
+    &quot;&quot;&quot;Random sliding-window sampler over a flat token stream.&quot;&quot;&quot;
+
+    def __init__(
+        self,
+        store: MmapTokenStore,
+        window_size: int = DEFAULT_WINDOW_SIZE,
+        batch_size: int = 4,
+        seed: int = 0,
+    ) -&gt; None:
+        if window_size &lt;= 1:
+            raise ValueError(&quot;window_size must be greater than 1&quot;)
+        if batch_size &lt;= 0:
+            raise ValueError(&quot;batch_size must be positive&quot;)
+        if store.total_tokens &lt;= window_size:
+            raise ValueError(
+                f&quot;store has only {store.total_tokens} tokens; need more than {window_size}&quot;
+            )
+        self.store = store
+        self.window_size = window_size
+        self.batch_size = batch_size
+        self._random = random.Random(seed)
+        self._max_start = store.total_tokens - window_size - 1
+
+    def _sample_window(self) -&gt; tuple[np.ndarray, np.ndarray]:
+        start = self._random.randint(0, self._max_start)
+        chunk = self.store.get_slice(start, start + self.window_size + 1)
+        return chunk[:-1], chunk[1:]
+
+    def __iter__(self) -&gt; Iterator[tuple[np.ndarray, np.ndarray]]:
+        while True:
+            inputs = np.empty((self.batch_size, self.window_size), dtype=TOKEN_DTYPE)
+            targets = np.empty((self.batch_size, self.window_size), dtype=TOKEN_DTYPE)
+            for row in range(self.batch_size):
+                inputs[row], targets[row] = self._sample_window()
+            yield inputs, targets
+
+    def take(self, num_batches: int) -&gt; list[tuple[np.ndarray, np.ndarray]]:
+        iterator = iter(self)
+        return [next(iterator) for _ in range(num_batches)]
+
+
+class JSONLSource:
+    &quot;&quot;&quot;Adapter that yields documents from a JSONL file with a configurable key.
+
+    The downloader (Phase 19 · 42) emits JSONL where each line is a JSON object
+    with a `text` field. This adapter pulls the text out and skips lines that
+    are malformed or missing the field. Real pipelines log the dropped lines;
+    this adapter counts them so callers can audit dropout rate.
+    &quot;&quot;&quot;
+
+    def __init__(self, path: Path, text_field: str = &quot;text&quot;) -&gt; None:
+        self.path = Path(path)
+        self.text_field = text_field
+        self.dropped_lines = 0
+
+    def __iter__(self) -&gt; Iterator[str]:
+        with self.path.open(&quot;r&quot;, encoding=&quot;utf-8&quot;) as fh:
+            for line in fh:
+                line = line.rstrip(&quot;\n&quot;)
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    self.dropped_lines += 1
+                    continue
+                if not isinstance(record, dict):
+                    self.dropped_lines += 1
+                    continue
+                value = record.get(self.text_field)
+                if not isinstance(value, str) or not value:
+                    self.dropped_lines += 1
+                    continue
+                yield value
+
+
+def pack_documents(
+    tokenizer: Tokenizer,
+    documents: Iterable[str],
+    max_tokens: int,
+) -&gt; Iterator[list[int]]:
+    &quot;&quot;&quot;Pack tokenized documents into fixed-length groups with boundary tokens.
+
+    Yields lists of exactly max_tokens token ids. Long documents are split
+    across groups; short documents share a group separated by BOUNDARY_TOKEN_ID.
+    The final group may be shorter than max_tokens and is yielded as-is.
+    &quot;&quot;&quot;
+
+    if max_tokens &lt;= 1:
+        raise ValueError(&quot;max_tokens must be greater than 1&quot;)
+    buffer: list[int] = []
+    for text in documents:
+        token_ids = tokenizer.encode(text)
+        if buffer:
+            buffer.append(BOUNDARY_TOKEN_ID)
+        buffer.extend(token_ids)
+        while len(buffer) &gt;= max_tokens:
+            yield buffer[:max_tokens]
+            buffer = buffer[max_tokens:]
+    if buffer:
+        yield buffer
+
+
+def tokenize_jsonl_path(
+    jsonl_path: Path,
+    output_dir: Path,
+    shard_id: str,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    text_field: str = &quot;text&quot;,
+) -&gt; ShardWriteResult:
+    &quot;&quot;&quot;Convenience wrapper: tokenize one JSONL file into one HDF5 shard.&quot;&quot;&quot;
+
+    tokenizer = Tokenizer()
+    pipeline = ShardedTokenizationPipeline(tokenizer, output_dir=output_dir, chunk_size=chunk_size)
+    source = JSONLSource(jsonl_path, text_field=text_field)
+    return pipeline.write_shard(shard_id, source)
+
+
+def load_index(index_path: Path) -&gt; list[ShardIndexEntry]:
+    &quot;&quot;&quot;Read shards.json and return ShardIndexEntry rows.&quot;&quot;&quot;
+
+    data = json.loads(Path(index_path).read_text(&quot;utf-8&quot;))
+    entries: list[ShardIndexEntry] = []
+    for row in data[&quot;shards&quot;]:
+        entries.append(
+            ShardIndexEntry(
+                shard_id=str(row[&quot;shard_id&quot;]),
+                path=str(row[&quot;path&quot;]),
+                token_count=int(row[&quot;token_count&quot;]),
+                document_count=int(row.get(&quot;document_count&quot;, 0)),
+                sha256=str(row[&quot;sha256&quot;]),
+                global_start=int(row[&quot;global_start&quot;]),
+            )
+        )
+    return entries
+
+
+def validate_corpus(index_entries: list[ShardIndexEntry]) -&gt; list[str]:
+    &quot;&quot;&quot;Recompute each shard&#39;s sha256 over its on-disk tokens and report mismatches.&quot;&quot;&quot;
+
+    failures: list[str] = []
+    for entry in index_entries:
+        with h5py.File(entry.path, &quot;r&quot;, swmr=True) as fh:
+            dataset = fh[&quot;tokens&quot;]
+            recorded_count = int(dataset.attrs.get(&quot;token_count&quot;, entry.token_count))
+            tokens = np.asarray(dataset[:recorded_count], dtype=TOKEN_DTYPE)
+            recomputed = hashlib.sha256(tokens.tobytes()).hexdigest()
+            if recomputed != entry.sha256:
+                failures.append(entry.shard_id)
+    return failures
+
+
+def build_demo_corpus() -&gt; dict[str, list[str]]:
+    &quot;&quot;&quot;Two shards of synthetic documents long enough to exercise mmap reads.&quot;&quot;&quot;
+
+    base = [
+        &quot;the alignment problem is a story about reward functions and the things they fail to write down&quot;,
+        &quot;attention scales better with sequence length so transformers replaced recurrent networks during the language modeling era&quot;,
+        &quot;an evaluation harness keeps training honest by treating the test corpus as a contract that cannot drift&quot;,
+        &quot;deduplication is upstream of tokenization because every duplicate token costs the trainer twice in compute&quot;,
+        &quot;checkpoints record the optimizer state and the random seed so that a restart resumes exactly where it stopped&quot;,
+    ]
+    long_repeat = &quot; &quot;.join(base * 4)
+    shards: dict[str, list[str]] = {
+        &quot;shard-0000&quot;: [long_repeat, long_repeat, long_repeat],
+        &quot;shard-0001&quot;: [long_repeat, long_repeat, long_repeat],
+    }
+    return shards
+
+
+def run_demo() -&gt; int:
+    &quot;&quot;&quot;Build a demo corpus, tokenize it, validate it, and run the dataloader.
+
+    Designed to be self-terminating: the pipeline writes into a temporary
+    directory and the dataloader takes a small fixed number of batches so the
+    script exits without external input.
+    &quot;&quot;&quot;
+
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp)
+        tokenizer = Tokenizer()
+        pipeline = ShardedTokenizationPipeline(tokenizer, output_dir=out, chunk_size=512)
+        shards = build_demo_corpus()
+        entries = pipeline.write_corpus(shards)
+        for entry in entries:
+            print(
+                f&quot;[shard] {entry.shard_id} tokens={entry.token_count} &quot;
+                f&quot;sha256={entry.sha256[:12]} global_start={entry.global_start}&quot;
+            )
+        validation_failures = validate_corpus(entries)
+        if validation_failures:
+            print(f&quot;[validate] failed: {validation_failures}&quot;)
+            return 1
+        print(f&quot;[validate] all {len(entries)} shards match recorded sha256&quot;)
+        with MmapTokenStore(entries) as store:
+            loader = SlidingWindowDataloader(store, window_size=64, batch_size=4, seed=7)
+            for batch_index, (inputs, targets) in enumerate(loader.take(10)):
+                checksum = int(hashlib.blake2b(inputs.tobytes(), digest_size=4).hexdigest(), 16)
+                print(
+                    f&quot;[batch] step={batch_index} shape={tuple(inputs.shape)} &quot;
+                    f&quot;checksum={checksum:08x}&quot;
+                )
+    return 0
+
+
+if __name__ == &quot;__main__&quot;:
+    sys.exit(run_demo())
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/43-hdf5-tokenized-corpus/code/tests/__init__.py">phases/19-capstone-projects/43-hdf5-tokenized-corpus/code/tests/__init__.py</a><details><summary>查看原始文本</summary><pre><code></code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/43-hdf5-tokenized-corpus/code/tests/test_hdf5_corpus.py">phases/19-capstone-projects/43-hdf5-tokenized-corpus/code/tests/test_hdf5_corpus.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Unit tests for the HDF5 tokenized corpus pipeline.
+
+Run with: python3 -m unittest discover code/tests -v
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import hashlib
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent))
+
+import h5py
+import numpy as np
+
+from main import (
+    BOUNDARY_TOKEN_ID,
+    DEFAULT_CHUNK_SIZE,
+    HDF5ShardWriter,
+    JSONLSource,
+    MmapTokenStore,
+    ShardIndexEntry,
+    ShardedTokenizationPipeline,
+    SlidingWindowDataloader,
+    TOKEN_DTYPE,
+    Tokenizer,
+    build_demo_corpus,
+    load_index,
+    pack_documents,
+    validate_corpus,
+)
+
+
+class TokenizerTests(unittest.TestCase):
+    def test_encode_round_trip_preserves_ascii(self) -&gt; None:
+        tokenizer = Tokenizer()
+        ids = tokenizer.encode(&quot;hello&quot;)
+        self.assertEqual(tokenizer.decode(ids), &quot;hello&quot;)
+
+    def test_empty_encode_returns_empty_list(self) -&gt; None:
+        self.assertEqual(Tokenizer().encode(&quot;&quot;), [])
+
+    def test_boundary_token_is_reserved(self) -&gt; None:
+        tokenizer = Tokenizer()
+        ids = tokenizer.encode(&quot;a&quot;)
+        self.assertNotIn(0, ids)
+
+
+class ShardWriterTests(unittest.TestCase):
+    def setUp(self) -&gt; None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+
+    def tearDown(self) -&gt; None:
+        self._tmp.cleanup()
+
+    def test_writer_rejects_zero_chunk(self) -&gt; None:
+        with self.assertRaises(ValueError):
+            HDF5ShardWriter(self.tmp / &quot;x.h5&quot;, chunk_size=0)
+
+    def test_writer_persists_token_count_attribute(self) -&gt; None:
+        path = self.tmp / &quot;shard.h5&quot;
+        writer = HDF5ShardWriter(path, chunk_size=8)
+        with writer:
+            writer.add_document([1, 2, 3, 4, 5])
+            writer.add_boundary()
+            writer.add_document([6, 7, 8, 9])
+        with h5py.File(path, &quot;r&quot;) as fh:
+            dataset = fh[&quot;tokens&quot;]
+            self.assertEqual(int(dataset.attrs[&quot;token_count&quot;]), 10)
+
+    def test_writer_chunk_alignment_produces_chunked_dataset(self) -&gt; None:
+        path = self.tmp / &quot;aligned.h5&quot;
+        writer = HDF5ShardWriter(path, chunk_size=4)
+        with writer:
+            writer.add_document(list(range(1, 17)))  # 16 tokens
+        with h5py.File(path, &quot;r&quot;) as fh:
+            dataset = fh[&quot;tokens&quot;]
+            self.assertEqual(dataset.shape, (16,))
+            self.assertEqual(dataset.chunks, (4,))
+
+    def test_sha256_matches_recomputed_value(self) -&gt; None:
+        path = self.tmp / &quot;hashed.h5&quot;
+        writer = HDF5ShardWriter(path, chunk_size=4)
+        with writer:
+            writer.add_document([1, 2, 3, 4, 5, 6, 7])
+        result = writer.result(&quot;shard&quot;)
+        with h5py.File(path, &quot;r&quot;) as fh:
+            tokens = np.asarray(fh[&quot;tokens&quot;][: result.token_count], dtype=TOKEN_DTYPE)
+            recomputed = hashlib.sha256(tokens.tobytes()).hexdigest()
+        self.assertEqual(recomputed, result.sha256)
+
+
+class PipelineTests(unittest.TestCase):
+    def test_pipeline_writes_index_with_global_starts(self) -&gt; None:
+        with tempfile.TemporaryDirectory() as out_dir:
+            out = Path(out_dir)
+            tokenizer = Tokenizer()
+            pipeline = ShardedTokenizationPipeline(tokenizer, output_dir=out, chunk_size=64)
+            entries = pipeline.write_corpus(
+                {
+                    &quot;shard-0000&quot;: [&quot;alpha beta&quot;, &quot;gamma delta&quot;],
+                    &quot;shard-0001&quot;: [&quot;epsilon zeta&quot;],
+                }
+            )
+            self.assertEqual(len(entries), 2)
+            self.assertEqual(entries[0].global_start, 0)
+            self.assertEqual(entries[1].global_start, entries[0].token_count)
+            index_path = out / &quot;shards.json&quot;
+            self.assertTrue(index_path.exists())
+            data = json.loads(index_path.read_text(&quot;utf-8&quot;))
+            self.assertEqual(data[&quot;total_tokens&quot;], entries[0].token_count + entries[1].token_count)
+
+    def test_load_index_round_trip(self) -&gt; None:
+        with tempfile.TemporaryDirectory() as out_dir:
+            out = Path(out_dir)
+            tokenizer = Tokenizer()
+            pipeline = ShardedTokenizationPipeline(tokenizer, output_dir=out, chunk_size=32)
+            entries = pipeline.write_corpus({&quot;shard-0000&quot;: [&quot;abc def&quot;]})
+            reloaded = load_index(out / &quot;shards.json&quot;)
+            self.assertEqual(len(reloaded), 1)
+            self.assertEqual(reloaded[0].sha256, entries[0].sha256)
+
+    def test_validate_corpus_passes_for_intact_shards(self) -&gt; None:
+        with tempfile.TemporaryDirectory() as out_dir:
+            out = Path(out_dir)
+            tokenizer = Tokenizer()
+            pipeline = ShardedTokenizationPipeline(tokenizer, output_dir=out, chunk_size=32)
+            entries = pipeline.write_corpus(build_demo_corpus())
+            failures = validate_corpus(entries)
+            self.assertEqual(failures, [])
+
+
+class MmapStoreTests(unittest.TestCase):
+    def test_get_slice_spans_two_shards(self) -&gt; None:
+        with tempfile.TemporaryDirectory() as out_dir:
+            out = Path(out_dir)
+            tokenizer = Tokenizer()
+            pipeline = ShardedTokenizationPipeline(tokenizer, output_dir=out, chunk_size=16)
+            entries = pipeline.write_corpus(
+                {
+                    &quot;shard-0000&quot;: [&quot;alphabet soup&quot;],
+                    &quot;shard-0001&quot;: [&quot;beta charlie delta&quot;],
+                }
+            )
+            with MmapTokenStore(entries) as store:
+                total = store.total_tokens
+                slice_a = store.get_slice(0, total)
+                self.assertEqual(slice_a.shape, (total,))
+                mid = total // 2
+                self.assertTrue(np.array_equal(store.get_slice(0, mid), slice_a[:mid]))
+                self.assertTrue(np.array_equal(store.get_slice(mid, total), slice_a[mid:]))
+
+    def test_get_slice_rejects_oob_request(self) -&gt; None:
+        with tempfile.TemporaryDirectory() as out_dir:
+            out = Path(out_dir)
+            tokenizer = Tokenizer()
+            pipeline = ShardedTokenizationPipeline(tokenizer, output_dir=out, chunk_size=16)
+            entries = pipeline.write_corpus({&quot;shard-0000&quot;: [&quot;alphabet soup&quot;]})
+            with MmapTokenStore(entries) as store:
+                with self.assertRaises(ValueError):
+                    store.get_slice(0, store.total_tokens + 1)
+
+
+class DataloaderTests(unittest.TestCase):
+    def test_dataloader_emits_shifted_targets(self) -&gt; None:
+        with tempfile.TemporaryDirectory() as out_dir:
+            out = Path(out_dir)
+            tokenizer = Tokenizer()
+            pipeline = ShardedTokenizationPipeline(tokenizer, output_dir=out, chunk_size=64)
+            entries = pipeline.write_corpus(build_demo_corpus())
+            with MmapTokenStore(entries) as store:
+                loader = SlidingWindowDataloader(store, window_size=16, batch_size=2, seed=42)
+                batches = loader.take(3)
+            self.assertEqual(len(batches), 3)
+            for inputs, targets in batches:
+                self.assertEqual(inputs.shape, (2, 16))
+                self.assertEqual(targets.shape, (2, 16))
+
+    def test_dataloader_deterministic_with_seed(self) -&gt; None:
+        with tempfile.TemporaryDirectory() as out_dir:
+            out = Path(out_dir)
+            tokenizer = Tokenizer()
+            pipeline = ShardedTokenizationPipeline(tokenizer, output_dir=out, chunk_size=64)
+            entries = pipeline.write_corpus(build_demo_corpus())
+            with MmapTokenStore(entries) as store:
+                loader_a = SlidingWindowDataloader(store, window_size=16, batch_size=2, seed=11)
+                loader_b = SlidingWindowDataloader(store, window_size=16, batch_size=2, seed=11)
+                batches_a = loader_a.take(4)
+                batches_b = loader_b.take(4)
+            for (ia, ta), (ib, tb) in zip(batches_a, batches_b):
+                self.assertTrue(np.array_equal(ia, ib))
+                self.assertTrue(np.array_equal(ta, tb))
+
+
+class JSONLSourceTests(unittest.TestCase):
+    def test_jsonl_source_drops_malformed_lines(self) -&gt; None:
+        with tempfile.TemporaryDirectory() as out_dir:
+            path = Path(out_dir) / &quot;docs.jsonl&quot;
+            payload = (
+                &#39;{&quot;text&quot;: &quot;good document one&quot;}\n&#39;
+                &quot;not json at all\n&quot;
+                &#39;{&quot;other&quot;: &quot;missing text&quot;}\n&#39;
+                &#39;{&quot;text&quot;: &quot;good document two&quot;}\n&#39;
+            )
+            path.write_text(payload, encoding=&quot;utf-8&quot;)
+            source = JSONLSource(path)
+            collected = list(source)
+            self.assertEqual(collected, [&quot;good document one&quot;, &quot;good document two&quot;])
+            self.assertEqual(source.dropped_lines, 2)
+
+
+class PackDocumentsTests(unittest.TestCase):
+    def test_pack_documents_yields_fixed_length_groups(self) -&gt; None:
+        tokenizer = Tokenizer()
+        docs = [&quot;alpha bravo&quot;, &quot;charlie delta echo&quot;, &quot;foxtrot&quot;]
+        groups = list(pack_documents(tokenizer, docs, max_tokens=8))
+        for group in groups[:-1]:
+            self.assertEqual(len(group), 8)
+        self.assertGreater(len(groups), 0)
+
+    def test_pack_documents_injects_boundary_between_documents(self) -&gt; None:
+        tokenizer = Tokenizer()
+        groups = list(pack_documents(tokenizer, [&quot;a&quot;, &quot;b&quot;], max_tokens=8))
+        joined = [token for group in groups for token in group]
+        self.assertIn(BOUNDARY_TOKEN_ID, joined)
+
+
+if __name__ == &quot;__main__&quot;:
+    unittest.main()
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. Why store the tokenized corpus in a resizable, chunked HDF5 dataset rather than JSONL?</legend><label class="option"><input type="radio" name="q0" value="0"> HDF5 has a smaller logo</label><label class="option"><input type="radio" name="q0" value="1"> JSONL is deprecated</label><label class="option"><input type="radio" name="q0" value="2"> Random reasons</label><label class="option"><input type="radio" name="q0" value="3"> HDF5 offers chunked, integer-only, memory-mapped reads with O(1) random access; JSONL forces the parser onto every hot-path read</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. What is the right rule for sizing the HDF5 chunk vs the trainer&#39;s window_size?</legend><label class="option"><input type="radio" name="q1" value="0"> Pick the largest chunk that fits in RAM</label><label class="option"><input type="radio" name="q1" value="1"> Always pick chunk=1</label><label class="option"><input type="radio" name="q1" value="2"> Set chunk to a multiple of window_size so each sample lands inside one or two chunks and reads stay page-cache aligned</label><label class="option"><input type="radio" name="q1" value="3"> Pick chunk equal to the document length</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. Why is token_count stored as an HDF5 attribute and not implied from dataset shape?</legend><label class="option"><input type="radio" name="q2" value="0"> The trailing chunk may be partially full; without the explicit attribute the reader walks past the real end into zero-padded tokens and the model learns to predict zero</label><label class="option"><input type="radio" name="q2" value="1"> Shapes are slow to read</label><label class="option"><input type="radio" name="q2" value="2"> Attributes are mandatory</label><label class="option"><input type="radio" name="q2" value="3"> Attributes are pretty</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. What does the writer accomplish by buffering tokens to chunk_size before each resize?</legend><label class="option"><input type="radio" name="q3" value="0"> Writes are contiguous and chunk-aligned, avoiding the fragmentation that follows one-token-at-a-time resizes</label><label class="option"><input type="radio" name="q3" value="1"> Reduces vocabulary size</label><label class="option"><input type="radio" name="q3" value="2"> Speeds up sha256</label><label class="option"><input type="radio" name="q3" value="3"> Saves a few CPU cycles</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. Why is swmr=True opened on the reader side, not on the writer side?</legend><label class="option"><input type="radio" name="q4" value="0"> Security</label><label class="option"><input type="radio" name="q4" value="1"> Random preference</label><label class="option"><input type="radio" name="q4" value="2"> Performance</label><label class="option"><input type="radio" name="q4" value="3"> Single-Writer-Multiple-Reader mode lets dataloader workers share the file safely; the writer needs no special mode because it writes one shard per process</label><p data-feedback="4"></p></fieldset><fieldset><legend>6. What does the boundary token id exist to make explicit?</legend><label class="option"><input type="radio" name="q5" value="0"> Compression</label><label class="option"><input type="radio" name="q5" value="1"> Vocabulary size limits</label><label class="option"><input type="radio" name="q5" value="2"> Random data</label><label class="option"><input type="radio" name="q5" value="3"> Document boundaries within a packed window so the model is not silently trained on cross-document concatenation</label><p data-feedback="5"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/19-capstone-projects/42-large-corpus-downloader/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/19-capstone-projects/44-cosine-lr-warmup/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/19-capstone-projects/43-hdf5-tokenized-corpus/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

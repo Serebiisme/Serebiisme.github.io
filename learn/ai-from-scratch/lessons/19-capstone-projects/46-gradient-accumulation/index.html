@@ -1,0 +1,772 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>渐进积累 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-19-capstone-projects" data-lesson="19-capstone-projects/46-gradient-accumulation" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/19-capstone-projects/">综合项目</a> / LESSON 46</p><h1 class="lesson-title">渐进积累</h1><p>Gradient Accumulation</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>渐进积累</h1>
+<blockquote>
+<p>训练一个有效的批量,你不能负担,一个微批量.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 19 lessons 42 to 45
+<strong>Time:</strong> ~90 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>取出有效批量身份: <code>effective_batch = micro_batch * accum_steps</code>现在,我们要去.</li>
+<li>实现每微批量损失规模化,使累积的梯度与单个全批次回归相匹配.</li>
+<li>跳过优化器同步到最后一批微量 (同步最后一步).</li>
+<li>读取一个吞吐量与有效批量曲线相比,并解释降低回报率.</li>
+</ul>
+<h2>问题</h2>
+<p>由于损失曲线更平滑,而优化步骤在这个规模上更有意义. 在桌子上的加速器上,有32个例子, 两倍的批量不是一个选择. 减半模型不是一个选择. 现场在2017年实现的技巧是运行16次倒退传递,让梯度积累在参数缓冲器内,</p>
+<p>没有扩展,梯度方向是正确的,但大小是错误的,优化步骤是16倍的太大.修复是一个分数.修复也是容易忘记的.</p>
+<h2>概念</h2>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-9730bb5534a765ab207f.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>合同很短.</p>
+<ul>
+<li>每个微批次的损失分为 <code>accum_steps</code>在之前<code>backward()</code>电器将梯度总算为<code>param.grad</code>按默认情况下, 分割将运行总额推回正确的规模.</li>
+<li>优化器步骤每次有效批次一次发射,最后一批微批次后退. 步骤中积累偏差每个参数,剩下的运行取决于.</li>
+<li>优化器状态 (momentum buffers,Adam moments) 每个有效步骤都会一次进步,而不是每一个微批次.</li>
+<li>在单个设备上,这是会计.在多级集群上,同样的模式将非最终的微批包裹在一个<code>no_sync</code>通过一个传输,最后一批微批减少了整个积累的梯度,而不是支付网络成本N倍.</li>
+</ul>
+<h3>代码中的等效证明</h3>
+<pre><code class="language-python">loss = criterion(model(x_full), y_full)
+loss.backward()
+opt.step()
+</code></pre>
+<p>相当于</p>
+<pre><code class="language-python">for x, y in chunks(x_full, y_full, n):
+    scaled = criterion(model(x), y) / n
+    scaled.backward()
+opt.step()
+</code></pre>
+<p>循环末积累的梯度缓冲器是单个全批后退产生的度.课程代码通过1e-4以下的最大abs差异来证明这一点.<code>equivalence_check</code>现在,我们要去.</p>
+<h3>价格上去哪里</h3>
+<p>每个微批量成本一个向前和一个向后. 随着积累,你会以时间换取内存.<code>outputs/accum-curve.json</code>显示有效批量在固定微批量上成长时发生什么:</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-fc72967dbde53354f0c2.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>没有免费午餐.<code>accum_steps</code>通过测试,我们可以将每个优化器步骤的墙时间翻一番. 变化是梯度估计的差异性:在同一墙预算中,你做了更少的优化器步骤,但每个步骤都在更多样本中平均. 文献将大批量和小批量视为不同的优化问题;这里的教训是机械的,而不是统计的.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-aae03fe0f3c97fe74e1b.png" alt="cc-grad-accumulation 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<p><code>code/main.py</code>它们可以执行三项操作.</p>
+<h3>步骤1:等效检查</h3>
+<p><code>equivalence_check()</code>函数比较优化器步骤前的梯度缓冲器和后的参数. 断言是<code>max_abs_diff &lt; 1e-4</code>现在,我们要去.</p>
+<h3>步骤2:最后步骤的同步模式</h3>
+<p><code>train_one_optimizer_step</code>走微批次,除了最后一次进入<code>no_sync_context(model)</code>在单一过程中,文本是无操作的;在DDP上,这是降低所有的梯度被跳过的地方.<code>sync_counter</code>记录了我们离开了no_sync范围的数次;对于N微批次,数量为每个有效步骤的1次,而不是N.</p>
+<h3>步骤3:输出曲线</h3>
+<p><code>sweep_effective_batches</code>运行相同的模型,具有固定微批量和积累步骤列表.</p>
+<ul>
+<li><code>samples_per_sec</code>: 通过墙时间分为所见的样本总数</li>
+<li><code>median_step_ms</code>:每一步有效的50个百分点</li>
+<li><code>sync_calls</code>: 集体点</li>
+<li><code>avg_loss</code>:扫描的优化步骤中平均</li>
+</ul>
+<p>产量降落在<code>outputs/accum-curve.json</code>并且可从笔记本中重复使用.</p>
+<p>运行它:</p>
+<pre><code class="language-bash">python3 code/main.py
+</code></pre>
+<p>脚本打印了等效差,然后扫描表,然后JSON路径.</p>
+<h2>用它</h2>
+<p>在生产训练中,梯度积累在一个后面.<code>accumulation_steps = effective_batch // (micro_batch * world_size)</code>您不允许使用的框架是相同的循环,但步骤是相同的:扩大损失,跳过非最终微信的同步,积累,步骤一次.</p>
+<p>野生动物的三个模式:</p>
+<ul>
+<li>微批量是为了和设备内存的选择.任何更小的东西会浪费加速器周期.任何更大的东西会崩.</li>
+<li>有效批次是从学习率时间表中选择的.大型有效批次需要扩大学习率和加热;这是自2017年以来所讨论的线性扩展规则.</li>
+<li>积累数量是两个和唯一的按之间的桥梁, 在运行时, 您可以调节,</li>
+</ul>
+<h2>运送它</h2>
+<p><code>outputs/skill-gradient-accumulation.md</code>通过取食谱,一个同行可以将其放入一个新的 repo:<code>accum_steps</code>通过JSON,将优化器同步到非最终微信上,按有效批量进行一次优化器,将有效批量进行记录,以便交易可见.</p>
+<h2>运动</h2>
+<ol>
+<li>再进行扫描<code>--num-steps 100</code>根据实际批量,每秒的图片样本.</li>
+<li>添加错误的扩展变量 (没有分区),并在步骤1显示参数diff与参考.</li>
+<li>换取ADMW的SGD,并确认优化状态的进步每一步一次,而不是每次微批次一次.</li>
+<li>引入一个真正的<code>DistributedDataParallel</code>包装和路线<code>no_sync_context</code>确认同步调用每批量下降为N-1.</li>
+<li>修改等效检查,将两个不同的微分区 (2 x 8 vs 4 x 4) 进行比较,并解释您需要放松的任何宽容.</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Micro batch</td>
+<td>The batch you forward</td>
+<td>The slice that fits in memory in a single forward pass</td>
+</tr>
+<tr>
+<td>Accum steps</td>
+<td>Backward passes per step</td>
+<td>Number of backwards summed before one optimizer step</td>
+</tr>
+<tr>
+<td>Effective batch</td>
+<td>The batch</td>
+<td>Micro batch times accum steps times data parallel world size</td>
+</tr>
+<tr>
+<td>Loss scaling</td>
+<td>Divide by N</td>
+<td>Per-micro-batch division so summed gradients match full batch</td>
+</tr>
+<tr>
+<td>Sync on last</td>
+<td>Skip the rest</td>
+<td>Only run the gradient collective on the last backward in the window</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li>关于Pytorch的文件<code>DistributedDataParallel.no_sync</code>对于生产版本的最后步骤同步技巧.</li>
+<li>关于大型批次训练的线性扩展,</li>
+<li>火器对梯度积累相互作用的发射跟踪器,并进行混合精度的不扩展.</li>
+<li>第19阶段课程42至45课程涵盖了本课程所设的模型,数据加载器,优化器和培训者架构.</li>
+<li>第19阶段课程47涵盖检查点和恢复,</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Gradient Accumulation</h1>
+<blockquote>
+<p>Train at an effective batch you cannot afford, one micro-batch at a time. Scale the loss, hold the optimizer step, and let the gradients pile up.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 19 lessons 42 to 45
+<strong>Time:</strong> ~90 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Derive the effective batch identity: <code>effective_batch = micro_batch * accum_steps</code>.</li>
+<li>Implement loss-per-micro-batch scaling so the accumulated gradient matches a single full-batch backward.</li>
+<li>Skip optimizer synchronization until the last micro-batch (sync-on-last-step).</li>
+<li>Read a throughput against effective batch curve and explain the diminishing return.</li>
+</ul>
+<h2>The Problem</h2>
+<p>You want to train at an effective batch of 512 because the loss curve is smoother and the optimizer step makes more sense at that scale. The accelerator on the desk holds 32 examples before it runs out of memory. Doubling the batch is not an option. Halving the model is not an option. The trick the field reached for in 2017 and never stopped using is to run 16 backward passes, let the gradients accumulate inside the parameter buffers, and only step the optimizer when the count reaches the target.</p>
+<p>The risk is that the loss is no longer the same number it was at the bigger batch. The cross entropy of 16 mini-batches summed naively is 16 times the loss of one full batch. Without scaling, the gradient direction is correct but the magnitude is wrong, and the optimizer step is 16 times too big. The fix is one division. The fix is also easy to forget.</p>
+<h2>The Concept</h2>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-9730bb5534a765ab207f.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>The contract is short:</p>
+<ul>
+<li>Loss for each micro-batch is divided by <code>accum_steps</code> before <code>backward()</code>. PyTorch sums gradients into <code>param.grad</code> by default; the division pushes the running sum back into the right scale.</li>
+<li>The optimizer step fires once per effective batch, after the last micro-batch's backward. Stepping mid-accumulation skews every parameter the rest of the run depends on.</li>
+<li>The optimizer's state (momentum buffers, Adam moments) advances once per effective step, not once per micro-batch. The exponential moving averages would otherwise see the wrong frequency and burn through the schedule.</li>
+<li>On a single device this is bookkeeping. On a multi-rank cluster the same pattern wraps the non-final micro-batches in a <code>no_sync</code> context that skips the gradient all-reduce; the last micro-batch reduces the full accumulated gradient in one pass instead of paying the network cost N times.</li>
+</ul>
+<h3>The equivalence proof in code</h3>
+<pre><code class="language-python">loss = criterion(model(x_full), y_full)
+loss.backward()
+opt.step()
+</code></pre>
+<p>is equivalent to</p>
+<pre><code class="language-python">for x, y in chunks(x_full, y_full, n):
+    scaled = criterion(model(x), y) / n
+    scaled.backward()
+opt.step()
+</code></pre>
+<p>up to floating point summation order. The accumulated gradient buffer at the end of the loop is the same tensor that a single full-batch backward would produce. The lesson code asserts this with a max-abs difference under 1e-4 in <code>equivalence_check</code>.</p>
+<h3>Where the cost goes</h3>
+<p>Each micro-batch costs one forward and one backward. With accumulation you trade memory for time. The throughput curve in <code>outputs/accum-curve.json</code> shows what happens as the effective batch grows at fixed micro-batch:</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-fc72967dbde53354f0c2.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>There is no free lunch. Doubling <code>accum_steps</code> doubles the wall time per optimizer step. What changes is the variance of the gradient estimate: at the same wall budget you have made fewer optimizer steps but each one was averaged over more samples. The literature treats large batch and small batch as different optimization problems; the lesson here is mechanical, not statistical.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-aae03fe0f3c97fe74e1b.png" alt="cc-grad-accumulation 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<p><code>code/main.py</code> is the runnable artifact. It does three things.</p>
+<h3>Step 1: equivalence check</h3>
+<p><code>equivalence_check()</code> builds two copies of the same network with the same seed. One sees a 16-sample batch in one forward pass. The other sees four 4-sample chunks with the loss divided by four. The function compares the gradient buffers before the optimizer step and the parameters after. The assertion is <code>max_abs_diff &lt; 1e-4</code>.</p>
+<h3>Step 2: sync-on-last-step pattern</h3>
+<p><code>train_one_optimizer_step</code> walks micro-batches. For every micro-batch except the last it enters <code>no_sync_context(model)</code>. On a single process the context is a no-op; on DDP this is where the gradient all-reduce is skipped. The bookkeeping is the same regardless. A <code>sync_counter</code> records how many times we left the no_sync scope; for N micro-batches the count is one per effective step, not N.</p>
+<h3>Step 3: the throughput curve</h3>
+<p><code>sweep_effective_batches</code> runs the same model with a fixed micro-batch and a list of accumulation steps. For each setting it logs:</p>
+<ul>
+<li><code>samples_per_sec</code>: total samples seen divided by wall time</li>
+<li><code>median_step_ms</code>: 50th percentile per effective step</li>
+<li><code>sync_calls</code>: collective points exercised</li>
+<li><code>avg_loss</code>: average across the sweep's optimizer steps</li>
+</ul>
+<p>The output lands in <code>outputs/accum-curve.json</code> and is reusable from a notebook.</p>
+<p>Run it:</p>
+<pre><code class="language-bash">python3 code/main.py
+</code></pre>
+<p>The script prints the equivalence diff, then the sweep table, then the JSON path. Exit code zero.</p>
+<h2>Use It</h2>
+<p>In production training, gradient accumulation lives behind one knob. PyTorch's pattern is <code>accumulation_steps = effective_batch // (micro_batch * world_size)</code>. Frameworks that you are not allowed to use here wrap the same loop, but the steps are the same: scale the loss, skip sync on non-final micros, accumulate, step once.</p>
+<p>Three patterns in the wild:</p>
+<ul>
+<li>The micro-batch size is chosen to saturate device memory. Anything smaller wastes accelerator cycles. Anything larger crashes.</li>
+<li>The effective batch is chosen from a learning rate schedule. Large effective batches need scaled learning rates and warmup; this is the linear scaling rule talked about since 2017.</li>
+<li>The accumulation count is the bridge between the two and the only knob you are free to tune at runtime without rewriting the data loader.</li>
+</ul>
+<h2>Ship It</h2>
+<p><code>outputs/skill-gradient-accumulation.md</code> captures the recipe so a peer can drop it into a new repo: scale loss by <code>accum_steps</code>, skip optimizer sync on non-final micros, step the optimizer once per effective batch, log throughput against effective batch as JSON so the trade is visible.</p>
+<h2>Exercises</h2>
+<ol>
+<li>Re-run the sweep with <code>--num-steps 100</code> and plot samples per second against effective batch. Where does the curve flatten?</li>
+<li>Add a wrong scaling variant (no division) and show the parameter diff at step 1 against the reference.</li>
+<li>Swap SGD for AdamW and confirm the optimizer state advances once per effective step, not once per micro-batch.</li>
+<li>Introduce a real <code>DistributedDataParallel</code> wrapper and route the <code>no_sync_context</code> to its method. Confirm sync_calls drops by N-1 per effective batch.</li>
+<li>Modify the equivalence check to compare two different micro splits (2 by 8 vs 4 by 4) and explain any tolerance you need to relax.</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Micro batch</td>
+<td>The batch you forward</td>
+<td>The slice that fits in memory in a single forward pass</td>
+</tr>
+<tr>
+<td>Accum steps</td>
+<td>Backward passes per step</td>
+<td>Number of backwards summed before one optimizer step</td>
+</tr>
+<tr>
+<td>Effective batch</td>
+<td>The batch</td>
+<td>Micro batch times accum steps times data parallel world size</td>
+</tr>
+<tr>
+<td>Loss scaling</td>
+<td>Divide by N</td>
+<td>Per-micro-batch division so summed gradients match full batch</td>
+</tr>
+<tr>
+<td>Sync on last</td>
+<td>Skip the rest</td>
+<td>Only run the gradient collective on the last backward in the window</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li>PyTorch docs on <code>DistributedDataParallel.no_sync</code> for the production version of the sync-on-last-step trick.</li>
+<li>Goyal et al., 2017, on linear scaling for large batch training, the canonical reason to care about effective batch.</li>
+<li>PyTorch issue tracker on gradient accumulation interactions with mixed precision unscaling.</li>
+<li>Phase 19 lessons 42 to 45 cover the model, data loader, optimizer, and trainer scaffolding this lesson assumes.</li>
+<li>Phase 19 lesson 47 covers checkpoint and resume so a long accumulation run survives a wallclock cap.</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-19-capstone-projects--46-gradient-accumulation.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-19-capstone-projects--46-gradient-accumulation.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/46-gradient-accumulation/code/main.py">phases/19-capstone-projects/46-gradient-accumulation/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Gradient accumulation from scratch.
+
+Effective batch size = micro batch size * accumulation steps. Accumulate
+gradients across several forward and backward passes, only step the
+optimizer after the last micro-batch. Tracks throughput against effective
+batch size so the curve is visible, not folklore.
+
+Run: python3 code/main.py
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import time
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+from typing import Callable, Iterable, List
+
+import torch
+from torch import nn
+
+
+HERE = Path(__file__).parent
+OUT_DIR = HERE.parent / &quot;outputs&quot;
+LOG_PATH = OUT_DIR / &quot;accum-curve.json&quot;
+
+
+@dataclass
+class StepResult:
+    step: int
+    effective_batch: int
+    micro_batch: int
+    accum_steps: int
+    loss: float
+    grad_norm: float
+    samples_per_sec: float
+    wall_ms: float
+    sync_calls: int
+
+
+@dataclass
+class CurvePoint:
+    effective_batch: int
+    accum_steps: int
+    micro_batch: int
+    avg_loss: float
+    samples_per_sec: float
+    median_step_ms: float
+    sync_calls: int
+    steps: int
+
+
+def seed_everything(seed: int) -&gt; None:
+    torch.manual_seed(seed)
+
+
+def synthetic_batch(batch_size: int, in_dim: int, out_dim: int, gen: torch.Generator) -&gt; tuple[torch.Tensor, torch.Tensor]:
+    x = torch.randn(batch_size, in_dim, generator=gen)
+    target = torch.randint(low=0, high=out_dim, size=(batch_size,), generator=gen)
+    return x, target
+
+
+def make_model(in_dim: int, hidden: int, out_dim: int) -&gt; nn.Module:
+    return nn.Sequential(
+        nn.Linear(in_dim, hidden),
+        nn.GELU(),
+        nn.Linear(hidden, hidden),
+        nn.GELU(),
+        nn.Linear(hidden, out_dim),
+    )
+
+
+def global_grad_norm(model: nn.Module) -&gt; float:
+    total = 0.0
+    for p in model.parameters():
+        if p.grad is None:
+            continue
+        total += float(p.grad.detach().pow(2).sum().item())
+    return math.sqrt(total)
+
+
+def zero_grads(model: nn.Module) -&gt; None:
+    for p in model.parameters():
+        if p.grad is not None:
+            p.grad.detach_()
+            p.grad.zero_()
+
+
+def loss_scaled_for_accum(logits: torch.Tensor, target: torch.Tensor, accum_steps: int, loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]) -&gt; torch.Tensor:
+    raw = loss_fn(logits, target)
+    return raw / accum_steps
+
+
+def train_one_optimizer_step(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    micro_batches: List[tuple[torch.Tensor, torch.Tensor]],
+    loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    *,
+    no_sync_until_last: bool,
+    sync_counter: List[int],
+) -&gt; tuple[float, float]:
+    &quot;&quot;&quot;Run accum_steps micro batches, accumulate grads, step once.
+
+    Returns (total_unscaled_loss, grad_norm).
+    &quot;&quot;&quot;
+    accum_steps = len(micro_batches)
+    zero_grads(model)
+    total = 0.0
+    for i, (x, y) in enumerate(micro_batches):
+        is_last = i == accum_steps - 1
+        if no_sync_until_last and not is_last:
+            with no_sync_context(model):
+                logits = model(x)
+                loss = loss_scaled_for_accum(logits, y, accum_steps, loss_fn)
+                loss.backward()
+        else:
+            logits = model(x)
+            loss = loss_scaled_for_accum(logits, y, accum_steps, loss_fn)
+            loss.backward()
+            sync_counter[0] += 1
+        total += float(loss.detach().item()) * accum_steps
+    grad_norm = global_grad_norm(model)
+    optimizer.step()
+    return total / accum_steps, grad_norm
+
+
+class _NoSyncCtx:
+    def __init__(self, model: nn.Module):
+        self.model = model
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+def no_sync_context(model: nn.Module):
+    &quot;&quot;&quot;Stand-in for DDP no_sync.
+
+    In DDP this skips the all-reduce on the trailing backward. In this
+    single-process demo there is no collective to skip, but we still
+    surface the call site so the pattern reads the same on a real cluster.
+    &quot;&quot;&quot;
+    return _NoSyncCtx(model)
+
+
+def run_config(
+    effective_batch: int,
+    accum_steps: int,
+    *,
+    in_dim: int,
+    hidden: int,
+    out_dim: int,
+    num_steps: int,
+    lr: float,
+    seed: int,
+) -&gt; CurvePoint:
+    assert effective_batch % accum_steps == 0, &quot;effective_batch must divide by accum_steps&quot;
+    micro_batch = effective_batch // accum_steps
+    seed_everything(seed)
+    gen = torch.Generator()
+    gen.manual_seed(seed)
+    model = make_model(in_dim, hidden, out_dim)
+    optimizer = torch.optim.SGD(model.parameters(), lr=lr)
+    loss_fn = nn.CrossEntropyLoss()
+
+    losses: List[float] = []
+    step_times_ms: List[float] = []
+    sync_counter = [0]
+    total_samples = 0
+    wall_start = time.perf_counter()
+    for step in range(num_steps):
+        t0 = time.perf_counter()
+        micro_batches = [synthetic_batch(micro_batch, in_dim, out_dim, gen) for _ in range(accum_steps)]
+        avg_loss, _grad_norm = train_one_optimizer_step(
+            model,
+            optimizer,
+            micro_batches,
+            loss_fn,
+            no_sync_until_last=True,
+            sync_counter=sync_counter,
+        )
+        wall_ms = (time.perf_counter() - t0) * 1000.0
+        losses.append(avg_loss)
+        step_times_ms.append(wall_ms)
+        total_samples += effective_batch
+    total_wall = time.perf_counter() - wall_start
+    sps = total_samples / max(total_wall, 1e-6)
+    step_times_ms.sort()
+    median_ms = step_times_ms[len(step_times_ms) // 2]
+    avg_loss = sum(losses) / len(losses)
+    return CurvePoint(
+        effective_batch=effective_batch,
+        accum_steps=accum_steps,
+        micro_batch=micro_batch,
+        avg_loss=avg_loss,
+        samples_per_sec=sps,
+        median_step_ms=median_ms,
+        sync_calls=sync_counter[0],
+        steps=num_steps,
+    )
+
+
+def sweep_effective_batches(
+    *,
+    micro_batch: int,
+    accum_grid: Iterable[int],
+    in_dim: int = 64,
+    hidden: int = 128,
+    out_dim: int = 16,
+    num_steps: int = 25,
+    lr: float = 0.05,
+    seed: int = 0,
+) -&gt; List[CurvePoint]:
+    points: List[CurvePoint] = []
+    for accum in accum_grid:
+        eff = micro_batch * accum
+        pt = run_config(
+            effective_batch=eff,
+            accum_steps=accum,
+            in_dim=in_dim,
+            hidden=hidden,
+            out_dim=out_dim,
+            num_steps=num_steps,
+            lr=lr,
+            seed=seed,
+        )
+        points.append(pt)
+    return points
+
+
+def equivalence_check(
+    *,
+    in_dim: int = 32,
+    hidden: int = 48,
+    out_dim: int = 8,
+    big_batch: int = 16,
+    accum_steps: int = 4,
+    lr: float = 0.1,
+    seed: int = 7,
+) -&gt; dict:
+    &quot;&quot;&quot;One full batch step vs accum_steps micro-batches must match.
+
+    Scaled loss is `raw / accum_steps`; the accumulated gradient equals the
+    full batch gradient up to floating point noise.
+    &quot;&quot;&quot;
+    assert big_batch % accum_steps == 0
+    micro = big_batch // accum_steps
+
+    seed_everything(seed)
+    gen_a = torch.Generator(); gen_a.manual_seed(seed)
+    x, y = synthetic_batch(big_batch, in_dim, out_dim, gen_a)
+
+    seed_everything(seed)
+    model_full = make_model(in_dim, hidden, out_dim)
+    opt_full = torch.optim.SGD(model_full.parameters(), lr=lr)
+    loss_fn = nn.CrossEntropyLoss()
+    zero_grads(model_full)
+    out = model_full(x)
+    loss_full = loss_fn(out, y)
+    loss_full.backward()
+    full_params_before = [p.detach().clone() for p in model_full.parameters()]
+    full_grads = [p.grad.detach().clone() for p in model_full.parameters()]
+    opt_full.step()
+    full_params_after = [p.detach().clone() for p in model_full.parameters()]
+
+    seed_everything(seed)
+    model_accum = make_model(in_dim, hidden, out_dim)
+    opt_accum = torch.optim.SGD(model_accum.parameters(), lr=lr)
+    zero_grads(model_accum)
+    chunks_x = list(torch.split(x, micro, dim=0))
+    chunks_y = list(torch.split(y, micro, dim=0))
+    for cx, cy in zip(chunks_x, chunks_y):
+        scaled = loss_fn(model_accum(cx), cy) / accum_steps
+        scaled.backward()
+    accum_grads = [p.grad.detach().clone() for p in model_accum.parameters()]
+    accum_params_before = [p.detach().clone() for p in model_accum.parameters()]
+    opt_accum.step()
+    accum_params_after = [p.detach().clone() for p in model_accum.parameters()]
+
+    grad_diffs = [
+        float((a - b).abs().max().item())
+        for a, b in zip(full_grads, accum_grads)
+    ]
+    param_diffs = [
+        float((a - b).abs().max().item())
+        for a, b in zip(full_params_after, accum_params_after)
+    ]
+    return {
+        &quot;max_grad_diff&quot;: max(grad_diffs),
+        &quot;max_param_diff&quot;: max(param_diffs),
+        &quot;params_init_match&quot;: all(
+            torch.equal(a, b) for a, b in zip(full_params_before, accum_params_before)
+        ),
+    }
+
+
+def write_curve(points: List[CurvePoint], path: Path) -&gt; None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        &quot;schema&quot;: &quot;accum-curve.v1&quot;,
+        &quot;points&quot;: [asdict(p) for p in points],
+    }
+    path.write_text(json.dumps(payload, indent=2) + &quot;\n&quot;)
+
+
+def parse_args() -&gt; argparse.Namespace:
+    p = argparse.ArgumentParser()
+    p.add_argument(&quot;--micro-batch&quot;, type=int, default=4)
+    p.add_argument(&quot;--accum-grid&quot;, type=str, default=&quot;1,2,4,8,16&quot;)
+    p.add_argument(&quot;--num-steps&quot;, type=int, default=25)
+    p.add_argument(&quot;--seed&quot;, type=int, default=0)
+    p.add_argument(&quot;--lr&quot;, type=float, default=0.05)
+    p.add_argument(&quot;--no-write&quot;, action=&quot;store_true&quot;)
+    return p.parse_args()
+
+
+def main() -&gt; int:
+    args = parse_args()
+    accum_grid = [int(s) for s in args.accum_grid.split(&quot;,&quot;) if s.strip()]
+    print(&quot;equivalence check (full batch vs accumulated)&quot;)
+    eq = equivalence_check()
+    print(json.dumps(eq, indent=2))
+    assert eq[&quot;max_grad_diff&quot;] &lt; 1e-4, f&quot;gradients diverge: {eq[&#39;max_grad_diff&#39;]}&quot;
+    assert eq[&quot;max_param_diff&quot;] &lt; 1e-4, f&quot;params diverge: {eq[&#39;max_param_diff&#39;]}&quot;
+    print(&quot;equivalence holds. running sweep...&quot;)
+
+    points = sweep_effective_batches(
+        micro_batch=args.micro_batch,
+        accum_grid=accum_grid,
+        num_steps=args.num_steps,
+        lr=args.lr,
+        seed=args.seed,
+    )
+    header = f&quot;{&#39;eff_batch&#39;:&gt;10}  {&#39;accum&#39;:&gt;5}  {&#39;micro&#39;:&gt;5}  {&#39;sps&#39;:&gt;10}  {&#39;median_ms&#39;:&gt;10}  {&#39;syncs&#39;:&gt;6}  {&#39;loss&#39;:&gt;8}&quot;
+    print(header)
+    for p in points:
+        print(
+            f&quot;{p.effective_batch:&gt;10}  {p.accum_steps:&gt;5}  {p.micro_batch:&gt;5}  &quot;
+            f&quot;{p.samples_per_sec:&gt;10.1f}  {p.median_step_ms:&gt;10.2f}  {p.sync_calls:&gt;6}  {p.avg_loss:&gt;8.4f}&quot;
+        )
+    if not args.no_write:
+        write_curve(points, LOG_PATH)
+        print(f&quot;wrote {LOG_PATH}&quot;)
+    return 0
+
+
+if __name__ == &quot;__main__&quot;:
+    raise SystemExit(main())
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/46-gradient-accumulation/code/test_main.py">phases/19-capstone-projects/46-gradient-accumulation/code/test_main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Tests for gradient accumulation core paths.&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import json
+import sys
+import unittest
+from pathlib import Path
+
+HERE = Path(__file__).parent
+sys.path.insert(0, str(HERE))
+
+import main as accum
+
+
+class EquivalenceTests(unittest.TestCase):
+    def test_full_batch_matches_accumulated(self):
+        diffs = accum.equivalence_check()
+        self.assertLess(diffs[&quot;max_grad_diff&quot;], 1e-4)
+        self.assertLess(diffs[&quot;max_param_diff&quot;], 1e-4)
+        self.assertTrue(diffs[&quot;params_init_match&quot;])
+
+    def test_loss_scaled_for_accum_divides(self):
+        import torch
+        from torch import nn
+
+        logits = torch.tensor([[2.0, 0.5, -1.0]])
+        target = torch.tensor([0])
+        fn = nn.CrossEntropyLoss()
+        raw = fn(logits, target)
+        scaled = accum.loss_scaled_for_accum(logits, target, 4, fn)
+        self.assertAlmostEqual(float(scaled.item()), float(raw.item()) / 4.0, places=6)
+
+
+class SweepTests(unittest.TestCase):
+    def test_sweep_returns_one_point_per_accum(self):
+        points = accum.sweep_effective_batches(
+            micro_batch=2,
+            accum_grid=[1, 2, 4],
+            in_dim=16,
+            hidden=24,
+            out_dim=4,
+            num_steps=5,
+            lr=0.05,
+        )
+        self.assertEqual(len(points), 3)
+        self.assertEqual([p.accum_steps for p in points], [1, 2, 4])
+        self.assertEqual([p.effective_batch for p in points], [2, 4, 8])
+        for p in points:
+            self.assertGreater(p.samples_per_sec, 0.0)
+            self.assertGreater(p.steps, 0)
+            self.assertGreater(p.median_step_ms, 0.0)
+
+    def test_sync_calls_equal_step_count(self):
+        points = accum.sweep_effective_batches(
+            micro_batch=2,
+            accum_grid=[1, 4],
+            in_dim=16,
+            hidden=24,
+            out_dim=4,
+            num_steps=7,
+            lr=0.05,
+        )
+        for p in points:
+            self.assertEqual(p.sync_calls, p.steps)
+
+
+class CurveOutputTests(unittest.TestCase):
+    def test_write_curve_round_trip(self):
+        import tempfile
+
+        points = accum.sweep_effective_batches(
+            micro_batch=2,
+            accum_grid=[1, 2],
+            in_dim=8,
+            hidden=12,
+            out_dim=3,
+            num_steps=3,
+            lr=0.05,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / &quot;curve.json&quot;
+            accum.write_curve(points, path)
+            payload = json.loads(path.read_text())
+            self.assertEqual(payload[&quot;schema&quot;], &quot;accum-curve.v1&quot;)
+            self.assertEqual(len(payload[&quot;points&quot;]), 2)
+            self.assertIn(&quot;samples_per_sec&quot;, payload[&quot;points&quot;][0])
+
+    def test_effective_batch_must_divide_accum(self):
+        with self.assertRaises(AssertionError):
+            accum.run_config(
+                effective_batch=5,
+                accum_steps=2,
+                in_dim=8,
+                hidden=12,
+                out_dim=3,
+                num_steps=2,
+                lr=0.05,
+                seed=0,
+            )
+
+
+if __name__ == &quot;__main__&quot;:
+    unittest.main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/46-gradient-accumulation/outputs/accum-curve.json">phases/19-capstone-projects/46-gradient-accumulation/outputs/accum-curve.json</a><details><summary>查看原始文本</summary><pre><code>{
+  &quot;schema&quot;: &quot;accum-curve.v1&quot;,
+  &quot;points&quot;: [
+    {
+      &quot;effective_batch&quot;: 4,
+      &quot;accum_steps&quot;: 1,
+      &quot;micro_batch&quot;: 4,
+      &quot;avg_loss&quot;: 2.7746317982673645,
+      &quot;samples_per_sec&quot;: 10589.599020053975,
+      &quot;median_step_ms&quot;: 0.36970898509025574,
+      &quot;sync_calls&quot;: 8,
+      &quot;steps&quot;: 8
+    },
+    {
+      &quot;effective_batch&quot;: 8,
+      &quot;accum_steps&quot;: 2,
+      &quot;micro_batch&quot;: 4,
+      &quot;avg_loss&quot;: 2.778739705681801,
+      &quot;samples_per_sec&quot;: 12129.73295382913,
+      &quot;median_step_ms&quot;: 0.6751659093424678,
+      &quot;sync_calls&quot;: 8,
+      &quot;steps&quot;: 8
+    },
+    {
+      &quot;effective_batch&quot;: 16,
+      &quot;accum_steps&quot;: 4,
+      &quot;micro_batch&quot;: 4,
+      &quot;avg_loss&quot;: 2.7735252678394318,
+      &quot;samples_per_sec&quot;: 12667.36269537429,
+      &quot;median_step_ms&quot;: 1.2691670563071966,
+      &quot;sync_calls&quot;: 8,
+      &quot;steps&quot;: 8
+    }
+  ]
+}
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/46-gradient-accumulation/outputs/skill-gradient-accumulation.md">phases/19-capstone-projects/46-gradient-accumulation/outputs/skill-gradient-accumulation.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: gradient-accumulation
+description: Train at an effective batch larger than device memory by scaling micro-batch losses and stepping the optimizer once per window.
+version: 1.0.0
+phase: 19
+lesson: 46
+tags: [training, batch-size, distributed, scaling]
+---
+
+## When to use
+
+Effective batch is the lever that smooths the gradient and matches the learning rate schedule. When you cannot afford it in a single forward pass, this is the recipe.
+
+## Recipe
+
+1. Pick `micro_batch` as the largest size that fits in memory and saturates the accelerator.
+2. Pick `effective_batch` from the learning rate schedule.
+3. Set `accum_steps = effective_batch // (micro_batch * world_size)` and assert it divides evenly.
+4. Per micro batch: `loss = criterion(model(x), y) / accum_steps; loss.backward()`.
+5. On non-final micros, enter `model.no_sync()` to skip the gradient all-reduce in DDP.
+6. After the last micro batch, run `optimizer.step()` once. Zero gradients before the next window.
+7. The optimizer state advances once per effective batch; the learning rate schedule ticks once per effective batch.
+
+## Logging
+
+Emit a small JSON record per effective step with `samples_per_sec`, `median_step_ms`, `sync_calls`, `accum_steps`, `effective_batch`. Without this the cost trade is invisible.
+
+## Failure modes
+
+- Forgetting the `/ accum_steps` scaling: gradients explode by N.
+- Stepping mid-window: parameters drift.
+- Sync on every micro batch: network bound for no statistical gain.
+- Mixing this with mixed precision unscaling: scale the unscaled loss only.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. What is the effective batch identity that gradient accumulation expresses?</legend><label class="option"><input type="radio" name="q0" value="0"> effective_batch = micro_batch / accum_steps</label><label class="option"><input type="radio" name="q0" value="1"> effective_batch = world_size only</label><label class="option"><input type="radio" name="q0" value="2"> effective_batch = micro_batch + accum_steps</label><label class="option"><input type="radio" name="q0" value="3"> effective_batch = micro_batch * accum_steps</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. Why must the loss be divided by accum_steps before backward on each micro batch?</legend><label class="option"><input type="radio" name="q1" value="0"> It makes the loss curve prettier</label><label class="option"><input type="radio" name="q1" value="1"> It avoids NaNs</label><label class="option"><input type="radio" name="q1" value="2"> It is required for mixed precision only</label><label class="option"><input type="radio" name="q1" value="3"> PyTorch sums gradients into param.grad by default, so without the division the accumulated gradient is N times too large and the optimizer step is N times too aggressive</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. When does the optimizer step run inside the accumulation loop?</legend><label class="option"><input type="radio" name="q2" value="0"> Never; the optimizer is replaced</label><label class="option"><input type="radio" name="q2" value="1"> Twice per window for safety</label><label class="option"><input type="radio" name="q2" value="2"> After every micro batch</label><label class="option"><input type="radio" name="q2" value="3"> Only after the last micro batch in the accumulation window</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. What does the no_sync context wrap on a real multi-GPU run?</legend><label class="option"><input type="radio" name="q3" value="0"> The data loader</label><label class="option"><input type="radio" name="q3" value="1"> The non-final micro batches, so the gradient all-reduce only fires after the last backward instead of N times</label><label class="option"><input type="radio" name="q3" value="2"> The optimizer step</label><label class="option"><input type="radio" name="q3" value="3"> The forward pass</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. What does the equivalence_check function in main.py assert?</legend><label class="option"><input type="radio" name="q4" value="0"> That the loss converges</label><label class="option"><input type="radio" name="q4" value="1"> That gradients are zero</label><label class="option"><input type="radio" name="q4" value="2"> That a single full-batch backward and an accum_steps chunked backward with loss / N produce the same gradient buffer and the same post-step parameters up to a small tolerance</label><label class="option"><input type="radio" name="q4" value="3"> That throughput is constant</label><p data-feedback="4"></p></fieldset><fieldset><legend>6. Reading the throughput against effective batch curve, what stays roughly constant and what scales?</legend><label class="option"><input type="radio" name="q5" value="0"> Throughput goes up because the model gets faster</label><label class="option"><input type="radio" name="q5" value="1"> Both metrics scale linearly with accum</label><label class="option"><input type="radio" name="q5" value="2"> Samples per second saturates near the hardware limit while wall time per optimizer step scales linearly with accum_steps; optimizer steps per second is what falls</label><label class="option"><input type="radio" name="q5" value="3"> Samples per second drops with larger effective batch</label><p data-feedback="5"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/19-capstone-projects/45-gradient-clipping-amp/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/19-capstone-projects/47-checkpoint-save-resume/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/19-capstone-projects/46-gradient-accumulation/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

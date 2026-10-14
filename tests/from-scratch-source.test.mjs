@@ -13,6 +13,12 @@ async function imported(t, en = fixtureFiles, zh = translationFiles, overrides) 
 }
 const catalogFor = (root, counts = expectedCounts) => buildCatalog({ sourceRoot: resolve(root, 'upstream/en'), translationRoot: resolve(root, 'upstream/zh'), expectedCounts: counts });
 
+test('imports project figure providers needed by project-stage lesson blocks',async(t)=>{
+ const {root}=await imported(t,{...fixtureFiles,'site/figures/projects/runtime.js':'// fixed drawing runtime','site/figures/projects/demo.js':'// fixed project diagram'});
+ assert.equal(existsSync(resolve(root,'upstream/en/site/figures/projects/runtime.js')),true);
+ assert.equal(existsSync(resolve(root,'upstream/en/site/figures/projects/demo.js')),true);
+});
+
 test('imports pinned text and code without executing it, and retains every lesson and existing quiz', async (t) => {
   const { root, inventory } = await imported(t);
   const catalog = await catalogFor(root);

@@ -1,0 +1,605 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>生产规模 排队,检查点,耐用性 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-16-multi-agent-and-swarms" data-lesson="16-multi-agent-and-swarms/22-production-scaling-queues-checkpoints" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/16-multi-agent-and-swarms/">多 Agent 与群体</a> / LESSON 22</p><h1 class="lesson-title">生产规模 排队,检查点,耐用性</h1><p>Production Scaling — Queues, Checkpoints, Durability</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>生产规模 排队,检查点,耐用性</h1>
+<blockquote>
+<p>扩展多代理系统到数千次同时运行需要<strong>durable execution</strong>工作队列加上检查站,因此任何工人都可以在任何事故后恢复任何运行,只要租处理,无效的副作用和确定性重播都在位. 兰格拉夫的运行时间是参考例子:它在每个超级步骤后写出检查站<code>thread_id</code>工人失业后,工人重新开始租,代理人可以无限期地等待人力投入. <strong>MegaAgent</strong>根据该报告,该报告的内容包括:<strong>Fiber/async</strong>对于LLM流媒体,线程在99%的时间里停留无事,纤维在合作中输入/运输.<strong>FastAPI + Postgres + nothing else</strong>在负载证明不一样之前,简单的架构比预期要远.这个课程建立了一个持久的检查点日志,一个每个代理的工作队列,状态过渡,一个asyncvsthread演示,并降落实态的&quot;开始简单&quot;规则.</p>
+</blockquote>
+<p><strong>Type:</strong> Learn + Build
+<strong>Languages:</strong> Python (stdlib, <code>asyncio</code>, <code>sqlite3</code>)
+<strong>Prerequisites:</strong> Phase 16 · 09 (Parallel Swarm Networks), Phase 16 · 13 (Shared Memory)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>问题</h2>
+<p>一个原型多代理系统在一个笔记本电脑上运行,有三个代理在内存事件循环中.</p>
+<ul>
+<li>代理人有时会花费几个小时 (长时间的研究,</li>
+<li>工人进程崩,重新启动失去了状态.</li>
+<li>平均水平是10倍,需要水平扩展.</li>
+<li>用户每次运行都会付费,需要一次性语义来充电.</li>
+</ul>
+<p>记忆中的事件循环没有任何这些.你需要一个持久的执行层. 2026 规范的选项是:</p>
+<ol>
+<li>工作流动引擎,具有检查点 (时间,长图运行时间).</li>
+<li>随着国家商店的消息排队 (Postgres + SQS/RabbitMQ).</li>
+<li>演员模式框架 (每代理人每位MegaAgent的生产者-消费者).</li>
+<li>手动 FastAPI + Postgres (贝迪的论点).</li>
+</ol>
+<p>这一课构建了每个小图.</p>
+<h2>概念</h2>
+<h3>持续执行,模式</h3>
+<p>长期执行引擎在每一步之后保持完整的程序状态 (在LangGraph语言中说超级步骤).</p>
+<pre><code>worker crashes mid-step
+  -&gt; lease timeout
+  -&gt; another worker picks up the thread_id
+  -&gt; resumes from last checkpoint
+  -&gt; no duplicate side effects
+</code></pre>
+<p>要求:</p>
+<ul>
+<li>**Serializable state.**任何代理状态都必须持续. 连接数据库的功能关闭不会存活.</li>
+<li>**Deterministic resume.**由于相同状态和相同的输入,代理产生相同的行动 (或将其推迟到外部确定性预言器来进行LLM调用).</li>
+<li>**Idempotent side effects.**外部调用 (工具调用,支付) 必须无效或使用减倍密钥.</li>
+</ul>
+<p>拉格格拉夫在每一个超级步骤之后写一个检查点; 时间表在每一个活动之后写一个检查点; 重新使用事件来源的日志.所有三个都实现相同的模式.</p>
+<h3>检查点每步运行时间</h3>
+<p>运行时间是工作的例子:每个代理都有一个<code>thread_id</code>总结: 运行时间从最后一个检查点重播,而不是从零开始. 代理人可以<code>interrupt()</code>工作时间持续,释放了工人.</p>
+<p>根据&quot;中国&quot;的标题,</p>
+<h3>对于每位代理人,MegaAgent的排队</h3>
+<p>建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑: 建筑:</p>
+<pre><code>agent i:
+  state ∈ {Idle, Processing, Response}
+  in_queue   &lt;- messages addressed to agent i
+  out_queue  -&gt; replies + side effects
+
+coordinators:
+  intra-group chat  (agents in the same group)
+  inter-group admin chat  (high-level routing)
+</code></pre>
+<p>两层协调使得集团内部对话发生密集,而集团间保持稀少.</p>
+<h3>同比对每项工作的线程</h3>
+<p>电话是 I/O 绑定.一个线程等待下一个代币是置的99%.线程每一个成本 ~ 1MB RAM;在 10,000 个同时电话,这仅仅是10GB 堆.</p>
+<p>纤维 (Python <code>asyncio</code>走进节日,烂<code>tokio</code>) 合作地实现I/O. 同样的10,000通话舒适地适应过程.在LLM代理规模上,async不是一个优化,而是架构.</p>
+<p>唯一的例外: CPU 相关后处理 (嵌入,代币化技巧) 仍然需要线程或进程.将您的 I/O 层与 CPU 层分开.</p>
+<h3>贝迪的反点</h3>
+<p>&quot;扩展代理软件&quot; (Ashpreet Bedi, 2026) 认为大多数团队在测量负载之前过度工程.</p>
+<ul>
+<li>快速API+后期.</li>
+<li>每次代理运行都是一行;状态在现场更新,同时保持乐观.</li>
+<li>通过 <code>pg_notify</code>或是一个简单的菜工人.</li>
+<li>申请代码中重新尝试.</li>
+</ul>
+<p>对于可管理任务的负载量低于100个同时运行的代理,通常只需要这么做.</p>
+<p>规则:当你遇到一个具体的问题, 简单的建筑无法解决时, 采用持久的执行框架.</p>
+<h3>精确的语义</h3>
+<p>对于付费代理运行,你需要&quot;一次有效&quot; (至少一次交付 +无权消费者).</p>
+<ul>
+<li>**Dedup key per run.**加入每次副作用电话.</li>
+<li>**Outbox pattern.**后果首先写到一个表,然后一个单独的过程执行它们.</li>
+<li>**Compensating transactions.**如果副作用成功,但其追踪写失败,</li>
+</ul>
+<p>法律法师税仅仅是法律法师调用速度缓慢;其他的一切都是标准分布式系统.</p>
+<h3>彩虹部署</h3>
+<p>普奇的多代理研究系统使用&quot;彩虹部署&quot;:代理运行时间的多个版本同时运行,因此长期运行的代理人不需要在每个代码部署中被杀害.卡纳里新版本在一片流量上;当他们的代理人完成时退休旧版本.</p>
+<p>这对于长期运行的状态系统是标准的; 2026年适应是代理人可以活多小时,所以部署周期必须适应.</p>
+<h3>标准生产检查清单</h3>
+<ul>
+<li>持久状态 (检查点,快照或输出箱+可播放日志).</li>
+<li>无效的副作用.</li>
+<li>对于LLM电话来说,Async I/O层.</li>
+<li>至少一次送货,带着.</li>
+<li>适用于工作负载的彩虹/加拿大鱼部署.</li>
+<li>观察性:每位代理的痕迹,超级审计,重试计数.</li>
+</ul>
+<figure><img src="/learn/ai-from-scratch/figures/figure-feade6693699d9f207bb.png" alt="sw-checkpoint-replay 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<p><code>code/main.py</code>执行:</p>
+<ul>
+<li><code>CheckpointStore</code> SQLite支持的检查点日志,有线索ID键.每个超级步骤添加了一行.</li>
+<li><code>run_with_checkpoint(agent, thread_id)</code>模拟一次中跑事故;第二名工人从最后一个检查点恢复.</li>
+<li><code>AgentQueue</code>每代理</li>
+<li><code>demo_async_vs_threads()</code>通过无线和线程运行500个同时模拟的LLM调用;报告墙钟和峰值内存 (近似).</li>
+</ul>
+<p>运行:</p>
+<pre><code>python3 code/main.py
+</code></pre>
+<p>预期输出:检查点恢复在模拟崩后成功;async版本在&lt;1s内处理500次同时调用;线程版本需要几秒钟,每次同时使用数量更高的内存.</p>
+<h2>用它</h2>
+<p><code>outputs/skill-scaling-advisor.md</code>建议使用耐用执行选项:FastAPI + Postgres,LangGraph运行时间,时间或定制.按负载,状态保留需求和部署频率进行校准.</p>
+<h2>运送它</h2>
+<p>制产品硬化:</p>
+<ul>
+<li>**Start simple (Bedi's rule).**快API+后期,直到测量失败.</li>
+<li>**Instrument everything before optimizing.**运行延迟历史图,步骤时间,重复试数,失败分类.</li>
+<li>**Outbox pattern for side effects.**尤其是支付和外部API通话.</li>
+<li>**Rainbow deploys.**在部署时,不要杀死飞行中的特工.</li>
+<li><strong>Adopt durable-execution engines (Temporal / LangGraph / Restate) when</strong>您遇到特定问题:一个小时的循环等待,跨地区协调,复杂的重试/补偿政策.</li>
+<li>**Async for the I/O layer.**仅用于处理后处理.</li>
+</ul>
+<h2>运动</h2>
+<ol>
+<li>跑步<code>code/main.py</code>检查点恢复工作;测量异步与线程同步差异.</li>
+<li>实施一个<strong>outbox</strong>每个工具调用首先写到输出框,然后执行一个单独的 goroutine/任务.通过两次运行工具调用来验证无效性.</li>
+<li>模拟一个<strong>rainbow deploy</strong>:两个同时运行版本;将新线程_ID的半个线程向每一个;确认旧版本的飞行线程没有被打断.</li>
+<li>阅读LangGraph的运行时间文件 (下面链接).确定运行时间的哪些功能在手动滚动的FastAPI + Postgres版本中需要最长时间复制.这是否可以采取理由,或者您可以推迟?</li>
+<li>阅读MegaAgent (arXiv:2408.09955) 第三节. 两层协调 (组内 + 组间管理员聊天) 是明确的. 绘制一幅图,说明你如何将此映射到两个队列家庭的消息队列中.</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Durable execution</td>
+<td>&quot;Persist the program state&quot;</td>
+<td>Engine writes state after each super-step; crash recovery is deterministic.</td>
+</tr>
+<tr>
+<td>Super-step</td>
+<td>&quot;Transactional boundary&quot;</td>
+<td>Unit of work between checkpoints. LangGraph term.</td>
+</tr>
+<tr>
+<td>thread_id</td>
+<td>&quot;Agent run identifier&quot;</td>
+<td>Key that binds checkpoints and resume logic.</td>
+</tr>
+<tr>
+<td>Idempotency</td>
+<td>&quot;Safe to retry&quot;</td>
+<td>Repeating a side effect produces the same result as one attempt.</td>
+</tr>
+<tr>
+<td>Outbox pattern</td>
+<td>&quot;Decouple side effects&quot;</td>
+<td>Write intent to a table; a separate executor performs and marks done.</td>
+</tr>
+<tr>
+<td>At-least-once delivery</td>
+<td>&quot;Possible duplicates&quot;</td>
+<td>Message queue semantics; dedup key makes consumer effective-once.</td>
+</tr>
+<tr>
+<td>Rainbow deploy</td>
+<td>&quot;Overlapping versions&quot;</td>
+<td>Multiple runtime versions concurrent during long-running workloads.</td>
+</tr>
+<tr>
+<td>Async fiber</td>
+<td>&quot;Cooperative yielding&quot;</td>
+<td>User-mode concurrency; cheap compared to threads for I/O-bound loads.</td>
+</tr>
+<tr>
+<td>Checkpoint</td>
+<td>&quot;State snapshot&quot;</td>
+<td>Serialized state at a super-step boundary; key for resume.</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://www.langchain.com/conceptual-guides/runtime-behind-production-deep-agents" rel="noreferrer" data-network="true">LangChain — The runtime behind production deep agents <small>↗ 需要联网</small></a> 兰格拉夫运行时间设计</li>
+<li><a href="https://arxiv.org/abs/2408.09955" rel="noreferrer" data-network="true">MegaAgent <small>↗ 需要联网</small></a>每代理生产者-消费者队列;在数千个同时代理的两层协调</li>
+<li><a href="https://arxiv.org/abs/2511.21686" rel="noreferrer" data-network="true">Matrix <small>↗ 需要联网</small></a> 分离式框架,配合基层是信息队列</li>
+<li><a href="https://docs.temporal.io/" rel="noreferrer" data-network="true">Temporal docs <small>↗ 需要联网</small></a> 适用于耐用执行的参考工作流动引擎</li>
+<li><a href="https://www.anthropic.com/engineering/multi-agent-research-system" rel="noreferrer" data-network="true">Anthropic — Multi-agent research system <small>↗ 需要联网</small></a>生产课程,包括彩虹部署</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Production Scaling — Queues, Checkpoints, Durability</h1>
+<blockquote>
+<p>Scaling multi-agent systems to thousands of concurrent runs requires <strong>durable execution</strong> — work queues plus checkpoints, so any worker can resume any run after any crash, provided lease handling, idempotent side effects, and deterministic replay are in place. LangGraph's runtime is the reference example: it writes a checkpoint after each super-step keyed by <code>thread_id</code> (Postgres by default); worker crashes release a lease and another worker resumes. Agents can sleep indefinitely waiting for human input. <strong>MegaAgent</strong> (arXiv:2408.09955) ran a per-agent producer-consumer queue with three states (Idle / Processing / Response) and two-layer coordination (intra-group chat + inter-group admin chat). <strong>Fiber/async</strong> beats thread-per-job for LLM streaming: threads sit idle 99% of the time waiting for tokens, fibers cooperatively yield on I/O. Counterpoint: Ashpreet Bedi's &quot;Scaling Agentic Software&quot; argues for <strong>FastAPI + Postgres + nothing else</strong> until load proves otherwise — simple architectures go further than expected. This lesson builds a durable checkpoint log, a per-agent work queue with state transitions, an async-vs-thread demo, and lands the pragmatic &quot;start simple&quot; rule.</p>
+</blockquote>
+<p><strong>Type:</strong> Learn + Build
+<strong>Languages:</strong> Python (stdlib, <code>asyncio</code>, <code>sqlite3</code>)
+<strong>Prerequisites:</strong> Phase 16 · 09 (Parallel Swarm Networks), Phase 16 · 13 (Shared Memory)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>Problem</h2>
+<p>A prototype multi-agent system works on one laptop with three agents in an in-memory event loop. You move to production:</p>
+<ul>
+<li>Agents sometimes run for hours (long research, human-in-the-loop waits).</li>
+<li>Worker processes crash. Restarting loses state.</li>
+<li>Peak load is 10x average; you need horizontal scaling.</li>
+<li>Users pay per agent-run; you need exactly-once semantics for charging.</li>
+</ul>
+<p>The in-memory event loop does none of these. You need a durable execution layer underneath. The 2026 canonical options are:</p>
+<ol>
+<li>A workflow engine with checkpoints (Temporal, LangGraph runtime).</li>
+<li>A message queue with a state store (Postgres + SQS/RabbitMQ).</li>
+<li>Actor-model frameworks (MegaAgent's producer-consumer per agent).</li>
+<li>Hand-rolled FastAPI + Postgres (Bedi's argument).</li>
+</ol>
+<p>This lesson builds a miniature of each.</p>
+<h2>Concept</h2>
+<h3>Durable execution, the pattern</h3>
+<p>A durable-execution engine persists the full program state after each &quot;step&quot; (super-step, in LangGraph's language). On crash:</p>
+<pre><code>worker crashes mid-step
+  -&gt; lease timeout
+  -&gt; another worker picks up the thread_id
+  -&gt; resumes from last checkpoint
+  -&gt; no duplicate side effects
+</code></pre>
+<p>Requirements for this to work:</p>
+<ul>
+<li><strong>Serializable state.</strong> All agent state has to be persistable. Function closures with live database connections do not survive.</li>
+<li><strong>Deterministic resume.</strong> Given the same state and same inputs, the agent produces the same actions (or defers to an external deterministic oracle for LLM calls).</li>
+<li><strong>Idempotent side effects.</strong> External calls (tool calls, payments) must be idempotent or use a deduplication key.</li>
+</ul>
+<p>LangGraph writes a checkpoint after each super-step; Temporal writes after each activity; Restate uses event-sourced journals. All three implement the same pattern.</p>
+<h3>A checkpoint-per-step runtime</h3>
+<p>LangGraph's runtime is the worked example: each agent has a <code>thread_id</code>; state is a typed dict; each super-step writes a row to the checkpoints table. On resume, the runtime replays from the last checkpoint, not from scratch. Agents can <code>interrupt()</code> waiting for human input; the runtime persists and releases the worker. When input arrives, any worker can resume.</p>
+<p>This is the reference production design in April 2026.</p>
+<h3>MegaAgent's per-agent queue</h3>
+<p>arXiv:2408.09955 describes a scale experiment: thousands of concurrent agents in one cluster. Architecture:</p>
+<pre><code>agent i:
+  state ∈ {Idle, Processing, Response}
+  in_queue   &lt;- messages addressed to agent i
+  out_queue  -&gt; replies + side effects
+
+coordinators:
+  intra-group chat  (agents in the same group)
+  inter-group admin chat  (high-level routing)
+</code></pre>
+<p>The two-layer coordination lets intra-group conversation happen densely while inter-group stays sparse — the pattern used for keeping cost linear in thousands of agents.</p>
+<h3>Async vs thread-per-job</h3>
+<p>LLM calls are I/O-bound. A thread waiting for the next token is idle 99% of the time. Threads cost ~1MB RAM each; at 10,000 concurrent calls, that is 10GB just for stacks.</p>
+<p>Fibers (Python <code>asyncio</code>, Go goroutines, Rust <code>tokio</code>) cooperatively yield on I/O. The same 10,000 calls fit comfortably in process. At LLM-agent scale, async is not an optimization — it is the architecture.</p>
+<p>Exception: CPU-bound post-processing (embedding, tokenizer tricks) still wants threads or processes. Separate your I/O layer from your CPU layer.</p>
+<h3>Bedi's counterpoint</h3>
+<p>&quot;Scaling Agentic Software&quot; (Ashpreet Bedi, 2026) argues that most teams over-engineer before they have measured load. The pragmatic default:</p>
+<ul>
+<li>FastAPI + Postgres.</li>
+<li>Each agent run is a row; state updated in-place with optimistic concurrency.</li>
+<li>Background jobs via <code>pg_notify</code> or a simple Celery worker.</li>
+<li>Retry policy in application code.</li>
+</ul>
+<p>For loads under ~100 concurrent agent-runs on manageable tasks, this is often all you need. Upgrade when you measure it failing.</p>
+<p>The rule: adopt durable-execution frameworks when you hit a concrete problem that simple architectures cannot solve. Premature adoption burns time on ceremonies that do not pay off.</p>
+<h3>Exactly-once semantics</h3>
+<p>For paid agent runs, you need &quot;exactly-once effective&quot; (at-least-once delivery + idempotent consumer). The engineering moves:</p>
+<ul>
+<li><strong>Dedup key per run.</strong> Include it in every side-effect call.</li>
+<li><strong>Outbox pattern.</strong> Side effects write to a table first, then a separate process executes them. Both steps idempotent.</li>
+<li><strong>Compensating transactions.</strong> When a side effect succeeds but its tracking write fails, schedule a compensate.</li>
+</ul>
+<p>These are database-engineering patterns, not LLM-specific. The LLM tax is only that LLM calls are slow; everything else is standard distributed systems.</p>
+<h3>Rainbow deployment</h3>
+<p>Anthropic's multi-agent research system uses &quot;rainbow deployments&quot;: multiple versions of the agent runtime run concurrently so long-running agents do not have to be killed on every code deploy. Canary new versions on a slice of traffic; retire old versions when their agents finish.</p>
+<p>This is standard for long-running stateful systems; the 2026 adaptation is that agents can live for hours, so deployment cycles must accommodate.</p>
+<h3>The canonical production checklist</h3>
+<ul>
+<li>Durable state (checkpoints, snapshots, or outbox + replayable log).</li>
+<li>Idempotent side effects.</li>
+<li>Async I/O layer for LLM calls.</li>
+<li>At-least-once delivery with dedup.</li>
+<li>Rainbow/canary deployment for stateful workloads.</li>
+<li>Observability: per-agent traces, super-step audit, retry counter.</li>
+</ul>
+<figure><img src="/learn/ai-from-scratch/figures/figure-feade6693699d9f207bb.png" alt="sw-checkpoint-replay 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<p><code>code/main.py</code> implements:</p>
+<ul>
+<li><code>CheckpointStore</code> — SQLite-backed checkpoint log with thread-id keys. Each super-step appends a row.</li>
+<li><code>run_with_checkpoint(agent, thread_id)</code> — simulates a crash mid-run; a second worker resumes from last checkpoint.</li>
+<li><code>AgentQueue</code> — per-agent Idle / Processing / Response state machine with a small work queue.</li>
+<li><code>demo_async_vs_threads()</code> — runs 500 concurrent simulated &quot;LLM calls&quot; via asyncio and via threads; reports wall-clock and peak memory (approximated).</li>
+</ul>
+<p>Run:</p>
+<pre><code>python3 code/main.py
+</code></pre>
+<p>Expected output: checkpoint resume succeeds after simulated crash; async version handles 500 concurrent calls in &lt; 1s; thread version takes several seconds and uses orders of magnitude more memory per concurrent unit.</p>
+<h2>Use It</h2>
+<p><code>outputs/skill-scaling-advisor.md</code> advises on durable-execution choice: FastAPI + Postgres, LangGraph runtime, Temporal, or custom. Calibrated by load, state-retention needs, and deploy frequency.</p>
+<h2>Ship It</h2>
+<p>Canonical production hardening:</p>
+<ul>
+<li><strong>Start simple (Bedi's rule).</strong> FastAPI + Postgres until you measure it failing.</li>
+<li><strong>Instrument everything before optimizing.</strong> Per-run latency histogram, per-step time, retry count, failure categorization.</li>
+<li><strong>Outbox pattern for side effects.</strong> Especially payments and external API calls.</li>
+<li><strong>Rainbow deploys.</strong> Never kill in-flight agent runs during deploys.</li>
+<li><strong>Adopt durable-execution engines (Temporal / LangGraph / Restate) when</strong> you hit specific problems: hour-long human-in-the-loop waits, cross-region coordination, complex retry/compensation policies.</li>
+<li><strong>Async for the I/O layer.</strong> Threads only for CPU-bound post-processing.</li>
+</ul>
+<h2>Exercises</h2>
+<ol>
+<li>Run <code>code/main.py</code>. Confirm checkpoint resume works; measure async vs thread concurrency difference.</li>
+<li>Implement an <strong>outbox</strong> table: every tool call writes to outbox first, then a separate goroutine/task executes. Verify idempotency by running the tool call twice.</li>
+<li>Simulate a <strong>rainbow deploy</strong>: two concurrent runtime versions; route half of new thread_ids to each; confirm that in-flight threads on the old version are not interrupted.</li>
+<li>Read LangGraph's runtime doc (linked below). Identify which features of the runtime would take the longest to replicate in a hand-rolled FastAPI + Postgres version. Is that a reason to adopt, or can you defer?</li>
+<li>Read MegaAgent (arXiv:2408.09955) Section 3. The two-layer coordination (intra-group + inter-group admin chat) is explicit. Sketch how you would map this to a message queue with two queue families.</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Durable execution</td>
+<td>&quot;Persist the program state&quot;</td>
+<td>Engine writes state after each super-step; crash recovery is deterministic.</td>
+</tr>
+<tr>
+<td>Super-step</td>
+<td>&quot;Transactional boundary&quot;</td>
+<td>Unit of work between checkpoints. LangGraph term.</td>
+</tr>
+<tr>
+<td>thread_id</td>
+<td>&quot;Agent run identifier&quot;</td>
+<td>Key that binds checkpoints and resume logic.</td>
+</tr>
+<tr>
+<td>Idempotency</td>
+<td>&quot;Safe to retry&quot;</td>
+<td>Repeating a side effect produces the same result as one attempt.</td>
+</tr>
+<tr>
+<td>Outbox pattern</td>
+<td>&quot;Decouple side effects&quot;</td>
+<td>Write intent to a table; a separate executor performs and marks done.</td>
+</tr>
+<tr>
+<td>At-least-once delivery</td>
+<td>&quot;Possible duplicates&quot;</td>
+<td>Message queue semantics; dedup key makes consumer effective-once.</td>
+</tr>
+<tr>
+<td>Rainbow deploy</td>
+<td>&quot;Overlapping versions&quot;</td>
+<td>Multiple runtime versions concurrent during long-running workloads.</td>
+</tr>
+<tr>
+<td>Async fiber</td>
+<td>&quot;Cooperative yielding&quot;</td>
+<td>User-mode concurrency; cheap compared to threads for I/O-bound loads.</td>
+</tr>
+<tr>
+<td>Checkpoint</td>
+<td>&quot;State snapshot&quot;</td>
+<td>Serialized state at a super-step boundary; key for resume.</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://www.langchain.com/conceptual-guides/runtime-behind-production-deep-agents" rel="noreferrer" data-network="true">LangChain — The runtime behind production deep agents <small>↗ 需要联网</small></a> — LangGraph runtime design</li>
+<li><a href="https://arxiv.org/abs/2408.09955" rel="noreferrer" data-network="true">MegaAgent <small>↗ 需要联网</small></a> — per-agent producer-consumer queue; two-layer coordination at thousands of concurrent agents</li>
+<li><a href="https://arxiv.org/abs/2511.21686" rel="noreferrer" data-network="true">Matrix <small>↗ 需要联网</small></a> — decentralized framework with message queues as the coordination substrate</li>
+<li><a href="https://docs.temporal.io/" rel="noreferrer" data-network="true">Temporal docs <small>↗ 需要联网</small></a> — the reference workflow engine for durable execution</li>
+<li><a href="https://www.anthropic.com/engineering/multi-agent-research-system" rel="noreferrer" data-network="true">Anthropic — Multi-agent research system <small>↗ 需要联网</small></a> — production lessons including rainbow deployment</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-16-multi-agent-and-swarms--22-production-scaling-queues-checkpoints.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-16-multi-agent-and-swarms--22-production-scaling-queues-checkpoints.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/16-multi-agent-and-swarms/22-production-scaling-queues-checkpoints/code/main.py">phases/16-multi-agent-and-swarms/22-production-scaling-queues-checkpoints/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Production scaling demo: checkpoints, queues, async vs threads.
+
+All stdlib. CheckpointStore uses SQLite. AgentQueue is a per-agent state
+machine with 3 states. async vs threads benchmark runs 500 concurrent
+simulated LLM calls.
+&quot;&quot;&quot;
+from __future__ import annotations
+
+import asyncio
+import enum
+import json
+import os
+import sqlite3
+import tempfile
+import threading
+import time
+from dataclasses import dataclass, field
+
+
+# ---------- CheckpointStore ----------
+
+class CheckpointStore:
+    def __init__(self, path: str) -&gt; None:
+        self.conn = sqlite3.connect(path)
+        self.conn.execute(&quot;&quot;&quot;
+            CREATE TABLE IF NOT EXISTS checkpoints (
+                thread_id TEXT NOT NULL,
+                super_step INTEGER NOT NULL,
+                state_json TEXT NOT NULL,
+                PRIMARY KEY (thread_id, super_step)
+            )
+        &quot;&quot;&quot;)
+
+    def write(self, thread_id: str, super_step: int, state: dict) -&gt; None:
+        self.conn.execute(
+            &quot;INSERT OR REPLACE INTO checkpoints (thread_id, super_step, state_json) VALUES (?, ?, ?)&quot;,
+            (thread_id, super_step, json.dumps(state)),
+        )
+        self.conn.commit()
+
+    def latest(self, thread_id: str) -&gt; tuple[int, dict] | None:
+        row = self.conn.execute(
+            &quot;SELECT super_step, state_json FROM checkpoints WHERE thread_id = ? ORDER BY super_step DESC LIMIT 1&quot;,
+            (thread_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return row[0], json.loads(row[1])
+
+
+def run_agent_with_checkpoint(store: CheckpointStore, thread_id: str,
+                              start: int = 0, crash_at: int | None = None, goal: int = 5) -&gt; int:
+    &quot;&quot;&quot;Run a tiny 5-step agent; optionally crash at a given step.&quot;&quot;&quot;
+    restored = store.latest(thread_id)
+    if restored:
+        super_step, state = restored
+        super_step += 1
+    else:
+        super_step = 0
+        state = {&quot;counter&quot;: start}
+
+    while state[&quot;counter&quot;] &lt; goal:
+        if crash_at is not None and super_step == crash_at:
+            print(f&quot;    worker crashes at super_step={super_step}&quot;)
+            raise RuntimeError(&quot;simulated crash&quot;)
+        state[&quot;counter&quot;] += 1
+        store.write(thread_id, super_step, dict(state))
+        super_step += 1
+    return state[&quot;counter&quot;]
+
+
+# ---------- AgentQueue ----------
+
+class AgentState(enum.Enum):
+    IDLE = &quot;idle&quot;
+    PROCESSING = &quot;processing&quot;
+    RESPONSE = &quot;response&quot;
+
+
+@dataclass
+class AgentQueue:
+    agent_id: str
+    state: AgentState = AgentState.IDLE
+    in_queue: list[dict] = field(default_factory=list)
+    out_queue: list[dict] = field(default_factory=list)
+
+    def enqueue(self, msg: dict) -&gt; None:
+        self.in_queue.append(msg)
+
+    def step(self) -&gt; None:
+        if self.state == AgentState.IDLE and self.in_queue:
+            self.state = AgentState.PROCESSING
+        elif self.state == AgentState.PROCESSING:
+            msg = self.in_queue.pop(0)
+            self.out_queue.append({&quot;reply_to&quot;: msg, &quot;body&quot;: f&quot;{self.agent_id} processed {msg}&quot;})
+            self.state = AgentState.RESPONSE
+        elif self.state == AgentState.RESPONSE:
+            self.state = AgentState.IDLE
+
+
+def demo_queue() -&gt; None:
+    print(&quot;\n&quot; + &quot;=&quot; * 72)
+    print(&quot;PER-AGENT QUEUE — 3-state machine (idle / processing / response)&quot;)
+    print(&quot;=&quot; * 72)
+    a = AgentQueue(&quot;agent-a&quot;)
+    a.enqueue({&quot;task&quot;: &quot;compress logs&quot;})
+    a.enqueue({&quot;task&quot;: &quot;write summary&quot;})
+    print(f&quot;  initial: {a.state.value}  in_queue={len(a.in_queue)}&quot;)
+    for _ in range(7):
+        a.step()
+        print(f&quot;  state={a.state.value:11s} in={len(a.in_queue)} out={len(a.out_queue)}&quot;)
+
+
+# ---------- async vs threads ----------
+
+async def sim_llm_call_async(delay: float = 0.05) -&gt; None:
+    await asyncio.sleep(delay)
+
+
+def sim_llm_call_sync(delay: float = 0.05) -&gt; None:
+    time.sleep(delay)
+
+
+async def bench_async(n: int) -&gt; float:
+    t0 = time.perf_counter()
+    await asyncio.gather(*(sim_llm_call_async() for _ in range(n)))
+    return time.perf_counter() - t0
+
+
+def bench_threads(n: int) -&gt; float:
+    t0 = time.perf_counter()
+    threads = [threading.Thread(target=sim_llm_call_sync) for _ in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return time.perf_counter() - t0
+
+
+def demo_async_vs_threads() -&gt; None:
+    print(&quot;\n&quot; + &quot;=&quot; * 72)
+    print(&quot;ASYNC vs THREADS — 500 concurrent &#39;LLM calls&#39; (50ms each)&quot;)
+    print(&quot;=&quot; * 72)
+
+    async_elapsed = asyncio.run(bench_async(500))
+    print(f&quot;  async (asyncio):  {async_elapsed:.3f} s&quot;)
+
+    thread_elapsed = bench_threads(500)
+    print(f&quot;  threads:          {thread_elapsed:.3f} s&quot;)
+
+    print(&quot;  ratio: threads are {:.1f}x slower (and allocate ~1MB per thread stack)&quot;.format(
+        thread_elapsed / async_elapsed if async_elapsed &gt; 0 else float(&quot;inf&quot;)
+    ))
+
+
+def demo_checkpoint_resume() -&gt; None:
+    print(&quot;=&quot; * 72)
+    print(&quot;CHECKPOINT RESUME — worker crashes mid-run, second worker resumes&quot;)
+    print(&quot;=&quot; * 72)
+    with tempfile.NamedTemporaryFile(suffix=&quot;.db&quot;, delete=False) as f:
+        db_path = f.name
+    try:
+        store = CheckpointStore(db_path)
+
+        print(&quot;  worker 1 starts thread t-1, targeting counter=5&quot;)
+        try:
+            run_agent_with_checkpoint(store, &quot;t-1&quot;, crash_at=3, goal=5)
+        except RuntimeError:
+            pass
+
+        last = store.latest(&quot;t-1&quot;)
+        assert last is not None
+        print(f&quot;  last checkpoint: super_step={last[0]}, state={last[1]}&quot;)
+
+        print(&quot;  worker 2 resumes thread t-1&quot;)
+        final = run_agent_with_checkpoint(store, &quot;t-1&quot;, goal=5)
+        print(f&quot;  worker 2 completed; final counter = {final}&quot;)
+    finally:
+        os.unlink(db_path)
+
+
+def main() -&gt; None:
+    demo_checkpoint_resume()
+    demo_queue()
+    demo_async_vs_threads()
+    print(&quot;\nTakeaways:&quot;)
+    print(&quot;  durable execution = persist state per super-step + idempotent resume.&quot;)
+    print(&quot;  per-agent queues with 3-state machines scale to thousands of concurrent agents.&quot;)
+    print(&quot;  async is structural for I/O-bound LLM workloads, not just an optimization.&quot;)
+    print(&quot;  Bedi&#39;s rule: FastAPI + Postgres covers most teams; escalate on measured need.&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/16-multi-agent-and-swarms/22-production-scaling-queues-checkpoints/outputs/skill-scaling-advisor.md">phases/16-multi-agent-and-swarms/22-production-scaling-queues-checkpoints/outputs/skill-scaling-advisor.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: scaling-advisor
+description: Advise on durable-execution choice for a multi-agent production system. Picks between FastAPI + Postgres, LangGraph runtime, Temporal, Restate, or custom based on concrete load and state-retention needs.
+version: 1.0.0
+phase: 16
+lesson: 22
+tags: [multi-agent, production, scaling, durable-execution, queues, checkpoints]
+---
+
+Given a multi-agent production deployment plan, recommend the durable-execution substrate.
+
+Produce:
+
+1. **Load profile.** Concurrent agent-runs (p50, p99). Per-run duration (seconds to hours). Fraction of runs requiring human-in-the-loop waits. Deploy frequency.
+2. **State profile.** Size of per-run state (KB to MB). Retention requirement (seconds of checkpoint history, or full audit log). Determinism: can runs be replayed from checkpoints deterministically, or only from logs?
+3. **Side-effect profile.** Which side effects need exactly-once (payments, external APIs, email)? Which can tolerate at-least-once (pure tool reads)? Outbox pattern needed for exactly-once.
+4. **Recommendation tier.**
+   - Tier 1 (Bedi&#39;s rule): FastAPI + Postgres. Under ~100 concurrent runs, sub-hour durations, simple retries.
+   - Tier 2: LangGraph runtime or Temporal. Hour-long runs, interrupt/resume, structured retries.
+   - Tier 3: Custom with outbox + event sourcing. Specialized needs, high throughput, strict audit.
+5. **Deploy model.** Single version or rainbow/canary? Rainbow required for long-running stateful workloads.
+6. **Async / thread boundary.** Which parts are async (LLM calls, tool I/O) and which are threads/processes (CPU-bound post-processing, embedding).
+7. **Observability.** Per-run traces, super-step audit, retry counter. Storage for traces (separate from checkpoint store).
+
+Hard rejects:
+
+- Recommending Temporal for a 10-concurrent-run prototype. Ceremony cost &gt; value.
+- Thread-per-job LLM call architectures. I/O-bound + 1MB/thread does not scale.
+- Designs without outbox pattern for paid side effects. Duplicate charges are expensive.
+- Single-version deploys for multi-hour agent runs. Users lose state on every code push.
+
+Refusal rules:
+
+- If load is unknown and untested, recommend Tier 1 plus load testing. Premature optimization burns time.
+- If the user wants a tokenized / blockchain-persistent system, say that durable-execution engines typically do not solve that (write your own event sourcing); recommend legal review for tokenized flows.
+- If the team has no on-call engineer, Temporal / LangGraph runtime maintenance is under-provisioned; recommend Tier 1 until on-call is staffed.
+
+Output: a two-page brief. Start with a one-sentence recommendation (&quot;Tier 1 (FastAPI + Postgres + outbox) for current load; escalate to LangGraph runtime when p99 run duration exceeds 10 min or concurrent runs exceed 200.&quot;), then the seven sections above. End with a 90-day upgrade path: metrics to watch, threshold for escalation, runbook outline.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原课程未提供测验。</p></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/16-multi-agent-and-swarms/21-agent-economies/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/16-multi-agent-and-swarms/23-failure-modes-mast-groupthink/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/16-multi-agent-and-swarms/22-production-scaling-queues-checkpoints/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

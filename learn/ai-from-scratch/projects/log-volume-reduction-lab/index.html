@@ -1,0 +1,126 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>Log Volume Reduction Lab · Serebii Labs</title></head><body data-pack="ai-from-scratch-project-log-volume-reduction-lab" data-lesson="" data-project="log-volume-reduction-lab"><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow">PROJECT / log-volume-reduction-lab</p><h1 class="lesson-title">Log Volume Reduction Lab</h1><p class="notice">本站中文导读 + 原作者英文全文 · 代码运行未验证</p><p>这是原课程的「Log Volume Reduction Lab」实践项目。先阅读下方原始目标与阶段说明，再按课序实现功能、运行评分器并比较参考实现。英文全文未缩写；中文长文尚未翻译。</p><p>练习骨架 starter：原项目未提供，勿将 solution 当作骨架；参考实现 solution：3 个文件。运行前按 README 准备依赖与输入；模型、数据或在线服务不包含在离线阅读包中。</p><div class="save-panel"><button type="button" data-save>保存本项目阅读资料</button><span data-save-status role="status">未检测离线状态</span></div><p><a download href="/learn/ai-from-scratch/downloads/project-log-volume-reduction-lab.zip">下载完整项目 ZIP（需联网，或单独保存）</a> <button data-save-download="/learn/ai-from-scratch/downloads/project-log-volume-reduction-lab.zip" type="button">单独保存项目 ZIP</button></p><section><h2>学习目标（原作者）</h2><ul></ul></section><section class="prose" lang="en"><h1>Log Volume Reduction Lab</h1>
+<p>Help an engineer build compact log context for an assistant. Learn bounded template grouping, counts and representative examples, then compare uniform and rarity-aware sampling on authored failure fixtures. Export compressed JSONL and a coverage report showing which important events were lost.</p>
+<p>Standard libraries only. Four stages, approximately eight hours. Rust, Python implementations are exercised by the grader.</p>
+<h2>Build it</h2>
+<ol>
+<li><a href="/learn/ai-from-scratch/projects/log-volume-reduction-lab/#01-parse-bounded-logs">Parse and bound log records</a></li>
+<li><a href="/learn/ai-from-scratch/projects/log-volume-reduction-lab/#02-group-templates">Group repeated templates with source locators</a></li>
+<li><a href="/learn/ai-from-scratch/projects/log-volume-reduction-lab/#03-compare-samplers">Compare sampling policies on rare events</a></li>
+<li><a href="/learn/ai-from-scratch/projects/log-volume-reduction-lab/#04-export-coverage">Export compact context and coverage</a></li>
+</ol>
+<pre><code class="language-bash">python3 scripts/project_test.py log-volume-reduction-lab --init /tmp/log-volume-reduction-lab-work
+python3 scripts/project_test.py log-volume-reduction-lab --stage 1 --path /tmp/log-volume-reduction-lab-work --strict
+python3 scripts/project_test.py log-volume-reduction-lab --all --solution --strict
+</code></pre>
+<p>The fresh starter fails until you implement it. Reference-solution runs never grant learner completion certificates.</p>
+<h2>Run your own logs</h2>
+<pre><code class="language-bash">cd projects/log-volume-reduction-lab/solution
+rustc --edition 2021 main.rs -o /tmp/log-context
+/tmp/log-context fixtures/burst.log 8 rarity /tmp/context.jsonl
+python3 main.py fixtures/burst.log /tmp/context.jsonl --out /tmp/coverage.json
+python3 demo.py
+</code></pre>
+<p>Input is UTF-8 <code>LEVEL&lt;TAB&gt;message</code>, one record per line. The Rust tool replaces maximal ASCII digit runs with <code>#</code>, groups by severity plus template and retains representative groups under a sample-record budget. It writes schema-version-1 JSONL containing total source counts and first/last line locators. The Python consumer independently checks group identity and counts against the original source, then reports rare-template coverage (frequency at most 2 by default).</p>
+<p>The authored 200-line fixture has one disk-full event at line 138. Uniform sampling with budget 8 misses it; rarity retains it. Normalization can merge unrelated messages, and ranges are not full source identity lists. This tool neither redacts sensitive log text nor proves preservation of every causal clue. Pre-redact inputs before sending context to an assistant. The bounded core accepts one MiB, 10,000 lines and 4096 bytes per line.</p>
+<p>The demo compiles and executes the actual Rust implementation and feeds both resulting JSONL files into the Python coverage implementation. <a href="https://doc.rust-lang.org/std/string/struct.String.html" rel="noreferrer" data-network="true">Rust strings <small>↗ 需要联网</small></a> document UTF-8 behavior.</p>
+<h2>Completion evidence</h2>
+<pre><code class="language-bash">python3 scripts/project_test.py log-volume-reduction-lab --all --path /tmp/log-volume-reduction-lab-work --strict --report /tmp/log-volume-reduction-lab-result.json
+</code></pre>
+<p>Local reports are unsigned, self-reported evidence. The editable figures calculate illustrative values; the CLI runs the actual implementation.</p>
+</section><section id="01-parse-bounded-logs"><h2>01-parse-bounded-logs · 原始阶段说明</h2><div class="prose" lang="en"><h1>Parse and bound log records</h1>
+<blockquote>
+<p>Turn each line into a validated, located record.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Rust, Python
+<strong>Stage:</strong> 1 of 4
+<strong>Prerequisites:</strong> Basic functions, collections, JSON and the previous stages when applicable.
+<strong>Time:</strong> ~2 hours</p>
+<h2>What you build</h2>
+<p>Rust parses a UTF-8 file with one LEVEL, tab and message per line. Levels are DEBUG, INFO, WARN or ERROR. Preserve the one-based source line. The bounded contract accepts at most one MiB, 10,000 records and 4096 bytes per line.</p>
+<h2>Worked example</h2>
+<p><code>WARN	retry request 42 after 50ms</code> becomes line 1, level WARN, original message, and template <code>retry request # after #ms</code>. Only ASCII digit runs are replaced; non-ASCII text remains intact.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-413d0a3fdd0b9890b8cb.png" alt="pj-log-volume-reduction-lab-1 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Implement the contract</h2>
+<p><code>parse_logs(&amp;str) -&gt; Result&lt;Vec&lt;Record&gt;,String&gt;</code>; <code>Record{line:usize,level:String,message:String,template:String}</code>. <code>template(&amp;str)-&gt;String</code> replaces maximal ASCII digit runs with #. Reject blank messages, invalid severity and control characters.</p>
+<p>Reject malformed input before producing a partial artifact. The tests include held-out records separate from the demonstration fixture.</p>
+<h2>Run your work</h2>
+<pre><code class="language-bash">python3 scripts/project_test.py log-volume-reduction-lab --init /tmp/log-volume-reduction-lab-work
+python3 scripts/project_test.py log-volume-reduction-lab --stage 1 --path /tmp/log-volume-reduction-lab-work --strict
+</code></pre>
+<p>Initialization copies cumulative scaffolding without replacing your work. Implement the TODO functions in the first-stage starter; later-stage starter notes describe the new behavior. Tests import the learner workspace. Run the command in the README against your own input after passing the stage.</p>
+<h2>Inspect and extend</h2>
+<p>Try a Unicode digit. Explain why a wider numeric normalization might merge identifiers unexpectedly.</p>
+<p><a href="https://pkg.go.dev/std" rel="noreferrer" data-network="true">Go standard library <small>↗ 需要联网</small></a> and <a href="https://nodejs.org/api/" rel="noreferrer" data-network="true">Node standard library <small>↗ 需要联网</small></a>. All fixtures and implementations are original.</p>
+</div></section><section id="02-group-templates"><h2>02-group-templates · 原始阶段说明</h2><div class="prose" lang="en"><h1>Group repeated templates with source locators</h1>
+<blockquote>
+<p>Count repetition without discarding its source range.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Rust, Python
+<strong>Stage:</strong> 2 of 4
+<strong>Prerequisites:</strong> Basic functions, collections, JSON and the previous stages when applicable.
+<strong>Time:</strong> ~2 hours</p>
+<h2>What you build</h2>
+<p>Group by the pair (level, template). A group contains total count, first and last source line, and the first encountered original message. Sorted group keys make serialization stable. Digit normalization is a heuristic, not semantic equivalence.</p>
+<h2>Worked example</h2>
+<p>The 200-line burst contains 199 WARN retries and one ERROR disk-full message at line 138. Its retry group spans lines 1 through 200. The disk group has firstLine=lastLine=138.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-83023d7244ba36f2a3e2.png" alt="pj-log-volume-reduction-lab-2 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Implement the contract</h2>
+<p><code>group(&amp;[Record])-&gt;Vec&lt;Group&gt;</code>; <code>Group{level,template,count,first,last,example}</code>. Return groups in lexical level/template order. Source ranges include gaps; they are not a claim that every intervening line belongs to the group.</p>
+<p>Reject malformed input before producing a partial artifact. The tests include held-out records separate from the demonstration fixture.</p>
+<h2>Run your work</h2>
+<pre><code class="language-bash">python3 scripts/project_test.py log-volume-reduction-lab --init /tmp/log-volume-reduction-lab-work
+python3 scripts/project_test.py log-volume-reduction-lab --stage 2 --path /tmp/log-volume-reduction-lab-work --strict
+</code></pre>
+<p>Initialization copies cumulative scaffolding without replacing your work. Implement the TODO functions in the first-stage starter; later-stage starter notes describe the new behavior. Tests import the learner workspace. Run the command in the README against your own input after passing the stage.</p>
+<h2>Inspect and extend</h2>
+<p>Create two different messages that collapse to the same digit template and discuss the diagnostic evidence this loses.</p>
+<p><a href="https://pkg.go.dev/std" rel="noreferrer" data-network="true">Go standard library <small>↗ 需要联网</small></a> and <a href="https://nodejs.org/api/" rel="noreferrer" data-network="true">Node standard library <small>↗ 需要联网</small></a>. All fixtures and implementations are original.</p>
+</div></section><section id="03-compare-samplers"><h2>03-compare-samplers · 原始阶段说明</h2><div class="prose" lang="en"><h1>Compare sampling policies on rare events</h1>
+<blockquote>
+<p>Spend a fixed record budget on common or rare templates.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Rust, Python
+<strong>Stage:</strong> 3 of 4
+<strong>Prerequisites:</strong> Basic functions, collections, JSON and the previous stages when applicable.
+<strong>Time:</strong> ~2 hours</p>
+<h2>What you build</h2>
+<p>Uniform sampling chooses indices floor(i*N/budget). Rarity sampling sorts by template frequency and then source line, selects one representative of each template first, and fills any remaining budget from that sorted order. No random seed or model is needed.</p>
+<h2>Worked example</h2>
+<p>With 200 records and budget 8, uniform chooses indices 0,25,50,75,100,125,150,175 and misses disk-full at index 137. Rarity selects that one-off template first. Both return at most eight records.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-54644920818b5e75bafb.png" alt="pj-log-volume-reduction-lab-3 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Implement the contract</h2>
+<p><code>sample(records:&amp;[Record],budget:usize,policy:&amp;str)-&gt;Result&lt;Vec&lt;Record&gt;,String&gt;</code>. Policy is exactly uniform or rarity. Zero budget and empty input return an empty vector; a budget beyond the input returns every record once.</p>
+<p>Reject malformed input before producing a partial artifact. The tests include held-out records separate from the demonstration fixture.</p>
+<h2>Run your work</h2>
+<pre><code class="language-bash">python3 scripts/project_test.py log-volume-reduction-lab --init /tmp/log-volume-reduction-lab-work
+python3 scripts/project_test.py log-volume-reduction-lab --stage 3 --path /tmp/log-volume-reduction-lab-work --strict
+</code></pre>
+<p>Initialization copies cumulative scaffolding without replacing your work. Implement the TODO functions in the first-stage starter; later-stage starter notes describe the new behavior. Tests import the learner workspace. Run the command in the README against your own input after passing the stage.</p>
+<h2>Inspect and extend</h2>
+<p>Move the rare event onto a uniform index. The demonstration advantage should disappear for this fixture, which illustrates why one example cannot establish universal superiority.</p>
+<p><a href="https://pkg.go.dev/std" rel="noreferrer" data-network="true">Go standard library <small>↗ 需要联网</small></a> and <a href="https://nodejs.org/api/" rel="noreferrer" data-network="true">Node standard library <small>↗ 需要联网</small></a>. All fixtures and implementations are original.</p>
+</div></section><section id="04-export-coverage"><h2>04-export-coverage · 原始阶段说明</h2><div class="prose" lang="en"><h1>Export compact context and coverage</h1>
+<blockquote>
+<p>Measure which diagnostic templates survive compression.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Rust, Python
+<strong>Stage:</strong> 4 of 4
+<strong>Prerequisites:</strong> Basic functions, collections, JSON and the previous stages when applicable.
+<strong>Time:</strong> ~2 hours</p>
+<h2>What you build</h2>
+<p>Rust compact output emits one JSON object per retained template, with counts from the full source stream. Python validates the exported groups against the source and calculates rare-template coverage. The context can be read by any JSONL consumer.</p>
+<h2>Worked example</h2>
+<p>Uniform output retains one template and represents 199 source records; rareCoverage is 0. Rarity output retains two templates representing all 200 records; rareCoverage is 1. This measures templates, not token savings or causal understanding.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-30735fd66c97632ed08c.png" alt="pj-log-volume-reduction-lab-4 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Implement the contract</h2>
+<p>Rust <code>compact(&amp;[Record],&amp;[Record])-&gt;String</code>; JSONL fields <code>schemaVersion,level,template,count,firstLine,lastLine,example</code>. Python <code>coverage(source:str,compact:str,rare_max:int=2)-&gt;dict</code> rejects unknown groups, duplicates, count mismatches and invalid locators.</p>
+<p>Reject malformed input before producing a partial artifact. The tests include held-out records separate from the demonstration fixture.</p>
+<h2>Run your work</h2>
+<pre><code class="language-bash">python3 scripts/project_test.py log-volume-reduction-lab --init /tmp/log-volume-reduction-lab-work
+python3 scripts/project_test.py log-volume-reduction-lab --stage 4 --path /tmp/log-volume-reduction-lab-work --strict
+</code></pre>
+<p>Initialization copies cumulative scaffolding without replacing your work. Implement the TODO functions in the first-stage starter; later-stage starter notes describe the new behavior. Tests import the learner workspace. Run the command in the README against your own input after passing the stage.</p>
+<h2>Inspect and extend</h2>
+<p>Change rare_max and compare recall. Add a byte-size metric separately; a long example can make fewer rows larger than expected.</p>
+<p><a href="https://doc.rust-lang.org/std/collections/" rel="noreferrer" data-network="true">Rust collections <small>↗ 需要联网</small></a> and <a href="https://docs.python.org/3/library/json.html" rel="noreferrer" data-network="true">Python JSON <small>↗ 需要联网</small></a>.</p>
+</div></section><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

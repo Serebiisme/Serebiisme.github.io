@@ -1,0 +1,2534 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>量化:使模型适合 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-10-llms-from-scratch" data-lesson="10-llms-from-scratch/11-quantization" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/10-llms-from-scratch/">从零构建大语言模型</a> / LESSON 11</p><h1 class="lesson-title">量化:使模型适合</h1><p>Quantization: Making Models Fit</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>量化:使模型适合</h1>
+<blockquote>
+<p>对于FP16的70B模型,需要140GB. 只有两个A100,只需加重. 量化为FP8:一个80GB的GPU.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python (with numpy)
+<strong>Prerequisites:</strong> Phase 10, Lessons 01-10 (LLMs from Scratch)
+<strong>Time:</strong> ~120 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>实现对称和不对称的量化从FP16到INT8和INT4,包括每ensor和每道的扩展</li>
+<li>计算量子化所节省的内存,并确定哪个精度适应给定的GPU的VRAM</li>
+<li>解释训练后量化 (PTQ) 和量化意识培训 (QAT) 的区别</li>
+<li>应用GPTQ或 AWQ来定量实模型,并根据基准衡量准确性记忆的交易</li>
+</ul>
+<h2>问题</h2>
+<p>拉马370B有70亿参数.每个参数是16位浮点号码.这就是140亿字节.140GB.一个A100有80GB的VRAM.你甚至不能在一个GPU上加载重量,更不用说推断.你需要两个A100每一个$2/小时只为服务一个模型.</p>
+<p>但是每参数的16位是浪费的.在一个神经网络集群中,大多数重量接近零.FP16的全部动态范围 (从0.000000059到65.504) 几乎完全没有使用.如果你测量Llama 3 70B中的实际重量分布,其中95%在0.1到+0.1之间.你燃烧16位来表示值可以合适于4.</p>
+<p>量子化取代了高精度数字,并用更低精度的数字.FP16到FP8将内存减半.FP16到INT4将内存减半.该140GB模型变成35GB.它适合单个消费者GPU.推向2位量子化 (攻击性,损失性,但可用于某些任务),并且相同的模型运行在16GB笔记本电脑上.</p>
+<p>成本是精确性.你删除的每一块都会破坏信息.问题是你失去了多少精确性,以及在哪里.一个精确量化的INT4模型在大多数基准上保持了原始的95%到99%.一个天真的量化到INT4可以完全摧毁模型.区别是技术.</p>
+<p>社区对Llama 3到INT4的量子化与GPTQ显示,在WikiText上失去了大约1-2个困难点.Mistral发布了Mixtral 8x22B的FP8检查点,MMLU上没有可测量的质量损失.GGUF格式支持 llama.cpp,在M系列芯片的MacBook上运行70B模型.量子化不是一个黑客.这是7B以上的每个模型的标准部署路径.</p>
+<h2>概念</h2>
+<h3>数字格式:每个比特的作用</h3>
+<p>每个浮点数有三个部分:标志,指数和位 (也称为意义).标志是一位.指数决定范围 (数量可能多大或小).位决定精度 (你得到多少个数分位).</p>
+<pre><code>FP32:  [1 sign] [8 exponent] [23 mantissa]  = 32 bits
+FP16:  [1 sign] [5 exponent] [10 mantissa]  = 16 bits
+BF16:  [1 sign] [8 exponent] [7  mantissa]  = 16 bits
+FP8:   [1 sign] [4 exponent] [3  mantissa]  = 8  bits (E4M3)
+FP8:   [1 sign] [5 exponent] [2  mantissa]  = 8  bits (E5M2)
+INT8:  [1 sign] [7 value]                   = 8  bits (uniform steps)
+INT4:  [1 sign] [3 value]                   = 4  bits (16 levels total)
+</code></pre>
+<p><strong>FP32</strong>距离:大约1.2 x 10^-38 到 3.4 x 10^38.以前的训练仅在FP32中进行.它仍然适用于积累 (矩阵乘法时运行的数量).</p>
+<p><strong>FP16</strong>分数为10个,使得分数大约为3.3个. 指数缩小到5个,大大减少范围 (最大值为65.504). 这对于重量 (接近零的集群) 很好,但对于在训练过程中可能会升的激活和梯度是危险的. FP16训练需要减小损失,以防止下流.</p>
+<p><strong>BF16</strong>(大脑浮动16),保持8位指数从FP32,但缩小了7位. 与FP32相同的范围,比FP16更精确. 谷歌专门为深度学习设计. 对于神经网络来说, 距离比精度更重要. 在FP16中下流到零的10^-20梯度在BF16中存活. 在BF16中,重量为0.07342圆到0.0734是足够接近的. 每个现代训练运行都使用BF16或BF16/FP32混合物.</p>
+<p><strong>FP8</strong>子的子是子,子是子,子是子,子是子,子是子,子是子,子是子,子是子,子是子,子是子,子是子,子是子,子是子,子是子,子是子,子是子,子是子,子是子,子是子,子是子,子是子,子是子,子是子,子是子,子是子,子是子,子是子,子是子,子是子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子,子</p>
+<p><strong>INT8</strong>只有256个均间隔值从 -128到127.你需要一个尺度因子来将浮点权重映射到这个范围.</p>
+<p><strong>INT4</strong>只有16个可能的值. 尺寸因子是很重的. 质量完全取决于你如何选择尺寸和量化什么权重. 最先进的INT4方法 (GPTQ, AWQ) 保持了原始模型质量的95%以上.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-4561a9788f385892c63b.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>量化如何工作</h3>
+<p>核心操作很简单. 取一个浮点值的数,找到一个尺度因子,乘以圆到最近的整数,并存储整数加上尺度因子.</p>
+<p><strong>Quantize:</strong></p>
+<pre><code>scale = max(abs(tensor)) / max_int_value
+quantized = round(tensor / scale)
+</code></pre>
+<p><strong>Dequantize:</strong></p>
+<pre><code>reconstructed = quantized * scale
+</code></pre>
+<p>对于对称范围 (-127至 127) 的INT8:</p>
+<pre><code>scale = max(abs(tensor)) / 127
+quantized = clamp(round(tensor / scale), -128, 127)
+</code></pre>
+<p>错误是圆形错误.每个值可以最大的减值<code>scale / 2</code>整个层的总误差取决于你有多少重量以及模型对这些重量的扰乱有多敏感.</p>
+<p>**Per-tensor vs per-channel quantization.**缩器使用一个尺度因子来对整个重量矩阵进行测量. 简单但具有损失率:如果一个列具有较大的值,另一个则具有较小的值,则较小的值会失去其大部分精度. 每道使用每输出道 (按重量矩阵的行或列) 一个尺度因子. 更多的总费用 (你储存N尺度因素而不是1) 但质量显著提高. 每种生产量化方法都采用每道或更细颗粒度.</p>
+<p><strong>Asymmetric quantization</strong>增加零点的偏移: <code>quantized = round(tensor / scale) + zero_point</code>对于零点的分布来说,这种方法是非常有效的.例如,ReLU激活总是非负的.对称量化浪费了半个整数范围的负值,从来没有出现.对称量化将实际范围 [min,max]映射到完整整数范围.</p>
+<h3>敏感性等级</h3>
+<p>模型中的所有东西都不能平等地接受量化.</p>
+<p>**Weights (most robust).**模型重量在训练过程中缓慢变化,遵循接近零的大致高斯分布.它们量化良好.每道尺度的INT8重量几乎产生无损的结果.INT4需要更复杂的方法,但有效.</p>
+<p>**Activations (moderate sensitivity).**激活是推断过程中通过网络流动的中间值. 它们的动态范围比重量更广泛,并且含有异常值. 一个单一的注意力头可能会产生超过平均的100倍的激活值. 这些异常值对于模型质量至关重要. 简单地将它们量化,就会破坏信息. 解决方案:保持更精确的偏差道 (LLM.int8(),使用每代币或每道激活度.</p>
+<p>**KV cache (high sensitivity).**关键值缓存存储所有前代币的注意状态.在长的语境长度时,KV缓存占主导地位的内存.在32K语境的70B模型中,KV缓存仅仅在FP16中为40GB.将KV缓存量为FP8或INT8节省了大量的内存,但任何错误在所有未来的注意计算中都会增加.质量影响量随着序列长度而扩大.</p>
+<p>**Attention logits (most sensitive).**注意力软max对输入的小变化非常敏感.在软max前的逻辑中,0.01的量化错误可以有意义地改变注意力分布.大多数量化方案都会使注意力计算更精确 (FP16或BF16) 即使其他一切都量化.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-a258093340bd25efebe6.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>关与关</h3>
+<p>**Post-Training Quantization (PTQ)**对于INT8和FP8来说,简单的PTQ通常会失败,因为圆形错误积累.先进的PTQ方法 (GPTQ, AWQ) 使用校准数据以最大限度地减少量化错误.</p>
+<p>**Quantization-Aware Training (QAT)**在培训期间将假定量化操作插入前进通行. 模型学会将其重量放在圆形错误小的地方. 渐变体通过使用直径估计器 (STE) 进行虚假量化流动:假设圆化操作具有梯度1. 特生产的INT4和INT2模型比PTQ更好,但需要进行全面的培训. 谷歌使用QAT来提供双胞胎的有效服务. 对于一些拉马部署目标,Meta使用了QAT.</p>
+<table>
+<thead>
+<tr>
+<th>Aspect</th>
+<th>PTQ</th>
+<th>QAT</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Cost</td>
+<td>Minutes to hours</td>
+<td>Full training run</td>
+</tr>
+<tr>
+<td>Quality at INT8</td>
+<td>Excellent (&lt; 0.1% loss)</td>
+<td>Excellent</td>
+</tr>
+<tr>
+<td>Quality at INT4</td>
+<td>Good with GPTQ/AWQ (1-3% loss)</td>
+<td>Better (&lt; 1% loss)</td>
+</tr>
+<tr>
+<td>Quality at INT2</td>
+<td>Poor</td>
+<td>Usable for some tasks</td>
+</tr>
+<tr>
+<td>Calibration data</td>
+<td>128-1024 examples</td>
+<td>Full training dataset</td>
+</tr>
+<tr>
+<td>When to use</td>
+<td>Deployment, iteration</td>
+<td>Maximum quality at low bit-width</td>
+</tr>
+</tbody>
+</table>
+<h3>其他类型的产品</h3>
+<p>**GPTQ (GPT Quantization)**是一个一次性PTQ方法. 它一次量化重量,使用一个小的校准数据集 (128个例子是典型的) 来测量赫西亚 (关于输出对每个重量有多敏感的第二级信息). 赫西亚人认为重要的重量得到更仔细的量化. 对于 LLM来说,GPTQ是第一个使INT4量化为实用的方法. 拥抱面孔的TheBlooke通过发布数百个模型的量化版本来普及GPTQ.</p>
+<p>**AWQ (Activation-Aware Weight Quantization)**由于它们乘以大激活值,小部分重量 (约1%) 是不成比例的重要. AWQ使用校准数据识别这些突出重量,并在量化之前将它们扩大 (然后将相应的激活量降低). 这使得重要重量保持在INT4量化准确的范围内. 质量通常与GPTQ质量相匹配或略高于GPTQ质量,而应用速度则比1.5-2倍快.</p>
+<p>**GGUF (GPT-Generated Unified Format)**是 llama.cpp及其生态系统所使用的文件格式. 它支持混合量化:不同的层得到不同的比特宽度. 首先和最后的层 (嵌入和输出头) 通常保持更高的精度. 中层得到INT4或INT3. 文件是自主的:重量,代币,元数据都在一个文件中. 该格式是用于CPU推断和Apple Silicon,在CPU或金属GPU上将整个模型加载到内存中并运行矩阵乘法是标准的路径. Q4_K_M是最受欢迎的GGUF量化变体,平衡质量和尺寸.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-9f08bec80a5294bae2bf.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>质量测量</h3>
+<p>你怎么知道你的量子模型仍然是好的吗?</p>
+<p>**Perplexity.**最常见的指标.较低更好.对原始和量化模型都计算出一个保留的数据集 (WikiText-2是标准的) 的困难. 德尔塔告诉你量化破坏了多少信息. 指规则:德尔塔 &lt;0.5是优秀的,0.5-1.0是好,1.0-2.0是大多数任务的接受,&gt;2.0意味着有些事情发生错误.</p>
+<p>**Task-specific benchmarks.**运行量化模型在MMLU,HumanEval,GSM8K或您的定制评估套件上.与原始相比较.量化影响不同能力不均.数学和代码任务对精度损失比一般知识更敏感.</p>
+<p>**Output comparison.**根据相同提示,生成两个模型的响应,并进行比较. 作为法官的LLM (课程10) 在这里很好. 计算一个胜利率:量子化模型的提示与原始模型相匹配或超过多少?</p>
+<p>**Latency and throughput.**量子化是为了使模型更快,更便宜. 每秒测量代币,时间到第一个代币,以及存储器使用.比原始慢的量化模型比无用的更糟糕.</p>
+<table>
+<thead>
+<tr>
+<th>Model</th>
+<th>Format</th>
+<th>Size</th>
+<th>Perplexity (WikiText-2)</th>
+<th>MMLU</th>
+<th>Tokens/sec (A100)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Llama 3 70B</td>
+<td>FP16</td>
+<td>140GB</td>
+<td>3.12</td>
+<td>79.5%</td>
+<td>38</td>
+</tr>
+<tr>
+<td>Llama 3 70B</td>
+<td>FP8</td>
+<td>70GB</td>
+<td>3.14</td>
+<td>79.3%</td>
+<td>55</td>
+</tr>
+<tr>
+<td>Llama 3 70B</td>
+<td>GPTQ INT4</td>
+<td>35GB</td>
+<td>4.32</td>
+<td>77.8%</td>
+<td>72</td>
+</tr>
+<tr>
+<td>Llama 3 70B</td>
+<td>AWQ INT4</td>
+<td>35GB</td>
+<td>4.18</td>
+<td>78.1%</td>
+<td>75</td>
+</tr>
+<tr>
+<td>Llama 3 70B</td>
+<td>GGUF Q4_K_M</td>
+<td>40GB</td>
+<td>4.25</td>
+<td>77.9%</td>
+<td>28 (CPU)</td>
+</tr>
+</tbody>
+</table>
+<p>模式:FP8几乎是免费的.INT4成本1-2MMLU点,但吞吐量和内存的四分之一. 交易几乎是值得每次部署.</p>
+<h3>真实数字</h3>
+<p>对于H100的FP16到FP8: 30-50%的推断速度, &lt;0.1%的质量损失.这是无脑力量化.每一个H100部署都应该使用它.</p>
+<p>混合精度方法保持FP16的异常特征,同时对其他的所有内容进行量化为INT8.</p>
+<p>根据模型和方法,FP16到INT4 (GPTQ/AWQ): 4倍的内存减少, 1-3%的质量损失.</p>
+<p>简单的计算方法是:FP16到INT4 (GGUF Q4_K_M): 3.5倍的内存减少,1-2%的质量损失.优化用于CPU推断.Q4_K_M的70B模型约为40GB,在64GB的M3 Max上运行在10-15代币/秒.</p>
+<p>只有在特定的狭窄任务中才可以容忍降解.研究界限,并非准备用于一般用途.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-00337646bb399b2abd58.png" alt="quantization 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<h3>步骤1:数字格式表示</h3>
+<p>构建每个格式的位级表示,以查看符号,指数和语的确切作用.</p>
+<pre><code class="language-python">import numpy as np
+
+
+def float_to_fp32_bits(value):
+    bits = np.float32(value).view(np.uint32)
+    sign = (bits &gt;&gt; 31) &amp; 1
+    exponent = (bits &gt;&gt; 23) &amp; 0xFF
+    mantissa = bits &amp; 0x7FFFFF
+    return {&quot;sign&quot;: int(sign), &quot;exponent&quot;: int(exponent), &quot;mantissa&quot;: int(mantissa),
+            &quot;exponent_bits&quot;: format(int(exponent), '08b'),
+            &quot;mantissa_bits&quot;: format(int(mantissa), '023b'),
+            &quot;value&quot;: float(value),
+            &quot;actual_exponent&quot;: int(exponent) - 127}
+
+
+def float_to_fp16_bits(value):
+    fp16 = np.float16(value)
+    bits = fp16.view(np.uint16)
+    sign = (bits &gt;&gt; 15) &amp; 1
+    exponent = (bits &gt;&gt; 10) &amp; 0x1F
+    mantissa = bits &amp; 0x3FF
+    return {&quot;sign&quot;: int(sign), &quot;exponent&quot;: int(exponent), &quot;mantissa&quot;: int(mantissa),
+            &quot;exponent_bits&quot;: format(int(exponent), '05b'),
+            &quot;mantissa_bits&quot;: format(int(mantissa), '010b'),
+            &quot;value&quot;: float(fp16),
+            &quot;actual_exponent&quot;: int(exponent) - 15}
+
+
+def float_to_bf16_bits(value):
+    fp32_bits = np.float32(value).view(np.uint32)
+    bf16_bits = (fp32_bits &gt;&gt; 16).astype(np.uint16)
+    sign = (bf16_bits &gt;&gt; 15) &amp; 1
+    exponent = (bf16_bits &gt;&gt; 7) &amp; 0xFF
+    mantissa = bf16_bits &amp; 0x7F
+    reconstructed = np.uint32(bf16_bits.astype(np.uint32) &lt;&lt; 16).view(np.float32)
+    return {&quot;sign&quot;: int(sign), &quot;exponent&quot;: int(exponent), &quot;mantissa&quot;: int(mantissa),
+            &quot;exponent_bits&quot;: format(int(exponent), '08b'),
+            &quot;mantissa_bits&quot;: format(int(mantissa), '07b'),
+            &quot;value&quot;: float(reconstructed),
+            &quot;actual_exponent&quot;: int(exponent) - 127}
+
+
+def simulate_fp8_e4m3(value):
+    sign = 1 if value &lt; 0 else 0
+    abs_val = abs(value)
+    max_val = 448.0
+    abs_val = min(abs_val, max_val)
+    if abs_val == 0:
+        return {&quot;sign&quot;: sign, &quot;exponent&quot;: 0, &quot;mantissa&quot;: 0, &quot;value&quot;: 0.0,
+                &quot;exponent_bits&quot;: &quot;0000&quot;, &quot;mantissa_bits&quot;: &quot;000&quot;}
+    exp = int(np.floor(np.log2(abs_val)))
+    exp = max(-6, min(8, exp))
+    mantissa_val = abs_val / (2.0 ** exp) - 1.0
+    mantissa_quant = round(mantissa_val * 8) / 8
+    mantissa_quant = max(0, min(0.875, mantissa_quant))
+    reconstructed = (1.0 + mantissa_quant) * (2.0 ** exp)
+    if sign:
+        reconstructed = -reconstructed
+    mantissa_int = int(round(mantissa_quant * 8))
+    return {&quot;sign&quot;: sign, &quot;exponent&quot;: exp + 7, &quot;mantissa&quot;: mantissa_int,
+            &quot;exponent_bits&quot;: format(exp + 7, '04b'),
+            &quot;mantissa_bits&quot;: format(mantissa_int, '03b'),
+            &quot;value&quot;: float(reconstructed),
+            &quot;actual_exponent&quot;: exp}
+
+
+def display_format_comparison(value):
+    fp32 = float_to_fp32_bits(value)
+    fp16 = float_to_fp16_bits(value)
+    bf16 = float_to_bf16_bits(value)
+    fp8 = simulate_fp8_e4m3(value)
+
+    print(f&quot;\n  Value: {value}&quot;)
+    print(f&quot;  {'Format':&lt;8} {'Stored Value':&gt;14} {'Error':&gt;12} {'Sign':&gt;5} {'Exp Bits':&gt;10} {'Man Bits':&gt;25}&quot;)
+    print(f&quot;  {'-'*76}&quot;)
+    print(f&quot;  {'FP32':&lt;8} {fp32['value']:&gt;14.6f} {abs(fp32['value'] - value):&gt;12.8f} {fp32['sign']:&gt;5} {fp32['exponent_bits']:&gt;10} {fp32['mantissa_bits']:&gt;25}&quot;)
+    print(f&quot;  {'FP16':&lt;8} {fp16['value']:&gt;14.6f} {abs(fp16['value'] - value):&gt;12.8f} {fp16['sign']:&gt;5} {fp16['exponent_bits']:&gt;10} {fp16['mantissa_bits']:&gt;25}&quot;)
+    print(f&quot;  {'BF16':&lt;8} {bf16['value']:&gt;14.6f} {abs(bf16['value'] - value):&gt;12.8f} {bf16['sign']:&gt;5} {bf16['exponent_bits']:&gt;10} {bf16['mantissa_bits']:&gt;25}&quot;)
+    print(f&quot;  {'FP8e4m3':&lt;8} {fp8['value']:&gt;14.6f} {abs(fp8['value'] - value):&gt;12.8f} {fp8['sign']:&gt;5} {fp8['exponent_bits']:&gt;10} {fp8['mantissa_bits']:&gt;25}&quot;)
+</code></pre>
+<h3>步骤2:对称量化 (每ensor和每道)</h3>
+<p>基本的量化操作. 缩器使用一个尺度来对整个矩阵. 道使用一个尺度每行或列.</p>
+<pre><code class="language-python">def quantize_symmetric(tensor, num_bits=8):
+    qmin = -(2 ** (num_bits - 1))
+    qmax = 2 ** (num_bits - 1) - 1
+    abs_max = np.max(np.abs(tensor))
+    if abs_max == 0:
+        return np.zeros_like(tensor, dtype=np.int32), 1.0
+    scale = abs_max / qmax
+    quantized = np.clip(np.round(tensor / scale), qmin, qmax).astype(np.int32)
+    return quantized, float(scale)
+
+
+def dequantize_symmetric(quantized, scale):
+    return quantized.astype(np.float64) * scale
+
+
+def quantize_per_channel(tensor, num_bits=8, axis=0):
+    qmin = -(2 ** (num_bits - 1))
+    qmax = 2 ** (num_bits - 1) - 1
+
+    if axis == 0:
+        abs_max = np.max(np.abs(tensor), axis=1, keepdims=True)
+    else:
+        abs_max = np.max(np.abs(tensor), axis=0, keepdims=True)
+
+    abs_max = np.where(abs_max == 0, 1.0, abs_max)
+    scales = abs_max / qmax
+    quantized = np.clip(np.round(tensor / scales), qmin, qmax).astype(np.int32)
+    return quantized, scales.squeeze()
+
+
+def dequantize_per_channel(quantized, scales, axis=0):
+    if axis == 0:
+        return quantized.astype(np.float64) * scales.reshape(-1, 1)
+    else:
+        return quantized.astype(np.float64) * scales.reshape(1, -1)
+
+
+def quantize_asymmetric(tensor, num_bits=8):
+    qmin = 0
+    qmax = 2 ** num_bits - 1
+    t_min = np.min(tensor)
+    t_max = np.max(tensor)
+    if t_max == t_min:
+        return np.zeros_like(tensor, dtype=np.int32), 1.0, 0
+    scale = (t_max - t_min) / (qmax - qmin)
+    zero_point = int(np.round(qmin - t_min / scale))
+    zero_point = max(qmin, min(qmax, zero_point))
+    quantized = np.clip(np.round(tensor / scale + zero_point), qmin, qmax).astype(np.int32)
+    return quantized, float(scale), int(zero_point)
+
+
+def dequantize_asymmetric(quantized, scale, zero_point):
+    return (quantized.astype(np.float64) - zero_point) * scale
+</code></pre>
+<h3>第三步:测量质量</h3>
+<p>测量量子化破坏多少信息. 平均二次错误,信号与噪音比率,以及原始和重建的子之间的共数相似性.</p>
+<pre><code class="language-python">def quantization_error(original, reconstructed):
+    diff = original - reconstructed
+    mse = float(np.mean(diff ** 2))
+    rmse = float(np.sqrt(mse))
+    max_error = float(np.max(np.abs(diff)))
+    signal_power = float(np.mean(original ** 2))
+    snr_db = 10 * np.log10(signal_power / max(mse, 1e-20))
+
+    orig_flat = original.flatten()
+    recon_flat = reconstructed.flatten()
+    norm_orig = np.linalg.norm(orig_flat)
+    norm_recon = np.linalg.norm(recon_flat)
+    if norm_orig == 0 or norm_recon == 0:
+        cosine_sim = 0.0
+    else:
+        cosine_sim = float(np.dot(orig_flat, recon_flat) / (norm_orig * norm_recon))
+
+    return {&quot;mse&quot;: mse, &quot;rmse&quot;: rmse, &quot;max_error&quot;: max_error,
+            &quot;snr_db&quot;: float(snr_db), &quot;cosine_similarity&quot;: cosine_sim}
+
+
+def compare_quantization_methods(tensor, num_bits=8):
+    q_pt, s_pt = quantize_symmetric(tensor, num_bits)
+    recon_pt = dequantize_symmetric(q_pt, s_pt)
+    err_pt = quantization_error(tensor, recon_pt)
+
+    q_pc, s_pc = quantize_per_channel(tensor, num_bits, axis=0)
+    recon_pc = dequantize_per_channel(q_pc, s_pc, axis=0)
+    err_pc = quantization_error(tensor, recon_pc)
+
+    q_asym, s_asym, zp = quantize_asymmetric(tensor, num_bits)
+    recon_asym = dequantize_asymmetric(q_asym, s_asym, zp)
+    err_asym = quantization_error(tensor, recon_asym)
+
+    print(f&quot;\n  Quantization Comparison ({num_bits}-bit, tensor shape {tensor.shape}):&quot;)
+    print(f&quot;  {'Method':&lt;20} {'MSE':&gt;12} {'SNR (dB)':&gt;10} {'Cosine Sim':&gt;12} {'Max Error':&gt;12}&quot;)
+    print(f&quot;  {'-'*68}&quot;)
+    print(f&quot;  {'Per-tensor sym':&lt;20} {err_pt['mse']:&gt;12.8f} {err_pt['snr_db']:&gt;10.2f} {err_pt['cosine_similarity']:&gt;12.8f} {err_pt['max_error']:&gt;12.8f}&quot;)
+    print(f&quot;  {'Per-channel sym':&lt;20} {err_pc['mse']:&gt;12.8f} {err_pc['snr_db']:&gt;10.2f} {err_pc['cosine_similarity']:&gt;12.8f} {err_pc['max_error']:&gt;12.8f}&quot;)
+    print(f&quot;  {'Asymmetric':&lt;20} {err_asym['mse']:&gt;12.8f} {err_asym['snr_db']:&gt;10.2f} {err_asym['cosine_similarity']:&gt;12.8f} {err_asym['max_error']:&gt;12.8f}&quot;)
+
+    return {&quot;per_tensor&quot;: err_pt, &quot;per_channel&quot;: err_pc, &quot;asymmetric&quot;: err_asym}
+</code></pre>
+<h3>步骤4: 扫描幅度</h3>
+<p>量化相同的子在不同的位宽度 (2, 3, 4, 8, 16) 上,并测量每个级别的质量. 这就显示了质量悬崖的位置.</p>
+<pre><code class="language-python">def bit_width_sweep(tensor):
+    print(f&quot;\n  Bit-Width Sweep (tensor shape {tensor.shape}):&quot;)
+    print(f&quot;  {'Bits':&gt;6} {'Levels':&gt;8} {'MSE':&gt;14} {'SNR (dB)':&gt;10} {'Cosine Sim':&gt;12} {'Compression':&gt;12}&quot;)
+    print(f&quot;  {'-'*64}&quot;)
+
+    results = []
+    for bits in [2, 3, 4, 8, 16]:
+        q, s = quantize_per_channel(tensor, bits, axis=0)
+        recon = dequantize_per_channel(q, s, axis=0)
+        err = quantization_error(tensor, recon)
+        levels = 2 ** bits
+        compression = 32.0 / bits
+
+        print(f&quot;  {bits:&gt;6} {levels:&gt;8} {err['mse']:&gt;14.8f} {err['snr_db']:&gt;10.2f} {err['cosine_similarity']:&gt;12.8f} {compression:&gt;11.1f}x&quot;)
+        results.append({&quot;bits&quot;: bits, &quot;levels&quot;: levels, &quot;error&quot;: err, &quot;compression&quot;: compression})
+
+    return results
+</code></pre>
+<h3>步骤5:敏感性实验</h3>
+<p>模拟变压器的不同部件量化,测量哪些部件最敏感. 这表明了敏感度等级:重量 &lt;激活 &lt; KV缓存 &lt;注意.</p>
+<pre><code class="language-python">def simulate_transformer_layer(input_data, weights, kv_scale=1.0):
+    hidden = input_data @ weights[&quot;qkv&quot;]
+    seq_len = hidden.shape[1]
+    d_model = weights[&quot;qkv&quot;].shape[1] // 3
+    q, k, v = hidden[:, :, :d_model], hidden[:, :, d_model:2*d_model], hidden[:, :, 2*d_model:]
+
+    attn_scores = (q @ k.transpose(0, 2, 1)) / np.sqrt(d_model) * kv_scale
+    attn_max = np.max(attn_scores, axis=-1, keepdims=True)
+    attn_exp = np.exp(attn_scores - attn_max)
+    attn_weights = attn_exp / np.sum(attn_exp, axis=-1, keepdims=True)
+
+    attn_output = attn_weights @ v
+    output = attn_output @ weights[&quot;out&quot;]
+    return output, {&quot;q&quot;: q, &quot;k&quot;: k, &quot;v&quot;: v, &quot;attn_scores&quot;: attn_scores,
+                    &quot;attn_weights&quot;: attn_weights, &quot;attn_output&quot;: attn_output}
+
+
+def sensitivity_experiment(batch_size=2, seq_len=16, d_model=64, num_bits=8):
+    np.random.seed(42)
+    input_data = np.random.randn(batch_size, seq_len, d_model) * 0.1
+
+    weights = {
+        &quot;qkv&quot;: np.random.randn(d_model, 3 * d_model) * (2.0 / d_model) ** 0.5,
+        &quot;out&quot;: np.random.randn(d_model, d_model) * (2.0 / d_model) ** 0.5,
+    }
+
+    baseline_output, baseline_internals = simulate_transformer_layer(input_data, weights)
+
+    experiments = {}
+
+    q_qkv, s_qkv = quantize_per_channel(weights[&quot;qkv&quot;], num_bits, axis=0)
+    q_out, s_out = quantize_per_channel(weights[&quot;out&quot;], num_bits, axis=0)
+    quantized_weights = {
+        &quot;qkv&quot;: dequantize_per_channel(q_qkv, s_qkv, axis=0),
+        &quot;out&quot;: dequantize_per_channel(q_out, s_out, axis=0),
+    }
+    weight_quant_output, _ = simulate_transformer_layer(input_data, quantized_weights)
+    experiments[&quot;Weights only&quot;] = quantization_error(baseline_output, weight_quant_output)
+
+    _, fresh_internals = simulate_transformer_layer(input_data, weights)
+    q_act, s_act = quantize_per_channel(
+        fresh_internals[&quot;attn_output&quot;].reshape(-1, d_model), num_bits, axis=0
+    )
+    quant_attn_out = dequantize_per_channel(q_act, s_act, axis=0).reshape(batch_size, seq_len, d_model)
+    act_quant_output = quant_attn_out @ weights[&quot;out&quot;]
+    experiments[&quot;Activations only&quot;] = quantization_error(baseline_output, act_quant_output)
+
+    q_k, s_k = quantize_per_channel(fresh_internals[&quot;k&quot;].reshape(-1, d_model), num_bits, axis=0)
+    q_v, s_v = quantize_per_channel(fresh_internals[&quot;v&quot;].reshape(-1, d_model), num_bits, axis=0)
+    quant_k = dequantize_per_channel(q_k, s_k, axis=0).reshape(batch_size, seq_len, d_model)
+    quant_v = dequantize_per_channel(q_v, s_v, axis=0).reshape(batch_size, seq_len, d_model)
+    attn_scores_kv = (fresh_internals[&quot;q&quot;] @ quant_k.transpose(0, 2, 1)) / np.sqrt(d_model)
+    attn_max_kv = np.max(attn_scores_kv, axis=-1, keepdims=True)
+    attn_exp_kv = np.exp(attn_scores_kv - attn_max_kv)
+    attn_weights_kv = attn_exp_kv / np.sum(attn_exp_kv, axis=-1, keepdims=True)
+    kv_quant_output = (attn_weights_kv @ quant_v) @ weights[&quot;out&quot;]
+    experiments[&quot;KV cache only&quot;] = quantization_error(baseline_output, kv_quant_output)
+
+    noise_scale = np.std(fresh_internals[&quot;attn_scores&quot;]) * 0.05
+    noisy_scores = fresh_internals[&quot;attn_scores&quot;] + np.random.randn(*fresh_internals[&quot;attn_scores&quot;].shape) * noise_scale
+    noisy_max = np.max(noisy_scores, axis=-1, keepdims=True)
+    noisy_exp = np.exp(noisy_scores - noisy_max)
+    noisy_weights = noisy_exp / np.sum(noisy_exp, axis=-1, keepdims=True)
+    attn_quant_output = (noisy_weights @ fresh_internals[&quot;v&quot;]) @ weights[&quot;out&quot;]
+    experiments[&quot;Attention logits (5% noise)&quot;] = quantization_error(baseline_output, attn_quant_output)
+
+    print(f&quot;\n  Sensitivity Experiment ({num_bits}-bit quantization):&quot;)
+    print(f&quot;  {'Component':&lt;30} {'MSE':&gt;14} {'SNR (dB)':&gt;10} {'Cosine Sim':&gt;12}&quot;)
+    print(f&quot;  {'-'*68}&quot;)
+    for name, err in sorted(experiments.items(), key=lambda x: x[1][&quot;mse&quot;]):
+        print(f&quot;  {name:&lt;30} {err['mse']:&gt;14.8f} {err['snr_db']:&gt;10.2f} {err['cosine_similarity']:&gt;12.8f}&quot;)
+
+    return experiments
+</code></pre>
+<h3>步骤 6:模拟GPTQ</h3>
+<p>GPTQ一次量化一个列,使用Hessian来决定如何分配圆形错误.这是一个简化版本,捕捉了核心想法:使用校准数据来测量重量重要性,然后更积极地量化最不重要的重量.</p>
+<pre><code class="language-python">def simulated_gptq(weight_matrix, calibration_inputs, num_bits=4):
+    n_in, n_out = weight_matrix.shape
+    qmin = -(2 ** (num_bits - 1))
+    qmax = 2 ** (num_bits - 1) - 1
+
+    H = np.zeros((n_in, n_in))
+    for x in calibration_inputs:
+        x = x.reshape(-1, 1) if x.ndim == 1 else x
+        for row in range(x.shape[0]):
+            xi = x[row].reshape(-1, 1)
+            H += xi @ xi.T
+    H /= len(calibration_inputs)
+    H += np.eye(n_in) * 1e-4
+
+    weight_importance = np.diag(H)
+
+    quantized = np.zeros_like(weight_matrix, dtype=np.int32)
+    scales = np.zeros(n_out)
+    errors = np.zeros(n_out)
+
+    W = weight_matrix.copy()
+
+    for col in range(n_out):
+        w_col = W[:, col]
+        abs_max = np.max(np.abs(w_col))
+        if abs_max == 0:
+            scales[col] = 1.0
+            continue
+        scale = abs_max / qmax
+        scales[col] = scale
+
+        q_col = np.clip(np.round(w_col / scale), qmin, qmax).astype(np.int32)
+        quantized[:, col] = q_col
+
+        quant_error = w_col - q_col * scale
+        errors[col] = np.sqrt(np.mean(quant_error ** 2))
+
+        if col &lt; n_out - 1:
+            importance_weights = weight_importance / (np.max(weight_importance) + 1e-10)
+            for next_col in range(col + 1, min(col + 4, n_out)):
+                compensation = quant_error * importance_weights * 0.1
+                W[:, next_col] += compensation
+
+    return quantized, scales, {&quot;column_errors&quot;: errors,
+                               &quot;mean_error&quot;: float(np.mean(errors)),
+                               &quot;max_error&quot;: float(np.max(errors))}
+
+
+def dequantize_gptq(quantized, scales):
+    result = np.zeros_like(quantized, dtype=np.float64)
+    for col in range(quantized.shape[1]):
+        result[:, col] = quantized[:, col] * scales[col]
+    return result
+</code></pre>
+<h3>步骤 7: AWQ 模拟</h3>
+<p>AWQ识别出突出重量 (通过大激活乘以重量) 并通过量化之前扩展保护它们.</p>
+<pre><code class="language-python">def simulated_awq(weight_matrix, calibration_inputs, num_bits=4, salient_fraction=0.01):
+    n_in, n_out = weight_matrix.shape
+    qmin = -(2 ** (num_bits - 1))
+    qmax = 2 ** (num_bits - 1) - 1
+
+    activation_magnitudes = np.zeros(n_in)
+    for x in calibration_inputs:
+        if x.ndim == 1:
+            activation_magnitudes += np.abs(x)
+        else:
+            activation_magnitudes += np.mean(np.abs(x), axis=0)
+    activation_magnitudes /= len(calibration_inputs)
+
+    n_salient = max(1, int(n_in * salient_fraction))
+    salient_indices = np.argsort(activation_magnitudes)[-n_salient:]
+
+    scale_factors = np.ones(n_in)
+    for idx in salient_indices:
+        col_max = np.max(np.abs(weight_matrix[idx, :]))
+        if col_max &gt; 0:
+            scale_factors[idx] = min(4.0, 1.0 / (col_max + 1e-8) * np.mean(np.abs(weight_matrix)))
+
+    scaled_weights = weight_matrix * scale_factors.reshape(-1, 1)
+
+    quantized, scales = quantize_per_channel(scaled_weights, num_bits, axis=0)
+    dequantized = dequantize_per_channel(quantized, scales, axis=0)
+
+    result = dequantized / scale_factors.reshape(-1, 1)
+
+    err = quantization_error(weight_matrix, result)
+
+    return result, {&quot;salient_indices&quot;: salient_indices,
+                    &quot;scale_factors&quot;: scale_factors[salient_indices],
+                    &quot;error&quot;: err,
+                    &quot;n_salient&quot;: n_salient}
+</code></pre>
+<h3>八步: 完整的管道</h3>
+<p>通过同一个重量矩阵进行简单的量化,每道,GPTQ和 AWQ进行比较.</p>
+<pre><code class="language-python">def full_quantization_comparison(d_in=256, d_out=512, num_bits=4, n_calibration=32):
+    np.random.seed(42)
+
+    weight = np.random.randn(d_in, d_out) * 0.02
+    outlier_rows = np.random.choice(d_in, size=5, replace=False)
+    weight[outlier_rows] *= 10
+
+    calibration = [np.random.randn(8, d_in) * 0.1 for _ in range(n_calibration)]
+
+    q_naive, s_naive = quantize_symmetric(weight, num_bits)
+    recon_naive = dequantize_symmetric(q_naive, s_naive)
+    err_naive = quantization_error(weight, recon_naive)
+
+    q_pc, s_pc = quantize_per_channel(weight, num_bits, axis=0)
+    recon_pc = dequantize_per_channel(q_pc, s_pc, axis=0)
+    err_pc = quantization_error(weight, recon_pc)
+
+    q_gptq, s_gptq, gptq_info = simulated_gptq(weight, calibration, num_bits)
+    recon_gptq = dequantize_gptq(q_gptq, s_gptq)
+    err_gptq = quantization_error(weight, recon_gptq)
+
+    recon_awq, awq_info = simulated_awq(weight, calibration, num_bits)
+    err_awq = awq_info[&quot;error&quot;]
+
+    print(f&quot;\n  Full Quantization Comparison ({num_bits}-bit, {d_in}x{d_out} matrix)&quot;)
+    print(f&quot;  Matrix has {len(outlier_rows)} outlier rows (10x scale)&quot;)
+    print()
+    print(f&quot;  {'Method':&lt;20} {'MSE':&gt;14} {'SNR (dB)':&gt;10} {'Cosine Sim':&gt;12}&quot;)
+    print(f&quot;  {'-'*58}&quot;)
+    print(f&quot;  {'Naive per-tensor':&lt;20} {err_naive['mse']:&gt;14.8f} {err_naive['snr_db']:&gt;10.2f} {err_naive['cosine_similarity']:&gt;12.8f}&quot;)
+    print(f&quot;  {'Per-channel':&lt;20} {err_pc['mse']:&gt;14.8f} {err_pc['snr_db']:&gt;10.2f} {err_pc['cosine_similarity']:&gt;12.8f}&quot;)
+    print(f&quot;  {'Simulated GPTQ':&lt;20} {err_gptq['mse']:&gt;14.8f} {err_gptq['snr_db']:&gt;10.2f} {err_gptq['cosine_similarity']:&gt;12.8f}&quot;)
+    print(f&quot;  {'Simulated AWQ':&lt;20} {err_awq['mse']:&gt;14.8f} {err_awq['snr_db']:&gt;10.2f} {err_awq['cosine_similarity']:&gt;12.8f}&quot;)
+
+    test_input = np.random.randn(4, d_in) * 0.1
+    baseline = test_input @ weight
+    output_naive = test_input @ recon_naive
+    output_pc = test_input @ recon_pc
+    output_gptq = test_input @ recon_gptq
+    output_awq = test_input @ recon_awq
+
+    print(f&quot;\n  End-to-End Output Error (matmul with test input):&quot;)
+    print(f&quot;  {'Method':&lt;20} {'Output MSE':&gt;14} {'Output Cosine':&gt;14}&quot;)
+    print(f&quot;  {'-'*50}&quot;)
+    for name, output in [(&quot;Naive&quot;, output_naive), (&quot;Per-channel&quot;, output_pc),
+                          (&quot;GPTQ&quot;, output_gptq), (&quot;AWQ&quot;, output_awq)]:
+        out_err = quantization_error(baseline, output)
+        print(f&quot;  {name:&lt;20} {out_err['mse']:&gt;14.8f} {out_err['cosine_similarity']:&gt;14.8f}&quot;)
+
+    return {&quot;naive&quot;: err_naive, &quot;per_channel&quot;: err_pc, &quot;gptq&quot;: err_gptq, &quot;awq&quot;: err_awq}
+
+
+def memory_calculator(num_params_billions, bits_per_param):
+    bytes_per_param = bits_per_param / 8
+    total_bytes = num_params_billions * 1e9 * bytes_per_param
+    total_gb = total_bytes / (1024 ** 3)
+    return total_gb
+
+
+def print_memory_table():
+    print(&quot;\n  Memory Requirements by Model and Precision:&quot;)
+    print(f&quot;  {'Model':&lt;15} {'FP32':&gt;8} {'FP16':&gt;8} {'FP8':&gt;8} {'INT8':&gt;8} {'INT4':&gt;8} {'INT2':&gt;8}&quot;)
+    print(f&quot;  {'-'*64}&quot;)
+    for name, params in [(&quot;7B&quot;, 7), (&quot;13B&quot;, 13), (&quot;34B&quot;, 34), (&quot;70B&quot;, 70), (&quot;405B&quot;, 405)]:
+        fp32 = memory_calculator(params, 32)
+        fp16 = memory_calculator(params, 16)
+        fp8 = memory_calculator(params, 8)
+        int8 = memory_calculator(params, 8)
+        int4 = memory_calculator(params, 4)
+        int2 = memory_calculator(params, 2)
+        print(f&quot;  {name:&lt;15} {fp32:&gt;7.1f}G {fp16:&gt;7.1f}G {fp8:&gt;7.1f}G {int8:&gt;7.1f}G {int4:&gt;7.1f}G {int2:&gt;7.1f}G&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    np.random.seed(42)
+
+    print(&quot;=&quot; * 70)
+    print(&quot;QUANTIZATION: MAKING MODELS FIT&quot;)
+    print(&quot;=&quot; * 70)
+
+    print(&quot;\nSTEP 1: Number Format Comparison&quot;)
+    print(&quot;-&quot; * 50)
+    for val in [0.1, 3.14159, -0.00073, 42.5, 0.0000012]:
+        display_format_comparison(val)
+
+    print(&quot;\n\nSTEP 2: Memory Requirements&quot;)
+    print(&quot;-&quot; * 50)
+    print_memory_table()
+
+    print(&quot;\n\nSTEP 3: Quantization Methods Comparison&quot;)
+    print(&quot;-&quot; * 50)
+    weight_matrix = np.random.randn(128, 256) * 0.02
+    weight_matrix[0] *= 15
+    weight_matrix[42] *= 8
+    compare_quantization_methods(weight_matrix, num_bits=8)
+    compare_quantization_methods(weight_matrix, num_bits=4)
+
+    print(&quot;\n\nSTEP 4: Bit-Width Sweep&quot;)
+    print(&quot;-&quot; * 50)
+    sweep_tensor = np.random.randn(64, 128) * 0.05
+    bit_width_sweep(sweep_tensor)
+
+    print(&quot;\n\nSTEP 5: Sensitivity Experiment&quot;)
+    print(&quot;-&quot; * 50)
+    print(&quot;\n  INT8:&quot;)
+    sensitivity_experiment(num_bits=8)
+    print(&quot;\n  INT4:&quot;)
+    sensitivity_experiment(num_bits=4)
+
+    print(&quot;\n\nSTEP 6: GPTQ vs AWQ vs Naive (INT4)&quot;)
+    print(&quot;-&quot; * 50)
+    full_quantization_comparison(d_in=256, d_out=512, num_bits=4)
+
+    print(&quot;\n\nSTEP 7: Distribution Analysis&quot;)
+    print(&quot;-&quot; * 50)
+    np.random.seed(0)
+    simulated_weights = np.random.randn(1000) * 0.02
+    abs_vals = np.abs(simulated_weights)
+    pct_in_range = np.mean(abs_vals &lt; 0.1) * 100
+    print(f&quot;\n  Simulated weight distribution (1000 params, std=0.02):&quot;)
+    print(f&quot;  Weights in [-0.1, 0.1]: {pct_in_range:.1f}%&quot;)
+    print(f&quot;  Weights in [-0.05, 0.05]: {np.mean(abs_vals &lt; 0.05) * 100:.1f}%&quot;)
+    print(f&quot;  Weights in [-0.01, 0.01]: {np.mean(abs_vals &lt; 0.01) * 100:.1f}%&quot;)
+    print(f&quot;  Max absolute value: {np.max(abs_vals):.6f}&quot;)
+    print(f&quot;  Mean absolute value: {np.mean(abs_vals):.6f}&quot;)
+
+    histogram = np.histogram(simulated_weights, bins=20)
+    print(f&quot;\n  Weight histogram:&quot;)
+    max_count = max(histogram[0])
+    for i in range(len(histogram[0])):
+        bar_len = int(histogram[0][i] / max_count * 40)
+        lo = histogram[1][i]
+        hi = histogram[1][i + 1]
+        print(f&quot;  [{lo:&gt;7.4f}, {hi:&gt;7.4f}] {'#' * bar_len} ({histogram[0][i]})&quot;)
+
+    print(&quot;\n\n&quot; + &quot;=&quot; * 70)
+    print(&quot;DONE&quot;)
+    print(&quot;=&quot; * 70)
+</code></pre>
+<h2>用它</h2>
+<h3>通过GPTQModel进行量化</h3>
+<pre><code class="language-python"># pip install gptqmodel
+# from gptqmodel import GPTQConfig, GPTQModel
+#
+# model_id = &quot;meta-llama/Llama-3.1-8B&quot;
+# quant_config = GPTQConfig(bits=4, group_size=128)
+#
+# model = GPTQModel.load(model_id, quant_config)
+# model.quantize(calibration_texts[:128], batch_size=1)
+# model.save(&quot;llama-8b-gptq-int4&quot;)
+</code></pre>
+<h3>通过LLM压缩机对 AWQ进行量化</h3>
+<pre><code class="language-python"># pip install llmcompressor
+# from transformers import AutoModelForCausalLM, AutoTokenizer
+# from llmcompressor import oneshot
+# from llmcompressor.modifiers.quantization import QuantizationModifier
+# from llmcompressor.modifiers.transform.awq import AWQModifier
+#
+# model_id = &quot;meta-llama/Llama-3.1-8B&quot;
+# model = AutoModelForCausalLM.from_pretrained(model_id)
+# tokenizer = AutoTokenizer.from_pretrained(model_id)
+#
+# recipe = [
+#     AWQModifier(duo_scaling=&quot;both&quot;),
+#     QuantizationModifier(ignore=[&quot;lm_head&quot;], scheme=&quot;W4A16_ASYM&quot;, targets=[&quot;Linear&quot;]),
+# ]
+# oneshot(
+#     model=model,
+#     dataset=&quot;perfectblend&quot;,
+#     splits=&quot;train[:512]&quot;,
+#     recipe=recipe,
+#     max_seq_length=512,
+#     num_calibration_samples=256,
+# )
+# model.save_pretrained(&quot;llama-8b-awq-int4&quot;, save_compressed=True)
+# tokenizer.save_pretrained(&quot;llama-8b-awq-int4&quot;)
+</code></pre>
+<p>存档了这些方法的原始工具,AutoGPTQ和AutoAWQ. GPTQModel和LLM Compressor是保持后代.</p>
+<h3>转换为GGUF</h3>
+<pre><code class="language-bash"># git clone https://github.com/ggml-org/llama.cpp
+# cmake -S llama.cpp -B llama.cpp/build &amp;&amp; cmake --build llama.cpp/build --config Release
+# pip install -r llama.cpp/requirements.txt
+# hf download meta-llama/Llama-3.1-8B --local-dir Llama-3.1-8B
+# python llama.cpp/convert_hf_to_gguf.py Llama-3.1-8B --outtype f16 --outfile llama-8b-f16.gguf
+# llama.cpp/build/bin/llama-quantize llama-8b-f16.gguf llama-8b-q4km.gguf Q4_K_M
+# llama.cpp/build/bin/llama-server -m llama-8b-q4km.gguf -c 4096 -ngl 99
+</code></pre>
+<p>转换器没有K量子输出 (<code>--outtype</code>接受<code>f32</code>现在<code>f16</code>现在<code>bf16</code>现在<code>q8_0</code>现在<code>tq1_0</code>现在<code>tq2_0</code>其他<code>auto</code>),所以<code>llama-quantize</code>产生Q4_K_M文件.</p>
+<h3>提供量化模型</h3>
+<pre><code class="language-python"># pip install vllm
+# vllm serve llama-8b-awq-int4 --max-model-len 8192
+</code></pre>
+<p>vLLM原来支持 AWQ 和 GPTQ 模型,并从检查点的配置中读取量化方法,所以没有<code>--quantization</code>需要旗.它处理矩阵乘法过程中的分量化,并使用页面关注 KV缓存.在H100上的FP8中,添加<code>--quantization fp8_per_tensor</code>量化16位检查点在加载时间的重量.</p>
+<h2>运送它</h2>
+<p>这一课产生了<code>outputs/skill-quantization.md</code>根据模型大小,目标硬件和质量要求,它告诉您使用哪种格式,方法和验证步骤.它包括内存预算计算,每个组件的精确性建议以及vLLM, llama.cpp和TensorRT-LLM的部署配方.</p>
+<h2>运动</h2>
+<ol>
+<li>
+<p>实现组量化.每频道的尺度,使用一个尺度,每组的 128 个重量在一个频道内.这是GPTQ和 AWQ实际上使用的.在同一重量矩阵上比较组尺寸 32, 64, 128 和 256.较小的组提供更好的质量,但更大的存储费用.</p>
+</li>
+<li>
+<p>构建混合精度量化器.量化多层网络的第一层和最后层在INT8中,同时量化中层在INT4. 比较端到端输出质量与统一INT4和统一INT8. 与所有INT8相比,测量存储量.</p>
+</li>
+<li>
+<p>实现对量子化的意识训练的直径估计器 (STE).将简单的二层网络训练在回归任务上的前进传输中插入虚假的量子化/脱量化操作.将正常训练的模型 (然后 PTQ 到 INT4) 与从开始训练的QAT模型之间的最终损失进行比较.</p>
+</li>
+<li>
+<p>建立一个以 LLM.int8 (法学) 启发的异常量化仪.检测激活大小超过平均的频道.将这些频道保持在FP16中,并量化其他所有内容到INT8. 从第5步开始,测量变压器层的端到端质量,具有不同异常门 (3x,6x,10x).</p>
+</li>
+<li>
+<p>实施量化质量仪表板. 考虑到一个重量矩阵,计算和显示:重量分布 histogram,量化错误分布,每频道尺度因素,最差量化道 (最高重建错误),以及原始和量化输出之间的共数相似性在100个随机输入中.确定哪些道应该保持更高精度.</p>
+</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>FP16</td>
+<td>&quot;Half precision&quot;</td>
+<td>16-bit float with 5 exponent bits and 10 mantissa bits, max value 65,504, standard inference format</td>
+</tr>
+<tr>
+<td>BF16</td>
+<td>&quot;Brain float&quot;</td>
+<td>16-bit float with 8 exponent bits (same range as FP32) and 7 mantissa bits, designed by Google for training</td>
+</tr>
+<tr>
+<td>FP8</td>
+<td>&quot;Eight-bit float&quot;</td>
+<td>Two variants: E4M3 (inference, more precision) and E5M2 (training, more range), native on H100</td>
+</tr>
+<tr>
+<td>INT8</td>
+<td>&quot;Eight-bit integer&quot;</td>
+<td>256 uniformly spaced values from -128 to 127, needs a scale factor to map from floats</td>
+</tr>
+<tr>
+<td>INT4</td>
+<td>&quot;Four-bit integer&quot;</td>
+<td>16 levels total, requires sophisticated methods (GPTQ, AWQ) to maintain quality</td>
+</tr>
+<tr>
+<td>Per-channel quantization</td>
+<td>&quot;One scale per row&quot;</td>
+<td>Uses a separate scale factor for each output channel instead of one for the whole tensor, dramatically reduces error</td>
+</tr>
+<tr>
+<td>GPTQ</td>
+<td>&quot;The Hessian method&quot;</td>
+<td>Post-training quantization using second-order information to minimize output error, one layer at a time</td>
+</tr>
+<tr>
+<td>AWQ</td>
+<td>&quot;Activation-aware&quot;</td>
+<td>Scales salient weights (those multiplied by large activations) before quantization to protect them</td>
+</tr>
+<tr>
+<td>GGUF</td>
+<td>&quot;The llama.cpp format&quot;</td>
+<td>Self-contained model file with mixed-precision layers, optimized for CPU and Apple Silicon inference</td>
+</tr>
+<tr>
+<td>PTQ</td>
+<td>&quot;Quantize after training&quot;</td>
+<td>Convert a trained model's weights to lower precision without retraining, fast but limited at extreme compression</td>
+</tr>
+<tr>
+<td>QAT</td>
+<td>&quot;Quantize during training&quot;</td>
+<td>Insert fake quantization into the forward pass so the model learns to tolerate rounding, better at INT4/INT2</td>
+</tr>
+<tr>
+<td>Calibration data</td>
+<td>&quot;The 128 examples&quot;</td>
+<td>A small dataset run through the model to compute activation statistics for setting scale factors</td>
+</tr>
+<tr>
+<td>Scale factor</td>
+<td>&quot;The multiplier&quot;</td>
+<td>Converts between floating-point range and integer range: <code>float_val = int_val * scale</code></td>
+</tr>
+<tr>
+<td>Perplexity delta</td>
+<td>&quot;How much worse&quot;</td>
+<td>Difference in perplexity between original and quantized model, &lt; 0.5 is excellent, &gt; 2.0 is a problem</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2210.17323" rel="noreferrer" data-network="true">Frantar et al., 2022 -- &quot;GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers&quot; <small>↗ 需要联网</small></a>-- 论文使得INT4量化在使用Hessian指导重量圆化的 LLM中成为实用</li>
+<li><a href="https://arxiv.org/abs/2306.00978" rel="noreferrer" data-network="true">Lin et al., 2023 -- &quot;AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration&quot; <small>↗ 需要联网</small></a>-- 通过量化前扩展,匹配或击败GPTQ来保护显著重量</li>
+<li><a href="https://arxiv.org/abs/2208.07339" rel="noreferrer" data-network="true">Dettmers et al., 2022 -- &quot;LLM.int8(): 8-bit Matrix Multiplication for Transformers at Scale&quot; <small>↗ 需要联网</small></a>--混合精密的INT8保持在FP16中更异常的特性,使得INT8推断无损质量</li>
+<li><a href="https://arxiv.org/abs/2211.10438" rel="noreferrer" data-network="true">Xiao et al., 2023 -- &quot;SmoothQuant: Accurate and Efficient Post-Training Quantization for Large Language Models&quot; <small>↗ 需要联网</small></a>-- 转移从激活到W8A8部署的权重量化难度</li>
+<li><a href="https://arxiv.org/abs/2209.05433" rel="noreferrer" data-network="true">Micikevicius et al., 2022 -- &quot;FP8 Formats for Deep Learning&quot; <small>↗ 需要联网</small></a>-- 现在H100上原生的E4M3和E5M2格式的NVIDIA/ARM/Intel论文</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Quantization: Making Models Fit</h1>
+<blockquote>
+<p>A 70B model in FP16 needs 140GB. Two A100s just for weights. Quantize to FP8: one 80GB GPU. INT4: a MacBook.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python (with numpy)
+<strong>Prerequisites:</strong> Phase 10, Lessons 01-10 (LLMs from Scratch)
+<strong>Time:</strong> ~120 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Implement symmetric and asymmetric quantization from FP16 to INT8 and INT4, including per-tensor and per-channel scaling</li>
+<li>Calculate the memory savings from quantization and determine which precision fits a given GPU's VRAM</li>
+<li>Explain the difference between post-training quantization (PTQ) and quantization-aware training (QAT)</li>
+<li>Apply GPTQ or AWQ to quantize a real model and measure the accuracy-memory tradeoff on a benchmark</li>
+</ul>
+<h2>The Problem</h2>
+<p>Llama 3 70B has 70 billion parameters. Each parameter is a 16-bit floating point number. That is 140 billion bytes. 140GB. A single A100 has 80GB of VRAM. You cannot even load the weights, let alone run inference, on a single GPU. You need two A100s at $2/hour each just to serve one model.</p>
+<p>But 16 bits per parameter is wasteful. Most weights in a neural network cluster near zero. The full dynamic range of FP16 (from 0.000000059 to 65,504) is almost entirely unused. If you measure the actual distribution of weights in Llama 3 70B, 95% of them fall between -0.1 and +0.1. You are burning 16 bits to represent values that could fit in 4.</p>
+<p>Quantization replaces high-precision numbers with lower-precision ones. FP16 to FP8 cuts memory in half. FP16 to INT4 cuts it to a quarter. That 140GB model becomes 35GB. It fits on a single consumer GPU. Push to 2-bit quantization (aggressive, lossy, but usable for some tasks) and the same model runs on a 16GB laptop.</p>
+<p>The cost is accuracy. Every bit you remove destroys information. The question is how much accuracy you lose and where. A well-quantized INT4 model retains 95-99% of the original's quality on most benchmarks. A naive quantization to INT4 can destroy the model entirely. The difference is technique.</p>
+<p>Community quantizations of Llama 3 to INT4 with GPTQ show roughly 1-2 perplexity points lost on WikiText. Mistral released FP8 checkpoints of Mixtral 8x22B with zero measurable quality loss on MMLU. The GGUF format powers llama.cpp, running 70B models on MacBooks with M-series chips. Quantization is not a hack. It is the standard deployment path for every model larger than 7B.</p>
+<h2>The Concept</h2>
+<h3>Number Formats: What Each Bit Does</h3>
+<p>Every floating-point number has three parts: sign, exponent, and mantissa (also called significand). The sign is one bit. The exponent determines the range (how large or small the number can be). The mantissa determines the precision (how many decimal places you get).</p>
+<pre><code>FP32:  [1 sign] [8 exponent] [23 mantissa]  = 32 bits
+FP16:  [1 sign] [5 exponent] [10 mantissa]  = 16 bits
+BF16:  [1 sign] [8 exponent] [7  mantissa]  = 16 bits
+FP8:   [1 sign] [4 exponent] [3  mantissa]  = 8  bits (E4M3)
+FP8:   [1 sign] [5 exponent] [2  mantissa]  = 8  bits (E5M2)
+INT8:  [1 sign] [7 value]                   = 8  bits (uniform steps)
+INT4:  [1 sign] [3 value]                   = 4  bits (16 levels total)
+</code></pre>
+<p><strong>FP32</strong> is full precision. 23 mantissa bits give you about 7 decimal digits of precision. Range: roughly 1.2 x 10^-38 to 3.4 x 10^38. Training used to happen exclusively in FP32. It still does for accumulation (running sums during matrix multiplication).</p>
+<p><strong>FP16</strong> halves the bits. 10 mantissa bits give about 3.3 decimal digits. The exponent shrinks to 5 bits, reducing the range dramatically (max value ~65,504). This is fine for weights (which cluster near zero) but dangerous for activations and gradients that can spike during training. FP16 training requires loss scaling to prevent underflow.</p>
+<p><strong>BF16</strong> (Brain Float 16) keeps the 8-bit exponent from FP32 but shrinks the mantissa to 7 bits. Same range as FP32, less precision than FP16. Google designed it specifically for deep learning. The intuition: range matters more than precision for neural networks. A gradient of 10^-20 that underflows to zero in FP16 survives in BF16. A weight of 0.07342 that rounds to 0.0734 in BF16 is close enough. Every modern training run uses BF16 or a BF16/FP32 mix.</p>
+<p><strong>FP8</strong> comes in two flavors. E4M3 (4 exponent, 3 mantissa) is used for weights and activations during inference. E5M2 (5 exponent, 2 mantissa) is used for gradients during training where range matters more than precision. FP8 inference on H100 GPUs achieves 30-50% speedup over FP16 with negligible quality loss.</p>
+<p><strong>INT8</strong> is an integer format. No exponent, no mantissa. Just 256 evenly spaced values from -128 to 127. You need a scale factor to map floating-point weights into this range. The advantage: integer arithmetic is faster and more power-efficient than floating-point. INT8 matrix multiplication on an A100 runs at 624 TOPS versus 312 TFLOPS for FP16.</p>
+<p><strong>INT4</strong> pushes further. Only 16 possible values. The scale factor does heavy lifting. Quality depends entirely on how you choose the scale and which weights you quantize. State-of-the-art INT4 methods (GPTQ, AWQ) retain 95%+ of original model quality.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-4561a9788f385892c63b.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>How Quantization Works</h3>
+<p>The core operation is simple. Take a tensor of floating-point values, find a scale factor, multiply, round to the nearest integer, and store the integers plus the scale factor.</p>
+<p><strong>Quantize:</strong></p>
+<pre><code>scale = max(abs(tensor)) / max_int_value
+quantized = round(tensor / scale)
+</code></pre>
+<p><strong>Dequantize:</strong></p>
+<pre><code>reconstructed = quantized * scale
+</code></pre>
+<p>For INT8 with a symmetric range (-127 to 127):</p>
+<pre><code>scale = max(abs(tensor)) / 127
+quantized = clamp(round(tensor / scale), -128, 127)
+</code></pre>
+<p>The error is the rounding error. Each value can be off by at most <code>scale / 2</code>. The total error across a layer depends on how many weights you have and how sensitive the model is to perturbations in those weights.</p>
+<p><strong>Per-tensor vs per-channel quantization.</strong> Per-tensor uses one scale factor for the entire weight matrix. Simple but lossy: if one column has large values and another has small values, the small values lose most of their precision. Per-channel uses one scale factor per output channel (per row or column of the weight matrix). More overhead (you store N scale factors instead of 1) but dramatically better quality. Every production quantization method uses per-channel or finer granularity.</p>
+<p><strong>Asymmetric quantization</strong> adds a zero-point offset: <code>quantized = round(tensor / scale) + zero_point</code>. This handles distributions that are not centered at zero. ReLU activations, for example, are always non-negative. Symmetric quantization wastes half the integer range on negative values that never appear. Asymmetric quantization maps the actual range [min, max] to the full integer range.</p>
+<h3>Sensitivity Hierarchy</h3>
+<p>Not everything in a model tolerates quantization equally. There is a clear hierarchy.</p>
+<p><strong>Weights (most robust).</strong> Model weights change slowly during training and follow a roughly Gaussian distribution centered near zero. They quantize well. INT8 weights with per-channel scales produce nearly lossless results. INT4 requires more sophisticated methods but works.</p>
+<p><strong>Activations (moderate sensitivity).</strong> Activations are the intermediate values flowing through the network during inference. They have wider dynamic range than weights and contain outliers. A single attention head might produce activation values 100x larger than the mean. These outliers are critical for model quality. Quantizing them naively destroys information. Solutions: keep outlier channels in higher precision (LLM.int8()), use per-token or per-channel activation scales.</p>
+<p><strong>KV cache (high sensitivity).</strong> The key-value cache stores attention states for all previous tokens. At long context lengths, the KV cache dominates memory. For a 70B model at 32K context, the KV cache alone is 40GB in FP16. Quantizing the KV cache to FP8 or INT8 saves massive memory but any error compounds across all future attention computations. The quality impact scales with sequence length.</p>
+<p><strong>Attention logits (most sensitive).</strong> The softmax in attention is highly sensitive to small changes in its inputs. A quantization error of 0.01 in a pre-softmax logit can shift the attention distribution meaningfully. Most quantization schemes keep attention computation in higher precision (FP16 or BF16) even when everything else is quantized.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-a258093340bd25efebe6.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>PTQ vs QAT</h3>
+<p><strong>Post-Training Quantization (PTQ)</strong> quantizes an already-trained model. No retraining. You take the FP16 weights, compute scale factors, round, and deploy. Fast (minutes to hours) and cheap. Works well for INT8 and FP8. For INT4, naive PTQ often fails badly because rounding errors accumulate. Advanced PTQ methods (GPTQ, AWQ) use calibration data to minimize the quantization error.</p>
+<p><strong>Quantization-Aware Training (QAT)</strong> inserts fake quantization operations into the forward pass during training. The model learns to place its weights where rounding errors are small. Gradients flow through the fake quantization using the straight-through estimator (STE): pretend the rounding operation has gradient 1. QAT produces better INT4 and INT2 models than PTQ but requires a full training run. Google used QAT for Gemini's efficient serving. Meta used QAT for some Llama deployment targets.</p>
+<table>
+<thead>
+<tr>
+<th>Aspect</th>
+<th>PTQ</th>
+<th>QAT</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Cost</td>
+<td>Minutes to hours</td>
+<td>Full training run</td>
+</tr>
+<tr>
+<td>Quality at INT8</td>
+<td>Excellent (&lt; 0.1% loss)</td>
+<td>Excellent</td>
+</tr>
+<tr>
+<td>Quality at INT4</td>
+<td>Good with GPTQ/AWQ (1-3% loss)</td>
+<td>Better (&lt; 1% loss)</td>
+</tr>
+<tr>
+<td>Quality at INT2</td>
+<td>Poor</td>
+<td>Usable for some tasks</td>
+</tr>
+<tr>
+<td>Calibration data</td>
+<td>128-1024 examples</td>
+<td>Full training dataset</td>
+</tr>
+<tr>
+<td>When to use</td>
+<td>Deployment, iteration</td>
+<td>Maximum quality at low bit-width</td>
+</tr>
+</tbody>
+</table>
+<h3>GPTQ, AWQ, GGUF</h3>
+<p><strong>GPTQ (GPT Quantization)</strong> is a one-shot PTQ method. It quantizes weights one layer at a time, using a small calibration dataset (128 examples is typical) to measure the Hessian (second-order information about how sensitive the output is to each weight). Weights that the Hessian says are important get quantized more carefully. GPTQ was the first method to make INT4 quantization practical for LLMs. The TheBloke on Hugging Face popularized GPTQ by releasing quantized versions of hundreds of models.</p>
+<p><strong>AWQ (Activation-Aware Weight Quantization)</strong> observes that a small fraction of weights (about 1%) are disproportionately important because they multiply with large activation values. AWQ identifies these salient weights using calibration data and scales them up before quantization (then scales the corresponding activations down). This keeps the important weights in a range where INT4 quantization is accurate. AWQ typically matches or slightly beats GPTQ quality while being 1.5-2x faster to apply.</p>
+<p><strong>GGUF (GPT-Generated Unified Format)</strong> is the file format used by llama.cpp and its ecosystem. It supports mixed quantization: different layers get different bit widths. The first and last layers (embedding and output head) are typically kept at higher precision. Middle layers get INT4 or INT3. GGUF files are self-contained: weights, tokenizer, metadata all in one file. The format is designed for CPU inference and Apple Silicon, where loading the entire model into memory and running matrix multiplications on the CPU or Metal GPU is the standard path. Q4_K_M is the most popular GGUF quantization variant, balancing quality and size.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-9f08bec80a5294bae2bf.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>Quality Measurement</h3>
+<p>How do you know if your quantized model is still good?</p>
+<p><strong>Perplexity.</strong> The most common metric. Lower is better. Compute perplexity on a held-out dataset (WikiText-2 is standard) for both the original and quantized model. The delta tells you how much information the quantization destroyed. Rules of thumb: delta &lt; 0.5 is excellent, 0.5-1.0 is good, 1.0-2.0 is acceptable for most tasks, &gt; 2.0 means something went wrong.</p>
+<p><strong>Task-specific benchmarks.</strong> Run the quantized model on MMLU, HumanEval, GSM8K, or your custom eval suite. Compare against the original. Quantization affects different capabilities unevenly. Math and code tasks are more sensitive to precision loss than general knowledge.</p>
+<p><strong>Output comparison.</strong> Generate responses from both models on the same prompts and compare. LLM-as-judge (Lesson 10) works well here. Compute a win rate: what fraction of prompts does the quantized model match or beat the original on?</p>
+<p><strong>Latency and throughput.</strong> Quantization exists to make models faster and cheaper. Measure tokens per second, time to first token, and memory usage. A quantized model that is slower than the original is worse than useless.</p>
+<table>
+<thead>
+<tr>
+<th>Model</th>
+<th>Format</th>
+<th>Size</th>
+<th>Perplexity (WikiText-2)</th>
+<th>MMLU</th>
+<th>Tokens/sec (A100)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Llama 3 70B</td>
+<td>FP16</td>
+<td>140GB</td>
+<td>3.12</td>
+<td>79.5%</td>
+<td>38</td>
+</tr>
+<tr>
+<td>Llama 3 70B</td>
+<td>FP8</td>
+<td>70GB</td>
+<td>3.14</td>
+<td>79.3%</td>
+<td>55</td>
+</tr>
+<tr>
+<td>Llama 3 70B</td>
+<td>GPTQ INT4</td>
+<td>35GB</td>
+<td>4.32</td>
+<td>77.8%</td>
+<td>72</td>
+</tr>
+<tr>
+<td>Llama 3 70B</td>
+<td>AWQ INT4</td>
+<td>35GB</td>
+<td>4.18</td>
+<td>78.1%</td>
+<td>75</td>
+</tr>
+<tr>
+<td>Llama 3 70B</td>
+<td>GGUF Q4_K_M</td>
+<td>40GB</td>
+<td>4.25</td>
+<td>77.9%</td>
+<td>28 (CPU)</td>
+</tr>
+</tbody>
+</table>
+<p>The pattern: FP8 is nearly free. INT4 costs 1-2 MMLU points but doubles throughput and quarters memory. The tradeoff is worth it for almost every deployment.</p>
+<h3>Real Numbers</h3>
+<p>FP16 to FP8 on H100: 30-50% inference speedup, &lt; 0.1% quality loss. This is the no-brainer quantization. Every H100 deployment should use it.</p>
+<p>FP16 to INT8 (LLM.int8()): 2x memory reduction, &lt; 0.5% quality loss. The mixed-precision approach keeps outlier features in FP16 while quantizing everything else to INT8.</p>
+<p>FP16 to INT4 (GPTQ/AWQ): 4x memory reduction, 1-3% quality loss depending on the model and method. Enables 70B models on a single 48GB GPU.</p>
+<p>FP16 to INT4 (GGUF Q4_K_M): 3.5x memory reduction, 1-2% quality loss. Optimized for CPU inference. A 70B model at Q4_K_M is about 40GB and runs at 10-15 tokens/second on an M3 Max with 64GB.</p>
+<p>FP16 to INT2: 8x memory reduction, 5-15% quality loss. Only viable for specific narrow tasks where you can tolerate degradation. Research frontier, not production-ready for general use.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-00337646bb399b2abd58.png" alt="quantization 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<h3>Step 1: Number Format Representations</h3>
+<p>Build the bit-level representation of each format to see exactly what sign, exponent, and mantissa do.</p>
+<pre><code class="language-python">import numpy as np
+
+
+def float_to_fp32_bits(value):
+    bits = np.float32(value).view(np.uint32)
+    sign = (bits &gt;&gt; 31) &amp; 1
+    exponent = (bits &gt;&gt; 23) &amp; 0xFF
+    mantissa = bits &amp; 0x7FFFFF
+    return {&quot;sign&quot;: int(sign), &quot;exponent&quot;: int(exponent), &quot;mantissa&quot;: int(mantissa),
+            &quot;exponent_bits&quot;: format(int(exponent), '08b'),
+            &quot;mantissa_bits&quot;: format(int(mantissa), '023b'),
+            &quot;value&quot;: float(value),
+            &quot;actual_exponent&quot;: int(exponent) - 127}
+
+
+def float_to_fp16_bits(value):
+    fp16 = np.float16(value)
+    bits = fp16.view(np.uint16)
+    sign = (bits &gt;&gt; 15) &amp; 1
+    exponent = (bits &gt;&gt; 10) &amp; 0x1F
+    mantissa = bits &amp; 0x3FF
+    return {&quot;sign&quot;: int(sign), &quot;exponent&quot;: int(exponent), &quot;mantissa&quot;: int(mantissa),
+            &quot;exponent_bits&quot;: format(int(exponent), '05b'),
+            &quot;mantissa_bits&quot;: format(int(mantissa), '010b'),
+            &quot;value&quot;: float(fp16),
+            &quot;actual_exponent&quot;: int(exponent) - 15}
+
+
+def float_to_bf16_bits(value):
+    fp32_bits = np.float32(value).view(np.uint32)
+    bf16_bits = (fp32_bits &gt;&gt; 16).astype(np.uint16)
+    sign = (bf16_bits &gt;&gt; 15) &amp; 1
+    exponent = (bf16_bits &gt;&gt; 7) &amp; 0xFF
+    mantissa = bf16_bits &amp; 0x7F
+    reconstructed = np.uint32(bf16_bits.astype(np.uint32) &lt;&lt; 16).view(np.float32)
+    return {&quot;sign&quot;: int(sign), &quot;exponent&quot;: int(exponent), &quot;mantissa&quot;: int(mantissa),
+            &quot;exponent_bits&quot;: format(int(exponent), '08b'),
+            &quot;mantissa_bits&quot;: format(int(mantissa), '07b'),
+            &quot;value&quot;: float(reconstructed),
+            &quot;actual_exponent&quot;: int(exponent) - 127}
+
+
+def simulate_fp8_e4m3(value):
+    sign = 1 if value &lt; 0 else 0
+    abs_val = abs(value)
+    max_val = 448.0
+    abs_val = min(abs_val, max_val)
+    if abs_val == 0:
+        return {&quot;sign&quot;: sign, &quot;exponent&quot;: 0, &quot;mantissa&quot;: 0, &quot;value&quot;: 0.0,
+                &quot;exponent_bits&quot;: &quot;0000&quot;, &quot;mantissa_bits&quot;: &quot;000&quot;}
+    exp = int(np.floor(np.log2(abs_val)))
+    exp = max(-6, min(8, exp))
+    mantissa_val = abs_val / (2.0 ** exp) - 1.0
+    mantissa_quant = round(mantissa_val * 8) / 8
+    mantissa_quant = max(0, min(0.875, mantissa_quant))
+    reconstructed = (1.0 + mantissa_quant) * (2.0 ** exp)
+    if sign:
+        reconstructed = -reconstructed
+    mantissa_int = int(round(mantissa_quant * 8))
+    return {&quot;sign&quot;: sign, &quot;exponent&quot;: exp + 7, &quot;mantissa&quot;: mantissa_int,
+            &quot;exponent_bits&quot;: format(exp + 7, '04b'),
+            &quot;mantissa_bits&quot;: format(mantissa_int, '03b'),
+            &quot;value&quot;: float(reconstructed),
+            &quot;actual_exponent&quot;: exp}
+
+
+def display_format_comparison(value):
+    fp32 = float_to_fp32_bits(value)
+    fp16 = float_to_fp16_bits(value)
+    bf16 = float_to_bf16_bits(value)
+    fp8 = simulate_fp8_e4m3(value)
+
+    print(f&quot;\n  Value: {value}&quot;)
+    print(f&quot;  {'Format':&lt;8} {'Stored Value':&gt;14} {'Error':&gt;12} {'Sign':&gt;5} {'Exp Bits':&gt;10} {'Man Bits':&gt;25}&quot;)
+    print(f&quot;  {'-'*76}&quot;)
+    print(f&quot;  {'FP32':&lt;8} {fp32['value']:&gt;14.6f} {abs(fp32['value'] - value):&gt;12.8f} {fp32['sign']:&gt;5} {fp32['exponent_bits']:&gt;10} {fp32['mantissa_bits']:&gt;25}&quot;)
+    print(f&quot;  {'FP16':&lt;8} {fp16['value']:&gt;14.6f} {abs(fp16['value'] - value):&gt;12.8f} {fp16['sign']:&gt;5} {fp16['exponent_bits']:&gt;10} {fp16['mantissa_bits']:&gt;25}&quot;)
+    print(f&quot;  {'BF16':&lt;8} {bf16['value']:&gt;14.6f} {abs(bf16['value'] - value):&gt;12.8f} {bf16['sign']:&gt;5} {bf16['exponent_bits']:&gt;10} {bf16['mantissa_bits']:&gt;25}&quot;)
+    print(f&quot;  {'FP8e4m3':&lt;8} {fp8['value']:&gt;14.6f} {abs(fp8['value'] - value):&gt;12.8f} {fp8['sign']:&gt;5} {fp8['exponent_bits']:&gt;10} {fp8['mantissa_bits']:&gt;25}&quot;)
+</code></pre>
+<h3>Step 2: Symmetric Quantization (Per-Tensor and Per-Channel)</h3>
+<p>The fundamental quantization operations. Per-tensor uses one scale for the whole matrix. Per-channel uses one scale per row or column.</p>
+<pre><code class="language-python">def quantize_symmetric(tensor, num_bits=8):
+    qmin = -(2 ** (num_bits - 1))
+    qmax = 2 ** (num_bits - 1) - 1
+    abs_max = np.max(np.abs(tensor))
+    if abs_max == 0:
+        return np.zeros_like(tensor, dtype=np.int32), 1.0
+    scale = abs_max / qmax
+    quantized = np.clip(np.round(tensor / scale), qmin, qmax).astype(np.int32)
+    return quantized, float(scale)
+
+
+def dequantize_symmetric(quantized, scale):
+    return quantized.astype(np.float64) * scale
+
+
+def quantize_per_channel(tensor, num_bits=8, axis=0):
+    qmin = -(2 ** (num_bits - 1))
+    qmax = 2 ** (num_bits - 1) - 1
+
+    if axis == 0:
+        abs_max = np.max(np.abs(tensor), axis=1, keepdims=True)
+    else:
+        abs_max = np.max(np.abs(tensor), axis=0, keepdims=True)
+
+    abs_max = np.where(abs_max == 0, 1.0, abs_max)
+    scales = abs_max / qmax
+    quantized = np.clip(np.round(tensor / scales), qmin, qmax).astype(np.int32)
+    return quantized, scales.squeeze()
+
+
+def dequantize_per_channel(quantized, scales, axis=0):
+    if axis == 0:
+        return quantized.astype(np.float64) * scales.reshape(-1, 1)
+    else:
+        return quantized.astype(np.float64) * scales.reshape(1, -1)
+
+
+def quantize_asymmetric(tensor, num_bits=8):
+    qmin = 0
+    qmax = 2 ** num_bits - 1
+    t_min = np.min(tensor)
+    t_max = np.max(tensor)
+    if t_max == t_min:
+        return np.zeros_like(tensor, dtype=np.int32), 1.0, 0
+    scale = (t_max - t_min) / (qmax - qmin)
+    zero_point = int(np.round(qmin - t_min / scale))
+    zero_point = max(qmin, min(qmax, zero_point))
+    quantized = np.clip(np.round(tensor / scale + zero_point), qmin, qmax).astype(np.int32)
+    return quantized, float(scale), int(zero_point)
+
+
+def dequantize_asymmetric(quantized, scale, zero_point):
+    return (quantized.astype(np.float64) - zero_point) * scale
+</code></pre>
+<h3>Step 3: Quality Measurement</h3>
+<p>Measure how much information quantization destroys. Mean squared error, signal-to-noise ratio, and cosine similarity between original and reconstructed tensors.</p>
+<pre><code class="language-python">def quantization_error(original, reconstructed):
+    diff = original - reconstructed
+    mse = float(np.mean(diff ** 2))
+    rmse = float(np.sqrt(mse))
+    max_error = float(np.max(np.abs(diff)))
+    signal_power = float(np.mean(original ** 2))
+    snr_db = 10 * np.log10(signal_power / max(mse, 1e-20))
+
+    orig_flat = original.flatten()
+    recon_flat = reconstructed.flatten()
+    norm_orig = np.linalg.norm(orig_flat)
+    norm_recon = np.linalg.norm(recon_flat)
+    if norm_orig == 0 or norm_recon == 0:
+        cosine_sim = 0.0
+    else:
+        cosine_sim = float(np.dot(orig_flat, recon_flat) / (norm_orig * norm_recon))
+
+    return {&quot;mse&quot;: mse, &quot;rmse&quot;: rmse, &quot;max_error&quot;: max_error,
+            &quot;snr_db&quot;: float(snr_db), &quot;cosine_similarity&quot;: cosine_sim}
+
+
+def compare_quantization_methods(tensor, num_bits=8):
+    q_pt, s_pt = quantize_symmetric(tensor, num_bits)
+    recon_pt = dequantize_symmetric(q_pt, s_pt)
+    err_pt = quantization_error(tensor, recon_pt)
+
+    q_pc, s_pc = quantize_per_channel(tensor, num_bits, axis=0)
+    recon_pc = dequantize_per_channel(q_pc, s_pc, axis=0)
+    err_pc = quantization_error(tensor, recon_pc)
+
+    q_asym, s_asym, zp = quantize_asymmetric(tensor, num_bits)
+    recon_asym = dequantize_asymmetric(q_asym, s_asym, zp)
+    err_asym = quantization_error(tensor, recon_asym)
+
+    print(f&quot;\n  Quantization Comparison ({num_bits}-bit, tensor shape {tensor.shape}):&quot;)
+    print(f&quot;  {'Method':&lt;20} {'MSE':&gt;12} {'SNR (dB)':&gt;10} {'Cosine Sim':&gt;12} {'Max Error':&gt;12}&quot;)
+    print(f&quot;  {'-'*68}&quot;)
+    print(f&quot;  {'Per-tensor sym':&lt;20} {err_pt['mse']:&gt;12.8f} {err_pt['snr_db']:&gt;10.2f} {err_pt['cosine_similarity']:&gt;12.8f} {err_pt['max_error']:&gt;12.8f}&quot;)
+    print(f&quot;  {'Per-channel sym':&lt;20} {err_pc['mse']:&gt;12.8f} {err_pc['snr_db']:&gt;10.2f} {err_pc['cosine_similarity']:&gt;12.8f} {err_pc['max_error']:&gt;12.8f}&quot;)
+    print(f&quot;  {'Asymmetric':&lt;20} {err_asym['mse']:&gt;12.8f} {err_asym['snr_db']:&gt;10.2f} {err_asym['cosine_similarity']:&gt;12.8f} {err_asym['max_error']:&gt;12.8f}&quot;)
+
+    return {&quot;per_tensor&quot;: err_pt, &quot;per_channel&quot;: err_pc, &quot;asymmetric&quot;: err_asym}
+</code></pre>
+<h3>Step 4: Bit-Width Sweep</h3>
+<p>Quantize the same tensor at different bit widths (2, 3, 4, 8, 16) and measure quality at each level. This shows exactly where the quality cliff is.</p>
+<pre><code class="language-python">def bit_width_sweep(tensor):
+    print(f&quot;\n  Bit-Width Sweep (tensor shape {tensor.shape}):&quot;)
+    print(f&quot;  {'Bits':&gt;6} {'Levels':&gt;8} {'MSE':&gt;14} {'SNR (dB)':&gt;10} {'Cosine Sim':&gt;12} {'Compression':&gt;12}&quot;)
+    print(f&quot;  {'-'*64}&quot;)
+
+    results = []
+    for bits in [2, 3, 4, 8, 16]:
+        q, s = quantize_per_channel(tensor, bits, axis=0)
+        recon = dequantize_per_channel(q, s, axis=0)
+        err = quantization_error(tensor, recon)
+        levels = 2 ** bits
+        compression = 32.0 / bits
+
+        print(f&quot;  {bits:&gt;6} {levels:&gt;8} {err['mse']:&gt;14.8f} {err['snr_db']:&gt;10.2f} {err['cosine_similarity']:&gt;12.8f} {compression:&gt;11.1f}x&quot;)
+        results.append({&quot;bits&quot;: bits, &quot;levels&quot;: levels, &quot;error&quot;: err, &quot;compression&quot;: compression})
+
+    return results
+</code></pre>
+<h3>Step 5: Sensitivity Experiment</h3>
+<p>Simulate quantizing different parts of a transformer and measure which components are most sensitive. This demonstrates the sensitivity hierarchy: weights &lt; activations &lt; KV cache &lt; attention.</p>
+<pre><code class="language-python">def simulate_transformer_layer(input_data, weights, kv_scale=1.0):
+    hidden = input_data @ weights[&quot;qkv&quot;]
+    seq_len = hidden.shape[1]
+    d_model = weights[&quot;qkv&quot;].shape[1] // 3
+    q, k, v = hidden[:, :, :d_model], hidden[:, :, d_model:2*d_model], hidden[:, :, 2*d_model:]
+
+    attn_scores = (q @ k.transpose(0, 2, 1)) / np.sqrt(d_model) * kv_scale
+    attn_max = np.max(attn_scores, axis=-1, keepdims=True)
+    attn_exp = np.exp(attn_scores - attn_max)
+    attn_weights = attn_exp / np.sum(attn_exp, axis=-1, keepdims=True)
+
+    attn_output = attn_weights @ v
+    output = attn_output @ weights[&quot;out&quot;]
+    return output, {&quot;q&quot;: q, &quot;k&quot;: k, &quot;v&quot;: v, &quot;attn_scores&quot;: attn_scores,
+                    &quot;attn_weights&quot;: attn_weights, &quot;attn_output&quot;: attn_output}
+
+
+def sensitivity_experiment(batch_size=2, seq_len=16, d_model=64, num_bits=8):
+    np.random.seed(42)
+    input_data = np.random.randn(batch_size, seq_len, d_model) * 0.1
+
+    weights = {
+        &quot;qkv&quot;: np.random.randn(d_model, 3 * d_model) * (2.0 / d_model) ** 0.5,
+        &quot;out&quot;: np.random.randn(d_model, d_model) * (2.0 / d_model) ** 0.5,
+    }
+
+    baseline_output, baseline_internals = simulate_transformer_layer(input_data, weights)
+
+    experiments = {}
+
+    q_qkv, s_qkv = quantize_per_channel(weights[&quot;qkv&quot;], num_bits, axis=0)
+    q_out, s_out = quantize_per_channel(weights[&quot;out&quot;], num_bits, axis=0)
+    quantized_weights = {
+        &quot;qkv&quot;: dequantize_per_channel(q_qkv, s_qkv, axis=0),
+        &quot;out&quot;: dequantize_per_channel(q_out, s_out, axis=0),
+    }
+    weight_quant_output, _ = simulate_transformer_layer(input_data, quantized_weights)
+    experiments[&quot;Weights only&quot;] = quantization_error(baseline_output, weight_quant_output)
+
+    _, fresh_internals = simulate_transformer_layer(input_data, weights)
+    q_act, s_act = quantize_per_channel(
+        fresh_internals[&quot;attn_output&quot;].reshape(-1, d_model), num_bits, axis=0
+    )
+    quant_attn_out = dequantize_per_channel(q_act, s_act, axis=0).reshape(batch_size, seq_len, d_model)
+    act_quant_output = quant_attn_out @ weights[&quot;out&quot;]
+    experiments[&quot;Activations only&quot;] = quantization_error(baseline_output, act_quant_output)
+
+    q_k, s_k = quantize_per_channel(fresh_internals[&quot;k&quot;].reshape(-1, d_model), num_bits, axis=0)
+    q_v, s_v = quantize_per_channel(fresh_internals[&quot;v&quot;].reshape(-1, d_model), num_bits, axis=0)
+    quant_k = dequantize_per_channel(q_k, s_k, axis=0).reshape(batch_size, seq_len, d_model)
+    quant_v = dequantize_per_channel(q_v, s_v, axis=0).reshape(batch_size, seq_len, d_model)
+    attn_scores_kv = (fresh_internals[&quot;q&quot;] @ quant_k.transpose(0, 2, 1)) / np.sqrt(d_model)
+    attn_max_kv = np.max(attn_scores_kv, axis=-1, keepdims=True)
+    attn_exp_kv = np.exp(attn_scores_kv - attn_max_kv)
+    attn_weights_kv = attn_exp_kv / np.sum(attn_exp_kv, axis=-1, keepdims=True)
+    kv_quant_output = (attn_weights_kv @ quant_v) @ weights[&quot;out&quot;]
+    experiments[&quot;KV cache only&quot;] = quantization_error(baseline_output, kv_quant_output)
+
+    noise_scale = np.std(fresh_internals[&quot;attn_scores&quot;]) * 0.05
+    noisy_scores = fresh_internals[&quot;attn_scores&quot;] + np.random.randn(*fresh_internals[&quot;attn_scores&quot;].shape) * noise_scale
+    noisy_max = np.max(noisy_scores, axis=-1, keepdims=True)
+    noisy_exp = np.exp(noisy_scores - noisy_max)
+    noisy_weights = noisy_exp / np.sum(noisy_exp, axis=-1, keepdims=True)
+    attn_quant_output = (noisy_weights @ fresh_internals[&quot;v&quot;]) @ weights[&quot;out&quot;]
+    experiments[&quot;Attention logits (5% noise)&quot;] = quantization_error(baseline_output, attn_quant_output)
+
+    print(f&quot;\n  Sensitivity Experiment ({num_bits}-bit quantization):&quot;)
+    print(f&quot;  {'Component':&lt;30} {'MSE':&gt;14} {'SNR (dB)':&gt;10} {'Cosine Sim':&gt;12}&quot;)
+    print(f&quot;  {'-'*68}&quot;)
+    for name, err in sorted(experiments.items(), key=lambda x: x[1][&quot;mse&quot;]):
+        print(f&quot;  {name:&lt;30} {err['mse']:&gt;14.8f} {err['snr_db']:&gt;10.2f} {err['cosine_similarity']:&gt;12.8f}&quot;)
+
+    return experiments
+</code></pre>
+<h3>Step 6: Simulated GPTQ</h3>
+<p>GPTQ quantizes one column at a time, using the Hessian to decide how to distribute the rounding error. This is a simplified version that captures the core idea: use calibration data to measure weight importance, then quantize the least important weights more aggressively.</p>
+<pre><code class="language-python">def simulated_gptq(weight_matrix, calibration_inputs, num_bits=4):
+    n_in, n_out = weight_matrix.shape
+    qmin = -(2 ** (num_bits - 1))
+    qmax = 2 ** (num_bits - 1) - 1
+
+    H = np.zeros((n_in, n_in))
+    for x in calibration_inputs:
+        x = x.reshape(-1, 1) if x.ndim == 1 else x
+        for row in range(x.shape[0]):
+            xi = x[row].reshape(-1, 1)
+            H += xi @ xi.T
+    H /= len(calibration_inputs)
+    H += np.eye(n_in) * 1e-4
+
+    weight_importance = np.diag(H)
+
+    quantized = np.zeros_like(weight_matrix, dtype=np.int32)
+    scales = np.zeros(n_out)
+    errors = np.zeros(n_out)
+
+    W = weight_matrix.copy()
+
+    for col in range(n_out):
+        w_col = W[:, col]
+        abs_max = np.max(np.abs(w_col))
+        if abs_max == 0:
+            scales[col] = 1.0
+            continue
+        scale = abs_max / qmax
+        scales[col] = scale
+
+        q_col = np.clip(np.round(w_col / scale), qmin, qmax).astype(np.int32)
+        quantized[:, col] = q_col
+
+        quant_error = w_col - q_col * scale
+        errors[col] = np.sqrt(np.mean(quant_error ** 2))
+
+        if col &lt; n_out - 1:
+            importance_weights = weight_importance / (np.max(weight_importance) + 1e-10)
+            for next_col in range(col + 1, min(col + 4, n_out)):
+                compensation = quant_error * importance_weights * 0.1
+                W[:, next_col] += compensation
+
+    return quantized, scales, {&quot;column_errors&quot;: errors,
+                               &quot;mean_error&quot;: float(np.mean(errors)),
+                               &quot;max_error&quot;: float(np.max(errors))}
+
+
+def dequantize_gptq(quantized, scales):
+    result = np.zeros_like(quantized, dtype=np.float64)
+    for col in range(quantized.shape[1]):
+        result[:, col] = quantized[:, col] * scales[col]
+    return result
+</code></pre>
+<h3>Step 7: AWQ Simulation</h3>
+<p>AWQ identifies salient weights (those that multiply with large activations) and protects them by scaling before quantization.</p>
+<pre><code class="language-python">def simulated_awq(weight_matrix, calibration_inputs, num_bits=4, salient_fraction=0.01):
+    n_in, n_out = weight_matrix.shape
+    qmin = -(2 ** (num_bits - 1))
+    qmax = 2 ** (num_bits - 1) - 1
+
+    activation_magnitudes = np.zeros(n_in)
+    for x in calibration_inputs:
+        if x.ndim == 1:
+            activation_magnitudes += np.abs(x)
+        else:
+            activation_magnitudes += np.mean(np.abs(x), axis=0)
+    activation_magnitudes /= len(calibration_inputs)
+
+    n_salient = max(1, int(n_in * salient_fraction))
+    salient_indices = np.argsort(activation_magnitudes)[-n_salient:]
+
+    scale_factors = np.ones(n_in)
+    for idx in salient_indices:
+        col_max = np.max(np.abs(weight_matrix[idx, :]))
+        if col_max &gt; 0:
+            scale_factors[idx] = min(4.0, 1.0 / (col_max + 1e-8) * np.mean(np.abs(weight_matrix)))
+
+    scaled_weights = weight_matrix * scale_factors.reshape(-1, 1)
+
+    quantized, scales = quantize_per_channel(scaled_weights, num_bits, axis=0)
+    dequantized = dequantize_per_channel(quantized, scales, axis=0)
+
+    result = dequantized / scale_factors.reshape(-1, 1)
+
+    err = quantization_error(weight_matrix, result)
+
+    return result, {&quot;salient_indices&quot;: salient_indices,
+                    &quot;scale_factors&quot;: scale_factors[salient_indices],
+                    &quot;error&quot;: err,
+                    &quot;n_salient&quot;: n_salient}
+</code></pre>
+<h3>Step 8: Full Pipeline</h3>
+<p>Wire everything together. Compare naive quantization, per-channel, GPTQ, and AWQ on the same weight matrix.</p>
+<pre><code class="language-python">def full_quantization_comparison(d_in=256, d_out=512, num_bits=4, n_calibration=32):
+    np.random.seed(42)
+
+    weight = np.random.randn(d_in, d_out) * 0.02
+    outlier_rows = np.random.choice(d_in, size=5, replace=False)
+    weight[outlier_rows] *= 10
+
+    calibration = [np.random.randn(8, d_in) * 0.1 for _ in range(n_calibration)]
+
+    q_naive, s_naive = quantize_symmetric(weight, num_bits)
+    recon_naive = dequantize_symmetric(q_naive, s_naive)
+    err_naive = quantization_error(weight, recon_naive)
+
+    q_pc, s_pc = quantize_per_channel(weight, num_bits, axis=0)
+    recon_pc = dequantize_per_channel(q_pc, s_pc, axis=0)
+    err_pc = quantization_error(weight, recon_pc)
+
+    q_gptq, s_gptq, gptq_info = simulated_gptq(weight, calibration, num_bits)
+    recon_gptq = dequantize_gptq(q_gptq, s_gptq)
+    err_gptq = quantization_error(weight, recon_gptq)
+
+    recon_awq, awq_info = simulated_awq(weight, calibration, num_bits)
+    err_awq = awq_info[&quot;error&quot;]
+
+    print(f&quot;\n  Full Quantization Comparison ({num_bits}-bit, {d_in}x{d_out} matrix)&quot;)
+    print(f&quot;  Matrix has {len(outlier_rows)} outlier rows (10x scale)&quot;)
+    print()
+    print(f&quot;  {'Method':&lt;20} {'MSE':&gt;14} {'SNR (dB)':&gt;10} {'Cosine Sim':&gt;12}&quot;)
+    print(f&quot;  {'-'*58}&quot;)
+    print(f&quot;  {'Naive per-tensor':&lt;20} {err_naive['mse']:&gt;14.8f} {err_naive['snr_db']:&gt;10.2f} {err_naive['cosine_similarity']:&gt;12.8f}&quot;)
+    print(f&quot;  {'Per-channel':&lt;20} {err_pc['mse']:&gt;14.8f} {err_pc['snr_db']:&gt;10.2f} {err_pc['cosine_similarity']:&gt;12.8f}&quot;)
+    print(f&quot;  {'Simulated GPTQ':&lt;20} {err_gptq['mse']:&gt;14.8f} {err_gptq['snr_db']:&gt;10.2f} {err_gptq['cosine_similarity']:&gt;12.8f}&quot;)
+    print(f&quot;  {'Simulated AWQ':&lt;20} {err_awq['mse']:&gt;14.8f} {err_awq['snr_db']:&gt;10.2f} {err_awq['cosine_similarity']:&gt;12.8f}&quot;)
+
+    test_input = np.random.randn(4, d_in) * 0.1
+    baseline = test_input @ weight
+    output_naive = test_input @ recon_naive
+    output_pc = test_input @ recon_pc
+    output_gptq = test_input @ recon_gptq
+    output_awq = test_input @ recon_awq
+
+    print(f&quot;\n  End-to-End Output Error (matmul with test input):&quot;)
+    print(f&quot;  {'Method':&lt;20} {'Output MSE':&gt;14} {'Output Cosine':&gt;14}&quot;)
+    print(f&quot;  {'-'*50}&quot;)
+    for name, output in [(&quot;Naive&quot;, output_naive), (&quot;Per-channel&quot;, output_pc),
+                          (&quot;GPTQ&quot;, output_gptq), (&quot;AWQ&quot;, output_awq)]:
+        out_err = quantization_error(baseline, output)
+        print(f&quot;  {name:&lt;20} {out_err['mse']:&gt;14.8f} {out_err['cosine_similarity']:&gt;14.8f}&quot;)
+
+    return {&quot;naive&quot;: err_naive, &quot;per_channel&quot;: err_pc, &quot;gptq&quot;: err_gptq, &quot;awq&quot;: err_awq}
+
+
+def memory_calculator(num_params_billions, bits_per_param):
+    bytes_per_param = bits_per_param / 8
+    total_bytes = num_params_billions * 1e9 * bytes_per_param
+    total_gb = total_bytes / (1024 ** 3)
+    return total_gb
+
+
+def print_memory_table():
+    print(&quot;\n  Memory Requirements by Model and Precision:&quot;)
+    print(f&quot;  {'Model':&lt;15} {'FP32':&gt;8} {'FP16':&gt;8} {'FP8':&gt;8} {'INT8':&gt;8} {'INT4':&gt;8} {'INT2':&gt;8}&quot;)
+    print(f&quot;  {'-'*64}&quot;)
+    for name, params in [(&quot;7B&quot;, 7), (&quot;13B&quot;, 13), (&quot;34B&quot;, 34), (&quot;70B&quot;, 70), (&quot;405B&quot;, 405)]:
+        fp32 = memory_calculator(params, 32)
+        fp16 = memory_calculator(params, 16)
+        fp8 = memory_calculator(params, 8)
+        int8 = memory_calculator(params, 8)
+        int4 = memory_calculator(params, 4)
+        int2 = memory_calculator(params, 2)
+        print(f&quot;  {name:&lt;15} {fp32:&gt;7.1f}G {fp16:&gt;7.1f}G {fp8:&gt;7.1f}G {int8:&gt;7.1f}G {int4:&gt;7.1f}G {int2:&gt;7.1f}G&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    np.random.seed(42)
+
+    print(&quot;=&quot; * 70)
+    print(&quot;QUANTIZATION: MAKING MODELS FIT&quot;)
+    print(&quot;=&quot; * 70)
+
+    print(&quot;\nSTEP 1: Number Format Comparison&quot;)
+    print(&quot;-&quot; * 50)
+    for val in [0.1, 3.14159, -0.00073, 42.5, 0.0000012]:
+        display_format_comparison(val)
+
+    print(&quot;\n\nSTEP 2: Memory Requirements&quot;)
+    print(&quot;-&quot; * 50)
+    print_memory_table()
+
+    print(&quot;\n\nSTEP 3: Quantization Methods Comparison&quot;)
+    print(&quot;-&quot; * 50)
+    weight_matrix = np.random.randn(128, 256) * 0.02
+    weight_matrix[0] *= 15
+    weight_matrix[42] *= 8
+    compare_quantization_methods(weight_matrix, num_bits=8)
+    compare_quantization_methods(weight_matrix, num_bits=4)
+
+    print(&quot;\n\nSTEP 4: Bit-Width Sweep&quot;)
+    print(&quot;-&quot; * 50)
+    sweep_tensor = np.random.randn(64, 128) * 0.05
+    bit_width_sweep(sweep_tensor)
+
+    print(&quot;\n\nSTEP 5: Sensitivity Experiment&quot;)
+    print(&quot;-&quot; * 50)
+    print(&quot;\n  INT8:&quot;)
+    sensitivity_experiment(num_bits=8)
+    print(&quot;\n  INT4:&quot;)
+    sensitivity_experiment(num_bits=4)
+
+    print(&quot;\n\nSTEP 6: GPTQ vs AWQ vs Naive (INT4)&quot;)
+    print(&quot;-&quot; * 50)
+    full_quantization_comparison(d_in=256, d_out=512, num_bits=4)
+
+    print(&quot;\n\nSTEP 7: Distribution Analysis&quot;)
+    print(&quot;-&quot; * 50)
+    np.random.seed(0)
+    simulated_weights = np.random.randn(1000) * 0.02
+    abs_vals = np.abs(simulated_weights)
+    pct_in_range = np.mean(abs_vals &lt; 0.1) * 100
+    print(f&quot;\n  Simulated weight distribution (1000 params, std=0.02):&quot;)
+    print(f&quot;  Weights in [-0.1, 0.1]: {pct_in_range:.1f}%&quot;)
+    print(f&quot;  Weights in [-0.05, 0.05]: {np.mean(abs_vals &lt; 0.05) * 100:.1f}%&quot;)
+    print(f&quot;  Weights in [-0.01, 0.01]: {np.mean(abs_vals &lt; 0.01) * 100:.1f}%&quot;)
+    print(f&quot;  Max absolute value: {np.max(abs_vals):.6f}&quot;)
+    print(f&quot;  Mean absolute value: {np.mean(abs_vals):.6f}&quot;)
+
+    histogram = np.histogram(simulated_weights, bins=20)
+    print(f&quot;\n  Weight histogram:&quot;)
+    max_count = max(histogram[0])
+    for i in range(len(histogram[0])):
+        bar_len = int(histogram[0][i] / max_count * 40)
+        lo = histogram[1][i]
+        hi = histogram[1][i + 1]
+        print(f&quot;  [{lo:&gt;7.4f}, {hi:&gt;7.4f}] {'#' * bar_len} ({histogram[0][i]})&quot;)
+
+    print(&quot;\n\n&quot; + &quot;=&quot; * 70)
+    print(&quot;DONE&quot;)
+    print(&quot;=&quot; * 70)
+</code></pre>
+<h2>Use It</h2>
+<h3>Quantizing with GPTQModel</h3>
+<pre><code class="language-python"># pip install gptqmodel
+# from gptqmodel import GPTQConfig, GPTQModel
+#
+# model_id = &quot;meta-llama/Llama-3.1-8B&quot;
+# quant_config = GPTQConfig(bits=4, group_size=128)
+#
+# model = GPTQModel.load(model_id, quant_config)
+# model.quantize(calibration_texts[:128], batch_size=1)
+# model.save(&quot;llama-8b-gptq-int4&quot;)
+</code></pre>
+<h3>Quantizing to AWQ with LLM Compressor</h3>
+<pre><code class="language-python"># pip install llmcompressor
+# from transformers import AutoModelForCausalLM, AutoTokenizer
+# from llmcompressor import oneshot
+# from llmcompressor.modifiers.quantization import QuantizationModifier
+# from llmcompressor.modifiers.transform.awq import AWQModifier
+#
+# model_id = &quot;meta-llama/Llama-3.1-8B&quot;
+# model = AutoModelForCausalLM.from_pretrained(model_id)
+# tokenizer = AutoTokenizer.from_pretrained(model_id)
+#
+# recipe = [
+#     AWQModifier(duo_scaling=&quot;both&quot;),
+#     QuantizationModifier(ignore=[&quot;lm_head&quot;], scheme=&quot;W4A16_ASYM&quot;, targets=[&quot;Linear&quot;]),
+# ]
+# oneshot(
+#     model=model,
+#     dataset=&quot;perfectblend&quot;,
+#     splits=&quot;train[:512]&quot;,
+#     recipe=recipe,
+#     max_seq_length=512,
+#     num_calibration_samples=256,
+# )
+# model.save_pretrained(&quot;llama-8b-awq-int4&quot;, save_compressed=True)
+# tokenizer.save_pretrained(&quot;llama-8b-awq-int4&quot;)
+</code></pre>
+<p>AutoGPTQ and AutoAWQ, the original tools for these two methods, are archived. GPTQModel and LLM Compressor are the maintained successors.</p>
+<h3>Converting to GGUF</h3>
+<pre><code class="language-bash"># git clone https://github.com/ggml-org/llama.cpp
+# cmake -S llama.cpp -B llama.cpp/build &amp;&amp; cmake --build llama.cpp/build --config Release
+# pip install -r llama.cpp/requirements.txt
+# hf download meta-llama/Llama-3.1-8B --local-dir Llama-3.1-8B
+# python llama.cpp/convert_hf_to_gguf.py Llama-3.1-8B --outtype f16 --outfile llama-8b-f16.gguf
+# llama.cpp/build/bin/llama-quantize llama-8b-f16.gguf llama-8b-q4km.gguf Q4_K_M
+# llama.cpp/build/bin/llama-server -m llama-8b-q4km.gguf -c 4096 -ngl 99
+</code></pre>
+<p>The converter has no K-quant output (<code>--outtype</code> accepts <code>f32</code>, <code>f16</code>, <code>bf16</code>, <code>q8_0</code>, <code>tq1_0</code>, <code>tq2_0</code>, or <code>auto</code>), so <code>llama-quantize</code> produces the Q4_K_M file.</p>
+<h3>Serving quantized models</h3>
+<pre><code class="language-python"># pip install vllm
+# vllm serve llama-8b-awq-int4 --max-model-len 8192
+</code></pre>
+<p>vLLM natively supports AWQ and GPTQ models and reads the quantization method from the checkpoint's config, so no <code>--quantization</code> flag is needed. It handles the dequantization during matrix multiplication and uses paged attention for the KV cache. For FP8 on H100, add <code>--quantization fp8_per_tensor</code> to quantize a 16-bit checkpoint's weights at load time.</p>
+<h2>Ship It</h2>
+<p>This lesson produces <code>outputs/skill-quantization.md</code>, a decision framework for choosing the right quantization strategy. Given your model size, target hardware, and quality requirements, it tells you which format, method, and validation steps to use. It includes memory budget calculations, per-component precision recommendations, and deployment recipes for vLLM, llama.cpp, and TensorRT-LLM.</p>
+<h2>Exercises</h2>
+<ol>
+<li>
+<p>Implement group quantization. Instead of one scale per channel, use one scale per group of 128 weights within a channel. This is what GPTQ and AWQ actually use. Compare group sizes of 32, 64, 128, and 256 on the same weight matrix. Smaller groups give better quality but more storage overhead for scale factors.</p>
+</li>
+<li>
+<p>Build a mixed-precision quantizer. Quantize the first and last layers of a multi-layer network at INT8 while quantizing middle layers at INT4. Compare end-to-end output quality against uniform INT4 and uniform INT8. Measure the memory savings compared to all-INT8.</p>
+</li>
+<li>
+<p>Implement the straight-through estimator (STE) for quantization-aware training. Insert fake quantize/dequantize operations in the forward pass of a simple two-layer network trained on a regression task. Compare final loss between a model trained normally (then PTQ to INT4) versus a model trained with QAT from the start.</p>
+</li>
+<li>
+<p>Build an outlier-aware quantizer inspired by LLM.int8(). Detect channels where the activation magnitude exceeds 6x the mean. Keep those channels in FP16 and quantize everything else to INT8. Measure end-to-end quality on the transformer layer from Step 5 with varying outlier thresholds (3x, 6x, 10x).</p>
+</li>
+<li>
+<p>Implement a quantization quality dashboard. Given a weight matrix, compute and display: the weight distribution histogram, the quantization error distribution, per-channel scale factors, the worst-quantized channels (highest reconstruction error), and the cosine similarity between original and quantized outputs across 100 random inputs. Identify which channels should be kept at higher precision.</p>
+</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>FP16</td>
+<td>&quot;Half precision&quot;</td>
+<td>16-bit float with 5 exponent bits and 10 mantissa bits, max value 65,504, standard inference format</td>
+</tr>
+<tr>
+<td>BF16</td>
+<td>&quot;Brain float&quot;</td>
+<td>16-bit float with 8 exponent bits (same range as FP32) and 7 mantissa bits, designed by Google for training</td>
+</tr>
+<tr>
+<td>FP8</td>
+<td>&quot;Eight-bit float&quot;</td>
+<td>Two variants: E4M3 (inference, more precision) and E5M2 (training, more range), native on H100</td>
+</tr>
+<tr>
+<td>INT8</td>
+<td>&quot;Eight-bit integer&quot;</td>
+<td>256 uniformly spaced values from -128 to 127, needs a scale factor to map from floats</td>
+</tr>
+<tr>
+<td>INT4</td>
+<td>&quot;Four-bit integer&quot;</td>
+<td>16 levels total, requires sophisticated methods (GPTQ, AWQ) to maintain quality</td>
+</tr>
+<tr>
+<td>Per-channel quantization</td>
+<td>&quot;One scale per row&quot;</td>
+<td>Uses a separate scale factor for each output channel instead of one for the whole tensor, dramatically reduces error</td>
+</tr>
+<tr>
+<td>GPTQ</td>
+<td>&quot;The Hessian method&quot;</td>
+<td>Post-training quantization using second-order information to minimize output error, one layer at a time</td>
+</tr>
+<tr>
+<td>AWQ</td>
+<td>&quot;Activation-aware&quot;</td>
+<td>Scales salient weights (those multiplied by large activations) before quantization to protect them</td>
+</tr>
+<tr>
+<td>GGUF</td>
+<td>&quot;The llama.cpp format&quot;</td>
+<td>Self-contained model file with mixed-precision layers, optimized for CPU and Apple Silicon inference</td>
+</tr>
+<tr>
+<td>PTQ</td>
+<td>&quot;Quantize after training&quot;</td>
+<td>Convert a trained model's weights to lower precision without retraining, fast but limited at extreme compression</td>
+</tr>
+<tr>
+<td>QAT</td>
+<td>&quot;Quantize during training&quot;</td>
+<td>Insert fake quantization into the forward pass so the model learns to tolerate rounding, better at INT4/INT2</td>
+</tr>
+<tr>
+<td>Calibration data</td>
+<td>&quot;The 128 examples&quot;</td>
+<td>A small dataset run through the model to compute activation statistics for setting scale factors</td>
+</tr>
+<tr>
+<td>Scale factor</td>
+<td>&quot;The multiplier&quot;</td>
+<td>Converts between floating-point range and integer range: <code>float_val = int_val * scale</code></td>
+</tr>
+<tr>
+<td>Perplexity delta</td>
+<td>&quot;How much worse&quot;</td>
+<td>Difference in perplexity between original and quantized model, &lt; 0.5 is excellent, &gt; 2.0 is a problem</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2210.17323" rel="noreferrer" data-network="true">Frantar et al., 2022 -- &quot;GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers&quot; <small>↗ 需要联网</small></a> -- the paper that made INT4 quantization practical for LLMs using Hessian-guided weight rounding</li>
+<li><a href="https://arxiv.org/abs/2306.00978" rel="noreferrer" data-network="true">Lin et al., 2023 -- &quot;AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration&quot; <small>↗ 需要联网</small></a> -- protecting salient weights by scaling before quantization, matching or beating GPTQ</li>
+<li><a href="https://arxiv.org/abs/2208.07339" rel="noreferrer" data-network="true">Dettmers et al., 2022 -- &quot;LLM.int8(): 8-bit Matrix Multiplication for Transformers at Scale&quot; <small>↗ 需要联网</small></a> -- mixed-precision INT8 that keeps outlier features in FP16, enabling INT8 inference without quality loss</li>
+<li><a href="https://arxiv.org/abs/2211.10438" rel="noreferrer" data-network="true">Xiao et al., 2023 -- &quot;SmoothQuant: Accurate and Efficient Post-Training Quantization for Large Language Models&quot; <small>↗ 需要联网</small></a> -- migrating quantization difficulty from activations to weights for W8A8 deployment</li>
+<li><a href="https://arxiv.org/abs/2209.05433" rel="noreferrer" data-network="true">Micikevicius et al., 2022 -- &quot;FP8 Formats for Deep Learning&quot; <small>↗ 需要联网</small></a> -- the NVIDIA/ARM/Intel paper defining E4M3 and E5M2 formats now native on H100</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-10-llms-from-scratch--11-quantization.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-10-llms-from-scratch--11-quantization.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/10-llms-from-scratch/11-quantization/code/main.py">phases/10-llms-from-scratch/11-quantization/code/main.py</a><details><summary>查看原始文本</summary><pre><code>import numpy as np
+
+
+def float_to_fp32_bits(value):
+    bits = np.float32(value).view(np.uint32)
+    sign = (bits &gt;&gt; 31) &amp; 1
+    exponent = (bits &gt;&gt; 23) &amp; 0xFF
+    mantissa = bits &amp; 0x7FFFFF
+    return {&quot;sign&quot;: int(sign), &quot;exponent&quot;: int(exponent), &quot;mantissa&quot;: int(mantissa),
+            &quot;exponent_bits&quot;: format(int(exponent), &#39;08b&#39;),
+            &quot;mantissa_bits&quot;: format(int(mantissa), &#39;023b&#39;),
+            &quot;value&quot;: float(value),
+            &quot;actual_exponent&quot;: int(exponent) - 127}
+
+
+def float_to_fp16_bits(value):
+    fp16 = np.float16(value)
+    bits = fp16.view(np.uint16)
+    sign = (bits &gt;&gt; 15) &amp; 1
+    exponent = (bits &gt;&gt; 10) &amp; 0x1F
+    mantissa = bits &amp; 0x3FF
+    return {&quot;sign&quot;: int(sign), &quot;exponent&quot;: int(exponent), &quot;mantissa&quot;: int(mantissa),
+            &quot;exponent_bits&quot;: format(int(exponent), &#39;05b&#39;),
+            &quot;mantissa_bits&quot;: format(int(mantissa), &#39;010b&#39;),
+            &quot;value&quot;: float(fp16),
+            &quot;actual_exponent&quot;: int(exponent) - 15}
+
+
+def float_to_bf16_bits(value):
+    fp32_bits = np.float32(value).view(np.uint32)
+    bf16_bits = (fp32_bits &gt;&gt; 16).astype(np.uint16)
+    sign = (bf16_bits &gt;&gt; 15) &amp; 1
+    exponent = (bf16_bits &gt;&gt; 7) &amp; 0xFF
+    mantissa = bf16_bits &amp; 0x7F
+    reconstructed = np.uint32(bf16_bits.astype(np.uint32) &lt;&lt; 16).view(np.float32)
+    return {&quot;sign&quot;: int(sign), &quot;exponent&quot;: int(exponent), &quot;mantissa&quot;: int(mantissa),
+            &quot;exponent_bits&quot;: format(int(exponent), &#39;08b&#39;),
+            &quot;mantissa_bits&quot;: format(int(mantissa), &#39;07b&#39;),
+            &quot;value&quot;: float(reconstructed),
+            &quot;actual_exponent&quot;: int(exponent) - 127}
+
+
+def simulate_fp8_e4m3(value):
+    sign = 1 if value &lt; 0 else 0
+    abs_val = abs(value)
+    max_val = 448.0
+    abs_val = min(abs_val, max_val)
+    if abs_val == 0:
+        return {&quot;sign&quot;: sign, &quot;exponent&quot;: 0, &quot;mantissa&quot;: 0, &quot;value&quot;: 0.0,
+                &quot;exponent_bits&quot;: &quot;0000&quot;, &quot;mantissa_bits&quot;: &quot;000&quot;}
+    exp = int(np.floor(np.log2(abs_val)))
+    exp = max(-6, min(8, exp))
+    mantissa_val = abs_val / (2.0 ** exp) - 1.0
+    mantissa_quant = round(mantissa_val * 8) / 8
+    mantissa_quant = max(0, min(0.875, mantissa_quant))
+    reconstructed = (1.0 + mantissa_quant) * (2.0 ** exp)
+    if sign:
+        reconstructed = -reconstructed
+    mantissa_int = int(round(mantissa_quant * 8))
+    return {&quot;sign&quot;: sign, &quot;exponent&quot;: exp + 7, &quot;mantissa&quot;: mantissa_int,
+            &quot;exponent_bits&quot;: format(exp + 7, &#39;04b&#39;),
+            &quot;mantissa_bits&quot;: format(mantissa_int, &#39;03b&#39;),
+            &quot;value&quot;: float(reconstructed),
+            &quot;actual_exponent&quot;: exp}
+
+
+def display_format_comparison(value):
+    fp32 = float_to_fp32_bits(value)
+    fp16 = float_to_fp16_bits(value)
+    bf16 = float_to_bf16_bits(value)
+    fp8 = simulate_fp8_e4m3(value)
+
+    print(f&quot;\n  Value: {value}&quot;)
+    print(f&quot;  {&#39;Format&#39;:&lt;8} {&#39;Stored Value&#39;:&gt;14} {&#39;Error&#39;:&gt;12} {&#39;Sign&#39;:&gt;5} {&#39;Exp Bits&#39;:&gt;10} {&#39;Man Bits&#39;:&gt;25}&quot;)
+    print(f&quot;  {&#39;-&#39;*76}&quot;)
+    print(f&quot;  {&#39;FP32&#39;:&lt;8} {fp32[&#39;value&#39;]:&gt;14.6f} {abs(fp32[&#39;value&#39;] - value):&gt;12.8f} {fp32[&#39;sign&#39;]:&gt;5} {fp32[&#39;exponent_bits&#39;]:&gt;10} {fp32[&#39;mantissa_bits&#39;]:&gt;25}&quot;)
+    print(f&quot;  {&#39;FP16&#39;:&lt;8} {fp16[&#39;value&#39;]:&gt;14.6f} {abs(fp16[&#39;value&#39;] - value):&gt;12.8f} {fp16[&#39;sign&#39;]:&gt;5} {fp16[&#39;exponent_bits&#39;]:&gt;10} {fp16[&#39;mantissa_bits&#39;]:&gt;25}&quot;)
+    print(f&quot;  {&#39;BF16&#39;:&lt;8} {bf16[&#39;value&#39;]:&gt;14.6f} {abs(bf16[&#39;value&#39;] - value):&gt;12.8f} {bf16[&#39;sign&#39;]:&gt;5} {bf16[&#39;exponent_bits&#39;]:&gt;10} {bf16[&#39;mantissa_bits&#39;]:&gt;25}&quot;)
+    print(f&quot;  {&#39;FP8e4m3&#39;:&lt;8} {fp8[&#39;value&#39;]:&gt;14.6f} {abs(fp8[&#39;value&#39;] - value):&gt;12.8f} {fp8[&#39;sign&#39;]:&gt;5} {fp8[&#39;exponent_bits&#39;]:&gt;10} {fp8[&#39;mantissa_bits&#39;]:&gt;25}&quot;)
+
+
+def quantize_symmetric(tensor, num_bits=8):
+    qmin = -(2 ** (num_bits - 1))
+    qmax = 2 ** (num_bits - 1) - 1
+    abs_max = np.max(np.abs(tensor))
+    if abs_max == 0:
+        return np.zeros_like(tensor, dtype=np.int32), 1.0
+    scale = abs_max / qmax
+    quantized = np.clip(np.round(tensor / scale), qmin, qmax).astype(np.int32)
+    return quantized, float(scale)
+
+
+def dequantize_symmetric(quantized, scale):
+    return quantized.astype(np.float64) * scale
+
+
+def quantize_per_channel(tensor, num_bits=8, axis=0):
+    qmin = -(2 ** (num_bits - 1))
+    qmax = 2 ** (num_bits - 1) - 1
+
+    if axis == 0:
+        abs_max = np.max(np.abs(tensor), axis=1, keepdims=True)
+    else:
+        abs_max = np.max(np.abs(tensor), axis=0, keepdims=True)
+
+    abs_max = np.where(abs_max == 0, 1.0, abs_max)
+    scales = abs_max / qmax
+    quantized = np.clip(np.round(tensor / scales), qmin, qmax).astype(np.int32)
+    return quantized, scales.squeeze()
+
+
+def dequantize_per_channel(quantized, scales, axis=0):
+    if axis == 0:
+        return quantized.astype(np.float64) * scales.reshape(-1, 1)
+    else:
+        return quantized.astype(np.float64) * scales.reshape(1, -1)
+
+
+def quantize_asymmetric(tensor, num_bits=8):
+    qmin = 0
+    qmax = 2 ** num_bits - 1
+    t_min = np.min(tensor)
+    t_max = np.max(tensor)
+    if t_max == t_min:
+        return np.zeros_like(tensor, dtype=np.int32), 1.0, 0
+    scale = (t_max - t_min) / (qmax - qmin)
+    zero_point = int(np.round(qmin - t_min / scale))
+    zero_point = max(qmin, min(qmax, zero_point))
+    quantized = np.clip(np.round(tensor / scale + zero_point), qmin, qmax).astype(np.int32)
+    return quantized, float(scale), int(zero_point)
+
+
+def dequantize_asymmetric(quantized, scale, zero_point):
+    return (quantized.astype(np.float64) - zero_point) * scale
+
+
+def quantization_error(original, reconstructed):
+    diff = original - reconstructed
+    mse = float(np.mean(diff ** 2))
+    rmse = float(np.sqrt(mse))
+    max_error = float(np.max(np.abs(diff)))
+    signal_power = float(np.mean(original ** 2))
+    snr_db = 10 * np.log10(signal_power / max(mse, 1e-20))
+
+    orig_flat = original.flatten()
+    recon_flat = reconstructed.flatten()
+    norm_orig = np.linalg.norm(orig_flat)
+    norm_recon = np.linalg.norm(recon_flat)
+    if norm_orig == 0 or norm_recon == 0:
+        cosine_sim = 0.0
+    else:
+        cosine_sim = float(np.dot(orig_flat, recon_flat) / (norm_orig * norm_recon))
+
+    return {&quot;mse&quot;: mse, &quot;rmse&quot;: rmse, &quot;max_error&quot;: max_error,
+            &quot;snr_db&quot;: float(snr_db), &quot;cosine_similarity&quot;: cosine_sim}
+
+
+def compare_quantization_methods(tensor, num_bits=8):
+    q_pt, s_pt = quantize_symmetric(tensor, num_bits)
+    recon_pt = dequantize_symmetric(q_pt, s_pt)
+    err_pt = quantization_error(tensor, recon_pt)
+
+    q_pc, s_pc = quantize_per_channel(tensor, num_bits, axis=0)
+    recon_pc = dequantize_per_channel(q_pc, s_pc, axis=0)
+    err_pc = quantization_error(tensor, recon_pc)
+
+    q_asym, s_asym, zp = quantize_asymmetric(tensor, num_bits)
+    recon_asym = dequantize_asymmetric(q_asym, s_asym, zp)
+    err_asym = quantization_error(tensor, recon_asym)
+
+    print(f&quot;\n  Quantization Comparison ({num_bits}-bit, tensor shape {tensor.shape}):&quot;)
+    print(f&quot;  {&#39;Method&#39;:&lt;20} {&#39;MSE&#39;:&gt;12} {&#39;SNR (dB)&#39;:&gt;10} {&#39;Cosine Sim&#39;:&gt;12} {&#39;Max Error&#39;:&gt;12}&quot;)
+    print(f&quot;  {&#39;-&#39;*68}&quot;)
+    print(f&quot;  {&#39;Per-tensor sym&#39;:&lt;20} {err_pt[&#39;mse&#39;]:&gt;12.8f} {err_pt[&#39;snr_db&#39;]:&gt;10.2f} {err_pt[&#39;cosine_similarity&#39;]:&gt;12.8f} {err_pt[&#39;max_error&#39;]:&gt;12.8f}&quot;)
+    print(f&quot;  {&#39;Per-channel sym&#39;:&lt;20} {err_pc[&#39;mse&#39;]:&gt;12.8f} {err_pc[&#39;snr_db&#39;]:&gt;10.2f} {err_pc[&#39;cosine_similarity&#39;]:&gt;12.8f} {err_pc[&#39;max_error&#39;]:&gt;12.8f}&quot;)
+    print(f&quot;  {&#39;Asymmetric&#39;:&lt;20} {err_asym[&#39;mse&#39;]:&gt;12.8f} {err_asym[&#39;snr_db&#39;]:&gt;10.2f} {err_asym[&#39;cosine_similarity&#39;]:&gt;12.8f} {err_asym[&#39;max_error&#39;]:&gt;12.8f}&quot;)
+
+    return {&quot;per_tensor&quot;: err_pt, &quot;per_channel&quot;: err_pc, &quot;asymmetric&quot;: err_asym}
+
+
+def bit_width_sweep(tensor):
+    print(f&quot;\n  Bit-Width Sweep (tensor shape {tensor.shape}):&quot;)
+    print(f&quot;  {&#39;Bits&#39;:&gt;6} {&#39;Levels&#39;:&gt;8} {&#39;MSE&#39;:&gt;14} {&#39;SNR (dB)&#39;:&gt;10} {&#39;Cosine Sim&#39;:&gt;12} {&#39;Compression&#39;:&gt;12}&quot;)
+    print(f&quot;  {&#39;-&#39;*64}&quot;)
+
+    results = []
+    for bits in [2, 3, 4, 8, 16]:
+        q, s = quantize_per_channel(tensor, bits, axis=0)
+        recon = dequantize_per_channel(q, s, axis=0)
+        err = quantization_error(tensor, recon)
+        levels = 2 ** bits
+        compression = 32.0 / bits
+
+        print(f&quot;  {bits:&gt;6} {levels:&gt;8} {err[&#39;mse&#39;]:&gt;14.8f} {err[&#39;snr_db&#39;]:&gt;10.2f} {err[&#39;cosine_similarity&#39;]:&gt;12.8f} {compression:&gt;11.1f}x&quot;)
+        results.append({&quot;bits&quot;: bits, &quot;levels&quot;: levels, &quot;error&quot;: err, &quot;compression&quot;: compression})
+
+    return results
+
+
+def simulate_transformer_layer(input_data, weights, kv_scale=1.0):
+    hidden = input_data @ weights[&quot;qkv&quot;]
+    seq_len = hidden.shape[1]
+    d_model = weights[&quot;qkv&quot;].shape[1] // 3
+    q, k, v = hidden[:, :, :d_model], hidden[:, :, d_model:2*d_model], hidden[:, :, 2*d_model:]
+
+    attn_scores = (q @ k.transpose(0, 2, 1)) / np.sqrt(d_model) * kv_scale
+    attn_max = np.max(attn_scores, axis=-1, keepdims=True)
+    attn_exp = np.exp(attn_scores - attn_max)
+    attn_weights = attn_exp / np.sum(attn_exp, axis=-1, keepdims=True)
+
+    attn_output = attn_weights @ v
+    output = attn_output @ weights[&quot;out&quot;]
+    return output, {&quot;q&quot;: q, &quot;k&quot;: k, &quot;v&quot;: v, &quot;attn_scores&quot;: attn_scores,
+                    &quot;attn_weights&quot;: attn_weights, &quot;attn_output&quot;: attn_output}
+
+
+def sensitivity_experiment(batch_size=2, seq_len=16, d_model=64, num_bits=8):
+    np.random.seed(42)
+    input_data = np.random.randn(batch_size, seq_len, d_model) * 0.1
+
+    weights = {
+        &quot;qkv&quot;: np.random.randn(d_model, 3 * d_model) * (2.0 / d_model) ** 0.5,
+        &quot;out&quot;: np.random.randn(d_model, d_model) * (2.0 / d_model) ** 0.5,
+    }
+
+    baseline_output, baseline_internals = simulate_transformer_layer(input_data, weights)
+
+    experiments = {}
+
+    q_qkv, s_qkv = quantize_per_channel(weights[&quot;qkv&quot;], num_bits, axis=0)
+    q_out, s_out = quantize_per_channel(weights[&quot;out&quot;], num_bits, axis=0)
+    quantized_weights = {
+        &quot;qkv&quot;: dequantize_per_channel(q_qkv, s_qkv, axis=0),
+        &quot;out&quot;: dequantize_per_channel(q_out, s_out, axis=0),
+    }
+    weight_quant_output, _ = simulate_transformer_layer(input_data, quantized_weights)
+    experiments[&quot;Weights only&quot;] = quantization_error(baseline_output, weight_quant_output)
+
+    _, fresh_internals = simulate_transformer_layer(input_data, weights)
+    q_act, s_act = quantize_per_channel(
+        fresh_internals[&quot;attn_output&quot;].reshape(-1, d_model), num_bits, axis=0
+    )
+    quant_attn_out = dequantize_per_channel(q_act, s_act, axis=0).reshape(batch_size, seq_len, d_model)
+    act_quant_output = quant_attn_out @ weights[&quot;out&quot;]
+    experiments[&quot;Activations only&quot;] = quantization_error(baseline_output, act_quant_output)
+
+    q_k, s_k = quantize_per_channel(fresh_internals[&quot;k&quot;].reshape(-1, d_model), num_bits, axis=0)
+    q_v, s_v = quantize_per_channel(fresh_internals[&quot;v&quot;].reshape(-1, d_model), num_bits, axis=0)
+    quant_k = dequantize_per_channel(q_k, s_k, axis=0).reshape(batch_size, seq_len, d_model)
+    quant_v = dequantize_per_channel(q_v, s_v, axis=0).reshape(batch_size, seq_len, d_model)
+    attn_scores_kv = (fresh_internals[&quot;q&quot;] @ quant_k.transpose(0, 2, 1)) / np.sqrt(d_model)
+    attn_max_kv = np.max(attn_scores_kv, axis=-1, keepdims=True)
+    attn_exp_kv = np.exp(attn_scores_kv - attn_max_kv)
+    attn_weights_kv = attn_exp_kv / np.sum(attn_exp_kv, axis=-1, keepdims=True)
+    kv_quant_output = (attn_weights_kv @ quant_v) @ weights[&quot;out&quot;]
+    experiments[&quot;KV cache only&quot;] = quantization_error(baseline_output, kv_quant_output)
+
+    noise_scale = np.std(fresh_internals[&quot;attn_scores&quot;]) * 0.05
+    noisy_scores = fresh_internals[&quot;attn_scores&quot;] + np.random.randn(*fresh_internals[&quot;attn_scores&quot;].shape) * noise_scale
+    noisy_max = np.max(noisy_scores, axis=-1, keepdims=True)
+    noisy_exp = np.exp(noisy_scores - noisy_max)
+    noisy_weights = noisy_exp / np.sum(noisy_exp, axis=-1, keepdims=True)
+    attn_quant_output = (noisy_weights @ fresh_internals[&quot;v&quot;]) @ weights[&quot;out&quot;]
+    experiments[&quot;Attention logits (5% noise)&quot;] = quantization_error(baseline_output, attn_quant_output)
+
+    print(f&quot;\n  Sensitivity Experiment ({num_bits}-bit quantization):&quot;)
+    print(f&quot;  {&#39;Component&#39;:&lt;30} {&#39;MSE&#39;:&gt;14} {&#39;SNR (dB)&#39;:&gt;10} {&#39;Cosine Sim&#39;:&gt;12}&quot;)
+    print(f&quot;  {&#39;-&#39;*68}&quot;)
+    for name, err in sorted(experiments.items(), key=lambda x: x[1][&quot;mse&quot;]):
+        print(f&quot;  {name:&lt;30} {err[&#39;mse&#39;]:&gt;14.8f} {err[&#39;snr_db&#39;]:&gt;10.2f} {err[&#39;cosine_similarity&#39;]:&gt;12.8f}&quot;)
+
+    return experiments
+
+
+def simulated_gptq(weight_matrix, calibration_inputs, num_bits=4):
+    n_in, n_out = weight_matrix.shape
+    qmin = -(2 ** (num_bits - 1))
+    qmax = 2 ** (num_bits - 1) - 1
+
+    H = np.zeros((n_in, n_in))
+    for x in calibration_inputs:
+        x = x.reshape(-1, 1) if x.ndim == 1 else x
+        for row in range(x.shape[0]):
+            xi = x[row].reshape(-1, 1)
+            H += xi @ xi.T
+    H /= len(calibration_inputs)
+    H += np.eye(n_in) * 1e-4
+
+    weight_importance = np.diag(H)
+
+    quantized = np.zeros_like(weight_matrix, dtype=np.int32)
+    scales = np.zeros(n_out)
+    errors = np.zeros(n_out)
+
+    W = weight_matrix.copy()
+
+    for col in range(n_out):
+        w_col = W[:, col]
+        abs_max = np.max(np.abs(w_col))
+        if abs_max == 0:
+            scales[col] = 1.0
+            continue
+        scale = abs_max / qmax
+        scales[col] = scale
+
+        q_col = np.clip(np.round(w_col / scale), qmin, qmax).astype(np.int32)
+        quantized[:, col] = q_col
+
+        quant_error = w_col - q_col * scale
+        errors[col] = np.sqrt(np.mean(quant_error ** 2))
+
+        if col &lt; n_out - 1:
+            importance_weights = weight_importance / (np.max(weight_importance) + 1e-10)
+            for next_col in range(col + 1, min(col + 4, n_out)):
+                compensation = quant_error * importance_weights * 0.1
+                W[:, next_col] += compensation
+
+    return quantized, scales, {&quot;column_errors&quot;: errors,
+                               &quot;mean_error&quot;: float(np.mean(errors)),
+                               &quot;max_error&quot;: float(np.max(errors))}
+
+
+def dequantize_gptq(quantized, scales):
+    result = np.zeros_like(quantized, dtype=np.float64)
+    for col in range(quantized.shape[1]):
+        result[:, col] = quantized[:, col] * scales[col]
+    return result
+
+
+def simulated_awq(weight_matrix, calibration_inputs, num_bits=4, salient_fraction=0.01):
+    n_in, n_out = weight_matrix.shape
+    qmin = -(2 ** (num_bits - 1))
+    qmax = 2 ** (num_bits - 1) - 1
+
+    activation_magnitudes = np.zeros(n_in)
+    for x in calibration_inputs:
+        if x.ndim == 1:
+            activation_magnitudes += np.abs(x)
+        else:
+            activation_magnitudes += np.mean(np.abs(x), axis=0)
+    activation_magnitudes /= len(calibration_inputs)
+
+    n_salient = max(1, int(n_in * salient_fraction))
+    salient_indices = np.argsort(activation_magnitudes)[-n_salient:]
+
+    scale_factors = np.ones(n_in)
+    for idx in salient_indices:
+        col_max = np.max(np.abs(weight_matrix[idx, :]))
+        if col_max &gt; 0:
+            scale_factors[idx] = min(4.0, 1.0 / (col_max + 1e-8) * np.mean(np.abs(weight_matrix)))
+
+    scaled_weights = weight_matrix * scale_factors.reshape(-1, 1)
+
+    quantized, scales = quantize_per_channel(scaled_weights, num_bits, axis=0)
+    dequantized = dequantize_per_channel(quantized, scales, axis=0)
+
+    result = dequantized / scale_factors.reshape(-1, 1)
+
+    err = quantization_error(weight_matrix, result)
+
+    return result, {&quot;salient_indices&quot;: salient_indices,
+                    &quot;scale_factors&quot;: scale_factors[salient_indices],
+                    &quot;error&quot;: err,
+                    &quot;n_salient&quot;: n_salient}
+
+
+def full_quantization_comparison(d_in=256, d_out=512, num_bits=4, n_calibration=32):
+    np.random.seed(42)
+
+    weight = np.random.randn(d_in, d_out) * 0.02
+    outlier_rows = np.random.choice(d_in, size=5, replace=False)
+    weight[outlier_rows] *= 10
+
+    calibration = [np.random.randn(8, d_in) * 0.1 for _ in range(n_calibration)]
+
+    q_naive, s_naive = quantize_symmetric(weight, num_bits)
+    recon_naive = dequantize_symmetric(q_naive, s_naive)
+    err_naive = quantization_error(weight, recon_naive)
+
+    q_pc, s_pc = quantize_per_channel(weight, num_bits, axis=0)
+    recon_pc = dequantize_per_channel(q_pc, s_pc, axis=0)
+    err_pc = quantization_error(weight, recon_pc)
+
+    q_gptq, s_gptq, gptq_info = simulated_gptq(weight, calibration, num_bits)
+    recon_gptq = dequantize_gptq(q_gptq, s_gptq)
+    err_gptq = quantization_error(weight, recon_gptq)
+
+    recon_awq, awq_info = simulated_awq(weight, calibration, num_bits)
+    err_awq = awq_info[&quot;error&quot;]
+
+    print(f&quot;\n  Full Quantization Comparison ({num_bits}-bit, {d_in}x{d_out} matrix)&quot;)
+    print(f&quot;  Matrix has {len(outlier_rows)} outlier rows (10x scale)&quot;)
+    print()
+    print(f&quot;  {&#39;Method&#39;:&lt;20} {&#39;MSE&#39;:&gt;14} {&#39;SNR (dB)&#39;:&gt;10} {&#39;Cosine Sim&#39;:&gt;12}&quot;)
+    print(f&quot;  {&#39;-&#39;*58}&quot;)
+    print(f&quot;  {&#39;Naive per-tensor&#39;:&lt;20} {err_naive[&#39;mse&#39;]:&gt;14.8f} {err_naive[&#39;snr_db&#39;]:&gt;10.2f} {err_naive[&#39;cosine_similarity&#39;]:&gt;12.8f}&quot;)
+    print(f&quot;  {&#39;Per-channel&#39;:&lt;20} {err_pc[&#39;mse&#39;]:&gt;14.8f} {err_pc[&#39;snr_db&#39;]:&gt;10.2f} {err_pc[&#39;cosine_similarity&#39;]:&gt;12.8f}&quot;)
+    print(f&quot;  {&#39;Simulated GPTQ&#39;:&lt;20} {err_gptq[&#39;mse&#39;]:&gt;14.8f} {err_gptq[&#39;snr_db&#39;]:&gt;10.2f} {err_gptq[&#39;cosine_similarity&#39;]:&gt;12.8f}&quot;)
+    print(f&quot;  {&#39;Simulated AWQ&#39;:&lt;20} {err_awq[&#39;mse&#39;]:&gt;14.8f} {err_awq[&#39;snr_db&#39;]:&gt;10.2f} {err_awq[&#39;cosine_similarity&#39;]:&gt;12.8f}&quot;)
+
+    test_input = np.random.randn(4, d_in) * 0.1
+    baseline = test_input @ weight
+    output_naive = test_input @ recon_naive
+    output_pc = test_input @ recon_pc
+    output_gptq = test_input @ recon_gptq
+    output_awq = test_input @ recon_awq
+
+    print(f&quot;\n  End-to-End Output Error (matmul with test input):&quot;)
+    print(f&quot;  {&#39;Method&#39;:&lt;20} {&#39;Output MSE&#39;:&gt;14} {&#39;Output Cosine&#39;:&gt;14}&quot;)
+    print(f&quot;  {&#39;-&#39;*50}&quot;)
+    for name, output in [(&quot;Naive&quot;, output_naive), (&quot;Per-channel&quot;, output_pc),
+                          (&quot;GPTQ&quot;, output_gptq), (&quot;AWQ&quot;, output_awq)]:
+        out_err = quantization_error(baseline, output)
+        print(f&quot;  {name:&lt;20} {out_err[&#39;mse&#39;]:&gt;14.8f} {out_err[&#39;cosine_similarity&#39;]:&gt;14.8f}&quot;)
+
+    return {&quot;naive&quot;: err_naive, &quot;per_channel&quot;: err_pc, &quot;gptq&quot;: err_gptq, &quot;awq&quot;: err_awq}
+
+
+def memory_calculator(num_params_billions, bits_per_param):
+    bytes_per_param = bits_per_param / 8
+    total_bytes = num_params_billions * 1e9 * bytes_per_param
+    total_gb = total_bytes / (1024 ** 3)
+    return total_gb
+
+
+def print_memory_table():
+    print(&quot;\n  Memory Requirements by Model and Precision:&quot;)
+    print(f&quot;  {&#39;Model&#39;:&lt;15} {&#39;FP32&#39;:&gt;8} {&#39;FP16&#39;:&gt;8} {&#39;FP8&#39;:&gt;8} {&#39;INT8&#39;:&gt;8} {&#39;INT4&#39;:&gt;8} {&#39;INT2&#39;:&gt;8}&quot;)
+    print(f&quot;  {&#39;-&#39;*64}&quot;)
+    for name, params in [(&quot;7B&quot;, 7), (&quot;13B&quot;, 13), (&quot;34B&quot;, 34), (&quot;70B&quot;, 70), (&quot;405B&quot;, 405)]:
+        fp32 = memory_calculator(params, 32)
+        fp16 = memory_calculator(params, 16)
+        fp8 = memory_calculator(params, 8)
+        int8 = memory_calculator(params, 8)
+        int4 = memory_calculator(params, 4)
+        int2 = memory_calculator(params, 2)
+        print(f&quot;  {name:&lt;15} {fp32:&gt;7.1f}G {fp16:&gt;7.1f}G {fp8:&gt;7.1f}G {int8:&gt;7.1f}G {int4:&gt;7.1f}G {int2:&gt;7.1f}G&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    np.random.seed(42)
+
+    print(&quot;=&quot; * 70)
+    print(&quot;QUANTIZATION: MAKING MODELS FIT&quot;)
+    print(&quot;=&quot; * 70)
+
+    print(&quot;\nSTEP 1: Number Format Comparison&quot;)
+    print(&quot;-&quot; * 50)
+    for val in [0.1, 3.14159, -0.00073, 42.5, 0.0000012]:
+        display_format_comparison(val)
+
+    print(&quot;\n\nSTEP 2: Memory Requirements&quot;)
+    print(&quot;-&quot; * 50)
+    print_memory_table()
+
+    print(&quot;\n\nSTEP 3: Quantization Methods Comparison&quot;)
+    print(&quot;-&quot; * 50)
+    weight_matrix = np.random.randn(128, 256) * 0.02
+    weight_matrix[0] *= 15
+    weight_matrix[42] *= 8
+    compare_quantization_methods(weight_matrix, num_bits=8)
+    compare_quantization_methods(weight_matrix, num_bits=4)
+
+    print(&quot;\n\nSTEP 4: Bit-Width Sweep&quot;)
+    print(&quot;-&quot; * 50)
+    sweep_tensor = np.random.randn(64, 128) * 0.05
+    bit_width_sweep(sweep_tensor)
+
+    print(&quot;\n\nSTEP 5: Sensitivity Experiment&quot;)
+    print(&quot;-&quot; * 50)
+    print(&quot;\n  INT8:&quot;)
+    sensitivity_experiment(num_bits=8)
+    print(&quot;\n  INT4:&quot;)
+    sensitivity_experiment(num_bits=4)
+
+    print(&quot;\n\nSTEP 6: GPTQ vs AWQ vs Naive (INT4)&quot;)
+    print(&quot;-&quot; * 50)
+    full_quantization_comparison(d_in=256, d_out=512, num_bits=4)
+
+    print(&quot;\n\nSTEP 7: Distribution Analysis&quot;)
+    print(&quot;-&quot; * 50)
+    np.random.seed(0)
+    simulated_weights = np.random.randn(1000) * 0.02
+    abs_vals = np.abs(simulated_weights)
+    pct_in_range = np.mean(abs_vals &lt; 0.1) * 100
+    print(f&quot;\n  Simulated weight distribution (1000 params, std=0.02):&quot;)
+    print(f&quot;  Weights in [-0.1, 0.1]: {pct_in_range:.1f}%&quot;)
+    print(f&quot;  Weights in [-0.05, 0.05]: {np.mean(abs_vals &lt; 0.05) * 100:.1f}%&quot;)
+    print(f&quot;  Weights in [-0.01, 0.01]: {np.mean(abs_vals &lt; 0.01) * 100:.1f}%&quot;)
+    print(f&quot;  Max absolute value: {np.max(abs_vals):.6f}&quot;)
+    print(f&quot;  Mean absolute value: {np.mean(abs_vals):.6f}&quot;)
+
+    histogram = np.histogram(simulated_weights, bins=20)
+    print(f&quot;\n  Weight histogram:&quot;)
+    max_count = max(histogram[0])
+    for i in range(len(histogram[0])):
+        bar_len = int(histogram[0][i] / max_count * 40)
+        lo = histogram[1][i]
+        hi = histogram[1][i + 1]
+        print(f&quot;  [{lo:&gt;7.4f}, {hi:&gt;7.4f}] {&#39;#&#39; * bar_len} ({histogram[0][i]})&quot;)
+
+    print(&quot;\n\n&quot; + &quot;=&quot; * 70)
+    print(&quot;DONE&quot;)
+    print(&quot;=&quot; * 70)
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/10-llms-from-scratch/11-quantization/code/main.rs">phases/10-llms-from-scratch/11-quantization/code/main.rs</a><details><summary>查看原始文本</summary><pre><code>// Lesson: Quantization — INT8 / GPTQ / AWQ / GGUF (phase 10 / lesson 11)
+// Topic: symmetric INT8 quantization of an FP32 weight vector. Computes scale
+// from abs-max, rounds + clips to [-127, 127], dequantizes, reports MSE,
+// max abs error, SNR, cosine similarity, and a bit-width sweep (8 / 4 / 2 bit).
+// Refs:
+//   https://pytorch.org/docs/stable/quantization.html
+//   https://leimao.github.io/article/Neural-Networks-Quantization/
+//   https://arxiv.org/abs/2210.17323  (GPTQ)
+//   https://arxiv.org/abs/2306.00978  (AWQ)
+// Build: rustc --edition 2021 -O code/main.rs -o /tmp/lesson_quant &amp;&amp; /tmp/lesson_quant
+
+use std::f64;
+
+fn lcg(seed: &amp;mut u64) -&gt; f64 {
+    *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    let bits = (*seed &gt;&gt; 11) as u64;
+    let unit = bits as f64 / (1u64 &lt;&lt; 53) as f64;
+    unit * 2.0 - 1.0
+}
+
+// Box-Muller via the LCG, so we generate normal-ish floats without external crates.
+fn randn(seed: &amp;mut u64) -&gt; f64 {
+    let u1 = (lcg(seed) + 1.0) / 2.0;
+    let u2 = (lcg(seed) + 1.0) / 2.0;
+    let u1 = u1.max(1e-12);
+    let r = (-2.0 * u1.ln()).sqrt();
+    r * (2.0 * std::f64::consts::PI * u2).cos()
+}
+
+struct QuantResult {
+    qmin: i32,
+    qmax: i32,
+    scale: f64,
+    quantized: Vec&lt;i32&gt;,
+    reconstructed: Vec&lt;f64&gt;,
+}
+
+fn quantize_symmetric(weights: &amp;[f64], num_bits: u32) -&gt; QuantResult {
+    let qmax = (1i32 &lt;&lt; (num_bits - 1)) - 1;
+    let qmin = -qmax;
+
+    let abs_max = weights.iter().fold(0.0f64, |acc, &amp;x| acc.max(x.abs()));
+    let scale = if abs_max == 0.0 { 1.0 } else { abs_max / qmax as f64 };
+
+    let mut quantized = Vec::with_capacity(weights.len());
+    let mut reconstructed = Vec::with_capacity(weights.len());
+    for &amp;w in weights {
+        let q = (w / scale).round() as i32;
+        let q = q.max(qmin).min(qmax);
+        quantized.push(q);
+        reconstructed.push(q as f64 * scale);
+    }
+
+    QuantResult { qmin, qmax, scale, quantized, reconstructed }
+}
+
+struct ErrorReport {
+    mse: f64,
+    rmse: f64,
+    max_abs_error: f64,
+    snr_db: f64,
+    cosine: f64,
+}
+
+fn error_report(original: &amp;[f64], reconstructed: &amp;[f64]) -&gt; ErrorReport {
+    let n = original.len() as f64;
+    let mut sum_sq_err = 0.0f64;
+    let mut max_abs = 0.0f64;
+    let mut signal_power = 0.0f64;
+    let mut dot = 0.0f64;
+    let mut norm_a = 0.0f64;
+    let mut norm_b = 0.0f64;
+
+    for (a, b) in original.iter().zip(reconstructed.iter()) {
+        let diff = a - b;
+        sum_sq_err += diff * diff;
+        max_abs = max_abs.max(diff.abs());
+        signal_power += a * a;
+        dot += a * b;
+        norm_a += a * a;
+        norm_b += b * b;
+    }
+
+    let mse = sum_sq_err / n;
+    let rmse = mse.sqrt();
+    let snr_db = if mse &gt; 0.0 {
+        10.0 * (signal_power / n / mse).log10()
+    } else {
+        f64::INFINITY
+    };
+    let cosine = if norm_a &gt; 0.0 &amp;&amp; norm_b &gt; 0.0 {
+        dot / (norm_a.sqrt() * norm_b.sqrt())
+    } else {
+        0.0
+    };
+
+    ErrorReport { mse, rmse, max_abs_error: max_abs, snr_db, cosine }
+}
+
+fn print_quant_summary(label: &amp;str, weights: &amp;[f64], r: &amp;QuantResult, err: &amp;ErrorReport) {
+    println!(&quot;[{}]&quot;, label);
+    println!(&quot;  range [qmin, qmax]    {} .. {}&quot;, r.qmin, r.qmax);
+    println!(&quot;  scale (FP32 step)     {:.8}&quot;, r.scale);
+    println!(&quot;  sample weights (10)   {:?}&quot;, &amp;weights[..10.min(weights.len())]
+        .iter().map(|w| format!(&quot;{:+.4}&quot;, w)).collect::&lt;Vec&lt;_&gt;&gt;());
+    println!(&quot;  quantized codes (10)  {:?}&quot;, &amp;r.quantized[..10.min(r.quantized.len())]);
+    println!(&quot;  dequantized (10)      {:?}&quot;, &amp;r.reconstructed[..10.min(r.reconstructed.len())]
+        .iter().map(|w| format!(&quot;{:+.4}&quot;, w)).collect::&lt;Vec&lt;_&gt;&gt;());
+    println!();
+    println!(&quot;  mse                   {:.10}&quot;, err.mse);
+    println!(&quot;  rmse                  {:.10}&quot;, err.rmse);
+    println!(&quot;  max |error|           {:.10}&quot;, err.max_abs_error);
+    println!(&quot;  snr                   {:.2} dB&quot;, err.snr_db);
+    println!(&quot;  cosine similarity     {:.10}&quot;, err.cosine);
+    println!();
+}
+
+fn fmt_bytes(b: u64) -&gt; String {
+    let kb = b as f64 / 1024.0;
+    if kb &lt; 1024.0 { format!(&quot;{:.2} KB&quot;, kb) } else { format!(&quot;{:.2} MB&quot;, kb / 1024.0) }
+}
+
+fn main() {
+    let mut seed: u64 = 42;
+
+    let n = 8192;
+    let mut weights: Vec&lt;f64&gt; = (0..n).map(|_| randn(&amp;mut seed) * 0.02).collect();
+
+    weights[0] *= 25.0;
+    weights[123] *= 15.0;
+    weights[2048] *= 10.0;
+
+    let stats = {
+        let abs_vals: Vec&lt;f64&gt; = weights.iter().map(|x| x.abs()).collect();
+        let max = abs_vals.iter().fold(0.0f64, |a, &amp;b| a.max(b));
+        let mean: f64 = abs_vals.iter().sum::&lt;f64&gt;() / abs_vals.len() as f64;
+        let var: f64 = abs_vals.iter().map(|x| (x - mean).powi(2)).sum::&lt;f64&gt;() / abs_vals.len() as f64;
+        (max, mean, var.sqrt())
+    };
+
+    println!();
+    println!(&quot;=== INT8 quantization (Rust, stdlib only) ===&quot;);
+    println!();
+    println!(&quot;Tensor       : 1D weight vector, n = {}&quot;, n);
+    println!(&quot;Distribution : Normal(0, 0.02) with 3 outlier weights&quot;);
+    println!(&quot;  max |w|      {:.6}&quot;, stats.0);
+    println!(&quot;  mean |w|     {:.6}&quot;, stats.1);
+    println!(&quot;  std |w|      {:.6}&quot;, stats.2);
+    println!();
+
+    let r8 = quantize_symmetric(&amp;weights, 8);
+    let err8 = error_report(&amp;weights, &amp;r8.reconstructed);
+    print_quant_summary(&quot;INT8 symmetric per-tensor&quot;, &amp;weights, &amp;r8, &amp;err8);
+
+    println!(&quot;--- Bit-width sweep (symmetric per-tensor) ---&quot;);
+    println!(&quot;  {:&gt;5}  {:&gt;10}  {:&gt;14}  {:&gt;10}  {:&gt;12}  {:&gt;10}&quot;,
+             &quot;bits&quot;, &quot;levels&quot;, &quot;mse&quot;, &quot;snr_db&quot;, &quot;max |err|&quot;, &quot;ratio_vs_fp32&quot;);
+    for bits in [16u32, 8, 4, 2] {
+        let r = quantize_symmetric(&amp;weights, bits);
+        let er = error_report(&amp;weights, &amp;r.reconstructed);
+        let ratio = 32.0 / bits as f64;
+        let levels = (r.qmax - r.qmin + 1) as u64;
+        println!(&quot;  {:&gt;5}  {:&gt;10}  {:&gt;14.10}  {:&gt;10.2}  {:&gt;12.6}  {:&gt;9.1}x&quot;,
+                 bits, levels, er.mse, er.snr_db, er.max_abs_error, ratio);
+    }
+    println!();
+
+    let fp32_bytes = (n * 4) as u64;
+    let int8_bytes = (n * 1) as u64 + 8;
+    let int4_bytes = ((n + 1) / 2) as u64 + 8;
+    println!(&quot;--- Memory footprint ---&quot;);
+    println!(&quot;  FP32 weights     {}&quot;, fmt_bytes(fp32_bytes));
+    println!(&quot;  INT8 + scale     {}   ({:.1}x smaller)&quot;, fmt_bytes(int8_bytes), fp32_bytes as f64 / int8_bytes as f64);
+    println!(&quot;  INT4 + scale     {}   ({:.1}x smaller)&quot;, fmt_bytes(int4_bytes), fp32_bytes as f64 / int4_bytes as f64);
+    println!();
+
+    println!(&quot;Takeaway:&quot;);
+    println!(&quot;  - INT8 keeps SNR well above 30 dB for normal weight distributions.&quot;);
+    println!(&quot;  - Outliers dominate scale: 3 outliers in {} weights inflate scale and &quot;, n);
+    println!(&quot;    waste precision on the rest. Per-channel (or GPTQ/AWQ) helps.&quot;);
+    println!();
+}
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/10-llms-from-scratch/11-quantization/outputs/skill-quantization.md">phases/10-llms-from-scratch/11-quantization/outputs/skill-quantization.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: skill-quantization
+description: Choose the right quantization strategy for deploying LLMs based on hardware, quality, and latency constraints
+version: 1.0.0
+phase: 10
+lesson: 11
+tags: [quantization, inference, deployment, optimization, fp8, int4, int8, gptq, awq, gguf]
+---
+
+# Quantization Decision Framework
+
+When deploying a language model, use this framework to select the right number format, quantization method, and quality validation strategy.
+
+## Input Requirements
+
+Provide:
+- **Model** (name, parameter count, original precision)
+- **Target hardware** (GPU model/VRAM, CPU, Apple Silicon, edge device)
+- **Latency target** (tokens/second, time to first token)
+- **Quality floor** (max acceptable perplexity increase, benchmark delta)
+- **Serving pattern** (batch size, max context length, concurrent users)
+
+## Quick Selection
+
+| Your Situation | Format | Method | Expected Quality Loss |
+|---------------|--------|--------|----------------------|
+| H100 GPU, maximum throughput | FP8 E4M3 | Native H100 casting | &lt; 0.1% |
+| A100/A10, need 2x throughput | INT8 | LLM.int8() or SmoothQuant | &lt; 0.5% |
+| Single 24GB GPU, 70B model | INT4 | AWQ or GPTQ | 1-3% |
+| MacBook / Apple Silicon | INT4 GGUF | Q4_K_M via llama.cpp | 1-2% |
+| Mobile / edge device | INT4 or INT3 | QAT + device-specific | 2-5% |
+| Maximum compression, some loss OK | INT2 | QuIP# or AQLM | 5-15% |
+| Training (mixed precision) | BF16 + FP32 accum | Native framework support | 0% |
+
+## Precision Selection by Component
+
+Not all tensors should get the same treatment.
+
+| Component | Safe Minimum | Recommended | Avoid |
+|-----------|-------------|-------------|-------|
+| FFN weights | INT4 | INT4 (AWQ/GPTQ) | INT2 without QAT |
+| Attention weights | INT4 | INT8 or FP8 | INT2 |
+| Embedding layer | INT8 | FP16 (keep original) | INT4 |
+| Output head | INT8 | FP16 (keep original) | INT4 |
+| KV cache | FP8 | FP8 or INT8 | INT4 at long context |
+| Attention logits | FP16 | FP16 or BF16 | INT8 |
+| Activations (inference) | INT8 | FP8 or INT8 | INT4 |
+
+## Method Comparison
+
+### GPTQ
+- **When:** GPU inference, you want a Hugging Face-compatible model
+- **Calibration data:** 128 examples, 2048 tokens each
+- **Time:** 30-60 minutes for 70B on A100
+- **Tooling:** `gptqmodel`, `exllama`, `exllamav2`
+- **Strength:** Well-tested, huge model zoo on Hugging Face
+- **Weakness:** Slower than AWQ to apply, slightly lower quality than AWQ on some models
+
+### AWQ
+- **When:** GPU inference, you want best quality-per-bit
+- **Calibration data:** 128 examples
+- **Time:** 15-30 minutes for 70B on A100
+- **Tooling:** `llmcompressor`, `vLLM` (native support)
+- **Strength:** Best INT4 quality, fast to apply, vLLM integration
+- **Weakness:** Smaller model zoo than GPTQ
+
+### GGUF
+- **When:** CPU inference, Apple Silicon, llama.cpp ecosystem
+- **Variants:** Q2_K, Q3_K_S/M/L, Q4_K_S/M, Q5_K_S/M, Q6_K, Q8_0, F16
+- **Recommended default:** Q4_K_M (best quality/size balance)
+- **Tooling:** `llama.cpp`, `ollama`, `LM Studio`
+- **Strength:** Self-contained files, mixed precision, massive ecosystem
+- **Weakness:** Not optimal for GPU (designed for CPU/Metal)
+
+### SmoothQuant
+- **When:** INT8 on GPU, need both weight and activation quantization
+- **Key idea:** Migrate quantization difficulty from activations to weights via per-channel scaling
+- **Tooling:** `smoothquant`, `TensorRT-LLM`
+- **Strength:** Enables W8A8 (both weights and activations in INT8) for 2x speedup
+- **Weakness:** INT8 only, does not extend to INT4
+
+## Quality Validation Protocol
+
+After quantizing, validate before deploying:
+
+1. **Perplexity test.** Compute on WikiText-2 or your domain corpus. Delta &lt; 0.5 is excellent, 0.5-1.0 is good, &gt; 2.0 is a problem.
+
+2. **Benchmark sweep.** Run MMLU (general), GSM8K (math), HumanEval (code). Math and code are most sensitive to precision loss.
+
+3. **Output comparison.** Generate 100 responses from both original and quantized model. Use LLM-as-judge to compute win rate. Target: quantized model wins or ties on &gt; 90% of prompts.
+
+4. **Latency measurement.** Measure tokens/second at batch size 1 and your target batch size. Verify the speedup justifies the quality cost.
+
+5. **Long-context test.** If serving long contexts (&gt; 4K tokens), test at your maximum context length. KV cache quantization errors compound with sequence length.
+
+## Memory Budget Calculator
+
+```
+Weight memory (GB) = parameters (B) * bits / 8 / 1.073741824
+KV cache per token (MB) = 2 * num_layers * d_model * bits / 8 / 1048576
+KV cache for context (GB) = kv_per_token * max_context_length / 1024
+Activation memory (GB) ~ 1-4 GB (relatively constant, depends on batch size)
+Total = weight_memory + kv_cache + activation_memory + overhead (10-20%)
+```
+
+Example for Llama 3 70B at INT4, 32K context:
+- Weights: 70B * 4 / 8 / 1.07 = 32.6 GB
+- KV cache (FP16): 2 * 80 * 8192 * 16 / 8 / 1e9 * 32768 = ~40 GB
+- KV cache (FP8): ~20 GB
+- Total with FP8 KV: ~55 GB (fits one 80GB A100)
+
+## Common Mistakes
+
+| Mistake | Why It Fails | Fix |
+|---------|-------------|-----|
+| Quantizing the embedding layer to INT4 | First layer amplifies errors through entire model | Keep embeddings at FP16 or INT8 |
+| Using per-tensor scales for INT4 | One outlier row destroys precision for all rows | Use per-channel or per-group scales |
+| Not calibrating GPTQ/AWQ | Scale factors are wrong without representative data | Use 128 examples from your domain |
+| Same bit-width for all layers | First/last layers are more sensitive | Mixed precision: higher bits for first/last |
+| Quantizing KV cache at very long context | Errors compound quadratically with sequence length | Use FP8 for KV cache, not INT4 |
+| Skipping quality validation | Some models quantize poorly (especially at boundaries) | Always run perplexity + task evals |
+
+## Deployment Recipes
+
+### Recipe 1: vLLM with AWQ (GPU server)
+```
+pip install vllm
+vllm serve model-awq --quantization awq --dtype half --max-model-len 8192
+```
+
+### Recipe 2: llama.cpp with GGUF (MacBook)
+```
+./llama-server -m model.Q4_K_M.gguf -c 4096 -ngl 99
+```
+
+### Recipe 3: TensorRT-LLM with FP8 (H100)
+```
+trtllm-build --model_dir model --output_dir engine --dtype float16 --use_fp8
+```
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. How much VRAM does a 70B parameter model in FP16 require just for weights?</legend><label class="option"><input type="radio" name="q0" value="0"> 70 GB</label><label class="option"><input type="radio" name="q0" value="1"> 140 GB</label><label class="option"><input type="radio" name="q0" value="2"> 35 GB</label><label class="option"><input type="radio" name="q0" value="3"> 280 GB</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. What is quantization in the context of LLMs?</legend><label class="option"><input type="radio" name="q1" value="0"> Reducing the numerical precision of weights (e.g., FP16 to INT4) to decrease memory usage and increase inference speed</label><label class="option"><input type="radio" name="q1" value="1"> Compressing the training data</label><label class="option"><input type="radio" name="q1" value="2"> Removing unused model layers</label><label class="option"><input type="radio" name="q1" value="3"> Reducing the vocabulary size</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. What is the key difference between post-training quantization (PTQ) and quantization-aware training (QAT)?</legend><label class="option"><input type="radio" name="q2" value="0"> QAT doesn&#39;t use gradients</label><label class="option"><input type="radio" name="q2" value="1"> PTQ requires more data</label><label class="option"><input type="radio" name="q2" value="2"> PTQ quantizes after training with no retraining; QAT simulates quantization during training so the model learns to tolerate reduced precision</label><label class="option"><input type="radio" name="q2" value="3"> PTQ is more accurate</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. What does &#39;per-channel&#39; quantization mean and why is it better than &#39;per-tensor&#39;?</legend><label class="option"><input type="radio" name="q3" value="0"> It quantizes each output channel separately, using different scale/zero-point for each, reducing quantization error</label><label class="option"><input type="radio" name="q3" value="1"> It processes one color channel at a time</label><label class="option"><input type="radio" name="q3" value="2"> It&#39;s a type of data parallelism</label><label class="option"><input type="radio" name="q3" value="3"> It uses separate GPUs per channel</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. Why do 95% of weights in Llama 3 70B fall between -0.1 and +0.1?</legend><label class="option"><input type="radio" name="q4" value="0"> The weights haven&#39;t converged yet</label><label class="option"><input type="radio" name="q4" value="1"> Weight decay and normalization during training push weights toward small values, making the full FP16 range wasteful</label><label class="option"><input type="radio" name="q4" value="2"> This is specific to the Llama architecture</label><label class="option"><input type="radio" name="q4" value="3"> The model is poorly trained</label><p data-feedback="4"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/10-llms-from-scratch/10-evaluation/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/10-llms-from-scratch/12-inference-optimization/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/10-llms-from-scratch/11-quantization/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

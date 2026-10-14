@@ -1,0 +1,938 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>从零开始进行3D高斯式光 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-04-computer-vision" data-lesson="04-computer-vision/22-3d-gaussian-splatting" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/04-computer-vision/">计算机视觉</a> / LESSON 22</p><h1 class="lesson-title">从零开始进行3D高斯式光</h1><p>3D Gaussian Splatting from Scratch</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>从零开始进行3D高斯式光</h1>
+<blockquote>
+<p>一个场景是数百万的3D高斯人云. 每个场景都有位置,方向,尺度,度,以及一种颜色,取决于视角方向.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 4 Lesson 13 (3D Vision &amp; NeRF), Phase 1 Lesson 12 (Tensor Operations), Phase 4 Lesson 10 (Diffusion basics optional)
+<strong>Time:</strong> ~90 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>解释为什么3D高斯斯派特替代了NeRF作为2026年光现实3D重建的生产默认</li>
+<li>说明每高斯参数的六个参数 (位置,旋转四旋翼,尺度,度,球状和色,可选特征) 以及每个浮动的数量</li>
+<li>通过使用2D高斯式光光器从零开始<code>alpha</code>编译,然后显示3D案例如何向同一循环投影</li>
+<li>使用<code>nerfstudio</code>现在<code>gsplat</code>其他<code>SuperSplat</code>为了从20-50张照片中重建一个场景,<code>KHR_gaussian_splatting</code>扩展GLTF或OpenUSD 26.03 <code>UsdVolParticleField3DGaussianSplat</code>方案</li>
+</ul>
+<h2>问题</h2>
+<p>一个NeRF存储一个场景作为一个MLP的权重.每一个染的像素都是数百个MLP查询沿线射线.训练需要几个小时,染需要几秒,并且权重不能编辑.如果你想在场景内移动椅子,你必须重新训练.</p>
+<p>现在,我们已经开始使用了3D高斯式分光 (Kerbl,Kopanas,Leimkühler,Drettakis,SIGGRAPH 2023) 一个场景是3D高斯人. 转像是GPU缩速度100+fps. 训练需要几分钟. 编辑是直接的:翻译一个小组的高西人,你已经移动了椅子. 到2026年,克罗诺斯集团批准了高斯斯地块的GLTF扩展,OpenUSD 26.03将一个高斯地块方案发送,Zillow和 Apartments.com将房地产带入,大多数关于3D重建的新研究论文都是3DGS核心想法的变体.</p>
+<p>心理模型很简单,数学有足够的移动部分,大多数介绍都从化开始,然后跳过投影和球状和.这个课程首先构建了整个东西 2D版本,然后是3D扩展.</p>
+<h2>概念</h2>
+<h3>盖斯人带着什么</h3>
+<p>一个3D高斯人是空间中的一个参数点,</p>
+<pre><code>position         mu         (3,)    centre in world coordinates
+rotation         q          (4,)    unit quaternion encoding orientation
+scale            s          (3,)    log-scales per axis (exponentiated at render time)
+opacity          alpha      (1,)    post-sigmoid opacity [0, 1]
+SH coefficients  c_lm       (3 * (L+1)^2,)   view-dependent colour
+</code></pre>
+<p>转换+尺度构建3x3的共变性: <code>Sigma = R S S^T R^T</code>球状和使颜色变化,视角方向镜亮点,微妙的光,视角依赖的光,而不需要存储视角纹理.在SH级3时,每种颜色道均为16个系数,仅仅为颜色,每种颜色均为48个浮动.</p>
+<p>一场场景通常有1-500万个高斯人.每个场景都存储约60个浮动 (3 + 4 + 3 + 1 + 48 + 混合).这为5百万个高斯人场景的240MB,远小于每个点纹理的等级点云,并且大小量小于NeRF的MLP重量,高分辨率重新呈现.</p>
+<h3>化,而不是射线行驶</h3>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-0f7ce9153918f332568e.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>五步,所有 GPU 兼容,每像素没有 MLP 查询. 一个 RTX 3080 Ti 能在 147 fps 提供600 万个位置.</p>
+<h3>投影步骤</h3>
+<p>现在,我们在世界位置上.<code>mu</code>具有3D共变性<code>Sigma</code>投影机在屏幕位置上<code>mu'</code>具有2D共变性<code>Sigma'</code>其他:</p>
+<pre><code>mu' = project(mu)
+Sigma' = J W Sigma W^T J^T          (2 x 2)
+
+W = viewing transform (rotation + translation of camera)
+J = Jacobian of the perspective projection at mu'
+</code></pre>
+<p>两维高斯人的足迹是一个圆,其轴是<code>Sigma'</code>每个圆的内部的像素都得到了高斯人的贡献,<code>exp(-0.5 * (p - mu')^T Sigma'^-1 (p - mu'))</code>现在,我们要去.</p>
+<h3>组的规则</h3>
+<p>对于一个像素,它覆盖的高西式被排序为前向 (或以逆式相等于前向后向).颜色由80年代以来的每种半透明的纹器相同的方程组成:</p>
+<pre><code>C_pixel = sum_i alpha_i * T_i * c_i
+
+T_i = prod_{j &lt; i} (1 - alpha_j)       transmittance up to i
+alpha_i = opacity_i * exp(-0.5 * d^T Sigma'^-1 d)   local contribution
+c_i = eval_SH(SH_i, view_direction)    view-dependent colour
+</code></pre>
+<p>这是<strong>the same equation as NeRF's volumetric render</strong>由于这种身份,所以染质量与NeRF相匹配,它们都整合了相同的辐射场方程.</p>
+<h3>为什么这可以区分</h3>
+<p>根据高斯的参数,每个步骤都可对其进行分化. 鉴于真相图像,计算呈现的像素损失,通过拉斯特里斯器进行后置,更新所有<code>(mu, q, s, alpha, c_lm)</code>通过梯度下降. 超过3万次的代,高斯人找到正确的位置,尺度和颜色.</p>
+<h3>密集和切割</h3>
+<p>一组固定的高斯人不能覆盖一个复杂的场景.</p>
+<ul>
+<li><strong>Clone</strong>现在的位置是高斯的,但它的尺度很小.</li>
+<li><strong>Split</strong>高梯度时,一个大高梯度太平滑,不能适合该区域.</li>
+<li><strong>Prune</strong>光率下降到值以下的高斯人,</li>
+</ul>
+<p>密度运行每次N代.一个场景通常从100k初始高斯人 (从SfM点种植) 增长到训练结束时的1-5M.</p>
+<h3>圆形和在一个段落中</h3>
+<p>视图依赖的颜色是函数<code>c(direction)</code>球体和是球体的福利尔基.<code>L</code>你会得到<code>(L+1)^2</code>根据一个频道的基本函数.对新视图的颜色进行评估是学习的SH系数和在视图方向评估的基础之间的点分数. 度0 =一个系数 = 常态颜色. 度3 = 16系数 = 足以捕捉兰伯特色,镜像和轻微反射. SD Gaussian Splatting 论文默认使用3 度.</p>
+<h3>2026年生产堆</h3>
+<pre><code>1. Capture         smartphone / DJI drone / handheld scanner
+2. SfM / MVS       COLMAP or GLOMAP derives camera poses + sparse points
+3. Train 3DGS      nerfstudio / gsplat / inria official / PostShot (~10-30 min on RTX 4090)
+4. Edit            SuperSplat / SplatForge (clean floaters, segment)
+5. Export          .ply -&gt; glTF KHR_gaussian_splatting or .usd (OpenUSD 26.03)
+6. View            Cesium / Unreal / Babylon.js / Three.js / Vision Pro
+</code></pre>
+<h3>4D和生成型变体</h3>
+<ul>
+<li><strong>4D Gaussian Splatting</strong>高西人是时间的函数;用于体积视频 (超人2026年,A$AP罗基的&quot;直升机&quot;).</li>
+<li><strong>Generative splats</strong>文字到片模型 (世界实验室的理石) 幻觉整个场景.</li>
+<li><strong>3D Gaussian Unscented Transform</strong>NVIDIA NuRec的自动驾驶模拟版本.</li>
+</ul>
+<figure><img src="/learn/ai-from-scratch/figures/figure-6f7a6f2246356f541e4d.png" alt="cv3-gaussian-splat 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<h3>步骤1:一个2D高斯人</h3>
+<p>我们首先建造一个2D的纹器,然后在投影后,3D的缩到它.</p>
+<pre><code class="language-python">import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+def eval_2d_gaussian(means, covs, points):
+    &quot;&quot;&quot;
+    means:  (G, 2)      centres
+    covs:   (G, 2, 2)   covariance matrices
+    points: (H, W, 2)   pixel coordinates
+    returns: (G, H, W)  density at every pixel for every Gaussian
+    &quot;&quot;&quot;
+    G = means.size(0)
+    H, W, _ = points.shape
+    flat = points.view(-1, 2)
+    inv = torch.linalg.inv(covs)
+    diff = flat[None, :, :] - means[:, None, :]
+    d = torch.einsum(&quot;gpi,gij,gpj-&gt;gp&quot;, diff, inv, diff)
+    density = torch.exp(-0.5 * d)
+    return density.view(G, H, W)
+</code></pre>
+<p><code>einsum</code>方形形状是什么?<code>diff^T Sigma^-1 diff</code>对于每一个 (高斯,像素) 双.</p>
+<h3>步骤2: 2D 喷式片</h3>
+<p>两维的深度是无意义的,所以我们使用了学到的每高斯人的尺度来来排序.</p>
+<pre><code class="language-python">def rasterise_2d(means, covs, colours, opacities, depths, image_size):
+    &quot;&quot;&quot;
+    means:     (G, 2)
+    covs:      (G, 2, 2)
+    colours:   (G, 3)
+    opacities: (G,)     in [0, 1]
+    depths:    (G,)     per-Gaussian scalar used for ordering
+    image_size: (H, W)
+    returns:   (H, W, 3) rendered image
+    &quot;&quot;&quot;
+    H, W = image_size
+    yy, xx = torch.meshgrid(
+        torch.arange(H, dtype=torch.float32, device=means.device),
+        torch.arange(W, dtype=torch.float32, device=means.device),
+        indexing=&quot;ij&quot;,
+    )
+    points = torch.stack([xx, yy], dim=-1)
+
+    densities = eval_2d_gaussian(means, covs, points)
+    alphas = opacities[:, None, None] * densities
+    alphas = alphas.clamp(0.0, 0.99)
+
+    order = torch.argsort(depths)
+    alphas = alphas[order]
+    colours_sorted = colours[order]
+
+    T = torch.ones(H, W, device=means.device)
+    out = torch.zeros(H, W, 3, device=means.device)
+    for i in range(means.size(0)):
+        a = alphas[i]
+        out += (T * a)[..., None] * colours_sorted[i][None, None, :]
+        T = T * (1.0 - a)
+    return out
+</code></pre>
+<p>实际的实现不快,使用基 CUDA ,但正确的数学和完全可分化.</p>
+<h3>步骤3:可训练的2D喷场景</h3>
+<pre><code class="language-python">class Splats2D(nn.Module):
+    def __init__(self, num_splats=128, image_size=64, seed=0):
+        super().__init__()
+        g = torch.Generator().manual_seed(seed)
+        H, W = image_size, image_size
+        self.means = nn.Parameter(torch.rand(num_splats, 2, generator=g) * torch.tensor([W, H]))
+        self.log_scale = nn.Parameter(torch.ones(num_splats, 2) * math.log(2.0))
+        self.rot = nn.Parameter(torch.zeros(num_splats))  # single angle in 2D
+        self.colour_logits = nn.Parameter(torch.randn(num_splats, 3, generator=g) * 0.5)
+        self.opacity_logit = nn.Parameter(torch.zeros(num_splats))
+        self.depth = nn.Parameter(torch.rand(num_splats, generator=g))
+
+    def covs(self):
+        s = torch.exp(self.log_scale)
+        c, si = torch.cos(self.rot), torch.sin(self.rot)
+        R = torch.stack([
+            torch.stack([c, -si], dim=-1),
+            torch.stack([si, c], dim=-1),
+        ], dim=-2)
+        S = torch.diag_embed(s ** 2)
+        return R @ S @ R.transpose(-1, -2)
+
+    def forward(self, image_size):
+        covs = self.covs()
+        colours = torch.sigmoid(self.colour_logits)
+        opacities = torch.sigmoid(self.opacity_logit)
+        return rasterise_2d(self.means, covs, colours, opacities, self.depth, image_size)
+</code></pre>
+<p><code>log_scale</code>现在<code>opacity_logit</code>其他<code>colour_logits</code>通过正确的激活在染时间,所有不受限制的参数都被映射出来.这是每个3DGS实现的标准模式.</p>
+<h3>步骤4:将2D高西安器与目标图像相匹配</h3>
+<pre><code class="language-python">import math
+import numpy as np
+
+def make_target(size=64):
+    yy, xx = np.meshgrid(np.arange(size), np.arange(size), indexing=&quot;ij&quot;)
+    img = np.zeros((size, size, 3), dtype=np.float32)
+    # Red circle
+    mask = (xx - 20) ** 2 + (yy - 20) ** 2 &lt; 10 ** 2
+    img[mask] = [1.0, 0.2, 0.2]
+    # Blue square
+    mask = (np.abs(xx - 45) &lt; 8) &amp; (np.abs(yy - 40) &lt; 8)
+    img[mask] = [0.2, 0.3, 1.0]
+    return torch.from_numpy(img)
+
+
+target = make_target(64)
+model = Splats2D(num_splats=64, image_size=64)
+opt = torch.optim.Adam(model.parameters(), lr=0.05)
+
+for step in range(200):
+    pred = model((64, 64))
+    loss = F.mse_loss(pred, target)
+    opt.zero_grad(); loss.backward(); opt.step()
+    if step % 40 == 0:
+        print(f&quot;step {step:3d}  mse {loss.item():.4f}&quot;)
+</code></pre>
+<p>通过200个步骤,64个高斯人定居在两个形状中.这是整个观念.</p>
+<h3>步骤5:从2D到3D</h3>
+<p>现在,我们需要一个新的系统,</p>
+<ol>
+<li>转换为一个角,而不是一个角.</li>
+<li>性是<code>R S S^T R^T</code>随着<code>R</code>基于四旋翼和<code>S = diag(exp(log_scale))</code>现在,我们要去.</li>
+<li>投影<code>(mu, Sigma) -&gt; (mu', Sigma')</code>通过使用相机外观和视角投影的雅可比安<code>mu</code>现在,我们要去.</li>
+<li>颜色成为一个球状和的扩展;在观测方向评估它.</li>
+<li>根据实际的相机空间,而不是学习的尺度.</li>
+</ol>
+<p>每个生产实施 (<code>gsplat</code>现在<code>inria/gaussian-splatting</code>现在<code>nerfstudio</code>) 在基于的CUDA核的GPU上做了这么做.</p>
+<h3>步骤 6: 球形和评价</h3>
+<p>标准标准为3级,每频道有16个条件.</p>
+<pre><code class="language-python">def eval_sh_degree_3(sh_coeffs, dirs):
+    &quot;&quot;&quot;
+    sh_coeffs: (..., 16, 3)   last dim is RGB channels
+    dirs:      (..., 3)       unit vectors
+    returns:   (..., 3)
+    &quot;&quot;&quot;
+    C0 = 0.282094791773878
+    C1 = 0.488602511902920
+    C2 = [1.092548430592079, 1.092548430592079,
+          0.315391565252520, 1.092548430592079,
+          0.546274215296039]
+    x, y, z = dirs[..., 0], dirs[..., 1], dirs[..., 2]
+    x2, y2, z2 = x * x, y * y, z * z
+    xy, yz, xz = x * y, y * z, x * z
+
+    result = C0 * sh_coeffs[..., 0, :]
+    result = result - C1 * y[..., None] * sh_coeffs[..., 1, :]
+    result = result + C1 * z[..., None] * sh_coeffs[..., 2, :]
+    result = result - C1 * x[..., None] * sh_coeffs[..., 3, :]
+
+    result = result + C2[0] * xy[..., None] * sh_coeffs[..., 4, :]
+    result = result + C2[1] * yz[..., None] * sh_coeffs[..., 5, :]
+    result = result + C2[2] * (2.0 * z2 - x2 - y2)[..., None] * sh_coeffs[..., 6, :]
+    result = result + C2[3] * xz[..., None] * sh_coeffs[..., 7, :]
+    result = result + C2[4] * (x2 - y2)[..., None] * sh_coeffs[..., 8, :]
+
+    # degree 3 terms omitted here for brevity; full 16-coefficient version in the code file
+    return result
+</code></pre>
+<p>学习<code>sh_coeffs</code>在转换时,你将其对当前的视图方向进行评估,并得到3向量 RGB.</p>
+<h2>用它</h2>
+<p>对于真正的3DGS工作,使用<code>gsplat</code>其他地方<code>nerfstudio</code>其他:</p>
+<pre><code class="language-bash">pip install nerfstudio gsplat
+ns-download-data example
+ns-train splatfacto --data path/to/data
+</code></pre>
+<p><code>splatfacto</code>运行时间在RTX 4090上需要10-30分钟,</p>
+<p>2026年重要的出口选择:</p>
+<ul>
+<li><code>.ply</code>原始的高斯云 (可载,最大的文件).</li>
+<li><code>.splat</code> 播放卡通/超级平板量化格式.</li>
+<li>鱼<code>KHR_gaussian_splatting</code> 克罗诺斯标准,可通过观众传输 (Feb 2026 RC).</li>
+<li>开通美元<code>UsdVolParticleField3DGaussianSplat</code> 美国元原产品,用于NVIDIA Omniverse和Vision Pro管道.</li>
+</ul>
+<p>对于4D/动态场景,<code>4DGS</code>其他<code>Deformable-3DGS</code>延伸相同的机器,使用不同的时间和不透明度.</p>
+<h2>运送它</h2>
+<p>这一课产生了:</p>
+<ul>
+<li><code>outputs/prompt-3dgs-capture-planner.md</code>一个提示,为特定场景类型计划拍摄会话 (照片数量,摄像头路径,照明).</li>
+<li><code>outputs/skill-3dgs-export-router.md</code>选择合适的出口格式的技能 (<code>.ply</code>现在,<code>.splat</code>视频显示器或发动机.</li>
+</ul>
+<h2>运动</h2>
+<ol>
+<li>**(Easy)**运行上面的2D光训练器,以不同的合成图像.<code>num_splats</code>在<code>[16, 64, 256]</code>确定降低回报的点.</li>
+<li>**(Medium)**扩展2D纹器以支持每高斯式RGB颜色,这些颜色依赖于一个尺度&quot;视角&quot;通过2度和. 训练一对目标图像,并验证模型重建两者.</li>
+<li>**(Hard)**克隆<code>nerfstudio</code>列车<code>splatfacto</code>您的任何场景 (桌子,植物,面部,房间) 拍摄的20张照片.<code>KHR_gaussian_splatting</code>打开一个视频器 (Three.js <code>GaussianSplats3D</code>报告训练时间,高斯人数量,和转载的fps.</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>3DGS</td>
+<td>&quot;Gaussian splats&quot;</td>
+<td>Explicit scene representation as millions of 3D Gaussians with per-Gaussian position, rotation, scale, opacity, SH colour</td>
+</tr>
+<tr>
+<td>Covariance</td>
+<td>&quot;Shape of the Gaussian&quot;</td>
+<td><code>Sigma = R S S^T R^T</code>; orientation and anisotropic scale of one Gaussian</td>
+</tr>
+<tr>
+<td>Alpha compositing</td>
+<td>&quot;Back-to-front blend&quot;</td>
+<td>Same equation as NeRF's volumetric render, now over an explicit sparse set</td>
+</tr>
+<tr>
+<td>Densification</td>
+<td>&quot;Clone and split&quot;</td>
+<td>Adaptive addition of new Gaussians where reconstruction is under-fit</td>
+</tr>
+<tr>
+<td>Pruning</td>
+<td>&quot;Delete low-opacity&quot;</td>
+<td>Remove Gaussians that have collapsed to near-zero opacity during training</td>
+</tr>
+<tr>
+<td>Spherical harmonics</td>
+<td>&quot;View-dependent colour&quot;</td>
+<td>Fourier basis on the sphere; stores colour as a function of viewing direction</td>
+</tr>
+<tr>
+<td>Splatfacto</td>
+<td>&quot;nerfstudio's 3DGS&quot;</td>
+<td>The easiest path to training 3DGS in 2026</td>
+</tr>
+<tr>
+<td><code>KHR_gaussian_splatting</code></td>
+<td>&quot;glTF standard&quot;</td>
+<td>Khronos 2026 extension that makes 3DGS portable across viewers and engines</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/" rel="noreferrer" data-network="true">3D Gaussian Splatting for Real-Time Radiance Field Rendering (Kerbl et al., SIGGRAPH 2023) <small>↗ 需要联网</small></a>原始纸</li>
+<li><a href="https://github.com/nerfstudio-project/gsplat" rel="noreferrer" data-network="true">gsplat (Meta/nerfstudio) <small>↗ 需要联网</small></a>生产质量的CUDA粉丝</li>
+<li><a href="https://docs.nerf.studio/nerfology/methods/splat.html" rel="noreferrer" data-network="true">nerfstudio Splatfacto <small>↗ 需要联网</small></a>参考培训配方</li>
+<li><a href="https://github.com/KhronosGroup/glTF/blob/main/extensions/2.0/Khronos/KHR_gaussian_splatting/README.md" rel="noreferrer" data-network="true">Khronos KHR_gaussian_splatting extension <small>↗ 需要联网</small></a>2026年可移植格式</li>
+<li><a href="https://openusd.org/release/" rel="noreferrer" data-network="true">OpenUSD 26.03 release notes <small>↗ 需要联网</small></a> <code>UsdVolParticleField3DGaussianSplat</code>方案</li>
+<li><a href="https://www.thefuture3d.com/blog-0/2026/4/4/state-of-gaussian-splatting-2026" rel="noreferrer" data-network="true">THE FUTURE 3D State of Gaussian Splatting 2026 <small>↗ 需要联网</small></a>行业概述</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>3D Gaussian Splatting from Scratch</h1>
+<blockquote>
+<p>A scene is a cloud of millions of 3D Gaussians. Each one has a position, orientation, scale, opacity, and a colour that depends on viewing direction. Rasterise them, backprop through the rasterisation, done.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 4 Lesson 13 (3D Vision &amp; NeRF), Phase 1 Lesson 12 (Tensor Operations), Phase 4 Lesson 10 (Diffusion basics optional)
+<strong>Time:</strong> ~90 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Explain why 3D Gaussian Splatting replaced NeRF as the production default for photorealistic 3D reconstruction in 2026</li>
+<li>State the six per-Gaussian parameters (position, rotation quaternion, scale, opacity, spherical harmonics colour, optional feature) and how many floats each contributes</li>
+<li>Implement a 2D Gaussian splatting rasterizer from scratch using <code>alpha</code> compositing, then show how the 3D case projects to the same loop</li>
+<li>Use <code>nerfstudio</code>, <code>gsplat</code>, or <code>SuperSplat</code> to reconstruct a scene from 20-50 photos and export to the <code>KHR_gaussian_splatting</code> glTF extension or the OpenUSD 26.03 <code>UsdVolParticleField3DGaussianSplat</code> schema</li>
+</ul>
+<h2>The Problem</h2>
+<p>A NeRF stores a scene as the weights of an MLP. Every rendered pixel is hundreds of MLP queries along a ray. Training takes hours, rendering takes seconds, and the weights cannot be edited — if you want to move a chair inside a scene, you have to retrain.</p>
+<p>3D Gaussian Splatting (Kerbl, Kopanas, Leimkühler, Drettakis, SIGGRAPH 2023) replaced all of that. A scene is an explicit set of 3D Gaussians. Rendering is GPU rasterisation at 100+ fps. Training takes minutes. Editing is direct: translate a subset of Gaussians and you have moved the chair. By 2026 the Khronos Group has ratified a glTF extension for Gaussian splats, OpenUSD 26.03 ships a Gaussian splat schema, Zillow and Apartments.com render real estate with them, and most new research papers on 3D reconstruction are variants on the core 3DGS idea.</p>
+<p>The mental model is simple, the math has enough moving parts that most introductions start at rasterisation and skip past the projections and spherical harmonics. This lesson builds the whole thing — a 2D version first, then the 3D extension.</p>
+<h2>The Concept</h2>
+<h3>What a Gaussian carries</h3>
+<p>One 3D Gaussian is a parametric blob in space with these attributes:</p>
+<pre><code>position         mu         (3,)    centre in world coordinates
+rotation         q          (4,)    unit quaternion encoding orientation
+scale            s          (3,)    log-scales per axis (exponentiated at render time)
+opacity          alpha      (1,)    post-sigmoid opacity [0, 1]
+SH coefficients  c_lm       (3 * (L+1)^2,)   view-dependent colour
+</code></pre>
+<p>Rotation + scale build a 3x3 covariance: <code>Sigma = R S S^T R^T</code>. That is the shape of the Gaussian in 3D. Spherical harmonics let the colour change with viewing direction — specular highlights, subtle sheen, view-dependent glow — without storing per-view textures. With SH degree 3 you get 16 coefficients per colour channel, 48 floats per Gaussian for colour alone.</p>
+<p>A scene typically has 1-5 million Gaussians. Each stores roughly 60 floats (3 + 4 + 3 + 1 + 48 + misc). That is 240 MB for a five-million-Gaussian scene — far smaller than the equivalent point cloud with per-point texture, and an order of magnitude smaller than a NeRF's MLP weights re-rendered at high resolution.</p>
+<h3>Rasterisation, not ray marching</h3>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-0f7ce9153918f332568e.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>Five steps, all GPU-friendly. No MLP query per pixel. A single RTX 3080 Ti renders 6 million splats at 147 fps.</p>
+<h3>The projection step</h3>
+<p>The 3D Gaussian at world position <code>mu</code> with 3D covariance <code>Sigma</code> projects to a 2D Gaussian at screen position <code>mu'</code> with 2D covariance <code>Sigma'</code>:</p>
+<pre><code>mu' = project(mu)
+Sigma' = J W Sigma W^T J^T          (2 x 2)
+
+W = viewing transform (rotation + translation of camera)
+J = Jacobian of the perspective projection at mu'
+</code></pre>
+<p>The 2D Gaussian's footprint is an ellipse whose axes are the eigenvectors of <code>Sigma'</code>. Every pixel inside that ellipse receives the Gaussian's contribution, weighted by <code>exp(-0.5 * (p - mu')^T Sigma'^-1 (p - mu'))</code>.</p>
+<h3>The alpha-compositing rule</h3>
+<p>For one pixel, the Gaussians that cover it are sorted back-to-front (or equivalently front-to-back with inverted formula). Colour is composited with the same equation as every semi-transparent rasteriser since the 1980s:</p>
+<pre><code>C_pixel = sum_i alpha_i * T_i * c_i
+
+T_i = prod_{j &lt; i} (1 - alpha_j)       transmittance up to i
+alpha_i = opacity_i * exp(-0.5 * d^T Sigma'^-1 d)   local contribution
+c_i = eval_SH(SH_i, view_direction)    view-dependent colour
+</code></pre>
+<p>This is <strong>the same equation as NeRF's volumetric render</strong>, just over an explicit sparse set of Gaussians instead of dense samples along a ray. That identity is why rendered quality matches NeRF — both are integrating the same radiance-field equation.</p>
+<h3>Why this is differentiable</h3>
+<p>Every step — projection, tile assignment, alpha compositing, SH evaluation — is differentiable with respect to the Gaussian parameters. Given a ground-truth image, compute rendered pixel loss, backprop through the rasteriser, update all <code>(mu, q, s, alpha, c_lm)</code> by gradient descent. Over ~30,000 iterations the Gaussians find their right positions, scales, and colours.</p>
+<h3>Densification and pruning</h3>
+<p>A fixed set of Gaussians cannot cover a complex scene. Training includes two adaptive mechanisms:</p>
+<ul>
+<li><strong>Clone</strong> a Gaussian at its current position when its gradient magnitude is high but its scale is small — the reconstruction needs more detail here.</li>
+<li><strong>Split</strong> a large-scale Gaussian into two smaller ones when its gradient is high — one big Gaussian is too smooth to fit the region.</li>
+<li><strong>Prune</strong> Gaussians whose opacity drops below a threshold — they are not contributing.</li>
+</ul>
+<p>Densification runs every N iterations. A scene typically grows from ~100k initial Gaussians (seeded from SfM points) to 1-5M at the end of training.</p>
+<h3>Spherical harmonics in one paragraph</h3>
+<p>View-dependent colour is a function <code>c(direction)</code> on the unit sphere. Spherical harmonics are the sphere's Fourier basis. Truncate at degree <code>L</code> and you get <code>(L+1)^2</code> basis functions per channel. Evaluating the colour for a new view is a dot product between the learned SH coefficients and the basis evaluated at the viewing direction. Degree 0 = one coefficient = constant colour. Degree 3 = 16 coefficients = enough to capture Lambertian shading, specular, and mild reflection. SD Gaussian Splatting papers use degree 3 by default.</p>
+<h3>The 2026 production stack</h3>
+<pre><code>1. Capture         smartphone / DJI drone / handheld scanner
+2. SfM / MVS       COLMAP or GLOMAP derives camera poses + sparse points
+3. Train 3DGS      nerfstudio / gsplat / inria official / PostShot (~10-30 min on RTX 4090)
+4. Edit            SuperSplat / SplatForge (clean floaters, segment)
+5. Export          .ply -&gt; glTF KHR_gaussian_splatting or .usd (OpenUSD 26.03)
+6. View            Cesium / Unreal / Babylon.js / Three.js / Vision Pro
+</code></pre>
+<h3>4D and generative variants</h3>
+<ul>
+<li><strong>4D Gaussian Splatting</strong> — Gaussians are functions of time; used for volumetric video (Superman 2026, A$AP Rocky's &quot;Helicopter&quot;).</li>
+<li><strong>Generative splats</strong> — text-to-splat models (Marble by World Labs) that hallucinate entire scenes.</li>
+<li><strong>3D Gaussian Unscented Transform</strong> — NVIDIA NuRec's variant for autonomous driving simulation.</li>
+</ul>
+<figure><img src="/learn/ai-from-scratch/figures/figure-6f7a6f2246356f541e4d.png" alt="cv3-gaussian-splat 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<h3>Step 1: A 2D Gaussian</h3>
+<p>We first build a 2D rasteriser. The 3D case reduces to it after projection.</p>
+<pre><code class="language-python">import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+def eval_2d_gaussian(means, covs, points):
+    &quot;&quot;&quot;
+    means:  (G, 2)      centres
+    covs:   (G, 2, 2)   covariance matrices
+    points: (H, W, 2)   pixel coordinates
+    returns: (G, H, W)  density at every pixel for every Gaussian
+    &quot;&quot;&quot;
+    G = means.size(0)
+    H, W, _ = points.shape
+    flat = points.view(-1, 2)
+    inv = torch.linalg.inv(covs)
+    diff = flat[None, :, :] - means[:, None, :]
+    d = torch.einsum(&quot;gpi,gij,gpj-&gt;gp&quot;, diff, inv, diff)
+    density = torch.exp(-0.5 * d)
+    return density.view(G, H, W)
+</code></pre>
+<p><code>einsum</code> does the quadratic form <code>diff^T Sigma^-1 diff</code> for every (Gaussian, pixel) pair.</p>
+<h3>Step 2: 2D splatting rasteriser</h3>
+<p>Alpha-compositing front-to-back. Depth in 2D is meaningless, so we use a learned per-Gaussian scalar for order.</p>
+<pre><code class="language-python">def rasterise_2d(means, covs, colours, opacities, depths, image_size):
+    &quot;&quot;&quot;
+    means:     (G, 2)
+    covs:      (G, 2, 2)
+    colours:   (G, 3)
+    opacities: (G,)     in [0, 1]
+    depths:    (G,)     per-Gaussian scalar used for ordering
+    image_size: (H, W)
+    returns:   (H, W, 3) rendered image
+    &quot;&quot;&quot;
+    H, W = image_size
+    yy, xx = torch.meshgrid(
+        torch.arange(H, dtype=torch.float32, device=means.device),
+        torch.arange(W, dtype=torch.float32, device=means.device),
+        indexing=&quot;ij&quot;,
+    )
+    points = torch.stack([xx, yy], dim=-1)
+
+    densities = eval_2d_gaussian(means, covs, points)
+    alphas = opacities[:, None, None] * densities
+    alphas = alphas.clamp(0.0, 0.99)
+
+    order = torch.argsort(depths)
+    alphas = alphas[order]
+    colours_sorted = colours[order]
+
+    T = torch.ones(H, W, device=means.device)
+    out = torch.zeros(H, W, 3, device=means.device)
+    for i in range(means.size(0)):
+        a = alphas[i]
+        out += (T * a)[..., None] * colours_sorted[i][None, None, :]
+        T = T * (1.0 - a)
+    return out
+</code></pre>
+<p>Not fast — a real implementation uses tile-based CUDA kernels — but exactly the right math and fully differentiable.</p>
+<h3>Step 3: A trainable 2D splat scene</h3>
+<pre><code class="language-python">class Splats2D(nn.Module):
+    def __init__(self, num_splats=128, image_size=64, seed=0):
+        super().__init__()
+        g = torch.Generator().manual_seed(seed)
+        H, W = image_size, image_size
+        self.means = nn.Parameter(torch.rand(num_splats, 2, generator=g) * torch.tensor([W, H]))
+        self.log_scale = nn.Parameter(torch.ones(num_splats, 2) * math.log(2.0))
+        self.rot = nn.Parameter(torch.zeros(num_splats))  # single angle in 2D
+        self.colour_logits = nn.Parameter(torch.randn(num_splats, 3, generator=g) * 0.5)
+        self.opacity_logit = nn.Parameter(torch.zeros(num_splats))
+        self.depth = nn.Parameter(torch.rand(num_splats, generator=g))
+
+    def covs(self):
+        s = torch.exp(self.log_scale)
+        c, si = torch.cos(self.rot), torch.sin(self.rot)
+        R = torch.stack([
+            torch.stack([c, -si], dim=-1),
+            torch.stack([si, c], dim=-1),
+        ], dim=-2)
+        S = torch.diag_embed(s ** 2)
+        return R @ S @ R.transpose(-1, -2)
+
+    def forward(self, image_size):
+        covs = self.covs()
+        colours = torch.sigmoid(self.colour_logits)
+        opacities = torch.sigmoid(self.opacity_logit)
+        return rasterise_2d(self.means, covs, colours, opacities, self.depth, image_size)
+</code></pre>
+<p><code>log_scale</code>, <code>opacity_logit</code>, and <code>colour_logits</code> are all unconstrained parameters mapped through the right activation at render time. This is the standard pattern for every 3DGS implementation.</p>
+<h3>Step 4: Fit 2D Gaussians to a target image</h3>
+<pre><code class="language-python">import math
+import numpy as np
+
+def make_target(size=64):
+    yy, xx = np.meshgrid(np.arange(size), np.arange(size), indexing=&quot;ij&quot;)
+    img = np.zeros((size, size, 3), dtype=np.float32)
+    # Red circle
+    mask = (xx - 20) ** 2 + (yy - 20) ** 2 &lt; 10 ** 2
+    img[mask] = [1.0, 0.2, 0.2]
+    # Blue square
+    mask = (np.abs(xx - 45) &lt; 8) &amp; (np.abs(yy - 40) &lt; 8)
+    img[mask] = [0.2, 0.3, 1.0]
+    return torch.from_numpy(img)
+
+
+target = make_target(64)
+model = Splats2D(num_splats=64, image_size=64)
+opt = torch.optim.Adam(model.parameters(), lr=0.05)
+
+for step in range(200):
+    pred = model((64, 64))
+    loss = F.mse_loss(pred, target)
+    opt.zero_grad(); loss.backward(); opt.step()
+    if step % 40 == 0:
+        print(f&quot;step {step:3d}  mse {loss.item():.4f}&quot;)
+</code></pre>
+<p>Over 200 steps the 64 Gaussians settle into the two shapes. That is the entire idea — gradient-descent on explicit geometric primitives.</p>
+<h3>Step 5: From 2D to 3D</h3>
+<p>The 3D extension keeps the same loop. The additions:</p>
+<ol>
+<li>Per-Gaussian rotation is a quaternion instead of a single angle.</li>
+<li>Covariance is <code>R S S^T R^T</code> with <code>R</code> built from the quaternion and <code>S = diag(exp(log_scale))</code>.</li>
+<li>Projection <code>(mu, Sigma) -&gt; (mu', Sigma')</code> uses the camera extrinsics and the Jacobian of the perspective projection at <code>mu</code>.</li>
+<li>Colour becomes a spherical-harmonics expansion; evaluate it at the viewing direction.</li>
+<li>Depth-sort is from actual camera-space z instead of a learned scalar.</li>
+</ol>
+<p>Every production implementation (<code>gsplat</code>, <code>inria/gaussian-splatting</code>, <code>nerfstudio</code>) does exactly this on the GPU with tile-based CUDA kernels.</p>
+<h3>Step 6: Spherical harmonics evaluation</h3>
+<p>The SH basis up to degree 3 has 16 terms per channel. Evaluation:</p>
+<pre><code class="language-python">def eval_sh_degree_3(sh_coeffs, dirs):
+    &quot;&quot;&quot;
+    sh_coeffs: (..., 16, 3)   last dim is RGB channels
+    dirs:      (..., 3)       unit vectors
+    returns:   (..., 3)
+    &quot;&quot;&quot;
+    C0 = 0.282094791773878
+    C1 = 0.488602511902920
+    C2 = [1.092548430592079, 1.092548430592079,
+          0.315391565252520, 1.092548430592079,
+          0.546274215296039]
+    x, y, z = dirs[..., 0], dirs[..., 1], dirs[..., 2]
+    x2, y2, z2 = x * x, y * y, z * z
+    xy, yz, xz = x * y, y * z, x * z
+
+    result = C0 * sh_coeffs[..., 0, :]
+    result = result - C1 * y[..., None] * sh_coeffs[..., 1, :]
+    result = result + C1 * z[..., None] * sh_coeffs[..., 2, :]
+    result = result - C1 * x[..., None] * sh_coeffs[..., 3, :]
+
+    result = result + C2[0] * xy[..., None] * sh_coeffs[..., 4, :]
+    result = result + C2[1] * yz[..., None] * sh_coeffs[..., 5, :]
+    result = result + C2[2] * (2.0 * z2 - x2 - y2)[..., None] * sh_coeffs[..., 6, :]
+    result = result + C2[3] * xz[..., None] * sh_coeffs[..., 7, :]
+    result = result + C2[4] * (x2 - y2)[..., None] * sh_coeffs[..., 8, :]
+
+    # degree 3 terms omitted here for brevity; full 16-coefficient version in the code file
+    return result
+</code></pre>
+<p>Learned <code>sh_coeffs</code> store the &quot;colour in every direction&quot; for that Gaussian. At render time you evaluate against the current view direction and get a 3-vector RGB.</p>
+<h2>Use It</h2>
+<p>For real 3DGS work, use <code>gsplat</code> (Meta) or <code>nerfstudio</code>:</p>
+<pre><code class="language-bash">pip install nerfstudio gsplat
+ns-download-data example
+ns-train splatfacto --data path/to/data
+</code></pre>
+<p><code>splatfacto</code> is nerfstudio's 3DGS trainer. The run takes 10-30 minutes on an RTX 4090 for a typical scene.</p>
+<p>Export options that matter in 2026:</p>
+<ul>
+<li><code>.ply</code> — raw Gaussian cloud (portable, largest file).</li>
+<li><code>.splat</code> — PlayCanvas / SuperSplat quantised format.</li>
+<li>glTF <code>KHR_gaussian_splatting</code> — Khronos standard, portable across viewers (Feb 2026 RC).</li>
+<li>OpenUSD <code>UsdVolParticleField3DGaussianSplat</code> — USD-native, for NVIDIA Omniverse and Vision Pro pipelines.</li>
+</ul>
+<p>For 4D / dynamic scenes, <code>4DGS</code> and <code>Deformable-3DGS</code> extend the same machinery with time-varying means and opacities.</p>
+<h2>Ship It</h2>
+<p>This lesson produces:</p>
+<ul>
+<li><code>outputs/prompt-3dgs-capture-planner.md</code> — a prompt that plans a capture session (number of photos, camera path, lighting) for a given scene type.</li>
+<li><code>outputs/skill-3dgs-export-router.md</code> — a skill that picks the right export format (<code>.ply</code> / <code>.splat</code> / glTF / USD) given the downstream viewer or engine.</li>
+</ul>
+<h2>Exercises</h2>
+<ol>
+<li><strong>(Easy)</strong> Run the 2D splat trainer above on a different synthetic image. Vary <code>num_splats</code> in <code>[16, 64, 256]</code> and plot MSE vs step for each. Identify the point of diminishing returns.</li>
+<li><strong>(Medium)</strong> Extend the 2D rasteriser to support per-Gaussian RGB colours that depend on a scalar &quot;view angle&quot; through a degree-2 harmonic. Train on a pair of target images and verify the model reconstructs both.</li>
+<li><strong>(Hard)</strong> Clone <code>nerfstudio</code> and train <code>splatfacto</code> on a 20-photo capture of any scene you have (desk, plant, face, room). Export to glTF <code>KHR_gaussian_splatting</code> and open it in a viewer (Three.js <code>GaussianSplats3D</code>, SuperSplat, Babylon.js V9). Report training time, number of Gaussians, and rendered fps.</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>3DGS</td>
+<td>&quot;Gaussian splats&quot;</td>
+<td>Explicit scene representation as millions of 3D Gaussians with per-Gaussian position, rotation, scale, opacity, SH colour</td>
+</tr>
+<tr>
+<td>Covariance</td>
+<td>&quot;Shape of the Gaussian&quot;</td>
+<td><code>Sigma = R S S^T R^T</code>; orientation and anisotropic scale of one Gaussian</td>
+</tr>
+<tr>
+<td>Alpha compositing</td>
+<td>&quot;Back-to-front blend&quot;</td>
+<td>Same equation as NeRF's volumetric render, now over an explicit sparse set</td>
+</tr>
+<tr>
+<td>Densification</td>
+<td>&quot;Clone and split&quot;</td>
+<td>Adaptive addition of new Gaussians where reconstruction is under-fit</td>
+</tr>
+<tr>
+<td>Pruning</td>
+<td>&quot;Delete low-opacity&quot;</td>
+<td>Remove Gaussians that have collapsed to near-zero opacity during training</td>
+</tr>
+<tr>
+<td>Spherical harmonics</td>
+<td>&quot;View-dependent colour&quot;</td>
+<td>Fourier basis on the sphere; stores colour as a function of viewing direction</td>
+</tr>
+<tr>
+<td>Splatfacto</td>
+<td>&quot;nerfstudio's 3DGS&quot;</td>
+<td>The easiest path to training 3DGS in 2026</td>
+</tr>
+<tr>
+<td><code>KHR_gaussian_splatting</code></td>
+<td>&quot;glTF standard&quot;</td>
+<td>Khronos 2026 extension that makes 3DGS portable across viewers and engines</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/" rel="noreferrer" data-network="true">3D Gaussian Splatting for Real-Time Radiance Field Rendering (Kerbl et al., SIGGRAPH 2023) <small>↗ 需要联网</small></a> — the original paper</li>
+<li><a href="https://github.com/nerfstudio-project/gsplat" rel="noreferrer" data-network="true">gsplat (Meta/nerfstudio) <small>↗ 需要联网</small></a> — production-quality CUDA rasteriser</li>
+<li><a href="https://docs.nerf.studio/nerfology/methods/splat.html" rel="noreferrer" data-network="true">nerfstudio Splatfacto <small>↗ 需要联网</small></a> — reference training recipe</li>
+<li><a href="https://github.com/KhronosGroup/glTF/blob/main/extensions/2.0/Khronos/KHR_gaussian_splatting/README.md" rel="noreferrer" data-network="true">Khronos KHR_gaussian_splatting extension <small>↗ 需要联网</small></a> — the 2026 portable format</li>
+<li><a href="https://openusd.org/release/" rel="noreferrer" data-network="true">OpenUSD 26.03 release notes <small>↗ 需要联网</small></a> — <code>UsdVolParticleField3DGaussianSplat</code> schema</li>
+<li><a href="https://www.thefuture3d.com/blog-0/2026/4/4/state-of-gaussian-splatting-2026" rel="noreferrer" data-network="true">THE FUTURE 3D State of Gaussian Splatting 2026 <small>↗ 需要联网</small></a> — industry overview</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-04-computer-vision--22-3d-gaussian-splatting.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-04-computer-vision--22-3d-gaussian-splatting.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/04-computer-vision/22-3d-gaussian-splatting/code/main.py">phases/04-computer-vision/22-3d-gaussian-splatting/code/main.py</a><details><summary>查看原始文本</summary><pre><code>import math
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+def eval_2d_gaussian(means, covs, points):
+    G = means.size(0)
+    H, W, _ = points.shape
+    flat = points.view(-1, 2)
+    inv = torch.linalg.inv(covs)
+    diff = flat[None, :, :] - means[:, None, :]
+    d = torch.einsum(&quot;gpi,gij,gpj-&gt;gp&quot;, diff, inv, diff)
+    density = torch.exp(-0.5 * d)
+    return density.view(G, H, W)
+
+
+def rasterise_2d(means, covs, colours, opacities, depths, image_size):
+    H, W = image_size
+    device = means.device
+    yy, xx = torch.meshgrid(
+        torch.arange(H, dtype=torch.float32, device=device),
+        torch.arange(W, dtype=torch.float32, device=device),
+        indexing=&quot;ij&quot;,
+    )
+    points = torch.stack([xx, yy], dim=-1)
+    densities = eval_2d_gaussian(means, covs, points)
+    alphas = opacities[:, None, None] * densities
+    alphas = alphas.clamp(0.0, 0.99)
+
+    order = torch.argsort(depths)
+    alphas = alphas[order]
+    colours_sorted = colours[order]
+
+    T = torch.ones(H, W, device=device)
+    out = torch.zeros(H, W, 3, device=device)
+    for i in range(means.size(0)):
+        a = alphas[i]
+        out = out + (T * a)[..., None] * colours_sorted[i][None, None, :]
+        T = T * (1.0 - a)
+    return out
+
+
+class Splats2D(nn.Module):
+    def __init__(self, num_splats=64, image_size=64, seed=0):
+        super().__init__()
+        g = torch.Generator().manual_seed(seed)
+        H, W = image_size, image_size
+        self.means = nn.Parameter(torch.rand(num_splats, 2, generator=g) * torch.tensor([W, H]))
+        self.log_scale = nn.Parameter(torch.full((num_splats, 2), math.log(3.0)))
+        self.rot = nn.Parameter(torch.zeros(num_splats))
+        self.colour_logits = nn.Parameter(torch.randn(num_splats, 3, generator=g) * 0.3)
+        self.opacity_logit = nn.Parameter(torch.zeros(num_splats))
+        self.depth = nn.Parameter(torch.rand(num_splats, generator=g))
+
+    def covs(self):
+        s = torch.exp(self.log_scale)
+        c, si = torch.cos(self.rot), torch.sin(self.rot)
+        R = torch.stack([
+            torch.stack([c, -si], dim=-1),
+            torch.stack([si, c], dim=-1),
+        ], dim=-2)
+        S = torch.diag_embed(s ** 2)
+        return R @ S @ R.transpose(-1, -2)
+
+    def forward(self, image_size):
+        covs = self.covs()
+        colours = torch.sigmoid(self.colour_logits)
+        opacities = torch.sigmoid(self.opacity_logit)
+        return rasterise_2d(self.means, covs, colours, opacities, self.depth, image_size)
+
+
+def make_target(size=48):
+    yy, xx = np.meshgrid(np.arange(size), np.arange(size), indexing=&quot;ij&quot;)
+    img = np.ones((size, size, 3), dtype=np.float32)
+    mask = (xx - 15) ** 2 + (yy - 15) ** 2 &lt; 8 ** 2
+    img[mask] = [0.95, 0.2, 0.15]
+    mask = (np.abs(xx - 34) &lt; 6) &amp; (np.abs(yy - 32) &lt; 6)
+    img[mask] = [0.2, 0.35, 0.95]
+    return torch.from_numpy(img)
+
+
+def sh_degree_3_basis(dirs):
+    x, y, z = dirs[..., 0], dirs[..., 1], dirs[..., 2]
+    x2, y2, z2 = x * x, y * y, z * z
+    xy, yz, xz = x * y, y * z, x * z
+    C0 = 0.282094791773878
+    C1 = 0.488602511902920
+    C2 = [1.092548430592079, 1.092548430592079,
+          0.315391565252520, 1.092548430592079,
+          0.546274215296039]
+    C3 = [0.590043589926644, 2.890611442640554,
+          0.457045799464465, 0.373176332590115,
+          0.457045799464465, 1.445305721320277,
+          0.590043589926644]
+    basis = torch.stack([
+        torch.full_like(x, C0),
+        -C1 * y, C1 * z, -C1 * x,
+        C2[0] * xy, C2[1] * yz, C2[2] * (2 * z2 - x2 - y2), C2[3] * xz, C2[4] * (x2 - y2),
+        -C3[0] * y * (3 * x2 - y2), C3[1] * xy * z, -C3[2] * y * (4 * z2 - x2 - y2),
+        C3[3] * z * (2 * z2 - 3 * x2 - 3 * y2), -C3[4] * x * (4 * z2 - x2 - y2),
+        C3[5] * z * (x2 - y2), -C3[6] * x * (x2 - 3 * y2),
+    ], dim=-1)
+    return basis
+
+
+def eval_sh_degree_3(sh_coeffs, dirs):
+    basis = sh_degree_3_basis(dirs)
+    return torch.einsum(&quot;...b,...bc-&gt;...c&quot;, basis, sh_coeffs)
+
+
+def main():
+    torch.manual_seed(0)
+    device = &quot;cpu&quot;
+
+    target = make_target(48).to(device)
+    model = Splats2D(num_splats=48, image_size=48).to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=0.08)
+
+    print(&quot;Fitting 48 2D Gaussians to a red circle + blue square...&quot;)
+    for step in range(300):
+        pred = model((48, 48))
+        loss = F.mse_loss(pred, target)
+        opt.zero_grad(); loss.backward(); opt.step()
+        if step % 50 == 0:
+            print(f&quot;  step {step:3d}  mse {loss.item():.4f}&quot;)
+
+    with torch.no_grad():
+        final = F.mse_loss(model((48, 48)), target).item()
+    print(f&quot;final mse: {final:.4f}&quot;)
+
+    print(&quot;\nSpherical harmonics sanity check:&quot;)
+    sh = torch.randn(1, 16, 3)
+    dirs = F.normalize(torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]), dim=-1)
+    rgb = eval_sh_degree_3(sh, dirs)
+    print(f&quot;  SH(16, 3) evaluated at 3 directions -&gt; {tuple(rgb.shape)}&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/04-computer-vision/22-3d-gaussian-splatting/outputs/prompt-3dgs-capture-planner.md">phases/04-computer-vision/22-3d-gaussian-splatting/outputs/prompt-3dgs-capture-planner.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: prompt-3dgs-capture-planner
+description: Plan a photo capture session for 3DGS reconstruction given scene type and hardware
+phase: 4
+lesson: 22
+---
+
+You are a 3DGS capture planner. Given the scene and hardware, return a specific shooting plan.
+
+## Inputs
+
+- `scene_type`: small_object | room | building_exterior | landscape | face_portrait | product_shot
+- `hardware`: smartphone | DSLR | drone | handheld_LiDAR_scanner
+- `lighting`: natural | indoor_controlled | mixed | harsh_sun
+- `target_quality`: preview | production
+
+## Decision rules
+
+### Photo count
+
+- small_object (&lt; 1 m): 60-120 photos, full sphere of angles.
+- room: 120-300 photos, figure-8 path through the room.
+- building_exterior: 200-500 photos, drone orbit at 2-3 altitudes.
+- landscape: drone mission grid, 150+ photos.
+- face_portrait: 60-80, evenly spaced on front hemisphere.
+- product_shot: 80-120 photos on turntable + elevation sweep.
+
+### Capture rules
+
+1. Overlap between consecutive photos must be &gt;= 70%.
+2. Camera exposure locked — autoexposure variance confuses SfM.
+3. No motion blur: fast shutter, stabilise or tripod.
+4. Cover every angle likely to be rendered; holes in coverage become floaters.
+5. Avoid mirrors, transparent glass, and highly reflective metal; 3DGS handles them poorly.
+6. Aim for matte surfaces and diffuse light; harsh shadows bake into the scene.
+
+### SfM step
+
+- Process photos through COLMAP or GLOMAP first to produce camera poses + sparse points.
+- Verify reprojection error &lt; 1 pixel on average before starting 3DGS training.
+- Typical output: `cameras.bin`, `images.bin`, `points3D.bin` — feed directly to `splatfacto`.
+
+## Output
+
+```
+[capture plan]
+  scene:           &lt;type&gt;
+  hardware:        &lt;device&gt;
+  photo count:     &lt;N&gt;
+  capture path:    &lt;orbit / figure-8 / hemisphere / grid&gt;
+  exposure:        locked at &lt;settings&gt;
+  focal length:    fixed | zoom-locked
+
+[processing pipeline]
+  1. SfM: COLMAP | GLOMAP
+  2. 3DGS train: nerfstudio splatfacto | gsplat
+  3. cleanup: SuperSplat (remove floaters)
+  4. export: &lt;.ply | glTF KHR_gaussian_splatting | USD&gt;
+
+[quality expectations]
+  Gaussian count after training: &lt;approx&gt;
+  rendered fps:                  &lt;approx&gt;
+  known failure modes:           &lt;list&gt;
+```
+
+## Rules
+
+- Do not recommend handheld captures for outdoor landscapes &gt; 100 m — use a drone mission.
+- For face portraits, flag that 3DGS struggles with hair detail below a certain photo count.
+- Never recommend capturing in direct harsh sunlight for production quality; suggest golden hour or overcast.
+- If the downstream engine is Omniverse, Pixar, or Apple Vision Pro, route export to OpenUSD (USDZ for Apple). If it is a web engine (Three.js, Babylon.js, Cesium), route to glTF `KHR_gaussian_splatting`. For Unreal, route to the Volinga plugin or glTF KHR.
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/04-computer-vision/22-3d-gaussian-splatting/outputs/skill-3dgs-export-router.md">phases/04-computer-vision/22-3d-gaussian-splatting/outputs/skill-3dgs-export-router.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: skill-3dgs-export-router
+description: Pick the right 3DGS export format (.ply / .splat / glTF KHR_gaussian_splatting / USD) given the downstream viewer or engine
+version: 1.0.0
+phase: 4
+lesson: 22
+tags: [3d-gaussian-splatting, export, glTF, OpenUSD, pipeline]
+---
+
+# 3DGS Export Router
+
+Map a downstream target to the right 3DGS file format. Saves hours of &quot;it does not load&quot; debugging.
+
+## When to use
+
+- After training a 3DGS scene, before sharing it with a content pipeline.
+- Choosing between research-grade (.ply) and production-grade (glTF / USD) formats.
+- Pipeline handoff: capture team -&gt; 3DGS engineer -&gt; game designer / VFX artist / web developer.
+
+## Inputs
+
+- `target_engine`: unreal | unity | omniverse | blender | vision_pro | three_js | babylon_js | cesium | playcanvas | supersplat
+- `priority`: portability | file_size | quality_preservation
+- `include_sh_degree`: 0 | 1 | 2 | 3
+
+## Format decision
+
+| Target | Recommended format | Why |
+|--------|--------------------|-----|
+| Unreal Engine (virtual production) | Volinga plugin or glTF KHR_gaussian_splatting | Native Unreal SDK path |
+| Unity (XR / game) | .ply via Aras-P Unity-GaussianSplatting plugin | Community-standard Unity pipeline |
+| NVIDIA Omniverse, Pixar tools | OpenUSD 26.03 (UsdVolParticleField3DGaussianSplat) | Native USD prim type |
+| Apple Vision Pro | OpenUSD 26.03 | Native to visionOS 2.x |
+| Blender | .ply + KIRI Engine add-on | Community add-on reads raw splats |
+| Three.js web viewer | glTF KHR_gaussian_splatting or .splat | Browser-standard, works with `GaussianSplats3D` |
+| Babylon.js V9+ | glTF KHR_gaussian_splatting | V9 added native support |
+| Cesium (CesiumJS 1.139+, Cesium for Unreal 2.23+) | glTF KHR_gaussian_splatting | Shipped explicit support |
+| PlayCanvas | .splat | PlayCanvas native quantised format |
+| SuperSplat (editor) | .ply or .splat | Import + export |
+
+## Quantisation trade-offs
+
+- `.ply` full-precision: largest file, lossless, any viewer.
+- `.splat`: 4x-8x smaller, slight quality loss on SH3 coefficients, PlayCanvas-ecosystem standard.
+- glTF KHR: configurable via EXT_meshopt_compression; smallest with highest compatibility.
+- USD: compressed by USDZ packaging; smallest for Apple pipelines.
+
+## Output report
+
+```
+[export plan]
+  target:         &lt;engine&gt;
+  format:         &lt;name&gt;
+  sh degree:      &lt;0|1|2|3&gt;
+  compression:    &lt;none|meshopt|quantisation|usdz&gt;
+  expected size:  &lt;MB&gt;
+  compatible with: &lt;list of viewers&gt;
+
+[pipeline]
+  1. source: &lt;.ply from training&gt;
+  2. optional: SuperSplat cleanup pass
+  3. convert: &lt;tool + CLI or API call&gt;
+  4. package: &lt;.gltf / .glb / .usd / .usdz / .splat / .ply&gt;
+  5. validate: &lt;viewer sanity check&gt;
+```
+
+## Rules
+
+- Never strip SH3 coefficients silently — it visibly changes specular reflections.
+- If `priority == file_size`, recommend `.splat` or glTF with meshopt; warn about quality loss.
+- For Apple platforms, prefer USD / USDZ over glTF in 2026; USDZ has first-class visionOS support.
+- If the target viewer&#39;s 3DGS support is pre-standard (pre-Feb 2026), recommend `.ply` and the viewer&#39;s custom loader; Khronos-standard glTF will not yet be recognised.
+- Always validate the exported file in at least one viewer before handing off; silent corruption happens during quantisation.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. Why did 3D Gaussian Splatting largely replace NeRF as the production default for photorealistic scene reconstruction by 2026?</legend><label class="option"><input type="radio" name="q0" value="0"> NeRF was retracted from the research record</label><label class="option"><input type="radio" name="q0" value="1"> 3DGS is explicit (no MLP per pixel): rendering is GPU rasterisation at 100+ fps, training takes minutes instead of hours, scenes are editable, and Khronos + OpenUSD both standardised it in 2026</label><label class="option"><input type="radio" name="q0" value="2"> Gaussian Splatting produces higher image quality than NeRF in every case</label><label class="option"><input type="radio" name="q0" value="3"> PyTorch stopped supporting NeRF operators</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. A 3D Gaussian in a scene carries position, rotation, scale, opacity, and what additional representation to handle view-dependent colour (like specular highlights)?</legend><label class="option"><input type="radio" name="q1" value="0"> A second RGB texture</label><label class="option"><input type="radio" name="q1" value="1"> A small MLP per Gaussian</label><label class="option"><input type="radio" name="q1" value="2"> Spherical harmonics coefficients: up to degree 3 gives 16 coefficients per colour channel, evaluated against the viewing direction at render time</label><label class="option"><input type="radio" name="q1" value="3"> A light probe cubemap</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. During 3DGS training, densification includes &#39;clone&#39; and &#39;split&#39; operations. What triggers each?</legend><label class="option"><input type="radio" name="q2" value="0"> Nothing — Gaussians are fixed after initialisation</label><label class="option"><input type="radio" name="q2" value="1"> High gradient magnitude with small scale triggers clone (more local detail needed); high gradient with large scale triggers split (one Gaussian too smooth to fit the region). Opacity-below-threshold triggers pruning</label><label class="option"><input type="radio" name="q2" value="2"> Time since last checkpoint</label><label class="option"><input type="radio" name="q2" value="3"> Random sampling during every epoch</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. The colour equation for one pixel in both NeRF and 3DGS is `C = sum_i alpha_i * T_i * c_i` where `T_i = prod_{j&lt;i}(1 - alpha_j)`. What does this shared equation say about the two methods?</legend><label class="option"><input type="radio" name="q3" value="0"> NeRF is strictly better</label><label class="option"><input type="radio" name="q3" value="1"> Both integrate the same volumetric rendering equation; the difference is only in the representation (implicit MLP samples vs explicit sparse Gaussians) and the rendering procedure (ray marching vs rasterisation) — which is why their image quality is comparable</label><label class="option"><input type="radio" name="q3" value="2"> They are mathematically identical in every way</label><label class="option"><input type="radio" name="q3" value="3"> 3DGS is strictly better</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. You want to ship a 3DGS scene across Unreal Engine, Vision Pro, Blender, and a Three.js web viewer in 2026. Which export format is the safest bet?</legend><label class="option"><input type="radio" name="q4" value="0"> A custom binary blob per viewer</label><label class="option"><input type="radio" name="q4" value="1"> PNG strips of the 3D Gaussians</label><label class="option"><input type="radio" name="q4" value="2"> Raw `.ply` alone</label><label class="option"><input type="radio" name="q4" value="3"> glTF with the `KHR_gaussian_splatting` extension (Khronos RC Feb 2026) and/or OpenUSD 26.03 with `UsdVolParticleField3DGaussianSplat`; these are the two ratified/standardised formats in 2026</label><p data-feedback="4"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/04-computer-vision/21-keypoint-pose/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/04-computer-vision/23-diffusion-transformers-rectified-flow/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/04-computer-vision/22-3d-gaussian-splatting/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

@@ -1,0 +1,719 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>终端到终端的分发培训 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-19-capstone-projects" data-lesson="19-capstone-projects/81-end-to-end-distributed-train" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/19-capstone-projects/">综合项目</a> / LESSON 81</p><h1 class="lesson-title">终端到终端的分发培训</h1><p>End-to-End Distributed Training</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>终端到终端的分发培训</h1>
+<blockquote>
+<p>课程76到80每个构建一个件.这是组装:一个小型的GPT训练在4个模拟列表中使用DDP进行梯度同步,ZRO-1用于优化状态分化,并在半路标志上进行分化检查点.演示程序运行20步骤,自动结束,打印损失曲线加上存储配置文件,并写出可重复的检查点.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 19 Track C lessons 42-49
+<strong>Time:</strong> ~90 min</p>
+<h2>学习目标</h2>
+<ul>
+<li>组建DDP (课77) 加上ZRO-1 (课78) 加上分断检查站 (课80) 成为一个训练循环.</li>
+<li>在一个小型合成体内训练一个2层变压器语言模型,</li>
+<li>打印每步输失表,每级内存配置文件,以及一个检查点表,</li>
+<li>捍卫作文:每一首作品在早期课程中都可以独立测试,</li>
+</ul>
+<h2>问题</h2>
+<p>石头是证明这些碎片合适的证据. 第76课 实施集体 课77将他们包裹在DPD. 课程 78 缩小_散射的优化状态. 分析了管道. 第80课拯救了一个破碎的检查站. 每个课程都有自己的考验. 如果组合错误,损失会偏离,检查点拒绝恢复,或者每级记忆量会增加,当它应该缩小时.</p>
+<p>本课程进行了端到端演示,验证了四种不变: (a) 漂浮噪音的20个步骤中损失单调减少, (b) 每个级别在每一步都保持相同的参数标准, (c) 每级优化器内存等于 ZeRO-1公式12P/N字节, (d) 步骤10的检查点重装字节等于重启. 演示自动结束:20步,单次命令,出口0.</p>
+<h2>概念</h2>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-8721757af483e72809c5.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>迷你GPT</h3>
+<p>模型是小的: 2个变压器块,嵌入式 32, 4个注意力头,词汇 64,序列长度 16,批量 4. 几千个参数. 足够大,可以执行每个线程决定 (多头注意力运行标准的掩盖路径;LayerNorm有重量进行同步;LM头是单独的线性投影回语音). 足够小,使4个CPU的20步数在几秒钟内完成.</p>
+<h3>组成规则</h3>
+<table>
+<thead>
+<tr>
+<th>Lesson piece</th>
+<th>What it owns</th>
+<th>What it leaves to the loop</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>DDP broadcast</td>
+<td>Initial parameter sync</td>
+<td>One call at construct time</td>
+</tr>
+<tr>
+<td>ZeRO-1 step</td>
+<td>Gradient sync, master copy update, parameter broadcast</td>
+<td>One call per step replacing optimiser.step</td>
+</tr>
+<tr>
+<td>Sharded checkpoint</td>
+<td>Persist per-rank state, manifest with sha256</td>
+<td>Called on rank 0 with state collected via allgather</td>
+</tr>
+<tr>
+<td>Training loop</td>
+<td>Forward, backward, loss logging</td>
+<td>Calls the three above in order</td>
+</tr>
+</tbody>
+</table>
+<p>循环不知道 reduce_scatter 或 rendezvous 文件. ZeRO 和检查点模块暴露了循环构成的狭窄界面.</p>
+<h3>为什么一个小的GPT而不是一个MLP</h3>
+<p>课程77的MLP足以验证梯度同步. 一个小 GPT 增加了三个东西:一个单独的 LM 头在词汇上 (在这个课程中,解开为了清晰度; 完整的 GPT 通常将头绑定到代币嵌入), 软max+跨作为损失 (比MSE更多的数值边缘案例), 和一个不对称的前进 (嵌入,然后注意,然后每层MLP). 粘贴一个MLP的顶石将隐藏是否组合处理LayerNorm或嵌入层的格拉格形状正确.</p>
+<h3>自动终止的意思是出口0</h3>
+<p>循环运行一个固定的20步,然后出门.<code>while True</code>没有人干预,没有外部状态的恢复.一个终点石,你可以让它运行不受监督,并在完成时找到一个完整的日志,这是一个证明系统是正确的线程.如果任何块局,演示器永远不会回来,测试平台抓住它.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-0629853054ce575f43d0.png" alt="ci-distributed-assembly 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<p><code>code/main.py</code>执行:</p>
+<ul>
+<li><code>MiniGPT</code>面具自警器和单独的LM头.</li>
+<li><code>make_corpus(seed, total_tokens)</code>预测数据:</li>
+<li><code>_train_worker</code>:每级发出;播出 init参数,运行循环,调用 ZeRO步骤,在步骤10上写下分断的检查点.</li>
+<li><code>verify_resume</code>: 在主运行后,在过程中重新加载步骤-10检查点,并表示保存的主分片与内存快照相匹配.</li>
+<li><code>main</code>编辑整个演示,打印损失表,内存配置文件和验证结果.</li>
+</ul>
+<p>运行它:</p>
+<pre><code class="language-bash">python3 code/main.py
+</code></pre>
+<p>输出:一个20行损失表,一个每排的4行内存配置文件,一个检查点明示,以及成功的&quot;回复验证&quot;行.</p>
+<h2>野生生产模式</h2>
+<p>对于真正的跑步,三种模式完成了构成.</p>
+<p>**Checkpoint every K minutes, not every K steps.**步骤时间与次数长度和微分数量不同.一个10分钟的检查点序列不论模型大小如何都能捕获相同的计算.课程使用步骤为简单;生产使用墙钟为基础.</p>
+<p>**Detect divergence early.**生产运行后添加一个后退的NAN保护器和损失峰值探测器;如果损失在一步中跳出超过2倍,然后滚回前检查点,而不是让优化者进入退化状态.课程的损失曲线是平滑的,因此保护器没有使用,但子仍然存在.</p>
+<p>**Aggregate the memory profile across ranks.**每级记忆在实运行中因级别而异 (最大管道阶段的级别具有更多激活).生产记录了数组中最大的数量加上平均值;课程打印了每级别,以显示公式匹配.</p>
+<h2>用它</h2>
+<p>生产模式:</p>
+<ul>
+<li>**DeepSpeed.**组合DDP+ZeRO+管道+激活检查点在一个配置下.课程的组成是微型的DeepSpeed形状.</li>
+<li>**PyTorch FSDP.**它们是原生的.<code>FullyShardedDataParallel</code>随着<code>ShardingStrategy.SHARD_GRAD_OP</code>现在,我们要做什么?</li>
+<li>**NeMo and Megatron-LM.**加入非常大的模型的子平行;否则,组合是相同的形状.</li>
+</ul>
+<h2>运送它</h2>
+<p>整个轨道在这里结束.这六个课程是真正的团队在采用DeepSpeed之前建立的分布式训练子系统;抽象已经被证明与 gloo相反,失败模式已经被运行.第17阶段 (基础设施和生产) 是将这些运行到一个真正的集群的地点.</p>
+<h2>运动</h2>
+<ol>
+<li>加入注意力头的子平行分区,验证损失匹配单级基线.两个排列:每排列的头半,全部减少注意力输出.</li>
+<li>增加4微分钟的梯度积累,证明梯度等于一个大批量的梯度.</li>
+<li>加入从步骤10开始的简历,实际上继续训练到步骤20,</li>
+<li>添加出口指标 (损失,分级标准,步骤时间) 到JSONL,以便在事实之后可视化运行.</li>
+<li>加入一个在损失点上回滚到前一个检查点的NAN保护器,并用一步LR乘法强制一个点来执行回滚.</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>End-to-end</td>
+<td>&quot;Wire it all up&quot;</td>
+<td>One run composes every piece, not a unit test per piece</td>
+</tr>
+<tr>
+<td>Memory profile</td>
+<td>&quot;GB per rank&quot;</td>
+<td>Bytes held on each rank for params, grads, optimiser state</td>
+</tr>
+<tr>
+<td>Resume contract</td>
+<td>&quot;Save and load&quot;</td>
+<td>Per-rank state byte-equal after a checkpoint round-trip</td>
+</tr>
+<tr>
+<td>Self-terminating</td>
+<td>&quot;Bounded run&quot;</td>
+<td>Fixed step count, exit 0 on completion, no human in the loop</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://www.deepspeed.ai/getting-started/" rel="noreferrer" data-network="true">DeepSpeed end-to-end training tutorial <small>↗ 需要联网</small></a></li>
+<li><a href="https://pytorch.org/tutorials/intermediate/FSDP_advanced_tutorial.html" rel="noreferrer" data-network="true">PyTorch FSDP advanced tutorial <small>↗ 需要联网</small></a></li>
+<li><a href="https://github.com/NVIDIA/Megatron-LM" rel="noreferrer" data-network="true">Megatron-LM training script reference <small>↗ 需要联网</small></a></li>
+<li>第十九阶段 第七六至八十课 - - 每一段课程都包含</li>
+<li>第17阶段 - 将组合转移到一个真正的集群</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>End-to-End Distributed Training</h1>
+<blockquote>
+<p>Lessons 76 through 80 each built one piece. This is the assembly: a tiny GPT trained across 4 simulated ranks with DDP for gradient sync, ZeRO-1 for optimiser-state sharding, and a sharded checkpoint at the halfway mark. The demo runs 20 steps, self-terminates, prints a loss curve plus a memory profile, and writes a resumable checkpoint.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 19 Track C lessons 42-49
+<strong>Time:</strong> ~90 min</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Compose DDP (lesson 77) plus ZeRO-1 (lesson 78) plus sharded checkpoints (lesson 80) into one training loop.</li>
+<li>Train a 2-layer transformer language model on a small synthetic corpus for 20 steps across 4 simulated ranks.</li>
+<li>Print a per-step loss table, a per-rank memory profile, and a checkpoint manifest that resumes byte-equal on the same world size.</li>
+<li>Defend the composition: each piece is independently testable in earlier lessons and this lesson proves they compose.</li>
+</ul>
+<h2>The Problem</h2>
+<p>A capstone is the proof that the pieces fit together. Lesson 76 implemented collectives. Lesson 77 wrapped them into DDP. Lesson 78 sharded optimiser state with reduce_scatter. Lesson 79 analysed pipeline. Lesson 80 saved a sharded checkpoint. Each lesson stood alone with its own test. A real training run uses every primitive at once; if the composition is wrong, the loss diverges, the checkpoint refuses to resume, or the per-rank memory grows when it should shrink.</p>
+<p>This lesson runs the end-to-end demo and verifies four invariants: (a) the loss decreases monotonically across the 20 steps within float noise, (b) every rank holds the same parameter norm at every step, (c) the per-rank optimiser memory equals the ZeRO-1 formula 12P/N bytes, and (d) the checkpoint at step 10 reloads byte-equal at restart. The demo self-terminates: 20 steps, single command, exit 0.</p>
+<h2>The Concept</h2>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-8721757af483e72809c5.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>The mini GPT</h3>
+<p>The model is small on purpose: 2 transformer blocks, embed dim 32, 4 attention heads, vocab 64, sequence length 16, batch 4. A few thousand parameters. Big enough to exercise every wiring decision (multi-head attention runs the standard masked path; LayerNorm has weights to sync; the LM head is a separate linear projection back to the vocab). Small enough that 20 steps on 4 CPU ranks finish in seconds.</p>
+<h3>The composition rules</h3>
+<table>
+<thead>
+<tr>
+<th>Lesson piece</th>
+<th>What it owns</th>
+<th>What it leaves to the loop</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>DDP broadcast</td>
+<td>Initial parameter sync</td>
+<td>One call at construct time</td>
+</tr>
+<tr>
+<td>ZeRO-1 step</td>
+<td>Gradient sync, master copy update, parameter broadcast</td>
+<td>One call per step replacing optimiser.step</td>
+</tr>
+<tr>
+<td>Sharded checkpoint</td>
+<td>Persist per-rank state, manifest with sha256</td>
+<td>Called on rank 0 with state collected via allgather</td>
+</tr>
+<tr>
+<td>Training loop</td>
+<td>Forward, backward, loss logging</td>
+<td>Calls the three above in order</td>
+</tr>
+</tbody>
+</table>
+<p>The loop does not know about reduce_scatter or rendezvous files. The ZeRO and checkpoint modules expose narrow interfaces that the loop composes.</p>
+<h3>Why a tiny GPT and not just an MLP</h3>
+<p>The MLP from lesson 77 was sufficient to verify gradient sync. A tiny GPT adds three things: a separate LM head over the vocab (in this lesson, untied for clarity; full GPT typically ties the head to the token embedding), softmax+cross-entropy as the loss (more numerical edge cases than MSE), and an asymmetric forward (embeddings then attention then MLP per layer). Sticking with an MLP for the capstone would hide whether the composition handles LayerNorm or the embedding layer's grad shape correctly.</p>
+<h3>Self-terminating means exit 0</h3>
+<p>The loop runs a fixed 20 steps and exits. No <code>while True</code>, no human intervention, no resume from external state. A capstone you can leave running unattended and find a complete log when it finishes is a capstone that proves the system is wired correctly. If any piece deadlocks the demo never returns and the test rig catches it.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-0629853054ce575f43d0.png" alt="ci-distributed-assembly 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<p><code>code/main.py</code> implements:</p>
+<ul>
+<li><code>MiniGPT</code>: 2-layer transformer with masked self-attention and a separate LM head.</li>
+<li><code>make_corpus(seed, total_tokens)</code>: deterministic next-token-prediction data.</li>
+<li><code>_train_worker</code>: spawned per rank; broadcasts init params, runs the loop, calls ZeRO step, writes the sharded checkpoint at step 10.</li>
+<li><code>verify_resume</code>: after the main run, reloads the step-10 checkpoint in-process and asserts the saved master shards match the in-memory snapshot byte-for-byte.</li>
+<li><code>main</code>: orchestrates the whole demo, prints the loss table, the memory profile, and the verification result.</li>
+</ul>
+<p>Run it:</p>
+<pre><code class="language-bash">python3 code/main.py
+</code></pre>
+<p>Output: a 20-row loss table, a 4-row per-rank memory profile, a checkpoint manifest, and a &quot;RESUME VERIFIED&quot; line on success.</p>
+<h2>Production patterns in the wild</h2>
+<p>Three patterns finish the composition for real runs.</p>
+<p><strong>Checkpoint every K minutes, not every K steps.</strong> Step time varies with seq length and microbatch count. A 10-minute checkpoint cadence catches the same compute regardless of model size. The lesson uses step-based for simplicity; production uses wall-clock-based.</p>
+<p><strong>Detect divergence early.</strong> Production runs add a NaN guard after backward and a loss-spike detector; if loss jumps by more than 2x in one step, roll back to the previous checkpoint instead of letting the optimiser march into a degenerate state. The lesson's loss curve is smooth so the guard is unused but the hook stays.</p>
+<p><strong>Aggregate the memory profile across ranks.</strong> Per-rank memory differs by rank in real runs (rank with the largest pipeline stage holds more activations). Production logs the max across ranks plus the mean; the lesson prints per-rank to show the formula matches.</p>
+<h2>Use It</h2>
+<p>Production patterns:</p>
+<ul>
+<li><strong>DeepSpeed.</strong> Combines DDP + ZeRO + pipeline + activation checkpointing under one config. The lesson's composition is the DeepSpeed shape in miniature.</li>
+<li><strong>PyTorch FSDP.</strong> The native equivalent. <code>FullyShardedDataParallel</code> with <code>ShardingStrategy.SHARD_GRAD_OP</code> is ZeRO-2.</li>
+<li><strong>NeMo and Megatron-LM.</strong> Add tensor parallel for the very largest models; otherwise the composition is the same shape.</li>
+</ul>
+<h2>Ship It</h2>
+<p>The full track ends here. The 6 lessons together are the distributed-training subsystem a real team would build before adopting DeepSpeed; the abstraction has been proven against gloo and the failure modes have been exercised. Phase 17 (infrastructure and production) is the place to take this to a real cluster.</p>
+<h2>Exercises</h2>
+<ol>
+<li>Add a tensor-parallel split of the attention head and verify the loss matches the single-rank baseline. Two ranks: half the heads per rank, allreduce of the attention output.</li>
+<li>Add gradient accumulation across 4 microbatches and prove the gradient equals the gradient of one big batch.</li>
+<li>Add a resume-from-step-10 path that actually continues training to step 20 and produces the same final loss as the original run.</li>
+<li>Add a metrics export (loss, grad norm, step time) to JSONL so the run can be visualised after the fact.</li>
+<li>Add a NaN guard that rolls back to the previous checkpoint on a loss spike, and force a spike with a one-step LR multiplier to exercise the rollback.</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>End-to-end</td>
+<td>&quot;Wire it all up&quot;</td>
+<td>One run composes every piece, not a unit test per piece</td>
+</tr>
+<tr>
+<td>Memory profile</td>
+<td>&quot;GB per rank&quot;</td>
+<td>Bytes held on each rank for params, grads, optimiser state</td>
+</tr>
+<tr>
+<td>Resume contract</td>
+<td>&quot;Save and load&quot;</td>
+<td>Per-rank state byte-equal after a checkpoint round-trip</td>
+</tr>
+<tr>
+<td>Self-terminating</td>
+<td>&quot;Bounded run&quot;</td>
+<td>Fixed step count, exit 0 on completion, no human in the loop</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://www.deepspeed.ai/getting-started/" rel="noreferrer" data-network="true">DeepSpeed end-to-end training tutorial <small>↗ 需要联网</small></a></li>
+<li><a href="https://pytorch.org/tutorials/intermediate/FSDP_advanced_tutorial.html" rel="noreferrer" data-network="true">PyTorch FSDP advanced tutorial <small>↗ 需要联网</small></a></li>
+<li><a href="https://github.com/NVIDIA/Megatron-LM" rel="noreferrer" data-network="true">Megatron-LM training script reference <small>↗ 需要联网</small></a></li>
+<li>Phase 19 Lessons 76-80 - each piece this lesson composes</li>
+<li>Phase 17 - moving the composition to a real cluster</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-19-capstone-projects--81-end-to-end-distributed-train.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-19-capstone-projects--81-end-to-end-distributed-train.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/81-end-to-end-distributed-train/code/main.py">phases/19-capstone-projects/81-end-to-end-distributed-train/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;End-to-end distributed training: tiny GPT, 4 ranks, DDP + ZeRO-1 + sharded checkpoint.
+
+Composes the pieces built in lessons 76-80:
+  * gloo backend with file rendezvous (lesson 76)
+  * broadcast at init for DDP-shape parameter sync (lesson 77)
+  * reduce_scatter on grad + allgather on params for ZeRO-1 (lesson 78)
+  * sharded checkpoint with atomic write at the halfway mark (lesson 80)
+
+20 steps, self-terminating, prints loss curve, per-rank memory profile, and a
+RESUME VERIFIED line proving the step-10 checkpoint reloads byte-equal.
+
+Run: python3 code/main.py
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import multiprocessing as mp
+import os
+import shutil
+import sys
+import tempfile
+from dataclasses import asdict, dataclass
+from pathlib import Path
+
+import torch
+import torch.distributed as dist
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+SEED = 41
+WORLD_SIZE = 4
+STEPS = 20
+CHECKPOINT_STEP = 10
+BATCH = 4
+SEQ_LEN = 16
+VOCAB = 64
+EMBED_DIM = 32
+NUM_HEADS = 4
+NUM_LAYERS = 2
+LR = 5e-3
+
+
+def _loopback_iface() -&gt; str:
+    return &quot;lo0&quot; if sys.platform == &quot;darwin&quot; else &quot;lo&quot;
+
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, embed_dim: int, num_heads: int):
+        super().__init__()
+        assert embed_dim % num_heads == 0
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        self.qkv = nn.Linear(embed_dim, 3 * embed_dim, bias=False)
+        self.proj = nn.Linear(embed_dim, embed_dim, bias=False)
+
+    def forward(self, x: torch.Tensor) -&gt; torch.Tensor:
+        b, t, e = x.shape
+        qkv = self.qkv(x).reshape(b, t, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv.unbind(dim=2)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        attn = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        mask = torch.triu(torch.ones(t, t), diagonal=1).bool()
+        attn = attn.masked_fill(mask, float(&quot;-inf&quot;))
+        attn = attn.softmax(dim=-1)
+        out = attn @ v
+        out = out.transpose(1, 2).reshape(b, t, e)
+        return self.proj(out)
+
+
+class TransformerBlock(nn.Module):
+    def __init__(self, embed_dim: int, num_heads: int):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(embed_dim)
+        self.attn = CausalSelfAttention(embed_dim, num_heads)
+        self.ln2 = nn.LayerNorm(embed_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, 4 * embed_dim),
+            nn.GELU(),
+            nn.Linear(4 * embed_dim, embed_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -&gt; torch.Tensor:
+        x = x + self.attn(self.ln1(x))
+        x = x + self.mlp(self.ln2(x))
+        return x
+
+
+class MiniGPT(nn.Module):
+    def __init__(self, vocab: int = VOCAB, embed_dim: int = EMBED_DIM,
+                 num_heads: int = NUM_HEADS, num_layers: int = NUM_LAYERS,
+                 seq_len: int = SEQ_LEN):
+        super().__init__()
+        self.tok_embed = nn.Embedding(vocab, embed_dim)
+        self.pos_embed = nn.Embedding(seq_len, embed_dim)
+        self.blocks = nn.ModuleList([
+            TransformerBlock(embed_dim, num_heads) for _ in range(num_layers)
+        ])
+        self.ln_f = nn.LayerNorm(embed_dim)
+        self.head = nn.Linear(embed_dim, vocab, bias=False)
+        self.seq_len = seq_len
+
+    def forward(self, ids: torch.Tensor) -&gt; torch.Tensor:
+        b, t = ids.shape
+        pos = torch.arange(t, device=ids.device)
+        x = self.tok_embed(ids) + self.pos_embed(pos)
+        for blk in self.blocks:
+            x = blk(x)
+        x = self.ln_f(x)
+        return self.head(x)
+
+
+def flat_param_numel(module: nn.Module) -&gt; int:
+    return sum(p.numel() for p in module.parameters())
+
+
+def gather_flat_params(module: nn.Module) -&gt; torch.Tensor:
+    return torch.cat([p.detach().to(torch.float32).flatten() for p in module.parameters()])
+
+
+def scatter_flat_to_params(module: nn.Module, flat: torch.Tensor) -&gt; None:
+    offset = 0
+    for p in module.parameters():
+        n = p.numel()
+        p.data.copy_(flat[offset:offset + n].reshape(p.shape).to(p.dtype))
+        offset += n
+
+
+def gather_flat_grads(module: nn.Module) -&gt; torch.Tensor:
+    parts = []
+    for p in module.parameters():
+        if p.grad is None:
+            parts.append(torch.zeros_like(p.data, dtype=torch.float32).flatten())
+        else:
+            parts.append(p.grad.detach().to(torch.float32).flatten())
+    return torch.cat(parts)
+
+
+class ZeroOptimizer:
+    &quot;&quot;&quot;Stage-1 sharded Adam, ported from lesson 78.&quot;&quot;&quot;
+
+    def __init__(self, module: nn.Module, world_size: int, rank: int,
+                 lr: float = LR, beta1: float = 0.9, beta2: float = 0.999,
+                 eps: float = 1e-8):
+        self.module = module
+        self.world_size = world_size
+        self.rank = rank
+        self.lr = lr
+        self.beta1 = beta1
+        self.beta2 = beta2
+        self.eps = eps
+        self.step_count = 0
+        total = flat_param_numel(module)
+        self.total = total
+        pad = (-total) % world_size
+        self.chunk = (total + pad) // world_size
+        full = gather_flat_params(module)
+        padded = torch.zeros(self.chunk * world_size, dtype=torch.float32)
+        padded[:total] = full
+        self.master_shard = padded[rank * self.chunk:(rank + 1) * self.chunk].clone()
+        self.m_shard = torch.zeros_like(self.master_shard)
+        self.v_shard = torch.zeros_like(self.master_shard)
+
+    def shard_bytes(self) -&gt; int:
+        return (self.master_shard.numel() + self.m_shard.numel() + self.v_shard.numel()) * 4
+
+    def step(self) -&gt; None:
+        flat_grad = gather_flat_grads(self.module)
+        pad = (-self.total) % self.world_size
+        padded = torch.zeros(self.total + pad, dtype=torch.float32)
+        padded[:self.total] = flat_grad
+        chunks = [c.contiguous() for c in padded.chunk(self.world_size)]
+        local_grad = torch.zeros_like(chunks[0])
+        dist.reduce_scatter(local_grad, chunks, op=dist.ReduceOp.SUM)
+        local_grad.div_(self.world_size)
+        self.step_count += 1
+        self.m_shard.mul_(self.beta1).add_(local_grad, alpha=1 - self.beta1)
+        self.v_shard.mul_(self.beta2).addcmul_(local_grad, local_grad, value=1 - self.beta2)
+        bc1 = 1 - self.beta1 ** self.step_count
+        bc2 = 1 - self.beta2 ** self.step_count
+        m_hat = self.m_shard / bc1
+        v_hat = self.v_shard / bc2
+        self.master_shard.addcdiv_(m_hat, v_hat.sqrt().add_(self.eps), value=-self.lr)
+        gathered = [torch.zeros_like(self.master_shard) for _ in range(self.world_size)]
+        dist.all_gather(gathered, self.master_shard)
+        flat_full = torch.cat(gathered)[:self.total]
+        scatter_flat_to_params(self.module, flat_full)
+
+    def zero_grad(self) -&gt; None:
+        for p in self.module.parameters():
+            if p.grad is not None:
+                p.grad.detach_()
+                p.grad.zero_()
+
+    def state_dict(self) -&gt; dict:
+        return {
+            &quot;master_shard&quot;: self.master_shard.clone(),
+            &quot;m_shard&quot;: self.m_shard.clone(),
+            &quot;v_shard&quot;: self.v_shard.clone(),
+            &quot;step_count&quot;: self.step_count,
+        }
+
+    def load_state_dict(self, state: dict) -&gt; None:
+        self.master_shard.copy_(state[&quot;master_shard&quot;])
+        self.m_shard.copy_(state[&quot;m_shard&quot;])
+        self.v_shard.copy_(state[&quot;v_shard&quot;])
+        self.step_count = state[&quot;step_count&quot;]
+
+
+@dataclass
+class ShardEntry:
+    rank: int
+    path: str
+    sha256: str
+
+
+def _sha(data: bytes) -&gt; str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _serialize(state: dict) -&gt; bytes:
+    import io
+    buf = io.BytesIO()
+    torch.save(state, buf, pickle_protocol=4)
+    return buf.getvalue()
+
+
+def _deserialize(data: bytes) -&gt; dict:
+    import io
+    return torch.load(io.BytesIO(data), weights_only=False)
+
+
+def save_sharded(per_rank_state: list, dest_dir: str, step: int) -&gt; dict:
+    dest = Path(dest_dir)
+    dest.mkdir(parents=True, exist_ok=True)
+    shards = []
+    tmps = []
+    for rank, state in enumerate(per_rank_state):
+        payload = _serialize(state)
+        sha = _sha(payload)
+        tmp_name = f&quot;rank{rank}.bin.tmp&quot;
+        final_name = f&quot;rank{rank}.bin&quot;
+        with open(dest / tmp_name, &quot;wb&quot;) as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        tmps.append((dest / tmp_name, dest / final_name))
+        shards.append(ShardEntry(rank=rank, path=final_name, sha256=sha))
+    manifest = {
+        &quot;world_size&quot;: len(per_rank_state),
+        &quot;step&quot;: step,
+        &quot;shards&quot;: [asdict(s) for s in shards],
+    }
+    manifest_tmp = dest / &quot;manifest.json.tmp&quot;
+    with open(manifest_tmp, &quot;w&quot;) as f:
+        f.write(json.dumps(manifest, indent=2, sort_keys=True))
+        f.flush()
+        os.fsync(f.fileno())
+    for tmp, final in tmps:
+        os.replace(tmp, final)
+    os.replace(manifest_tmp, dest / &quot;manifest.json&quot;)
+    return manifest
+
+
+def load_sharded(src_dir: str, expected_world_size: int) -&gt; list:
+    src = Path(src_dir)
+    manifest = json.loads((src / &quot;manifest.json&quot;).read_text())
+    if manifest[&quot;world_size&quot;] != expected_world_size:
+        raise RuntimeError(
+            f&quot;world_size mismatch: manifest={manifest[&#39;world_size&#39;]}, &quot;
+            f&quot;expected={expected_world_size}&quot;
+        )
+    per_rank = [None] * manifest[&quot;world_size&quot;]
+    for entry in manifest[&quot;shards&quot;]:
+        payload = (src / entry[&quot;path&quot;]).read_bytes()
+        actual = _sha(payload)
+        if actual != entry[&quot;sha256&quot;]:
+            raise RuntimeError(f&quot;sha256 mismatch on rank {entry[&#39;rank&#39;]}&quot;)
+        per_rank[entry[&quot;rank&quot;]] = _deserialize(payload)
+    return per_rank
+
+
+def make_corpus(seed: int, total_tokens: int) -&gt; torch.Tensor:
+    g = torch.Generator().manual_seed(seed)
+    return torch.randint(0, VOCAB, (total_tokens,), generator=g)
+
+
+def init_distributed(rank: int, world_size: int, init_file: str, iface: str) -&gt; None:
+    os.environ[&quot;GLOO_SOCKET_IFNAME&quot;] = iface
+    dist.init_process_group(
+        backend=&quot;gloo&quot;, init_method=f&quot;file://{init_file}&quot;,
+        rank=rank, world_size=world_size,
+    )
+
+
+def _gather_payloads_to_rank0(local_payload: bytes, world_size: int) -&gt; list:
+    &quot;&quot;&quot;Allgather variable-length byte buffers across ranks via padding.&quot;&quot;&quot;
+    tensor = torch.frombuffer(bytearray(local_payload), dtype=torch.uint8).clone()
+    sizes = [torch.zeros(1, dtype=torch.long) for _ in range(world_size)]
+    dist.all_gather(sizes, torch.tensor([tensor.numel()], dtype=torch.long))
+    max_size = max(int(s.item()) for s in sizes)
+    padded = torch.zeros(max_size, dtype=torch.uint8)
+    padded[:tensor.numel()] = tensor
+    gathered = [torch.zeros(max_size, dtype=torch.uint8) for _ in range(world_size)]
+    dist.all_gather(gathered, padded)
+    return [bytes(gathered[r][:int(sizes[r].item())].tolist()) for r in range(world_size)]
+
+
+def _train_worker(rank: int, world_size: int, init_file: str, iface: str,
+                  ckpt_dir: str, steps: int, out_queue) -&gt; None:
+    init_distributed(rank, world_size, init_file, iface)
+    torch.manual_seed(SEED)
+    model = MiniGPT()
+    for p in model.parameters():
+        dist.broadcast(p.data, src=0)
+    optim = ZeroOptimizer(model, world_size=world_size, rank=rank, lr=LR)
+    corpus_total = world_size * BATCH * (SEQ_LEN + 1) * steps
+    corpus = make_corpus(SEED + 7, corpus_total)
+    rank0_losses = []
+    master_at_ckpt = None
+    for step in range(steps):
+        offset = step * world_size * BATCH * (SEQ_LEN + 1) + rank * BATCH * (SEQ_LEN + 1)
+        block = corpus[offset:offset + BATCH * (SEQ_LEN + 1)].reshape(BATCH, SEQ_LEN + 1)
+        x = block[:, :-1]
+        y = block[:, 1:]
+        optim.zero_grad()
+        logits = model(x)
+        loss = F.cross_entropy(logits.reshape(-1, VOCAB), y.reshape(-1))
+        loss.backward()
+        optim.step()
+        if rank == 0:
+            rank0_losses.append(loss.item())
+        if step + 1 == CHECKPOINT_STEP:
+            state = {
+                &quot;model_state&quot;: {k: v.clone() for k, v in model.state_dict().items()},
+                &quot;optim_state&quot;: optim.state_dict(),
+                &quot;rank&quot;: rank,
+            }
+            master_at_ckpt = optim.master_shard.clone()
+            dist.barrier()
+            payloads = _gather_payloads_to_rank0(_serialize(state), world_size)
+            if rank == 0:
+                all_states = [_deserialize(p) for p in payloads]
+                save_sharded(all_states, ckpt_dir, step=CHECKPOINT_STEP)
+            dist.barrier()
+    param_norm = sum(p.detach().pow(2).sum().item() for p in model.parameters()) ** 0.5
+    out_queue.put((rank, rank0_losses if rank == 0 else [], param_norm, optim.shard_bytes(),
+                   master_at_ckpt))
+    out_queue.close()
+    out_queue.join_thread()
+    os._exit(0)
+
+
+def run_e2e(world_size: int = WORLD_SIZE, steps: int = STEPS) -&gt; dict:
+    ctx = mp.get_context(&quot;spawn&quot;)
+    out_queue = ctx.Queue()
+    workdir = tempfile.mkdtemp(prefix=&quot;aie_e2e_&quot;)
+    init_file = os.path.join(workdir, &quot;rendezvous&quot;)
+    ckpt_dir = os.path.join(workdir, f&quot;step_{CHECKPOINT_STEP:04d}&quot;)
+    iface = _loopback_iface()
+    procs = []
+    cleanup_workdir = False
+    try:
+        try:
+            for r in range(world_size):
+                p = ctx.Process(
+                    target=_train_worker,
+                    args=(r, world_size, init_file, iface, ckpt_dir, steps, out_queue),
+                )
+                p.start()
+                procs.append(p)
+            results = {}
+            for _ in range(world_size):
+                rank, losses, norm, shard_bytes, master_at_ckpt = out_queue.get(timeout=180)
+                results[rank] = {
+                    &quot;losses&quot;: losses,
+                    &quot;norm&quot;: norm,
+                    &quot;shard_bytes&quot;: shard_bytes,
+                    &quot;master_at_ckpt&quot;: master_at_ckpt,
+                }
+        except Exception:
+            cleanup_workdir = True
+            raise
+    finally:
+        for p in procs:
+            p.join(timeout=5)
+            if p.is_alive():
+                p.terminate()
+                p.join(timeout=2)
+        if cleanup_workdir:
+            shutil.rmtree(workdir, ignore_errors=True)
+    return {&quot;workdir&quot;: workdir, &quot;ckpt_dir&quot;: ckpt_dir, &quot;results&quot;: results}
+
+
+def verify_resume(ckpt_dir: str, expected_world_size: int,
+                  expected_master_shards: list) -&gt; bool:
+    &quot;&quot;&quot;Reload the checkpoint and compare master shards byte-equal to the snapshot.
+
+    Each rank captured its master shard at the moment of the checkpoint write;
+    reloading the saved manifest must return the same tensor byte-for-byte.
+    &quot;&quot;&quot;
+    loaded = load_sharded(ckpt_dir, expected_world_size=expected_world_size)
+    for r in range(expected_world_size):
+        saved = loaded[r][&quot;optim_state&quot;][&quot;master_shard&quot;]
+        snapshot = expected_master_shards[r]
+        if not torch.equal(saved, snapshot):
+            return False
+    return True
+
+
+def main() -&gt; int:
+    print(f&quot;world_size={WORLD_SIZE}, steps={STEPS}, model=MiniGPT&quot;)
+    total_params = flat_param_numel(MiniGPT())
+    print(f&quot;model params: {total_params}&quot;)
+    print(&quot;starting distributed train...&quot;)
+    out = run_e2e()
+    results = out[&quot;results&quot;]
+    ckpt_dir = out[&quot;ckpt_dir&quot;]
+    print(f&quot;\n{&#39;step&#39;:&lt;6}{&#39;rank0_loss&#39;:&lt;14}&quot;)
+    rank0_losses = results[0][&quot;losses&quot;]
+    for s, loss in enumerate(rank0_losses):
+        print(f&quot;{s:&lt;6}{loss:&lt;14.6f}&quot;)
+    norms = [results[r][&quot;norm&quot;] for r in range(WORLD_SIZE)]
+    print(&quot;\nfinal param norm (must agree across ranks):&quot;)
+    for r in range(WORLD_SIZE):
+        print(f&quot;  rank {r}: {norms[r]:.6f}&quot;)
+    norm_drift = max(norms) - min(norms)
+    print(f&quot;  drift across ranks: {norm_drift:.2e}&quot;)
+    print(&quot;\nper-rank optimiser memory (ZeRO-1 shard, bytes):&quot;)
+    for r in range(WORLD_SIZE):
+        print(f&quot;  rank {r}: {results[r][&#39;shard_bytes&#39;]}&quot;)
+    expected_zero = (total_params + (-total_params) % WORLD_SIZE) // WORLD_SIZE * 4 * 3
+    print(f&quot;  expected per-rank (fp32 master + m + v): {expected_zero}&quot;)
+    print(f&quot;\ncheckpoint at step {CHECKPOINT_STEP}: {ckpt_dir}&quot;)
+    master_shards = [results[r][&quot;master_at_ckpt&quot;] for r in range(WORLD_SIZE)]
+    if verify_resume(ckpt_dir, WORLD_SIZE, master_shards):
+        print(&quot;RESUME VERIFIED: saved shard at step 10 matches in-memory snapshot byte-for-byte&quot;)
+    else:
+        print(&quot;RESUME FAILED&quot;)
+        return 1
+    shutil.rmtree(out[&quot;workdir&quot;], ignore_errors=True)
+    return 0
+
+
+if __name__ == &quot;__main__&quot;:
+    raise SystemExit(main())
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. Why does a capstone matter when each lesson already had its own tests?</legend><label class="option"><input type="radio" name="q0" value="0"> Composition is a separate property: pieces can pass unit tests but the integration deadlocks, the loss diverges, or the memory grows when they run together</label><label class="option"><input type="radio" name="q0" value="1"> Cosmetic</label><label class="option"><input type="radio" name="q0" value="2"> Slower</label><label class="option"><input type="radio" name="q0" value="3"> Easier to grade</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. What four invariants does the demo verify?</legend><label class="option"><input type="radio" name="q1" value="0"> Speed</label><label class="option"><input type="radio" name="q1" value="1"> Tokens per second</label><label class="option"><input type="radio" name="q1" value="2"> Hardware</label><label class="option"><input type="radio" name="q1" value="3"> (a) loss runs to step 20 without NaN, (b) every rank&#39;s parameter norm agrees, (c) per-rank optimiser memory equals the ZeRO-1 formula, (d) the step-10 checkpoint reloads byte-equal</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. Why is the model a tiny GPT instead of an MLP?</legend><label class="option"><input type="radio" name="q2" value="0"> Required</label><label class="option"><input type="radio" name="q2" value="1"> Look fancy</label><label class="option"><input type="radio" name="q2" value="2"> GPT adds LayerNorm running statistics, embedding gradient shape, and softmax+cross-entropy edge cases that an MLP would hide</label><label class="option"><input type="radio" name="q2" value="3"> Faster</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. What does self-terminating mean in this context?</legend><label class="option"><input type="radio" name="q3" value="0"> Process kills itself</label><label class="option"><input type="radio" name="q3" value="1"> Fixed step count (20), exit 0 on completion, no human in the loop; if any piece deadlocks the demo never returns and CI catches it</label><label class="option"><input type="radio" name="q3" value="2"> Crash recovery</label><label class="option"><input type="radio" name="q3" value="3"> Manual</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. How does the demo combine DDP and ZeRO?</legend><label class="option"><input type="radio" name="q4" value="0"> ZeRO only</label><label class="option"><input type="radio" name="q4" value="1"> Both at once</label><label class="option"><input type="radio" name="q4" value="2"> DDP-style broadcast at init for parameter sync, ZeRO-1&#39;s reduce_scatter+allgather replaces optimiser.step; DDP gradient allreduce is subsumed into ZeRO&#39;s reduce_scatter</label><label class="option"><input type="radio" name="q4" value="3"> DDP only</label><p data-feedback="4"></p></fieldset><fieldset><legend>6. Why does production use wall-clock checkpoint cadence instead of step count?</legend><label class="option"><input type="radio" name="q5" value="0"> Looks cleaner</label><label class="option"><input type="radio" name="q5" value="1"> Faster</label><label class="option"><input type="radio" name="q5" value="2"> Required by NCCL</label><label class="option"><input type="radio" name="q5" value="3"> Step time varies with sequence length and microbatch count; a 10-minute cadence catches the same compute regardless of model size</label><p data-feedback="5"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/19-capstone-projects/80-checkpoint-sharded-resume/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/19-capstone-projects/82-jailbreak-taxonomy/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/19-capstone-projects/81-end-to-end-distributed-train/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

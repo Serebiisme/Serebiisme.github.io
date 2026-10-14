@@ -1,0 +1,979 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>石头课38:分类器 按头交换进行细调 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-19-capstone-projects" data-lesson="19-capstone-projects/38-classifier-finetuning" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/19-capstone-projects/">综合项目</a> / LESSON 38</p><h1 class="lesson-title">石头课38:分类器 按头交换进行细调</h1><p>Capstone Lesson 38: Classifier Fine-Tuning by Head Swap</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>石头课38:分类器 按头交换进行细调</h1>
+<blockquote>
+<p>B轨的第一颗结石. 预训练的语言模型是一个自我注意的块, 当你想要垃圾和肉时,头脑是错误的,但身体基本上是正确的. 这一课将头部撕裂,将两类线性层粘贴到合并的表示上, 评估是精确,回忆,F1在一个持久的分区. 你会知道每个策略都能给你带来什么,</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python (torch, numpy)
+<strong>Prerequisites:</strong> Phase 19 lessons 30-37 (NLP LLM track: tokenizer, embedding table, attention block, transformer body, pre-training loop, checkpointing, generation, perplexity)
+<strong>Time:</strong> ~90 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>换一个语言模型头换一个分类头,而不需要重新启动机器.</li>
+<li>实施两种训练模式:体 (仅用于头部) 和完全细调,共享一个训练循环.</li>
+<li>建立一个知情的数据管道, 填充,掩盖填充,</li>
+<li>计算精度,回忆,F1和从原始记录中进行混矩阵.</li>
+<li>参数数量,训练时间和头部空间之间的差异.</li>
+</ul>
+<h2>问题</h2>
+<p>输出头将最后一个隐藏状态投射到1000个代币词汇中.现在你有800个标记为垃圾邮件或的短信,你想要一个二进制分类器.有三个选择.</p>
+<p>错误的选择是从零开始训练一个新的分类器,使用800个例子.预训练模型的体格已经编码了有用的结构:词的身份,位置,简单的随机.</p>
+<p>只有头部训练是快速的,几乎是免费的,并且很少用这些小数据过度训练. 完全细调是慢的,可以在小数据上过度调整,但在下游域从预训练体中漂移时达到更高的精度.</p>
+<p>这一课是建立两者,所以你可以在同一器件上比较它们.</p>
+<h2>概念</h2>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-205673e023df83f7bd99.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>模型是一个函数<code>f_theta(tokens) -&gt; hidden_states</code>头部是一个功能<code>g_phi(hidden) -&gt; logits</code>换头意味着保持<code>theta</code>并且更换<code>g_phi</code>身体的参数是最昂贵的部分.头部是一个单一的线性层.</p>
+<p>两个可训练的参数组是重要的:</p>
+<ul>
+<li><code>theta</code>按注意力块的数万个重量.</li>
+<li><code>phi</code>子的头<code>hidden_dim * num_classes</code>体重加上偏见.</li>
+</ul>
+<p>在只对头进行训练时,你计算了梯度.<code>phi</code>并且将它们对抗.<code>theta</code>皮托奇让你设置<code>requires_grad=False</code>优化器只能看到头部,身体就会结.</p>
+<p>在完全细调中,你让梯度回流整个堆.身体的重量漂移到符合分类目标. 遗忘小数据的风险是灾难性的:身体的预训练会被过度的噪音冲洗.</p>
+<h2>汇集问题</h2>
+<p>类别器需要一个向量,而不是一个向量.</p>
+<ul>
+<li><strong>Mean pool</strong>平均测量,按注意力面具的重量,</li>
+<li><strong>CLS pool</strong>预备一个特殊的代币,只使用其输出.</li>
+<li><strong>Last-token pool</strong>接不到的代币是GPT类分类器所做的.</li>
+</ul>
+<p>这一课使用了中值聚合和明确的注意力面具权重. 它是最简单的,在序列长度上提供了稳定的信号,并且不需要预训练 CLS 代币.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-83a9ad9882592125f371.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h2>数据</h2>
+<p>通过确定性生成400个垃圾邮件和400个腿的SMS信息.<code>code/main.py</code>发电机使用固定种子,选择模板,替换插槽填充器,发出长度为5至25个代币之间的信息.实际数据集有噪音.</p>
+<p>测试组分为80/20:640列车,测试160. 分裂是层次的,因此测试组保持50/50平衡.一个已知平衡的延伸组允许精度和回忆被读取为诚实的数字.</p>
+<h2>标准</h2>
+<p>双式分类,类1作为正类 (垃圾邮件). 计数为:</p>
+<ul>
+<li><code>TP</code>预测的垃圾邮件,是垃圾邮件.</li>
+<li><code>FP</code>预测的垃圾邮件是肉.</li>
+<li><code>FN</code>预测的子,是垃圾邮件.</li>
+<li><code>TN</code>预测的子,是子.</li>
+</ul>
+<p>标题的三个指标:</p>
+<ul>
+<li><code>precision = TP / (TP + FP)</code>在标记的垃圾邮件中,实际上是多少?</li>
+<li><code>recall = TP / (TP + FN)</code>实际的垃圾邮件中,模型旗的比例是多少?</li>
+<li><code>F1 = 2 * P * R / (P + R)</code>两者之间的和平均值.</li>
+</ul>
+<p>模拟图为两种训练模式的模拟图.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-2791d373b3d9855b0048.png" alt="cap-classifier-head-swap 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建筑</h2>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-343132c1c1989f48275c.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>机器是一个故意微小的变压器:词汇260,隐藏64,4个头,2个块,最大序列32. 它足够小,可以训练两个模式在CPU上90秒内融合.它不是在课中预训练的;相反,它是<code>pretrain_quick</code>帮助者在同一器件的文本上进行了五次LM训练,以给身体一个非微不足道的起点. 这使得课程保持自有.</p>
+<h2>你会建造什么</h2>
+<p>实施是一个<code>main.py</code>加上一个试验模块 (<code>code/tests/test_main.py</code>)</p>
+<ol>
+<li><code>ByteTokenizer</code>图片字节到身份证,保留一个pad身份证.</li>
+<li><code>Block</code>转换器块,多头注意力和输送前置层.</li>
+<li><code>LMBody</code>标志 + 位置嵌入式加上一个堆块. 返回隐藏状态.</li>
+<li><code>MeanPool</code>: 按重量平均在序列轴上.</li>
+<li><code>Classifier</code>身体,池,线性头. 身体在各种政权中都是相同的.</li>
+<li><code>freeze_body</code>其他<code>unfreeze_body</code>转换<code>requires_grad</code>身体参数.</li>
+<li><code>train_classifier</code>接受模型和可用于任何参数组的优化器.</li>
+<li><code>evaluate</code>: 运行测试集,并返回<code>Metrics(precision, recall, f1, confusion)</code>现在,我们要去.</li>
+<li><code>run_demo</code>预训练身体,然后训练和评估头部,然后完整,打印了两份报告,</li>
+</ol>
+<h2>为什么比较是重要的</h2>
+<p>只有头部的模式通常训练得更快,更优雅.在这个装置上,你通常看到准确度接近0.9和回忆接近0.85在二十个时代的头部训练后.完全的细节调整需要大约三倍的时间,并且在随机种子上都会降落在几点内.</p>
+<p>课程不选胜者.它教你读取数字和成本.在800个例子和一个小体上,只有一头才是正确的选择.在80,000个例子和一个更大的体上,完整的细节调整开始付出代价.从这个课程中你取出的合同是API:相同<code>train_classifier</code>函数处理了两个,而转换是一个调用.</p>
+<h2>实现目标</h2>
+<ul>
+<li>加入第三种模式,只能解最后一个块,这有时被称为部分细调. 它成本低于完整的FT,并且只能学习更多.</li>
+<li>增加学习率调度器.头部上的可西因时间表加上身体上的较小的常量率是常见的生产设置.</li>
+<li>换成一个学习的注意力池:一个学习的查询的小注意力层. 这通常比较长的序列中平均的注意力池.</li>
+</ul>
+<p>执行给你,测试合同,数字是你的.</p>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Capstone Lesson 38: Classifier Fine-Tuning by Head Swap</h1>
+<blockquote>
+<p>Track B's first capstone. A pretrained language model is a stack of self-attention blocks ending in a token-prediction head. When you want spam vs ham, the head is wrong but the body is mostly right. This lesson rips the head off, glues a two-class linear layer onto the pooled representation, and trains the classifier two different ways: final-layer only, and full fine-tuning. The eval is precision, recall, and F1 on a held-out split. You learn what each strategy buys you and what it costs.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python (torch, numpy)
+<strong>Prerequisites:</strong> Phase 19 lessons 30-37 (NLP LLM track: tokenizer, embedding table, attention block, transformer body, pre-training loop, checkpointing, generation, perplexity)
+<strong>Time:</strong> ~90 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Replace a language-model head with a classification head without re-initialising the body.</li>
+<li>Implement two training regimes: frozen body (head-only) and full fine-tuning, sharing one training loop.</li>
+<li>Build a tokeniser-aware data pipeline that pads, masks padding, and pools attention output.</li>
+<li>Compute precision, recall, F1, and a confusion matrix from raw logits.</li>
+<li>Reason about the trade-off between parameter count, training time, and head-room.</li>
+</ul>
+<h2>The Problem</h2>
+<p>You pre-trained a small transformer on a generic corpus. The output head projects the last hidden state to a 1000-token vocabulary. You now have 800 SMS messages labelled spam or ham and you want a binary classifier. Three options exist.</p>
+<p>The wrong option is to train a fresh classifier from scratch on 800 examples. The body of the pretrained model already encodes useful structure: word identity, position, simple co-occurrence. Throwing it away wastes the compute that built it.</p>
+<p>The two right options are head swap with the body frozen, and head swap with the body trainable. Head-only training is fast, almost free in memory, and rarely overfits with this little data. Full fine-tuning is slower, can overfit on small data, but reaches higher accuracy when the downstream domain drifts from the pretraining corpus.</p>
+<p>This lesson builds both, so you can compare them on the same fixture.</p>
+<h2>The Concept</h2>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-205673e023df83f7bd99.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>The model is a function <code>f_theta(tokens) -&gt; hidden_states</code>. The head is a function <code>g_phi(hidden) -&gt; logits</code>. Swapping heads means keeping <code>theta</code> and replacing <code>g_phi</code>. The body's parameters are the expensive part. The head is a single linear layer.</p>
+<p>Two trainable parameter sets matter:</p>
+<ul>
+<li><code>theta</code> (the body): tens of thousands of weights per attention block.</li>
+<li><code>phi</code> (the head): <code>hidden_dim * num_classes</code> weights plus a bias.</li>
+</ul>
+<p>In head-only training you compute gradients against <code>phi</code> and zero them against <code>theta</code>. PyTorch lets you do this by setting <code>requires_grad=False</code> on body parameters. The optimiser then sees only the head and the body stays frozen.</p>
+<p>In full fine-tuning you let gradients flow back through the whole stack. The body's weights drift to fit the classification objective. The risk is catastrophic forgetting on small data: the body's pretraining gets washed out by overfitting noise.</p>
+<h2>The Pooling Question</h2>
+<p>A classifier needs one vector per sequence, not one vector per token. Three common choices:</p>
+<ul>
+<li><strong>Mean pool</strong>: average the hidden states across the sequence, weighted by the attention mask.</li>
+<li><strong>CLS pool</strong>: prepend a special token and use only its output. This is what BERT does.</li>
+<li><strong>Last-token pool</strong>: use the last non-padding token. This is what GPT-class classifiers do.</li>
+</ul>
+<p>This lesson uses mean pooling with explicit attention-mask weighting. It is the simplest, gives a stable signal across sequence lengths, and does not require pretraining a CLS token.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-83a9ad9882592125f371.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h2>The Data</h2>
+<p>Eight hundred SMS messages, balanced 400 spam and 400 ham, are generated deterministically in <code>code/main.py</code>. The generator uses a fixed seed, picks templates and substitutes slot fillers, and emits messages between 5 and 25 tokens long. Real datasets have noise this fixture does not. The point of the fixture is reproducibility.</p>
+<p>The data splits 80/20: 640 train, 160 test. Splits are stratified so the test set keeps the 50/50 balance. A held-out set with a known balance lets precision and recall be read as honest numbers.</p>
+<h2>The Metrics</h2>
+<p>Binary classification with class 1 as the positive class (spam). Counts are:</p>
+<ul>
+<li><code>TP</code>: predicted spam, was spam.</li>
+<li><code>FP</code>: predicted spam, was ham.</li>
+<li><code>FN</code>: predicted ham, was spam.</li>
+<li><code>TN</code>: predicted ham, was ham.</li>
+</ul>
+<p>The three headline metrics:</p>
+<ul>
+<li><code>precision = TP / (TP + FP)</code>. Of the messages flagged spam, what fraction actually are?</li>
+<li><code>recall = TP / (TP + FN)</code>. Of the actual spam, what fraction did the model flag?</li>
+<li><code>F1 = 2 * P * R / (P + R)</code>. The harmonic mean of the two.</li>
+</ul>
+<p>A confusion matrix prints the four counts as a 2x2 grid. The demo writes this to stdout for both training regimes.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-2791d373b3d9855b0048.png" alt="cap-classifier-head-swap 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Architecture</h2>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-343132c1c1989f48275c.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>The body is a deliberately tiny transformer: vocab 260, hidden 64, 4 heads, 2 blocks, max sequence 32. It is small enough to train both regimes to convergence inside ninety seconds on CPU. It is not pretrained in the lesson; instead, the <code>pretrain_quick</code> helper does five epochs of LM training on the same fixture's text to give the body a non-trivial starting point. This keeps the lesson self-contained.</p>
+<h2>What you will build</h2>
+<p>The implementation is one <code>main.py</code> plus one test module (<code>code/tests/test_main.py</code>).</p>
+<ol>
+<li><code>ByteTokenizer</code>: maps bytes to ids, reserves a pad id.</li>
+<li><code>Block</code>: a transformer block with multi-head attention and a feed-forward layer. Pre-norm.</li>
+<li><code>LMBody</code>: token + position embeddings plus a stack of blocks. Returns hidden states.</li>
+<li><code>MeanPool</code>: mask-weighted average over the sequence axis.</li>
+<li><code>Classifier</code>: body, pool, linear head. The body is the same instance across regimes.</li>
+<li><code>freeze_body</code> and <code>unfreeze_body</code>: toggle <code>requires_grad</code> on body parameters.</li>
+<li><code>train_classifier</code>: one shared loop. Accepts the model and an optimiser configured for whichever parameter group is trainable.</li>
+<li><code>evaluate</code>: runs the test set and returns <code>Metrics(precision, recall, f1, confusion)</code>.</li>
+<li><code>run_demo</code>: pretrains the body briefly, then trains and evaluates head-only, then full, prints both reports, and exits zero.</li>
+</ol>
+<h2>Why the comparison matters</h2>
+<p>The head-only regime usually trains faster and underfits more gracefully. On this fixture you typically see precision near 0.9 and recall near 0.85 after twenty epochs of head-only training. Full fine-tuning takes about three times longer and lands within a couple of points either way, depending on the random seed.</p>
+<p>The lesson does not pick a winner. It teaches you to read the numbers and the cost. On 800 examples and a tiny body, head-only is the right call. On 80,000 examples and a bigger body, full fine-tuning starts to pay off. The contract you take from this lesson is the API: the same <code>train_classifier</code> function handles both, and the toggle is one call.</p>
+<h2>Stretch goals</h2>
+<ul>
+<li>Add a third regime that unfreezes only the last block. This is sometimes called partial fine-tuning. It costs less than full FT and learns more than head-only.</li>
+<li>Add a learning-rate scheduler. A cosine schedule on the head plus a smaller constant rate on the body is a common production setup.</li>
+<li>Replace mean pooling with a learned attention pool: a small attention layer with one learned query. This often beats mean pool on longer sequences.</li>
+</ul>
+<p>The implementation gives you the hooks. The tests pin the contract. The numbers are yours to push.</p>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-19-capstone-projects--38-classifier-finetuning.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-19-capstone-projects--38-classifier-finetuning.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/38-classifier-finetuning/code/main.py">phases/19-capstone-projects/38-classifier-finetuning/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;
+Classifier fine-tuning by head swap.
+
+See: phases/19-capstone-projects/38-classifier-finetuning/docs/en.md
+
+Compares two strategies on a synthetic spam/ham fixture:
+  - Head-only: body frozen, only the linear classification head trains.
+  - Full FT:   body and head both train.
+
+The demo at the bottom pretrains a tiny transformer body briefly, then
+fine-tunes under both regimes and prints precision, recall, F1, and the
+confusion matrix for each. Exits 0 on success.
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import math
+import random
+import sys
+from dataclasses import dataclass
+from typing import Iterable, List, Sequence, Tuple
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
+
+
+# ---------------------------------------------------------------------------
+# Tokeniser
+# ---------------------------------------------------------------------------
+
+
+class ByteTokenizer:
+    &quot;&quot;&quot;Maps printable bytes to ids 0..255. Reserves PAD as id 256.&quot;&quot;&quot;
+
+    PAD_ID = 256
+    VOCAB = 260  # leave headroom for future specials
+
+    def encode(self, text: str, max_len: int) -&gt; Tuple[List[int], List[int]]:
+        &quot;&quot;&quot;Return (ids, attention_mask). Pads to max_len.&quot;&quot;&quot;
+        raw = list(text.encode(&quot;utf-8&quot;, errors=&quot;ignore&quot;))[:max_len]
+        attn = [1] * len(raw)
+        while len(raw) &lt; max_len:
+            raw.append(self.PAD_ID)
+            attn.append(0)
+        return raw, attn
+
+    def decode(self, ids: Sequence[int]) -&gt; str:
+        return bytes(i for i in ids if i &lt; 256).decode(&quot;utf-8&quot;, errors=&quot;replace&quot;)
+
+
+# ---------------------------------------------------------------------------
+# Tiny transformer body
+# ---------------------------------------------------------------------------
+
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, hidden: int, heads: int):
+        super().__init__()
+        if hidden % heads != 0:
+            raise ValueError(&quot;hidden must divide by heads&quot;)
+        self.heads = heads
+        self.head_dim = hidden // heads
+        self.qkv = nn.Linear(hidden, hidden * 3, bias=False)
+        self.out = nn.Linear(hidden, hidden, bias=False)
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor) -&gt; torch.Tensor:
+        B, T, D = x.shape
+        qkv = self.qkv(x).view(B, T, 3, self.heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        att = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        # mask: B x T, 1 for real, 0 for pad. broadcast to B x 1 x 1 x T.
+        m = mask.view(B, 1, 1, T).to(att.dtype)
+        att = att.masked_fill(m == 0, float(&quot;-inf&quot;))
+        weights = F.softmax(att, dim=-1)
+        # Replace nan rows (all-pad keys, never happens for valid input) with zeros.
+        weights = torch.nan_to_num(weights, nan=0.0)
+        ctx = (weights @ v).transpose(1, 2).contiguous().view(B, T, D)
+        return self.out(ctx)
+
+
+class FeedForward(nn.Module):
+    def __init__(self, hidden: int, mlp_ratio: int = 4):
+        super().__init__()
+        self.fc1 = nn.Linear(hidden, hidden * mlp_ratio)
+        self.fc2 = nn.Linear(hidden * mlp_ratio, hidden)
+
+    def forward(self, x: torch.Tensor) -&gt; torch.Tensor:
+        return self.fc2(F.gelu(self.fc1(x)))
+
+
+class Block(nn.Module):
+    def __init__(self, hidden: int, heads: int):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(hidden)
+        self.attn = MultiHeadAttention(hidden, heads)
+        self.ln2 = nn.LayerNorm(hidden)
+        self.ff = FeedForward(hidden)
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor) -&gt; torch.Tensor:
+        x = x + self.attn(self.ln1(x), mask)
+        x = x + self.ff(self.ln2(x))
+        return x
+
+
+class LMBody(nn.Module):
+    &quot;&quot;&quot;Embedding + position + N transformer blocks. Returns hidden states.&quot;&quot;&quot;
+
+    def __init__(self, vocab: int, hidden: int, heads: int, depth: int, max_len: int):
+        super().__init__()
+        self.tok = nn.Embedding(vocab, hidden)
+        self.pos = nn.Embedding(max_len, hidden)
+        self.blocks = nn.ModuleList([Block(hidden, heads) for _ in range(depth)])
+        self.ln_f = nn.LayerNorm(hidden)
+        self.max_len = max_len
+
+    def forward(self, ids: torch.Tensor, mask: torch.Tensor) -&gt; torch.Tensor:
+        B, T = ids.shape
+        positions = torch.arange(T, device=ids.device).unsqueeze(0).expand(B, T)
+        x = self.tok(ids) + self.pos(positions)
+        for block in self.blocks:
+            x = block(x, mask)
+        return self.ln_f(x)
+
+
+# ---------------------------------------------------------------------------
+# Pooling and classifier head
+# ---------------------------------------------------------------------------
+
+
+def mean_pool(hidden: torch.Tensor, mask: torch.Tensor) -&gt; torch.Tensor:
+    &quot;&quot;&quot;Mask-weighted mean across the sequence dimension.&quot;&quot;&quot;
+    m = mask.unsqueeze(-1).to(hidden.dtype)
+    summed = (hidden * m).sum(dim=1)
+    counts = m.sum(dim=1).clamp(min=1.0)
+    return summed / counts
+
+
+class Classifier(nn.Module):
+    def __init__(self, body: LMBody, num_classes: int = 2):
+        super().__init__()
+        self.body = body
+        hidden = body.ln_f.normalized_shape[0]
+        self.head = nn.Linear(hidden, num_classes)
+
+    def forward(self, ids: torch.Tensor, mask: torch.Tensor) -&gt; torch.Tensor:
+        h = self.body(ids, mask)
+        pooled = mean_pool(h, mask)
+        return self.head(pooled)
+
+
+class LMHead(nn.Module):
+    &quot;&quot;&quot;Token-prediction head, used during the brief pretraining pass.&quot;&quot;&quot;
+
+    def __init__(self, body: LMBody, vocab: int):
+        super().__init__()
+        self.body = body
+        hidden = body.ln_f.normalized_shape[0]
+        self.proj = nn.Linear(hidden, vocab, bias=False)
+
+    def forward(self, ids: torch.Tensor, mask: torch.Tensor) -&gt; torch.Tensor:
+        h = self.body(ids, mask)
+        return self.proj(h)
+
+
+# ---------------------------------------------------------------------------
+# Freeze toggles
+# ---------------------------------------------------------------------------
+
+
+def freeze_body(model: Classifier) -&gt; int:
+    &quot;&quot;&quot;Set requires_grad=False on every body parameter. Returns count frozen.&quot;&quot;&quot;
+    n = 0
+    for p in model.body.parameters():
+        p.requires_grad = False
+        n += 1
+    return n
+
+
+def unfreeze_body(model: Classifier) -&gt; int:
+    n = 0
+    for p in model.body.parameters():
+        p.requires_grad = True
+        n += 1
+    return n
+
+
+def trainable_params(model: nn.Module) -&gt; int:
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+# ---------------------------------------------------------------------------
+# Synthetic spam/ham fixture
+# ---------------------------------------------------------------------------
+
+
+SPAM_TEMPLATES = [
+    &quot;FREE entry in {n}wkly comp to win FA Cup&quot;,
+    &quot;URGENT call {phone} to claim your prize&quot;,
+    &quot;WINNER claim your {amount} pound award now&quot;,
+    &quot;Congrats you won {prize} reply YES&quot;,
+    &quot;Click {url} for {discount} percent off&quot;,
+    &quot;Cheap loans available call {phone}&quot;,
+    &quot;Hot singles in {city} text NOW&quot;,
+    &quot;Earn money working from home click {url}&quot;,
+    &quot;You have been selected for a {amount} pound voucher&quot;,
+    &quot;Limited offer reply STOP to opt out&quot;,
+]
+
+HAM_TEMPLATES = [
+    &quot;are you home for dinner tonight&quot;,
+    &quot;see you at {time} tomorrow&quot;,
+    &quot;can you pick up {item} on the way&quot;,
+    &quot;the meeting moved to {time}&quot;,
+    &quot;thanks for the {item} yesterday&quot;,
+    &quot;let me know when you are free&quot;,
+    &quot;running late by {n} minutes sorry&quot;,
+    &quot;have a good day at work&quot;,
+    &quot;did you watch the match last night&quot;,
+    &quot;happy birthday hope you have fun&quot;,
+]
+
+SLOTS = {
+    &quot;n&quot;: [&quot;1&quot;, &quot;2&quot;, &quot;3&quot;, &quot;5&quot;, &quot;10&quot;],
+    &quot;phone&quot;: [&quot;09061701461&quot;, &quot;08000839402&quot;, &quot;09058091870&quot;],
+    &quot;amount&quot;: [&quot;100&quot;, &quot;250&quot;, &quot;500&quot;, &quot;1000&quot;, &quot;5000&quot;],
+    &quot;prize&quot;: [&quot;a holiday&quot;, &quot;an iPhone&quot;, &quot;a laptop&quot;, &quot;cash&quot;],
+    &quot;url&quot;: [&quot;http://bit.ly/free&quot;, &quot;http://win.now/cash&quot;, &quot;http://promo.io&quot;],
+    &quot;discount&quot;: [&quot;20&quot;, &quot;30&quot;, &quot;50&quot;, &quot;70&quot;],
+    &quot;city&quot;: [&quot;London&quot;, &quot;Manchester&quot;, &quot;Leeds&quot;, &quot;Bristol&quot;],
+    &quot;time&quot;: [&quot;6pm&quot;, &quot;7pm&quot;, &quot;noon&quot;, &quot;9am&quot;],
+    &quot;item&quot;: [&quot;milk&quot;, &quot;bread&quot;, &quot;the kids&quot;, &quot;the dog&quot;, &quot;groceries&quot;],
+}
+
+
+def fill(template: str, rng: random.Random) -&gt; str:
+    out = template
+    for key, options in SLOTS.items():
+        marker = &quot;{&quot; + key + &quot;}&quot;
+        if marker in out:
+            out = out.replace(marker, rng.choice(options))
+    return out
+
+
+def make_dataset(n_per_class: int = 400, seed: int = 0) -&gt; Tuple[List[str], List[int]]:
+    rng = random.Random(seed)
+    texts: List[str] = []
+    labels: List[int] = []
+    for _ in range(n_per_class):
+        texts.append(fill(rng.choice(SPAM_TEMPLATES), rng))
+        labels.append(1)
+        texts.append(fill(rng.choice(HAM_TEMPLATES), rng))
+        labels.append(0)
+    # Shuffle deterministically.
+    order = list(range(len(texts)))
+    rng.shuffle(order)
+    return [texts[i] for i in order], [labels[i] for i in order]
+
+
+def stratified_split(
+    texts: Sequence[str], labels: Sequence[int], test_frac: float, seed: int
+) -&gt; Tuple[List[str], List[int], List[str], List[int]]:
+    rng = random.Random(seed)
+    by_label: dict[int, List[int]] = {}
+    for idx, y in enumerate(labels):
+        by_label.setdefault(y, []).append(idx)
+    train_idx: List[int] = []
+    test_idx: List[int] = []
+    for y, idxs in by_label.items():
+        idxs_copy = list(idxs)
+        rng.shuffle(idxs_copy)
+        cut = int(len(idxs_copy) * (1.0 - test_frac))
+        train_idx.extend(idxs_copy[:cut])
+        test_idx.extend(idxs_copy[cut:])
+    rng.shuffle(train_idx)
+    rng.shuffle(test_idx)
+    return (
+        [texts[i] for i in train_idx],
+        [labels[i] for i in train_idx],
+        [texts[i] for i in test_idx],
+        [labels[i] for i in test_idx],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Datasets
+# ---------------------------------------------------------------------------
+
+
+class ClassificationDataset(Dataset):
+    def __init__(self, texts: Sequence[str], labels: Sequence[int], tok: ByteTokenizer, max_len: int):
+        self.texts = list(texts)
+        self.labels = list(labels)
+        self.tok = tok
+        self.max_len = max_len
+
+    def __len__(self) -&gt; int:
+        return len(self.texts)
+
+    def __getitem__(self, idx: int):
+        ids, mask = self.tok.encode(self.texts[idx], self.max_len)
+        return (
+            torch.tensor(ids, dtype=torch.long),
+            torch.tensor(mask, dtype=torch.long),
+            torch.tensor(self.labels[idx], dtype=torch.long),
+        )
+
+
+class LMDataset(Dataset):
+    &quot;&quot;&quot;Causal LM dataset over the spam/ham strings. Used for the warm-up pretraining.&quot;&quot;&quot;
+
+    def __init__(self, texts: Sequence[str], tok: ByteTokenizer, max_len: int):
+        self.texts = list(texts)
+        self.tok = tok
+        self.max_len = max_len
+
+    def __len__(self) -&gt; int:
+        return len(self.texts)
+
+    def __getitem__(self, idx: int):
+        ids, mask = self.tok.encode(self.texts[idx], self.max_len)
+        return (
+            torch.tensor(ids, dtype=torch.long),
+            torch.tensor(mask, dtype=torch.long),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Training loops
+# ---------------------------------------------------------------------------
+
+
+def pretrain_quick(
+    body: LMBody,
+    tok: ByteTokenizer,
+    texts: Sequence[str],
+    max_len: int,
+    epochs: int = 5,
+    batch_size: int = 32,
+    lr: float = 3e-3,
+    seed: int = 0,
+) -&gt; List[float]:
+    &quot;&quot;&quot;A short LM pretraining pass to give the body non-trivial weights.&quot;&quot;&quot;
+    torch.manual_seed(seed)
+    head = LMHead(body, vocab=tok.VOCAB)
+    ds = LMDataset(texts, tok, max_len)
+    dl = DataLoader(ds, batch_size=batch_size, shuffle=True)
+    opt = torch.optim.Adam(head.parameters(), lr=lr)
+    losses: List[float] = []
+    head.train()
+    for _ in range(epochs):
+        epoch_loss = 0.0
+        n_batches = 0
+        for ids, mask in dl:
+            logits = head(ids, mask)
+            # Shift one for next-token prediction.
+            target = ids[:, 1:].contiguous()
+            tgt_mask = mask[:, 1:].contiguous()
+            logits = logits[:, :-1, :].contiguous()
+            loss_full = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                target.view(-1),
+                reduction=&quot;none&quot;,
+            )
+            loss_full = loss_full.view(target.shape) * tgt_mask
+            denom = tgt_mask.sum().clamp(min=1.0)
+            loss = loss_full.sum() / denom
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            epoch_loss += float(loss.item())
+            n_batches += 1
+        losses.append(epoch_loss / max(n_batches, 1))
+    return losses
+
+
+@dataclass
+class TrainReport:
+    losses: List[float]
+    final_loss: float
+    trainable: int
+
+
+def train_classifier(
+    model: Classifier,
+    train_loader: DataLoader,
+    epochs: int,
+    lr: float,
+    seed: int,
+) -&gt; TrainReport:
+    torch.manual_seed(seed)
+    params = [p for p in model.parameters() if p.requires_grad]
+    if not params:
+        raise ValueError(&quot;No trainable parameters. Did you freeze the head as well?&quot;)
+    opt = torch.optim.Adam(params, lr=lr)
+    losses: List[float] = []
+    model.train()
+    for _ in range(epochs):
+        epoch_loss = 0.0
+        n_batches = 0
+        for ids, mask, y in train_loader:
+            logits = model(ids, mask)
+            loss = F.cross_entropy(logits, y)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            epoch_loss += float(loss.item())
+            n_batches += 1
+        losses.append(epoch_loss / max(n_batches, 1))
+    return TrainReport(losses=losses, final_loss=losses[-1], trainable=trainable_params(model))
+
+
+# ---------------------------------------------------------------------------
+# Evaluation
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Metrics:
+    precision: float
+    recall: float
+    f1: float
+    tp: int
+    fp: int
+    fn: int
+    tn: int
+
+    def confusion(self) -&gt; str:
+        return (
+            &quot;                pred ham   pred spam\n&quot;
+            f&quot;  actual ham    {self.tn:&gt;8d}   {self.fp:&gt;8d}\n&quot;
+            f&quot;  actual spam   {self.fn:&gt;8d}   {self.tp:&gt;8d}&quot;
+        )
+
+
+def precision_recall_f1(tp: int, fp: int, fn: int) -&gt; Tuple[float, float, float]:
+    p = tp / (tp + fp) if (tp + fp) else 0.0
+    r = tp / (tp + fn) if (tp + fn) else 0.0
+    f1 = (2 * p * r) / (p + r) if (p + r) else 0.0
+    return p, r, f1
+
+
+@torch.no_grad()
+def evaluate(model: Classifier, loader: DataLoader, positive: int = 1) -&gt; Metrics:
+    model.eval()
+    tp = fp = fn = tn = 0
+    for ids, mask, y in loader:
+        logits = model(ids, mask)
+        pred = logits.argmax(dim=-1)
+        for p_i, y_i in zip(pred.tolist(), y.tolist()):
+            if p_i == positive and y_i == positive:
+                tp += 1
+            elif p_i == positive and y_i != positive:
+                fp += 1
+            elif p_i != positive and y_i == positive:
+                fn += 1
+            else:
+                tn += 1
+    p, r, f1 = precision_recall_f1(tp, fp, fn)
+    return Metrics(precision=p, recall=r, f1=f1, tp=tp, fp=fp, fn=fn, tn=tn)
+
+
+# ---------------------------------------------------------------------------
+# Configuration and demo
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Config:
+    vocab: int = ByteTokenizer.VOCAB
+    hidden: int = 64
+    heads: int = 4
+    depth: int = 2
+    max_len: int = 32
+    batch_size: int = 32
+    head_only_epochs: int = 20
+    full_ft_epochs: int = 20
+    head_lr: float = 5e-3
+    full_lr: float = 1e-3
+    pretrain_epochs: int = 5
+    seed: int = 0
+
+
+def build_model(cfg: Config) -&gt; Classifier:
+    torch.manual_seed(cfg.seed)
+    body = LMBody(
+        vocab=cfg.vocab,
+        hidden=cfg.hidden,
+        heads=cfg.heads,
+        depth=cfg.depth,
+        max_len=cfg.max_len,
+    )
+    return Classifier(body, num_classes=2)
+
+
+@dataclass
+class DemoReport:
+    head_only: Metrics
+    full_ft: Metrics
+    head_only_loss: float
+    full_ft_loss: float
+    head_only_trainable: int
+    full_ft_trainable: int
+
+    def passed(self) -&gt; bool:
+        # Both regimes should beat random (F1 &gt; 0.5) on this fixture.
+        return self.head_only.f1 &gt; 0.5 and self.full_ft.f1 &gt; 0.5
+
+
+def run_demo(cfg: Config | None = None) -&gt; int:
+    cfg = cfg or Config()
+    torch.manual_seed(cfg.seed)
+    np.random.seed(cfg.seed)
+
+    tok = ByteTokenizer()
+    texts, labels = make_dataset(n_per_class=400, seed=cfg.seed)
+    tr_t, tr_y, te_t, te_y = stratified_split(texts, labels, test_frac=0.2, seed=cfg.seed)
+
+    train_ds = ClassificationDataset(tr_t, tr_y, tok, cfg.max_len)
+    test_ds = ClassificationDataset(te_t, te_y, tok, cfg.max_len)
+    train_dl = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True)
+    test_dl = DataLoader(test_ds, batch_size=cfg.batch_size, shuffle=False)
+
+    print(&quot;CLASSIFIER FINE-TUNING DEMO&quot;)
+    print(f&quot;train={len(train_ds)} test={len(test_ds)} max_len={cfg.max_len}&quot;)
+    print(&quot;&quot;)
+    print(&quot;[1/3] pretraining body briefly on the corpus text...&quot;)
+    body_for_pretrain = LMBody(
+        vocab=cfg.vocab,
+        hidden=cfg.hidden,
+        heads=cfg.heads,
+        depth=cfg.depth,
+        max_len=cfg.max_len,
+    )
+    pre_losses = pretrain_quick(
+        body_for_pretrain,
+        tok,
+        tr_t,
+        cfg.max_len,
+        epochs=cfg.pretrain_epochs,
+        batch_size=cfg.batch_size,
+        seed=cfg.seed,
+    )
+    print(f&quot;      pretrain final loss = {pre_losses[-1]:.4f}&quot;)
+
+    # Two classifiers share the same pretrained body weights (copied to keep regimes independent).
+    head_only_model = Classifier(_clone_body(body_for_pretrain), num_classes=2)
+    full_ft_model = Classifier(_clone_body(body_for_pretrain), num_classes=2)
+
+    print(&quot;&quot;)
+    print(&quot;[2/3] training head-only (body frozen)...&quot;)
+    freeze_body(head_only_model)
+    head_report = train_classifier(
+        head_only_model,
+        train_dl,
+        epochs=cfg.head_only_epochs,
+        lr=cfg.head_lr,
+        seed=cfg.seed,
+    )
+    head_metrics = evaluate(head_only_model, test_dl)
+    print(f&quot;      trainable params = {head_report.trainable}&quot;)
+    print(f&quot;      final train loss = {head_report.final_loss:.4f}&quot;)
+    print(f&quot;      P={head_metrics.precision:.3f} R={head_metrics.recall:.3f} F1={head_metrics.f1:.3f}&quot;)
+    print(head_metrics.confusion())
+
+    print(&quot;&quot;)
+    print(&quot;[3/3] training full fine-tuning (body unfrozen)...&quot;)
+    unfreeze_body(full_ft_model)
+    full_report = train_classifier(
+        full_ft_model,
+        train_dl,
+        epochs=cfg.full_ft_epochs,
+        lr=cfg.full_lr,
+        seed=cfg.seed,
+    )
+    full_metrics = evaluate(full_ft_model, test_dl)
+    print(f&quot;      trainable params = {full_report.trainable}&quot;)
+    print(f&quot;      final train loss = {full_report.final_loss:.4f}&quot;)
+    print(f&quot;      P={full_metrics.precision:.3f} R={full_metrics.recall:.3f} F1={full_metrics.f1:.3f}&quot;)
+    print(full_metrics.confusion())
+
+    report = DemoReport(
+        head_only=head_metrics,
+        full_ft=full_metrics,
+        head_only_loss=head_report.final_loss,
+        full_ft_loss=full_report.final_loss,
+        head_only_trainable=head_report.trainable,
+        full_ft_trainable=full_report.trainable,
+    )
+
+    print(&quot;&quot;)
+    print(&quot;SUMMARY&quot;)
+    print(f&quot;  head-only:  trainable={report.head_only_trainable:&gt;6d} F1={report.head_only.f1:.3f}&quot;)
+    print(f&quot;  full-FT:    trainable={report.full_ft_trainable:&gt;6d} F1={report.full_ft.f1:.3f}&quot;)
+    if not report.passed():
+        print(&quot;ERROR: at least one regime did not beat random F1=0.5&quot;, file=sys.stderr)
+        return 1
+    return 0
+
+
+def _clone_body(body: LMBody) -&gt; LMBody:
+    &quot;&quot;&quot;Deep-copy a body so two regimes start from the same pretrained weights.&quot;&quot;&quot;
+    clone = LMBody(
+        vocab=body.tok.num_embeddings,
+        hidden=body.ln_f.normalized_shape[0],
+        heads=body.blocks[0].attn.heads,
+        depth=len(body.blocks),
+        max_len=body.max_len,
+    )
+    clone.load_state_dict(body.state_dict())
+    return clone
+
+
+if __name__ == &quot;__main__&quot;:
+    sys.exit(run_demo())
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/38-classifier-finetuning/code/tests/test_main.py">phases/19-capstone-projects/38-classifier-finetuning/code/tests/test_main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Tests for the classifier fine-tuning lesson.&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import os
+import sys
+import unittest
+
+import torch
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(HERE))
+
+from main import (  # noqa: E402
+    ByteTokenizer,
+    Classifier,
+    ClassificationDataset,
+    Config,
+    DataLoader,
+    LMBody,
+    Metrics,
+    build_model,
+    evaluate,
+    freeze_body,
+    make_dataset,
+    mean_pool,
+    precision_recall_f1,
+    run_demo,
+    stratified_split,
+    train_classifier,
+    trainable_params,
+    unfreeze_body,
+)
+
+
+class TokenizerTests(unittest.TestCase):
+    def test_pads_to_max_len(self) -&gt; None:
+        tok = ByteTokenizer()
+        ids, mask = tok.encode(&quot;hi&quot;, max_len=8)
+        self.assertEqual(len(ids), 8)
+        self.assertEqual(len(mask), 8)
+        self.assertEqual(mask[:2], [1, 1])
+        self.assertEqual(mask[2:], [0, 0, 0, 0, 0, 0])
+        self.assertEqual(ids[2], ByteTokenizer.PAD_ID)
+
+    def test_truncates_long_input(self) -&gt; None:
+        tok = ByteTokenizer()
+        text = &quot;abcdefghij&quot;
+        ids, mask = tok.encode(text, max_len=4)
+        self.assertEqual(len(ids), 4)
+        self.assertEqual(mask, [1, 1, 1, 1])
+
+    def test_decode_skips_pad(self) -&gt; None:
+        tok = ByteTokenizer()
+        ids, _ = tok.encode(&quot;ok&quot;, max_len=8)
+        self.assertEqual(tok.decode(ids), &quot;ok&quot;)
+
+
+class DatasetTests(unittest.TestCase):
+    def test_make_dataset_balanced(self) -&gt; None:
+        texts, labels = make_dataset(n_per_class=50, seed=1)
+        self.assertEqual(len(texts), 100)
+        self.assertEqual(labels.count(0), 50)
+        self.assertEqual(labels.count(1), 50)
+
+    def test_stratified_split_preserves_balance(self) -&gt; None:
+        texts, labels = make_dataset(n_per_class=100, seed=2)
+        tr_t, _tr_y, te_t, te_y = stratified_split(texts, labels, test_frac=0.2, seed=2)
+        self.assertEqual(len(tr_t) + len(te_t), 200)
+        # 20 percent of each class lands in the test split.
+        self.assertEqual(te_y.count(0), 20)
+        self.assertEqual(te_y.count(1), 20)
+
+
+class MetricsTests(unittest.TestCase):
+    def test_perfect_classifier(self) -&gt; None:
+        p, r, f1 = precision_recall_f1(tp=50, fp=0, fn=0)
+        self.assertEqual(p, 1.0)
+        self.assertEqual(r, 1.0)
+        self.assertEqual(f1, 1.0)
+
+    def test_all_false_positive(self) -&gt; None:
+        p, r, f1 = precision_recall_f1(tp=0, fp=10, fn=10)
+        self.assertEqual(p, 0.0)
+        self.assertEqual(r, 0.0)
+        self.assertEqual(f1, 0.0)
+
+    def test_f1_is_harmonic_mean(self) -&gt; None:
+        p, r, f1 = precision_recall_f1(tp=8, fp=2, fn=2)
+        self.assertAlmostEqual(p, 0.8, places=6)
+        self.assertAlmostEqual(r, 0.8, places=6)
+        self.assertAlmostEqual(f1, 0.8, places=6)
+
+
+class FreezeTests(unittest.TestCase):
+    def test_freeze_zeros_grad_flags_on_body_only(self) -&gt; None:
+        cfg = Config(hidden=16, depth=1, heads=2, max_len=8)
+        model = build_model(cfg)
+        before = trainable_params(model)
+        freeze_body(model)
+        after = trainable_params(model)
+        self.assertLess(after, before)
+        # Head must still be trainable.
+        self.assertGreater(after, 0)
+        for p in model.body.parameters():
+            self.assertFalse(p.requires_grad)
+        for p in model.head.parameters():
+            self.assertTrue(p.requires_grad)
+
+    def test_unfreeze_restores(self) -&gt; None:
+        cfg = Config(hidden=16, depth=1, heads=2, max_len=8)
+        model = build_model(cfg)
+        freeze_body(model)
+        unfreeze_body(model)
+        for p in model.parameters():
+            self.assertTrue(p.requires_grad)
+
+
+class PoolingTests(unittest.TestCase):
+    def test_mask_excludes_pads_from_pool(self) -&gt; None:
+        torch.manual_seed(0)
+        hidden = torch.tensor(
+            [
+                [[1.0, 0.0], [2.0, 0.0], [99.0, 99.0]],
+            ]
+        )
+        mask = torch.tensor([[1, 1, 0]])
+        pooled = mean_pool(hidden, mask)
+        self.assertTrue(torch.allclose(pooled, torch.tensor([[1.5, 0.0]])))
+
+    def test_empty_mask_does_not_divide_by_zero(self) -&gt; None:
+        hidden = torch.tensor([[[1.0, 1.0]]])
+        mask = torch.tensor([[0]])
+        pooled = mean_pool(hidden, mask)
+        self.assertFalse(torch.isnan(pooled).any())
+
+
+class ForwardTests(unittest.TestCase):
+    def test_forward_shape_is_batch_by_num_classes(self) -&gt; None:
+        cfg = Config(hidden=16, depth=1, heads=2, max_len=8)
+        model = build_model(cfg)
+        ids = torch.randint(0, ByteTokenizer.VOCAB, (3, cfg.max_len))
+        mask = torch.ones_like(ids)
+        out = model(ids, mask)
+        self.assertEqual(out.shape, (3, 2))
+
+    def test_pad_tokens_do_not_change_pooled_output(self) -&gt; None:
+        cfg = Config(hidden=16, depth=1, heads=2, max_len=8, seed=42)
+        model = build_model(cfg)
+        model.eval()
+        tok = ByteTokenizer()
+        ids1, mask1 = tok.encode(&quot;hello&quot;, max_len=cfg.max_len)
+        # Perturb only masked (pad) positions; pooled output must stay unchanged.
+        ids2 = list(ids1)
+        mask2 = list(mask1)
+        for i, m in enumerate(mask2):
+            if m == 0:
+                ids2[i] = (ids2[i] + 1) % ByteTokenizer.VOCAB
+        a = model(torch.tensor([ids1]), torch.tensor([mask1]))
+        b = model(torch.tensor([ids2]), torch.tensor([mask2]))
+        self.assertTrue(torch.allclose(a, b))
+
+
+class TrainingTests(unittest.TestCase):
+    def test_head_only_reduces_loss(self) -&gt; None:
+        cfg = Config(hidden=32, depth=1, heads=2, max_len=16, head_only_epochs=8)
+        tok = ByteTokenizer()
+        texts, labels = make_dataset(n_per_class=64, seed=cfg.seed)
+        ds = ClassificationDataset(texts, labels, tok, cfg.max_len)
+        dl = DataLoader(ds, batch_size=cfg.batch_size, shuffle=True)
+        model = build_model(cfg)
+        freeze_body(model)
+        rep = train_classifier(model, dl, epochs=cfg.head_only_epochs, lr=cfg.head_lr, seed=cfg.seed)
+        self.assertLess(rep.final_loss, rep.losses[0])
+        self.assertEqual(rep.trainable, trainable_params(model))
+
+
+class EvaluateTests(unittest.TestCase):
+    def test_evaluate_on_trained_model_is_above_random(self) -&gt; None:
+        cfg = Config(hidden=32, depth=1, heads=2, max_len=16, head_only_epochs=10)
+        tok = ByteTokenizer()
+        texts, labels = make_dataset(n_per_class=64, seed=cfg.seed)
+        tr_t, tr_y, te_t, te_y = stratified_split(texts, labels, test_frac=0.25, seed=cfg.seed)
+        train_ds = ClassificationDataset(tr_t, tr_y, tok, cfg.max_len)
+        test_ds = ClassificationDataset(te_t, te_y, tok, cfg.max_len)
+        train_dl = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True)
+        test_dl = DataLoader(test_ds, batch_size=cfg.batch_size, shuffle=False)
+        model = build_model(cfg)
+        freeze_body(model)
+        train_classifier(model, train_dl, epochs=cfg.head_only_epochs, lr=cfg.head_lr, seed=cfg.seed)
+        metrics = evaluate(model, test_dl)
+        self.assertIsInstance(metrics, Metrics)
+        self.assertGreater(metrics.f1, 0.5)
+        # Sanity: TP + FP + FN + TN must equal the test set size.
+        self.assertEqual(metrics.tp + metrics.fp + metrics.fn + metrics.tn, len(test_ds))
+
+
+if __name__ == &quot;__main__&quot;:
+    unittest.main()
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. Before reading: a pretrained language model has a body with 5M parameters and an output head that projects to a 30K vocabulary. You want a 2-class classifier. Which is the most defensible first move?</legend><label class="option"><input type="radio" name="q0" value="0"> Freeze the head and train only the body.</label><label class="option"><input type="radio" name="q0" value="1"> Discard the body and train a new transformer from scratch on the 800-example labelled set.</label><label class="option"><input type="radio" name="q0" value="2"> Keep the original head but mask all but two output logits.</label><label class="option"><input type="radio" name="q0" value="3"> Replace only the head with a 2-class linear layer and decide later whether to train the body.</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. Why does the lesson use mean pooling with an attention-mask weighting instead of a plain mean across the sequence axis?</legend><label class="option"><input type="radio" name="q1" value="0"> Plain mean ignores the batch dimension.</label><label class="option"><input type="radio" name="q1" value="1"> Mean pool requires masking by convention even when there are no pads.</label><label class="option"><input type="radio" name="q1" value="2"> Plain mean is mathematically undefined for transformers.</label><label class="option"><input type="radio" name="q1" value="3"> Padding positions contribute irrelevant hidden states that would pull the pooled vector toward zero.</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. In `train_classifier`, the optimiser is constructed with `[p for p in model.parameters() if p.requires_grad]`. What does this idiom enforce?</legend><label class="option"><input type="radio" name="q2" value="0"> It is required by the Adam constructor.</label><label class="option"><input type="radio" name="q2" value="1"> It tells PyTorch to autograd through frozen parameters anyway.</label><label class="option"><input type="radio" name="q2" value="2"> It silently ignores the head when the body is frozen.</label><label class="option"><input type="radio" name="q2" value="3"> It builds the param group from only the trainable subset, so the head-only and full-FT cases share the same code path.</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. Precision is 0.9 and recall is 0.6 on the spam class. What is the F1?</legend><label class="option"><input type="radio" name="q3" value="0"> 0.30</label><label class="option"><input type="radio" name="q3" value="1"> 0.50</label><label class="option"><input type="radio" name="q3" value="2"> 0.75</label><label class="option"><input type="radio" name="q3" value="3"> 0.72</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. You retrain the model with full fine-tuning at the same learning rate as head-only training. F1 collapses to 0.55 from 0.90. What is the most likely cause?</legend><label class="option"><input type="radio" name="q4" value="0"> PyTorch silently disables gradients during full fine-tuning.</label><label class="option"><input type="radio" name="q4" value="1"> The body parameters needed a smaller learning rate than the head.</label><label class="option"><input type="radio" name="q4" value="2"> Cross-entropy loss is not defined for two-class problems.</label><label class="option"><input type="radio" name="q4" value="3"> Adam is incompatible with classification objectives.</label><p data-feedback="4"></p></fieldset><fieldset><legend>6. Your team wants to deploy the classifier and asks how to record which regime produced the production checkpoint. Which artifact answers that question reproducibly?</legend><label class="option"><input type="radio" name="q5" value="0"> The final loss value, since head-only loss is always higher than full-FT loss.</label><label class="option"><input type="radio" name="q5" value="1"> The `trainable` count in `TrainReport`, which differs by orders of magnitude between regimes.</label><label class="option"><input type="radio" name="q5" value="2"> The confusion matrix, which uniquely identifies the regime.</label><label class="option"><input type="radio" name="q5" value="3"> The precision-recall-F1 triple.</label><p data-feedback="5"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/19-capstone-projects/37-loading-pretrained-weights/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/19-capstone-projects/39-instruction-tuning-sft/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/19-capstone-projects/38-classifier-finetuning/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

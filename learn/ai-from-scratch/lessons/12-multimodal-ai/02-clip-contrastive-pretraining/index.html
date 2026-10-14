@@ -1,0 +1,554 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>语和视觉语言预训 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-12-multimodal-ai" data-lesson="12-multimodal-ai/02-clip-contrastive-pretraining" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/12-multimodal-ai/">多模态 AI</a> / LESSON 02</p><h1 class="lesson-title">语和视觉语言预训</h1><p>CLIP and Contrastive Vision-Language Pretraining</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>语和视觉语言预训</h1>
+<blockquote>
+<p>开放AI的CLIP (2021) 证明了一个足够大的想法,可以在未来五年内实现:将图像编码器和文本编码器在同一向量空间中, 没有监督标签. 两千万个. 结果的嵌入空间进行零射击分类,图像文本检索,并作为其视觉塔插入每一个2026 VLM. siglip 2 (2025) 取代软max 通过sigmoid,以更低的成本扩展到CLIP之后. 这一课将从InfoNCE到sigmoid对式损失的数学进行,并建立了在 stdlib Python 中的训练步骤.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python (stdlib, InfoNCE + sigmoid loss implementations)
+<strong>Prerequisites:</strong> Phase 12 · 01 (ViT patches), Phase 7 (Transformers)
+<strong>Time:</strong> ~180 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>通过互通信息来推导InfoNCE损失,并实现数量稳定的向量化版本.</li>
+<li>解释为什么sigmoid对式损失 (SigLIP) 达到32768+批量,而没有全集的上空软max要求.</li>
+<li>通过构建文本模板来运行零截图的 ImageNet 分类 (<code>a photo of a {class}</code>) 和使用 argmax 与 cosine 类似性相比.</li>
+<li>列出CLIP/SigLIP预训练给你提供的四个杆:批量大小,温度,提示模板,数据质量.</li>
+</ul>
+<h2>问题</h2>
+<p>监督CLIP前的视觉.收集标记数据集 (ImageNet: 1.2M图像, 1000 类),训练一个CNN,运输它.标签昂贵,标签偏向标签商可以同意,标签不会转移到新的任务没有细节调整.</p>
+<p>图像标题网有超过10亿个宽松标签的双色球免费.一个带有&quot;我的狗马克斯在公园&quot;的黄金回归器的图片带有监督信号.</p>
+<p>根据Clip的答案:把图像标题对应当作匹配任务. 鉴于一批N图像和N标题,学会与N-1分散注意力的标题匹配. 监督是&quot;这两件事相应,这些N-1不. &quot;没有类标签.没有人注释.只是一个反驳的损失.</p>
+<p>图像网的零射击效果是因为&quot;一张猫的照片&quot;嵌入了没有明确标记的猫的照片附近.这是每2026年VLM产生的一项投注.</p>
+<h2>概念</h2>
+<h3>双码码器</h3>
+<p>克利普有两个塔楼:</p>
+<ul>
+<li>图像编码器<code>f</code>视频或ResNet,输出每张图像的D-dim向量.</li>
+<li>文字编码器<code>g</code>转换器,每字幕输出一个D-dim向量.</li>
+</ul>
+<p>两座塔都将输出正常化到单位长度.<code>cos(f(x), g(y)) = f(x)^T g(y)</code>由于它们都是单位标准.</p>
+<p>对于一批N (图片,字幕) 对,构建类似性矩阵<code>S</code>形状<code>(N, N)</code>其他:</p>
+<pre><code>S[i, j] = cos(f(x_i), g(y_j)) / tau
+</code></pre>
+<p>在哪里<code>tau</code>是学习温度 (CLIP初始化为0.07;在日记空间中学习).</p>
+<h3>信息NCE损失</h3>
+<p>通过Clip,在行列和列中使用对称的交叉透:</p>
+<pre><code>loss_i2t = CE(S, labels=identity)     # each image's positive is its own caption
+loss_t2i = CE(S^T, labels=identity)   # each caption's positive is its own image
+loss = (loss_i2t + loss_t2i) / 2
+</code></pre>
+<p>这就是InfoNCE.CE中软max强迫每个图像比批次中的其他所有标题更符合其标题.&quot;负&quot;是所有其他批次的项目.较大的批次 =更多负面 =更强的信号.Clip训练在批次32k;规模是重要的.</p>
+<h3>温度</h3>
+<p><code>tau</code>控制软max的敏度.低tau →敏分布,硬负矿效应.高tau →软,所有样本都贡献.CLIP学习 log(1/tau),切断以防止崩.SigLIP 2修复初始tau,并使用学习偏见.</p>
+<h3>为什么sigmoid 尺度更好 (SigLIP)</h3>
+<p>在分布式训练中,你必须把每个嵌入到每个复制品中,然后做软max.这是世界尺寸的方形.</p>
+<p>siglip取代 softmax 用元素智能sigmoid:为每对 <code>(i, j)</code>输出是&quot;这些是匹配的对吗?&quot;正数类标签是对角,其他的一切都是负数.</p>
+<pre><code>L = -1/N sum over (i, j) [ y_ij log sigmoid(S[i,j]) + (1-y_ij) log sigmoid(-S[i,j]) ]
+</code></pre>
+<p><code>y_ij = 1</code>如果<code>i == j</code>任何 GPU 都需要一个全集. 每个 GPU 都计算出其本地块和数量. SigLIP 2 量化为 32k-512k 批量便宜, CLIP 需要比较多的通信.</p>
+<h3>零射分类</h3>
+<p>给给N类名称,为每个类构建一个文本模板:</p>
+<pre><code>&quot;a photo of a {class}&quot;
+</code></pre>
+<p>嵌入每个模板与文本编码器. 嵌入图像与图像编码器. Argmax cosine 类似性 = 预测类. 没有对目标类进行培训.</p>
+<p>快速模板是重要的.CLIP的原始论文每类使用80个模板 (平坦,艺术,照片,绘画等) 并平均嵌入. +3 图像网点.现代使用通常选择一个或两个模板.</p>
+<h3>线性探测器和细调</h3>
+<p>零射线是基线.线性探测器 (为目标类的CIP功能加上一个线性层) 在域内任务中比零射线更好.完整的细节调整在域内探测器比线性探测器更好,但可以损害零射线转移.三个模式具有三个折扣.</p>
+<h3>标LIP 2: NaFlex 和密集的特征</h3>
+<p>siglip 2 (2025) 补充:</p>
+<ul>
+<li>纳弗莱克斯:单个模型处理可变的面积比和分辨率.</li>
+<li>较好的密度功能用于细分和深度估计, 针对于VLM中作为结的脊柱.</li>
+<li>多语言:在CIP仅使用英语的100多种语言上接受培训.</li>
+<li>升到400米的1B参数尺度.</li>
+</ul>
+<p>在2026年开放的VLM中,SigLIP 2 SO400m/14是默认的视觉塔.Clip仍然是纯图像文本检索的默认,其中特定的LAION-2B训练分布与查询模式匹配.</p>
+<h3>其他技术: 技术技术</h3>
+<p>简单的数据量度:CLIP (Google, 2021):与CLIP相同的想法,1.8B双尺度,90%的噪音. 已证明的噪音数据量度.OpenCLIP (LAION):在LAION-400M/2B上CLIP的开放复制,多个尺度,开放检查点.EVA-CLIP:从面具图像建模开始;VLM的强大脊柱.BASIC:谷歌的CLIP+ALIGN混合动力.所有相同的家族,不同的数据和调整.</p>
+<h3>零射击的天花板</h3>
+<p>CLIP类型的模型约占76%的ImageNet零射 (CLIP-G,OpenCLIP-G).此外需要更大的数据 (SigLIP 2获得80%+) 或结构变化 (监督头部,更多参数).基准值是和;实际值是下游VLM所消耗的嵌入空间.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-e7f8d074da8367f45379.png" alt="multimodal-fusion 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>用它</h2>
+<p><code>code/main.py</code>执行:</p>
+<ol>
+<li>玩具双码码器 (基于hash的图像功能,文字图表功能),以便您可以在无的情况下看到InfoNCE形状.</li>
+<li>在纯Python中输入InfoNCE (通过 log-sum-exp进行数字稳定).</li>
+<li>形双向损失比较.</li>
+<li>零射分类例程:计算与一组文本提示相似的共数,预测的 argmax.</li>
+</ol>
+<p>运行它,看输法曲线.绝对数字是玩具;形状与真正的Clip训练师的排放相匹配.</p>
+<h2>运送它</h2>
+<p>这一课产生了<code>outputs/skill-clip-zero-shot.md</code>鉴于图像集 (通过路径) 和目标类的列表,它使用CLIP模板构建文本提示,并将两个侧面嵌入到指定检查点 (例如,<code>openai/clip-vit-large-patch14</code>),并返回与相似度分数的前1/前5预测.技能拒绝对未列入提示列表的类别提出索赔.</p>
+<h2>运动</h2>
+<ol>
+<li>
+<p>通过手动实现4对的InfoNCE. 构建4x4相似度矩阵,运行软max,选择对角,计算交叉. 根据手动计算验证您的Python实现.</p>
+</li>
+<li>
+<p>siglip使用偏差参数<code>b</code>除了温度: <code>S'[i,j] = S[i,j]/tau + b</code>什么角色?<code>b</code>对于一轮的负数比正数多得多,请参阅SigLIP第3节 (arXiv:2303.15343).</p>
+</li>
+<li>
+<p>建立一个零射击分类器, 试试两个提示模板:<code>a photo of a {class}</code>其他<code>a picture of a {class}</code>测量100个试图图的精度. 模板组单击吗?</p>
+</li>
+<li>
+<p>计算软max InfoNCE 与 sigmoid 的通信成本,对 512GPU 运行在批量 32k. 什么规模为 O(N),哪个为 O(N ^ 2)? 引用 SigLIP 部分 4.</p>
+</li>
+<li>
+<p>根据数据量化结果,再现他们对数据量化的结论:在固定模型尺寸下,ImageNet零截图精度和训练数据尺寸之间的日志线性关系是什么?</p>
+</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>InfoNCE</td>
+<td>&quot;Contrastive loss&quot;</td>
+<td>Cross-entropy over a batch's similarity matrix; each item's positive is its paired item, negatives are everything else</td>
+</tr>
+<tr>
+<td>Sigmoid loss</td>
+<td>&quot;SigLIP loss&quot;</td>
+<td>Per-pair binary cross-entropy; no softmax, no all-gather, scales cheaply in distributed training</td>
+</tr>
+<tr>
+<td>Temperature</td>
+<td>&quot;tau&quot;</td>
+<td>Scalar that scales logits before softmax/sigmoid; controls sharpness of the distribution</td>
+</tr>
+<tr>
+<td>Zero-shot</td>
+<td>&quot;no-finetune classification&quot;</td>
+<td>Use text prompts to construct class embeddings and classify by cosine similarity; no training on target classes</td>
+</tr>
+<tr>
+<td>Prompt template</td>
+<td>&quot;a photo of a ...&quot;</td>
+<td>Text scaffold around a class name; affects zero-shot accuracy by 1-5 points</td>
+</tr>
+<tr>
+<td>Dual encoder</td>
+<td>&quot;Two-tower&quot;</td>
+<td>One image encoder + one text encoder, outputs in shared D-dim space</td>
+</tr>
+<tr>
+<td>Hard negative</td>
+<td>&quot;Tough distractor&quot;</td>
+<td>A negative similar enough to the positive that the model has to work to separate them</td>
+</tr>
+<tr>
+<td>Linear probe</td>
+<td>&quot;Frozen + one layer&quot;</td>
+<td>Train only a linear classifier on top of frozen features; measures feature quality</td>
+</tr>
+<tr>
+<td>NaFlex</td>
+<td>&quot;Native flexible resolution&quot;</td>
+<td>SigLIP 2 capability to ingest images at any aspect ratio and resolution without resizing</td>
+</tr>
+<tr>
+<td>Temperature scaling</td>
+<td>&quot;log-parametrized tau&quot;</td>
+<td>CLIP parametrizes <code>log(1/tau)</code> so gradients behave; clips to prevent collapse to near-zero tau</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2103.00020" rel="noreferrer" data-network="true">Radford et al. — Learning Transferable Visual Models From Natural Language Supervision (arXiv:2103.00020) <small>↗ 需要联网</small></a>Clip文件.</li>
+<li><a href="https://arxiv.org/abs/2303.15343" rel="noreferrer" data-network="true">Zhai et al. — Sigmoid Loss for Language Image Pre-Training (arXiv:2303.15343) <small>↗ 需要联网</small></a></li>
+<li><a href="https://arxiv.org/abs/2502.14786" rel="noreferrer" data-network="true">Tschannen et al. — SigLIP 2 (arXiv:2502.14786) <small>↗ 需要联网</small></a>多语言 + NaFlex.</li>
+<li><a href="https://arxiv.org/abs/2102.05918" rel="noreferrer" data-network="true">Jia et al. — ALIGN (arXiv:2102.05918) <small>↗ 需要联网</small></a>使用噪音的网页数据进行扩展.</li>
+<li><a href="https://arxiv.org/abs/2212.07143" rel="noreferrer" data-network="true">Cherti et al. — Reproducible scaling laws for contrastive language-image learning (arXiv:2212.07143) <small>↗ 需要联网</small></a>开放CLIP扩展法</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>CLIP and Contrastive Vision-Language Pretraining</h1>
+<blockquote>
+<p>OpenAI's CLIP (2021) proved a single idea big enough to power the next five years: align an image encoder and a text encoder in the same vector space using only noisy web image-caption pairs and a contrastive loss. Zero supervised labels. 400M pairs. The resulting embedding space does zero-shot classification, image-text retrieval, and plugs into every 2026 VLM as its vision tower. SigLIP 2 (2025) replaced softmax with sigmoid and scaled past CLIP at lower cost. This lesson walks the math from InfoNCE to sigmoid pairwise loss and builds the training step in stdlib Python.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python (stdlib, InfoNCE + sigmoid loss implementations)
+<strong>Prerequisites:</strong> Phase 12 · 01 (ViT patches), Phase 7 (Transformers)
+<strong>Time:</strong> ~180 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Derive InfoNCE loss from mutual information and implement a numerically-stable vectorized version.</li>
+<li>Explain why sigmoid pairwise loss (SigLIP) scales to batch 32768+ without the all-gather overhead softmax demands.</li>
+<li>Run zero-shot ImageNet classification by constructing text templates (<code>a photo of a {class}</code>) and taking argmax over cosine similarity.</li>
+<li>Name the four levers CLIP / SigLIP pretraining gives you: batch size, temperature, prompt template, data quality.</li>
+</ul>
+<h2>The Problem</h2>
+<p>Pre-CLIP vision was supervised. Collect labeled datasets (ImageNet: 1.2M images, 1000 classes), train a CNN, ship it. Labels are expensive, labels bias to what labelers can agree on, and labels do not transfer to new tasks without finetuning.</p>
+<p>The image-caption web has one billion-plus loosely-labeled pairs for free. A picture of a golden retriever with alt text &quot;my dog Max in the park&quot; carries a supervisory signal — the text describes the image. The question: can you turn this into useful training?</p>
+<p>CLIP's answer: treat image-caption pairs as a matching task. Given a batch of N images and N captions, learn to match each image to its own caption against N-1 distractors. The supervision is &quot;these two things belong together; these N-1 do not.&quot; No class labels. No human annotation. Just a contrastive loss.</p>
+<p>The resulting embedding space does more than CLIP was trained for. ImageNet zero-shot works because &quot;a photo of a cat&quot; embeds near pictures of cats that were never explicitly labeled cats. This is the bet that spawned every 2026 VLM.</p>
+<h2>The Concept</h2>
+<h3>The dual encoder</h3>
+<p>CLIP has two towers:</p>
+<ul>
+<li>Image encoder <code>f</code>: ViT or ResNet, outputs a D-dim vector per image.</li>
+<li>Text encoder <code>g</code>: small transformer, outputs a D-dim vector per caption.</li>
+</ul>
+<p>Both towers normalize their outputs to unit length. Similarity is <code>cos(f(x), g(y)) = f(x)^T g(y)</code> since both are unit-norm.</p>
+<p>For a batch of N (image, caption) pairs, build the similarity matrix <code>S</code> of shape <code>(N, N)</code>:</p>
+<pre><code>S[i, j] = cos(f(x_i), g(y_j)) / tau
+</code></pre>
+<p>where <code>tau</code> is a learned temperature (CLIP initializes to 0.07; learned in log-space).</p>
+<h3>InfoNCE loss</h3>
+<p>CLIP uses a symmetric cross-entropy over rows and columns:</p>
+<pre><code>loss_i2t = CE(S, labels=identity)     # each image's positive is its own caption
+loss_t2i = CE(S^T, labels=identity)   # each caption's positive is its own image
+loss = (loss_i2t + loss_t2i) / 2
+</code></pre>
+<p>This is InfoNCE. The softmax in CE forces each image to match its caption more than every other caption in the batch. The &quot;negatives&quot; are all other batch items. Bigger batches = more negatives = stronger signal. CLIP trained at batch 32k; scale matters.</p>
+<h3>Temperature</h3>
+<p><code>tau</code> controls the sharpness of the softmax. Low tau → sharp distribution, hard negative mining effect. High tau → soft, all samples contribute. CLIP learns log(1/tau), clipped to prevent collapse. SigLIP 2 fixes the initial tau and uses a learned bias instead.</p>
+<h3>Why sigmoid scales better (SigLIP)</h3>
+<p>Softmax needs the whole similarity matrix in sync. In distributed training you must all-gather every embedding to every replica, then do the softmax. This is quadratic in world size for communication.</p>
+<p>SigLIP replaces softmax with element-wise sigmoid: for each pair <code>(i, j)</code>, the loss is a binary classification of &quot;are these the matching pair?&quot; positive class labels are the diagonal, everything else is negative. The loss is:</p>
+<pre><code>L = -1/N sum over (i, j) [ y_ij log sigmoid(S[i,j]) + (1-y_ij) log sigmoid(-S[i,j]) ]
+</code></pre>
+<p><code>y_ij = 1</code> if <code>i == j</code>, else 0. Each pair's loss is independent. No all-gather needed. Each GPU computes its local block and sums. SigLIP 2 scales to batch 32k-512k cheaply where CLIP would need proportionally more communication.</p>
+<h3>Zero-shot classification</h3>
+<p>Given N class names, for each class build a text template:</p>
+<pre><code>&quot;a photo of a {class}&quot;
+</code></pre>
+<p>Embed each template with the text encoder. Embed your image with the image encoder. Argmax cosine similarity = predicted class. No training on the target classes.</p>
+<p>Prompt templates matter. CLIP's original paper used 80 templates per class (plain, artistic, photo, painting, etc.) and averaged the embeddings. +3 ImageNet points. Modern usage typically picks one or two templates.</p>
+<h3>Linear probes and finetuning</h3>
+<p>Zero-shot is a baseline. A linear probe (train one linear layer on top of frozen CLIP features for your target classes) beats zero-shot on in-domain tasks. Full finetuning beats linear probe on in-domain but can hurt zero-shot transfer. Three regimes with three trade-offs.</p>
+<h3>SigLIP 2: NaFlex and dense features</h3>
+<p>SigLIP 2 (2025) adds:</p>
+<ul>
+<li>NaFlex: single model handles variable aspect ratios and resolutions.</li>
+<li>Better dense features for segmentation and depth estimation, targeting use as a frozen backbone in VLMs.</li>
+<li>Multilingual: trained on 100+ languages where CLIP was English-only.</li>
+<li>1B param scale where CLIP topped out at 400M.</li>
+</ul>
+<p>In 2026 open VLMs, SigLIP 2 SO400m/14 is the default vision tower. CLIP remains the default for pure image-text retrieval where the specific LAION-2B training distribution matches your query pattern.</p>
+<h3>ALIGN, BASIC, OpenCLIP, EVA-CLIP</h3>
+<p>ALIGN (Google, 2021): same idea as CLIP, 1.8B pair scale, 90% noisy. Proved noisy data scales. OpenCLIP (LAION): open reproduction of CLIP on LAION-400M / 2B, multiple scales, the go-to open checkpoint. EVA-CLIP: initializes from masked image modeling; strong backbone for VLMs. BASIC: Google's CLIP+ALIGN hybrid. All the same family, different data and tuning.</p>
+<h3>The zero-shot ceiling</h3>
+<p>CLIP-class models cap around 76% ImageNet zero-shot (CLIP-G, OpenCLIP-G). Beyond requires either much larger data (SigLIP 2 gets 80%+) or architecture changes (supervised heads, more parameters). The benchmark is saturating; the real value is the embedding space that downstream VLMs consume.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-e7f8d074da8367f45379.png" alt="multimodal-fusion 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Use It</h2>
+<p><code>code/main.py</code> implements:</p>
+<ol>
+<li>A toy dual encoder (hash-based image features, text char features) so you can see the InfoNCE shape without numpy.</li>
+<li>InfoNCE loss in pure Python (numerical stability via log-sum-exp).</li>
+<li>Sigmoid pairwise loss for comparison.</li>
+<li>A zero-shot classification routine: compute cosine similarity against a set of text prompts, argmax for prediction.</li>
+</ol>
+<p>Run it and watch the loss curve. The absolute numbers are toy; the shape matches what a real CLIP trainer emits.</p>
+<h2>Ship It</h2>
+<p>This lesson produces <code>outputs/skill-clip-zero-shot.md</code>. Given a set of images (via path) and a list of target classes, it builds text prompts with the CLIP template, embeds both sides with a stated checkpoint (e.g., <code>openai/clip-vit-large-patch14</code>), and returns top-1 / top-5 predictions with similarity scores. The skill refuses to make claims about classes not in the prompt list.</p>
+<h2>Exercises</h2>
+<ol>
+<li>
+<p>Implement InfoNCE for a batch of 4 pairs by hand. Construct the 4x4 similarity matrix, run softmax, pick out the diagonal, compute cross-entropy. Verify your Python implementation against this hand calculation.</p>
+</li>
+<li>
+<p>SigLIP uses a bias parameter <code>b</code> in addition to temperature: <code>S'[i,j] = S[i,j]/tau + b</code>. What role does <code>b</code> play when the batch has a large class imbalance (many more negatives than positives per row)? Read SigLIP Section 3 (arXiv:2303.15343).</p>
+</li>
+<li>
+<p>Build a zero-shot classifier for cats vs dogs. Try two prompt templates: <code>a photo of a {class}</code> and <code>a picture of a {class}</code>. Measure accuracy on 100 test images. Does the ensemble of templates beat single?</p>
+</li>
+<li>
+<p>Compute the communication cost of softmax InfoNCE vs sigmoid pairwise for a 512-GPU run at batch 32k. Which scales as O(N), which as O(N^2)? Cite SigLIP Section 4.</p>
+</li>
+<li>
+<p>Read the OpenCLIP scaling-laws paper (arXiv:2212.07143, Cherti et al.). Reproduce their conclusion for data scaling from the figures: at fixed model size, what is the log-linear relationship between ImageNet zero-shot accuracy and training data size?</p>
+</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>InfoNCE</td>
+<td>&quot;Contrastive loss&quot;</td>
+<td>Cross-entropy over a batch's similarity matrix; each item's positive is its paired item, negatives are everything else</td>
+</tr>
+<tr>
+<td>Sigmoid loss</td>
+<td>&quot;SigLIP loss&quot;</td>
+<td>Per-pair binary cross-entropy; no softmax, no all-gather, scales cheaply in distributed training</td>
+</tr>
+<tr>
+<td>Temperature</td>
+<td>&quot;tau&quot;</td>
+<td>Scalar that scales logits before softmax/sigmoid; controls sharpness of the distribution</td>
+</tr>
+<tr>
+<td>Zero-shot</td>
+<td>&quot;no-finetune classification&quot;</td>
+<td>Use text prompts to construct class embeddings and classify by cosine similarity; no training on target classes</td>
+</tr>
+<tr>
+<td>Prompt template</td>
+<td>&quot;a photo of a ...&quot;</td>
+<td>Text scaffold around a class name; affects zero-shot accuracy by 1-5 points</td>
+</tr>
+<tr>
+<td>Dual encoder</td>
+<td>&quot;Two-tower&quot;</td>
+<td>One image encoder + one text encoder, outputs in shared D-dim space</td>
+</tr>
+<tr>
+<td>Hard negative</td>
+<td>&quot;Tough distractor&quot;</td>
+<td>A negative similar enough to the positive that the model has to work to separate them</td>
+</tr>
+<tr>
+<td>Linear probe</td>
+<td>&quot;Frozen + one layer&quot;</td>
+<td>Train only a linear classifier on top of frozen features; measures feature quality</td>
+</tr>
+<tr>
+<td>NaFlex</td>
+<td>&quot;Native flexible resolution&quot;</td>
+<td>SigLIP 2 capability to ingest images at any aspect ratio and resolution without resizing</td>
+</tr>
+<tr>
+<td>Temperature scaling</td>
+<td>&quot;log-parametrized tau&quot;</td>
+<td>CLIP parametrizes <code>log(1/tau)</code> so gradients behave; clips to prevent collapse to near-zero tau</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2103.00020" rel="noreferrer" data-network="true">Radford et al. — Learning Transferable Visual Models From Natural Language Supervision (arXiv:2103.00020) <small>↗ 需要联网</small></a> — the CLIP paper.</li>
+<li><a href="https://arxiv.org/abs/2303.15343" rel="noreferrer" data-network="true">Zhai et al. — Sigmoid Loss for Language Image Pre-Training (arXiv:2303.15343) <small>↗ 需要联网</small></a> — SigLIP.</li>
+<li><a href="https://arxiv.org/abs/2502.14786" rel="noreferrer" data-network="true">Tschannen et al. — SigLIP 2 (arXiv:2502.14786) <small>↗ 需要联网</small></a> — multilingual + NaFlex.</li>
+<li><a href="https://arxiv.org/abs/2102.05918" rel="noreferrer" data-network="true">Jia et al. — ALIGN (arXiv:2102.05918) <small>↗ 需要联网</small></a> — scale with noisy web data.</li>
+<li><a href="https://arxiv.org/abs/2212.07143" rel="noreferrer" data-network="true">Cherti et al. — Reproducible scaling laws for contrastive language-image learning (arXiv:2212.07143) <small>↗ 需要联网</small></a> — OpenCLIP scaling laws.</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-12-multimodal-ai--02-clip-contrastive-pretraining.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-12-multimodal-ai--02-clip-contrastive-pretraining.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/12-multimodal-ai/02-clip-contrastive-pretraining/code/main.py">phases/12-multimodal-ai/02-clip-contrastive-pretraining/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;CLIP / SigLIP contrastive loss toy — stdlib Python.
+
+Implements InfoNCE (softmax) and sigmoid pairwise loss on a hand-constructed
+similarity matrix. Also runs a tiny zero-shot-classification walkthrough using
+synthetic image and text embeddings.
+
+No numpy. No torch. The point is to see the loss math and the argmax pattern.
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import math
+import random
+
+
+def normalize(v: list[float]) -&gt; list[float]:
+    n = math.sqrt(sum(x * x for x in v)) or 1.0
+    return [x / n for x in v]
+
+
+def cosine(a: list[float], b: list[float]) -&gt; float:
+    return sum(x * y for x, y in zip(a, b))
+
+
+def similarity_matrix(images: list[list[float]],
+                      texts: list[list[float]],
+                      tau: float) -&gt; list[list[float]]:
+    I = [normalize(v) for v in images]
+    T = [normalize(v) for v in texts]
+    N = len(I)
+    S = [[0.0] * N for _ in range(N)]
+    for i in range(N):
+        for j in range(N):
+            S[i][j] = cosine(I[i], T[j]) / tau
+    return S
+
+
+def log_sum_exp(row: list[float]) -&gt; float:
+    m = max(row)
+    return m + math.log(sum(math.exp(x - m) for x in row))
+
+
+def infonce_loss(S: list[list[float]]) -&gt; float:
+    &quot;&quot;&quot;Symmetric InfoNCE over rows and columns.&quot;&quot;&quot;
+    N = len(S)
+    loss_i2t = 0.0
+    for i in range(N):
+        loss_i2t += -S[i][i] + log_sum_exp(S[i])
+    loss_t2i = 0.0
+    for j in range(N):
+        col = [S[i][j] for i in range(N)]
+        loss_t2i += -S[j][j] + log_sum_exp(col)
+    return (loss_i2t + loss_t2i) / (2 * N)
+
+
+def sigmoid(x: float) -&gt; float:
+    if x &gt;= 0:
+        z = math.exp(-x)
+        return 1.0 / (1.0 + z)
+    z = math.exp(x)
+    return z / (1.0 + z)
+
+
+def sigmoid_loss(S: list[list[float]], bias: float = 0.0) -&gt; float:
+    &quot;&quot;&quot;SigLIP-style per-pair BCE. Positives are the diagonal.&quot;&quot;&quot;
+    N = len(S)
+    total = 0.0
+    count = 0
+    for i in range(N):
+        for j in range(N):
+            logit = S[i][j] + bias
+            y = 1.0 if i == j else 0.0
+            p = sigmoid(logit)
+            eps = 1e-9
+            term = y * math.log(p + eps) + (1 - y) * math.log(1 - p + eps)
+            total += -term
+            count += 1
+    return total / count
+
+
+def zero_shot_classify(image: list[float],
+                       class_texts: dict[str, list[float]]) -&gt; list[tuple[str, float]]:
+    &quot;&quot;&quot;Argmax cosine similarity over class prompts.&quot;&quot;&quot;
+    img = normalize(image)
+    scores = []
+    for name, vec in class_texts.items():
+        scores.append((name, cosine(img, normalize(vec))))
+    scores.sort(key=lambda p: p[1], reverse=True)
+    return scores
+
+
+def make_fake_embedding(seed: int, dim: int = 64) -&gt; list[float]:
+    rng = random.Random(seed)
+    return [rng.gauss(0, 1) for _ in range(dim)]
+
+
+def demo_infonce() -&gt; None:
+    print(&quot;\nDEMO 1: InfoNCE on 4 aligned pairs&quot;)
+    print(&quot;-&quot; * 60)
+    images = [make_fake_embedding(i) for i in range(4)]
+    texts = [[x + 0.05 * make_fake_embedding(i + 100)[k] for k, x in enumerate(v)]
+             for i, v in enumerate(images)]
+
+    for tau in (0.07, 0.1, 1.0):
+        S = similarity_matrix(images, texts, tau=tau)
+        loss = infonce_loss(S)
+        slip = sigmoid_loss(S)
+        print(f&quot;  tau={tau:4.2f}  InfoNCE={loss:.4f}  SigLIP={slip:.4f}&quot;)
+
+
+def demo_shuffled() -&gt; None:
+    print(&quot;\nDEMO 2: what happens with misaligned pairs&quot;)
+    print(&quot;-&quot; * 60)
+    images = [make_fake_embedding(i) for i in range(6)]
+    texts = [make_fake_embedding(i + 500) for i in range(6)]
+    S = similarity_matrix(images, texts, tau=0.07)
+    loss = infonce_loss(S)
+    slip = sigmoid_loss(S)
+    print(f&quot;  misaligned: InfoNCE={loss:.4f}  SigLIP={slip:.4f}&quot;)
+    aligned_imgs = [make_fake_embedding(i) for i in range(6)]
+    aligned_txt = [[x + 0.02 for x in v] for v in aligned_imgs]
+    S2 = similarity_matrix(aligned_imgs, aligned_txt, tau=0.07)
+    print(f&quot;  aligned   : InfoNCE={infonce_loss(S2):.4f}  &quot;
+          f&quot;SigLIP={sigmoid_loss(S2):.4f}&quot;)
+    print(&quot;  aligned loss &lt; misaligned loss confirms the gradient signal.&quot;)
+
+
+def demo_zero_shot() -&gt; None:
+    print(&quot;\nDEMO 3: zero-shot classification&quot;)
+    print(&quot;-&quot; * 60)
+    classes = {
+        &quot;cat&quot;: make_fake_embedding(42),
+        &quot;dog&quot;: make_fake_embedding(43),
+        &quot;bird&quot;: make_fake_embedding(44),
+        &quot;car&quot;: make_fake_embedding(45),
+    }
+    query_image = [c + 0.3 * make_fake_embedding(999)[i]
+                   for i, c in enumerate(classes[&quot;dog&quot;])]
+
+    ranked = zero_shot_classify(query_image, classes)
+    print(&quot;  query image (close to &#39;dog&#39; prototype):&quot;)
+    for name, score in ranked:
+        print(f&quot;    {name:6s}: {score:+.4f}&quot;)
+    print(f&quot;  top-1: {ranked[0][0]}&quot;)
+
+
+def demo_prompt_ensemble() -&gt; None:
+    print(&quot;\nDEMO 4: prompt template ensemble&quot;)
+    print(&quot;-&quot; * 60)
+    templates = [
+        &quot;a photo of a {class}&quot;,
+        &quot;a picture of a {class}&quot;,
+        &quot;an image of a {class}&quot;,
+    ]
+    class_name = &quot;golden retriever&quot;
+    ensemble_vec = [0.0] * 64
+    count = 0
+    for t in templates:
+        prompt = t.format(**{&quot;class&quot;: class_name})
+        seed = sum(ord(c) for c in prompt)
+        emb = make_fake_embedding(seed)
+        for k in range(64):
+            ensemble_vec[k] += emb[k]
+        count += 1
+    ensemble_vec = [x / count for x in ensemble_vec]
+    print(f&quot;  ensembled {count} prompts for &#39;{class_name}&#39;&quot;)
+    print(f&quot;  first 6 dims: {[round(x, 3) for x in ensemble_vec[:6]]}&quot;)
+    print(&quot;  single-template: noisier; ensemble: +1-3 points on real benchmarks.&quot;)
+
+
+def main() -&gt; None:
+    print(&quot;=&quot; * 60)
+    print(&quot;CLIP / SIGLIP CONTRASTIVE TRAINING (Phase 12, Lesson 02)&quot;)
+    print(&quot;=&quot; * 60)
+    demo_infonce()
+    demo_shuffled()
+    demo_zero_shot()
+    demo_prompt_ensemble()
+    print(&quot;\n&quot; + &quot;=&quot; * 60)
+    print(&quot;TAKEAWAYS&quot;)
+    print(&quot;-&quot; * 60)
+    print(&quot;  · InfoNCE penalizes rows AND columns (symmetric)&quot;)
+    print(&quot;  · Lower tau -&gt; sharper softmax -&gt; more hard-negative pressure&quot;)
+    print(&quot;  · Sigmoid loss decouples pairs -&gt; no all-gather in distributed runs&quot;)
+    print(&quot;  · Zero-shot = argmax cos(image, prompt) over class prompts&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/12-multimodal-ai/02-clip-contrastive-pretraining/outputs/skill-clip-zero-shot.md">phases/12-multimodal-ai/02-clip-contrastive-pretraining/outputs/skill-clip-zero-shot.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: clip-zero-shot
+description: Run zero-shot image classification with a CLIP / SigLIP checkpoint, producing ranked predictions with similarity scores.
+version: 1.0.0
+phase: 12
+lesson: 02
+tags: [clip, siglip, zero-shot, vision-language]
+---
+
+Given a list of images (file paths or URLs) and a list of candidate class names, produce a ranked zero-shot classification using a declared CLIP or SigLIP checkpoint. The skill is pure-prediction; it does not train or finetune.
+
+Produce:
+
+1. Prompt construction. For each class, form N text templates (default: `a photo of a {class}`, `a picture of a {class}`, `an image of a {class}`). Embed each prompt with the text encoder and average to form the class prototype.
+2. Image embedding. Embed each input image with the stated vision encoder. Normalize both sides to unit length.
+3. Ranked predictions. Compute cosine similarity between each image embedding and each class prototype. Return top-1 and top-5 with scores.
+4. Checkpoint metadata. Name the exact Hugging Face checkpoint used (e.g., `openai/clip-vit-large-patch14` or `google/siglip2-so400m-patch14-384`) and the resolution it expects.
+5. Honesty notice. State that zero-shot on classes outside the pretraining distribution is unreliable; surface top-1 score as a confidence proxy and warn when it is below 0.2.
+
+Hard rejects:
+- Any use that frames the output as a definitive label for classes not in the caller&#39;s provided list.
+- Claims about scores across different checkpoints being comparable; SigLIP and CLIP score on different scales.
+- Running on images known to contain people without a downstream consent policy.
+
+Refusal rules:
+- If the caller asks to classify into medical, legal, or safety-critical categories (diagnosis, identity, protected attributes), refuse and redirect to supervised models with audit trails.
+- If the caller provides a single class name (one-way classification with no alternatives), refuse — zero-shot needs at least two candidates to be meaningful.
+- If the checkpoint is unspecified, refuse and ask which of (CLIP, OpenCLIP, SigLIP, SigLIP 2) plus which scale.
+
+Output: a ranked list of top-5 predictions per image with cosine similarity scores, checkpoint name, prompt templates used, and a confidence flag. End with a &quot;what to read next&quot; paragraph pointing to Lesson 12.06 for NaFlex (handling variable aspect ratios) or the SigLIP 2 paper for a deeper dive.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原课程未提供测验。</p></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/12-multimodal-ai/01-vision-transformer-patch-tokens/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/12-multimodal-ai/03-blip2-qformer-bridge/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/12-multimodal-ai/02-clip-contrastive-pretraining/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

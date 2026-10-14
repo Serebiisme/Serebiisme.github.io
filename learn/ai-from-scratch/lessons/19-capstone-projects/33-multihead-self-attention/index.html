@@ -1,0 +1,574 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>多头自律 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-19-capstone-projects" data-lesson="19-capstone-projects/33-multihead-self-attention" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/19-capstone-projects/">综合项目</a> / LESSON 33</p><h1 class="lesson-title">多头自律</h1><p>Multi-Head Self-Attention</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>多头自律</h1>
+<blockquote>
+<p>一个线性投影,三个视图,H平行头,一个面具.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 04 lessons, Phase 07 transformer lessons, Lessons 30 through 32 of this phase
+<strong>Time:</strong> ~90 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>执行批量查询/关键/值投影,作为一个单一线性层分为H头.</li>
+<li>计算点产品关注量度,使用正确的正常化和d型处理.</li>
+<li>应用因果化面具,防止位置在未来位置上进行处理.</li>
+<li>检查每头注意力重量,以确定每个头的输入和理由.</li>
+<li>训练一个小的注意力块在玩具任务和看损失下降,</li>
+</ul>
+<figure><img src="/learn/ai-from-scratch/figures/figure-e49b0ed0ead459c86c45.png" alt="cap-multihead-attention 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>框架</h2>
+<p>注意是允许代币的表示从同一序列中的其他代币中获取信息的函数.自我注意意味着查询,键和值都来自同一输入.多头意味着投影被分为H平行注意问题,其输出是连锁和投影回来的.</p>
+<p>有效的实施模式是从 <code>D</code>为了<code>3 * D</code>然后将其切成三个视角,然后再塑造成H尺寸的头.<code>D // H</code>,软max和重量总数都会发生在批量子操作中,</p>
+<p>通过这个课程,它构建了这个块.它还添加了因果化面具,所以同样的代码就像一个单独解码语言模型中的注意层一样工作.下一个课程将块堆积成一个完整的变压器,然后课程将它训练.</p>
+<h2>形状合同</h2>
+<p>输入是<code>(B, T, D)</code>输出量是<code>(B, T, D)</code>面具是<code>(T, T)</code>在区块内,中间子有形状.<code>(B, H, T, d_head)</code>在哪里<code>d_head = D // H</code>限制是<code>D % H == 0</code>现在,我们要去.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-57cfe1b66861fbdc4bcb.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>两个线性层 (QKV投影和输出投影) 是区块中的唯一参数.面具,软max,和重塑都是没有参数的.</p>
+<h2>车分裂</h2>
+<p>简单的实现有三个单独的线性层,每个层为Q,K和V.<code>3 * D</code>两个数学上相当,因为三个分别的矩阵乘法为<code>(D, D)</code>重量是正确的一个矩阵乘以一个<code>(3D, D)</code>他们被重量堆积.</p>
+<p>效率更快,因为加速器启动一个matmul而不是三个.它也更容易初始化,因为三个子矩阵生活在相同的参数子,可以一起初始化.</p>
+<h2>头部的形状</h2>
+<p>后的分离,Q,K,V的每个是<code>(B, T, D)</code>为了把这变成H平行注意力问题,我们重新塑造为<code>(B, T, H, d_head)</code>转移到<code>(B, H, T, d_head)</code>现在头部的尺寸就在批量尺寸旁边,所以PyTorch把每头的注意力视为一个批量操作.<code>B * H</code>独立的实例.</p>
+<p>总体的尺寸保持在最后,所以分数是相对的<code>Q @ K.transpose(-2, -1)</code>结果是:<code>(B, H, T, T)</code>平均注意力.</p>
+<h2>规模化</h2>
+<p>结果分为<code>sqrt(d_head)</code>没有这种扩展,点产品会增长<code>d_head</code>它们的度是微小的,学习的位. 分为<code>sqrt(d_head)</code>总体而言,在头部尺寸中,</p>
+<h2>原因面具</h2>
+<p>只有解码器语言模型才能在预测下一个代币时只能根据过去进行条件. 面具强制执行这一点. 具体来说,在软max之前,每一个输入都在线角上.<code>(T, T)</code>结果矩阵被负无限取代.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-8262d57b505e6f951a66.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>面具是面具的结构,它是面具的结构,它是面具的结构,它是面具的结构.<code>(T, T)</code>角落.</p>
+<h2>输出预测</h2>
+<p>按头的文本向量<code>(B, H, T, d_head)</code>我们将其转移到<code>(B, T, H, d_head)</code>改造成<code>(B, T, D)</code>通过最后的<code>(D, D)</code>没有它,H头只会通过后层重新结合,块将会被人工限制.</p>
+<h2>注意重量检查</h2>
+<p>课程揭示了<code>return_weights=True</code>按前进传输的标志. 当设置时,块返回每头的注意重量.<code>(B, H, T, T)</code>显示器将一个头的重量图打印在一个短输入中,以便你能看到因果三角形结构和每位重点.</p>
+<p>在训练模型中,不同头脑学习不同的模式.有些头脑关注直接前面的符号.有些头脑关注序列的开始.有些头脑几乎均地传播注意力.检查是解释性工作的入口点.</p>
+<h2>训练演示</h2>
+<p>底部的演示<code>main.py</code>导线注意区块到一个小的LM头,并训练整个东西重复任务.输入的每个行是整个文本中复制的单个随机ID.目标是一个转移的输入,所以模型必须学习下一个代币与前一个代币相同.损失是交叉.H=4,D=32,T=12,和64的词汇,损失从随机 (约<code>log(64) ~ 4.16</code>) 低到很低<code>1.0</code>在CPU上使用了3个时代.</p>
+<p>演示的目的不是训练一个有用的模型. 目的是确认梯度通过每块块流动,</p>
+<h2>这一课不做什么</h2>
+<p>实际模型中的变压器层是注意力,其次是两个层的MLP,每个层周围有剩余连接和层规范.下一个课程增加了这些.</p>
+<p>它不实现旋转或AliBi定位编码.这两者都适用于同一块的QKV投影阶段,但它们是一个独立的教学单位.在这里构建的块是通过在matmul之前转换Q和K相容的.</p>
+<p>它不实现KV缓存推理.在前进传递中缓存键和值是使自动降解快速的优化.它改变K和V子上的形状合约,但不是Q上的.它属于推理课程.</p>
+<h2>如何读取代码</h2>
+<p><code>main.py</code>定义<code>MultiHeadSelfAttention</code>现在,我们要去. 课程有两个线性层和一个注册的面具缓冲器. 通过前进的项目,重塑,分数,面具,软件,重量,重塑,再重塑. 下面的演示模型建立了一个小模型,它用符号和位置嵌入和LM头来吸引注意力, 测试在<code>code/tests/test_attention.py</code>定形状合约,因果性属性,软max属性,头分的属性和梯度流量.</p>
+<p>运行演示,然后增加<code>n_heads</code>保持 <code>d_model=32</code>现在,<code>d_head=4</code>) 并观察热图的变化.</p>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Multi-Head Self-Attention</h1>
+<blockquote>
+<p>One linear projection, three views, H parallel heads, one mask. The attention block as the model actually uses it.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 04 lessons, Phase 07 transformer lessons, Lessons 30 through 32 of this phase
+<strong>Time:</strong> ~90 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Implement a batched Query/Key/Value projection as a single linear layer split into H heads.</li>
+<li>Compute scaled dot-product attention with the correct normalization and dtype handling.</li>
+<li>Apply a causal mask that prevents a position from attending to future positions.</li>
+<li>Inspect per-head attention weights for a fixed input and reason about what each head looks at.</li>
+<li>Train a small attention block on a toy task and watch the loss fall as the heads specialize.</li>
+</ul>
+<figure><img src="/learn/ai-from-scratch/figures/figure-e49b0ed0ead459c86c45.png" alt="cap-multihead-attention 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>The frame</h2>
+<p>Attention is the function that lets a token's representation pull information from other tokens in the same sequence. Self-attention means queries, keys, and values are all derived from the same input. Multi-head means the projection is split into H parallel attention problems whose outputs are concatenated and projected back.</p>
+<p>The efficient implementation pattern is one linear layer that projects from <code>D</code> to <code>3 * D</code> and gets sliced into three views, then reshaped into H heads of size <code>D // H</code> each. The matmul, softmax, and weighted sum happen as batched tensor operations so the heads run in parallel on the accelerator.</p>
+<p>This lesson builds that block. It also adds the causal mask so the same code works as the attention layer in a decoder-only language model. The next lesson stacks the block into a full transformer and the lesson after trains it.</p>
+<h2>The shape contract</h2>
+<p>The input is <code>(B, T, D)</code>. The output is <code>(B, T, D)</code>. The mask is <code>(T, T)</code> or broadcastable to it. Inside the block the intermediate tensors have shape <code>(B, H, T, d_head)</code> where <code>d_head = D // H</code>. The constraint is <code>D % H == 0</code>.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-57cfe1b66861fbdc4bcb.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>The two linear layers (the QKV projection and the output projection) are the only parameters in the block. The mask, the softmax, the matmuls, and the reshapes are all parameter-free.</p>
+<h2>The QKV split</h2>
+<p>The naive implementation has three separate linear layers, one each for Q, K, and V. The efficient one has a single layer that outputs <code>3 * D</code> features and splits the result. The two are mathematically equivalent because three separate matrix multiplications by <code>(D, D)</code> weights are exactly one matrix multiplication by a <code>(3D, D)</code> weight stacked from them.</p>
+<p>The efficient version is faster because the accelerator launches one matmul instead of three. It is also easier to initialize because the three sub-matrices live in the same parameter tensor and can be initialized together.</p>
+<h2>The head reshape</h2>
+<p>After the split, each of Q, K, V is <code>(B, T, D)</code>. To turn that into H parallel attention problems, we reshape to <code>(B, T, H, d_head)</code> and transpose to <code>(B, H, T, d_head)</code>. The head dimension now sits next to the batch dimension so PyTorch treats the per-head attention as a batched operation across <code>B * H</code> independent instances.</p>
+<p>The d_head dimension stays last so the score matmul <code>Q @ K.transpose(-2, -1)</code> contracts it. The result is <code>(B, H, T, T)</code> per-head attention scores.</p>
+<h2>Scaling</h2>
+<p>The scores get divided by <code>sqrt(d_head)</code> before softmax. Without that scaling, dot products grow as <code>d_head</code> grows and push the softmax into a regime where one entry has almost all the mass and the others are vanishingly small. The gradients in that regime are tiny and learning stalls. Dividing by <code>sqrt(d_head)</code> keeps the variance of the scores roughly constant across head sizes.</p>
+<h2>The causal mask</h2>
+<p>A decoder-only language model can only condition on the past when predicting the next token. The mask enforces that. Concretely, before the softmax, every entry above the diagonal of the <code>(T, T)</code> score matrix gets replaced by negative infinity. After softmax those positions get weight zero.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-8262d57b505e6f951a66.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>We register the mask as a buffer at construction so it lives on the same device as the model and is not part of the gradient graph. The mask covers the maximum context length the block will ever see. At forward time we slice the top-left <code>(T, T)</code> corner.</p>
+<h2>The output projection</h2>
+<p>After per-head context vectors <code>(B, H, T, d_head)</code>, we transpose back to <code>(B, T, H, d_head)</code>, reshape to <code>(B, T, D)</code>, and apply a final <code>(D, D)</code> linear projection. The output projection lets the model mix the heads. Without it, the H heads would only ever recombine through later layers and the block would be artificially constrained.</p>
+<h2>Attention weight inspection</h2>
+<p>The lesson exposes a <code>return_weights=True</code> flag on the forward pass. When set, the block returns the per-head attention weights of shape <code>(B, H, T, T)</code> alongside the output. The demo prints a heatmap of one head's weights on a short input so you can see the causal-triangle structure and the per-position focus.</p>
+<p>In a trained model, different heads learn different patterns. Some heads attend to the immediately previous token. Some heads attend to the start of the sequence. Some heads spread attention almost uniformly. The inspection hook is the entry point for that interpretability work.</p>
+<h2>The training demo</h2>
+<p>The demo at the bottom of <code>main.py</code> wires the attention block to a tiny LM head and trains the whole thing on a repeat task. Each row of the input is a single random id replicated across the context. The target is the input shifted by one, so the model must learn that the next token is the same as the previous token. The loss is cross-entropy. With H=4, D=32, T=12, and a vocabulary of 64, the loss falls from random (around <code>log(64) ~ 4.16</code>) down to well under <code>1.0</code> over three epochs on CPU.</p>
+<p>The point of the demo is not to train a useful model. The point is to confirm the gradients flow through every piece of the block and the heads learn something on a problem where the answer is obvious.</p>
+<h2>What this lesson does not do</h2>
+<p>It does not add a feed-forward block. The transformer layer in a real model is attention followed by a two-layer MLP with a residual connection and layer norm around each. The next lesson adds those.</p>
+<p>It does not implement rotary or AliBi positional encoding. Both apply at the QKV projection step in the same block, but they are a separate teaching unit. The block as built here is compatible with either by transforming Q and K before the matmul.</p>
+<p>It does not implement KV cache for inference. Caching keys and values across forward passes is the optimization that makes autoregressive decoding fast. It changes the shape contract on the K and V tensors but not on Q. It belongs in the inference lesson.</p>
+<h2>How to read the code</h2>
+<p><code>main.py</code> defines <code>MultiHeadSelfAttention</code>. The class holds two linear layers and a registered mask buffer. The forward pass projects, reshapes, scores, masks, softmaxes, weights, reshapes, and projects again. The demo at the bottom builds a small model that wraps the attention with token and positional embeddings and an LM head, trains it on a copy task for three epochs, and prints the loss curve and a per-head attention heatmap. The tests in <code>code/tests/test_attention.py</code> pin the shape contract, the causality property, the softmax property, the head-split property, and the gradient flow.</p>
+<p>Run the demo. Then increase <code>n_heads</code> from 4 to 8 (keeping <code>d_model=32</code>, so <code>d_head=4</code>) and watch the heatmap change.</p>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-19-capstone-projects--33-multihead-self-attention.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-19-capstone-projects--33-multihead-self-attention.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/33-multihead-self-attention/code/main.py">phases/19-capstone-projects/33-multihead-self-attention/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Multi-head self-attention with causal mask, single QKV projection, and
+weight inspection.
+
+The demo trains a tiny model (attention + token/positional embeddings + LM head)
+on a copy task and prints the loss curve plus a per-head attention heatmap.
+
+Run: python3 code/main.py
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class MultiHeadSelfAttention(nn.Module):
+    &quot;&quot;&quot;Multi-head self-attention with a single QKV linear and a causal mask.&quot;&quot;&quot;
+
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        max_context_length: int,
+        attn_dropout: float = 0.0,
+        out_dropout: float = 0.0,
+    ) -&gt; None:
+        super().__init__()
+        if d_model &lt; 1:
+            raise ValueError(f&quot;d_model must be &gt;= 1, got {d_model}&quot;)
+        if n_heads &lt; 1:
+            raise ValueError(f&quot;n_heads must be &gt;= 1, got {n_heads}&quot;)
+        if d_model % n_heads != 0:
+            raise ValueError(
+                f&quot;d_model ({d_model}) must be divisible by n_heads ({n_heads})&quot;
+            )
+        if max_context_length &lt; 1:
+            raise ValueError(f&quot;max_context_length must be &gt;= 1, got {max_context_length}&quot;)
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+        self.max_context_length = max_context_length
+
+        self.qkv_proj = nn.Linear(d_model, 3 * d_model, bias=True)
+        self.out_proj = nn.Linear(d_model, d_model, bias=True)
+        self.attn_dropout = nn.Dropout(attn_dropout)
+        self.out_dropout = nn.Dropout(out_dropout)
+
+        causal_mask = torch.tril(torch.ones(max_context_length, max_context_length))
+        self.register_buffer(&quot;causal_mask&quot;, causal_mask, persistent=False)
+
+    def _split_heads(self, x: torch.Tensor) -&gt; torch.Tensor:
+        b, t, _ = x.shape
+        return x.view(b, t, self.n_heads, self.d_head).transpose(1, 2)
+
+    def _merge_heads(self, x: torch.Tensor) -&gt; torch.Tensor:
+        b, h, t, dh = x.shape
+        return x.transpose(1, 2).contiguous().view(b, t, h * dh)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        return_weights: bool = False,
+    ) -&gt; torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if x.dim() != 3:
+            raise ValueError(f&quot;input must be (B, T, D), got shape {tuple(x.shape)}&quot;)
+        b, t, d = x.shape
+        if d != self.d_model:
+            raise ValueError(f&quot;feature dim {d} != d_model {self.d_model}&quot;)
+        if t &gt; self.max_context_length:
+            raise ValueError(f&quot;seq_len {t} exceeds max_context_length {self.max_context_length}&quot;)
+
+        qkv = self.qkv_proj(x)
+        q, k, v = qkv.chunk(3, dim=-1)
+
+        q = self._split_heads(q)
+        k = self._split_heads(k)
+        v = self._split_heads(v)
+
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_head)
+        mask_slice = self.causal_mask[:t, :t]
+        scores = scores.masked_fill(mask_slice == 0, float(&quot;-inf&quot;))
+
+        weights = F.softmax(scores, dim=-1)
+        weights = self.attn_dropout(weights)
+
+        context = torch.matmul(weights, v)
+        context = self._merge_heads(context)
+
+        out = self.out_proj(context)
+        out = self.out_dropout(out)
+
+        if return_weights:
+            return out, weights
+        return out
+
+
+class TokenEmbedding(nn.Module):
+    &quot;&quot;&quot;Vocab id to vector lookup (compact copy of lesson 32).&quot;&quot;&quot;
+
+    def __init__(self, vocab_size: int, d_model: int) -&gt; None:
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        with torch.no_grad():
+            self.embedding.weight.normal_(0.0, 0.02)
+
+    def forward(self, ids: torch.Tensor) -&gt; torch.Tensor:
+        return self.embedding(ids)
+
+
+class SinusoidalPositionalEmbedding(nn.Module):
+    &quot;&quot;&quot;Parameter-free sin/cos positional table (compact copy of lesson 32).&quot;&quot;&quot;
+
+    def __init__(self, max_context_length: int, d_model: int, base: float = 10000.0) -&gt; None:
+        super().__init__()
+        if max_context_length &lt; 1:
+            raise ValueError(f&quot;max_context_length must be &gt;= 1, got {max_context_length}&quot;)
+        if d_model &lt; 1:
+            raise ValueError(f&quot;d_model must be &gt;= 1, got {d_model}&quot;)
+        if d_model % 2 != 0:
+            raise ValueError(f&quot;d_model must be even, got {d_model}&quot;)
+        self.max_context_length = max_context_length
+        pos = torch.arange(max_context_length, dtype=torch.float32).unsqueeze(1)
+        i = torch.arange(d_model // 2, dtype=torch.float32)
+        denom = base ** (2 * i / d_model)
+        angle = pos / denom
+        pe = torch.zeros(max_context_length, d_model, dtype=torch.float32)
+        pe[:, 0::2] = torch.sin(angle)
+        pe[:, 1::2] = torch.cos(angle)
+        self.register_buffer(&quot;pe&quot;, pe, persistent=False)
+
+    def forward(self, seq_len: int) -&gt; torch.Tensor:
+        if seq_len &lt; 1:
+            raise ValueError(f&quot;seq_len must be &gt;= 1, got {seq_len}&quot;)
+        if seq_len &gt; self.max_context_length:
+            raise ValueError(
+                f&quot;seq_len {seq_len} exceeds max_context_length {self.max_context_length}&quot;
+            )
+        return self.pe[:seq_len]
+
+
+class TinyAttentionLM(nn.Module):
+    &quot;&quot;&quot;Embedding + attention + LM head. Just enough to train a copy task.&quot;&quot;&quot;
+
+    def __init__(
+        self,
+        vocab_size: int,
+        d_model: int,
+        n_heads: int,
+        max_context_length: int,
+    ) -&gt; None:
+        super().__init__()
+        self.token_emb = TokenEmbedding(vocab_size, d_model)
+        self.pos_emb = SinusoidalPositionalEmbedding(max_context_length, d_model)
+        self.attn = MultiHeadSelfAttention(
+            d_model=d_model,
+            n_heads=n_heads,
+            max_context_length=max_context_length,
+        )
+        self.lm_head = nn.Linear(d_model, vocab_size)
+
+    def forward(
+        self,
+        ids: torch.Tensor,
+        return_weights: bool = False,
+    ) -&gt; torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        b, t = ids.shape
+        tok = self.token_emb(ids)
+        pos = self.pos_emb(t)
+        x = tok + pos.unsqueeze(0)
+        if return_weights:
+            attn_out, weights = self.attn(x, return_weights=True)
+            logits = self.lm_head(attn_out)
+            return logits, weights
+        attn_out = self.attn(x)
+        logits = self.lm_head(attn_out)
+        return logits
+
+
+@dataclass
+class DemoConfig:
+    vocab_size: int = 64
+    d_model: int = 32
+    n_heads: int = 4
+    seq_len: int = 12
+    batch_size: int = 16
+    n_epochs: int = 3
+    steps_per_epoch: int = 120
+    learning_rate: float = 5e-3
+    seed: int = 42
+
+
+def _make_repeat_batch(cfg: DemoConfig, generator: torch.Generator) -&gt; tuple[torch.Tensor, torch.Tensor]:
+    &quot;&quot;&quot;Repeat task. Pick a random id per row, repeat it across the row.
+
+    The model must learn that the next token is the same as the previous one.
+    A single attention head looking one token back is enough to solve it.
+    &quot;&quot;&quot;
+    base = torch.randint(
+        0, cfg.vocab_size, (cfg.batch_size, 1), generator=generator, dtype=torch.long
+    )
+    ids = base.expand(cfg.batch_size, cfg.seq_len + 1).contiguous()
+    return ids[:, :-1], ids[:, 1:]
+
+
+def _train(model: TinyAttentionLM, cfg: DemoConfig) -&gt; list[float]:
+    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.learning_rate)
+    generator = torch.Generator()
+    generator.manual_seed(cfg.seed)
+    loss_curve: list[float] = []
+    for epoch in range(cfg.n_epochs):
+        total = 0.0
+        for _ in range(cfg.steps_per_epoch):
+            inputs, targets = _make_repeat_batch(cfg, generator)
+            logits = model(inputs)
+            loss = F.cross_entropy(logits.reshape(-1, cfg.vocab_size), targets.reshape(-1))
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            total += loss.item()
+        avg = total / cfg.steps_per_epoch
+        loss_curve.append(avg)
+        print(f&quot;epoch {epoch + 1}/{cfg.n_epochs}  avg loss: {avg:.4f}&quot;)
+    return loss_curve
+
+
+def _print_section(title: str) -&gt; None:
+    bar = &quot;-&quot; * len(title)
+    print(f&quot;\n{title}\n{bar}&quot;)
+
+
+def _heatmap_row(row: torch.Tensor, width: int = 28) -&gt; str:
+    glyphs = &quot; .:-=+*#%@&quot;
+    cells: list[str] = []
+    for v in row.tolist():
+        idx = int(min(len(glyphs) - 1, max(0, v * len(glyphs))))
+        cells.append(glyphs[idx])
+    return &quot;&quot;.join(cells[:width])
+
+
+def main() -&gt; int:
+    cfg = DemoConfig()
+    torch.manual_seed(cfg.seed)
+
+    _print_section(&quot;Shape contract&quot;)
+    attn = MultiHeadSelfAttention(
+        d_model=cfg.d_model,
+        n_heads=cfg.n_heads,
+        max_context_length=cfg.seq_len,
+    )
+    x = torch.randn(cfg.batch_size, cfg.seq_len, cfg.d_model)
+    out = attn(x)
+    print(f&quot;input  : {tuple(x.shape)}&quot;)
+    print(f&quot;output : {tuple(out.shape)}&quot;)
+    assert out.shape == x.shape
+
+    _print_section(&quot;Causal mask check&quot;)
+    out_with_weights, weights = attn(x, return_weights=True)
+    upper = torch.triu(torch.ones(cfg.seq_len, cfg.seq_len), diagonal=1).bool()
+    upper_mass = weights[0, 0][upper].abs().sum().item()
+    print(f&quot;weights shape          : {tuple(weights.shape)}&quot;)
+    print(f&quot;sum over future cells  : {upper_mass:.6f}&quot;)
+    assert upper_mass &lt; 1e-5, &quot;future positions must have zero weight&quot;
+    rows = weights[0, 0].sum(dim=-1)
+    print(f&quot;row sums (head 0, batch 0): min={rows.min().item():.4f}, max={rows.max().item():.4f}&quot;)
+
+    _print_section(&quot;Train tiny model on repeat task&quot;)
+    model = TinyAttentionLM(
+        vocab_size=cfg.vocab_size,
+        d_model=cfg.d_model,
+        n_heads=cfg.n_heads,
+        max_context_length=cfg.seq_len,
+    )
+    initial_loss = math.log(cfg.vocab_size)
+    print(f&quot;random-init expected loss ~ log(V) = {initial_loss:.4f}&quot;)
+    curve = _train(model, cfg)
+    assert curve[-1] &lt; curve[0], &quot;loss must fall over training&quot;
+
+    _print_section(&quot;Per-head attention heatmap&quot;)
+    model.eval()
+    with torch.no_grad():
+        sample_gen = torch.Generator()
+        sample_gen.manual_seed(cfg.seed + 1)
+        base = torch.randint(0, cfg.vocab_size, (1, 1), generator=sample_gen, dtype=torch.long)
+        sample_ids = base.expand(1, cfg.seq_len).contiguous()
+        _, sample_weights = model(sample_ids, return_weights=True)
+    head_id = 0
+    print(f&quot;head {head_id}, query rows top-down, key cols left-to-right&quot;)
+    for t in range(cfg.seq_len):
+        row = sample_weights[0, head_id, t]
+        print(f&quot;  q={t:&gt;2}: |{_heatmap_row(row, width=cfg.seq_len)}|&quot;)
+
+    print(&quot;\nDemo OK.&quot;)
+    return 0
+
+
+if __name__ == &quot;__main__&quot;:
+    raise SystemExit(main())
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/33-multihead-self-attention/code/tests/test_attention.py">phases/19-capstone-projects/33-multihead-self-attention/code/tests/test_attention.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Tests for MultiHeadSelfAttention.&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import math
+import os
+import sys
+import unittest
+
+import torch
+import torch.nn.functional as F
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(HERE))
+
+from main import (  # noqa: E402
+    MultiHeadSelfAttention,
+    TinyAttentionLM,
+)
+
+
+class TestConstruction(unittest.TestCase):
+    def test_d_model_must_divide_n_heads(self) -&gt; None:
+        with self.assertRaises(ValueError):
+            MultiHeadSelfAttention(d_model=10, n_heads=3, max_context_length=8)
+
+    def test_zero_heads_rejected(self) -&gt; None:
+        with self.assertRaises(ValueError):
+            MultiHeadSelfAttention(d_model=8, n_heads=0, max_context_length=8)
+
+    def test_d_head_set_correctly(self) -&gt; None:
+        attn = MultiHeadSelfAttention(d_model=32, n_heads=4, max_context_length=8)
+        self.assertEqual(attn.d_head, 8)
+        self.assertEqual(attn.n_heads, 4)
+
+
+class TestShape(unittest.TestCase):
+    def test_output_shape_matches_input(self) -&gt; None:
+        torch.manual_seed(0)
+        attn = MultiHeadSelfAttention(d_model=16, n_heads=4, max_context_length=10)
+        x = torch.randn(2, 7, 16)
+        out = attn(x)
+        self.assertEqual(out.shape, x.shape)
+
+    def test_weights_shape(self) -&gt; None:
+        torch.manual_seed(0)
+        attn = MultiHeadSelfAttention(d_model=16, n_heads=4, max_context_length=10)
+        x = torch.randn(2, 7, 16)
+        out, weights = attn(x, return_weights=True)
+        self.assertEqual(weights.shape, (2, 4, 7, 7))
+        self.assertEqual(out.shape, (2, 7, 16))
+
+    def test_rejects_wrong_feature_dim(self) -&gt; None:
+        attn = MultiHeadSelfAttention(d_model=16, n_heads=4, max_context_length=8)
+        x = torch.randn(2, 5, 32)
+        with self.assertRaises(ValueError):
+            attn(x)
+
+    def test_rejects_seq_len_past_max(self) -&gt; None:
+        attn = MultiHeadSelfAttention(d_model=8, n_heads=2, max_context_length=4)
+        x = torch.randn(1, 5, 8)
+        with self.assertRaises(ValueError):
+            attn(x)
+
+
+class TestCausalMask(unittest.TestCase):
+    def setUp(self) -&gt; None:
+        torch.manual_seed(0)
+        self.attn = MultiHeadSelfAttention(d_model=16, n_heads=4, max_context_length=12)
+
+    def test_upper_triangle_has_zero_weight(self) -&gt; None:
+        x = torch.randn(2, 8, 16)
+        _, weights = self.attn(x, return_weights=True)
+        upper = torch.triu(torch.ones(8, 8), diagonal=1).bool()
+        upper_sum = weights[:, :, upper].abs().sum().item()
+        self.assertLess(upper_sum, 1e-5)
+
+    def test_weight_rows_sum_to_one(self) -&gt; None:
+        x = torch.randn(2, 6, 16)
+        _, weights = self.attn(x, return_weights=True)
+        row_sums = weights.sum(dim=-1)
+        ones = torch.ones_like(row_sums)
+        self.assertTrue(torch.allclose(row_sums, ones, atol=1e-5))
+
+    def test_future_tokens_do_not_change_past_output(self) -&gt; None:
+        x = torch.randn(1, 8, 16)
+        out_full = self.attn(x)
+        x_alt = x.clone()
+        x_alt[:, 4:, :] = torch.randn_like(x_alt[:, 4:, :])
+        out_alt = self.attn(x_alt)
+        self.assertTrue(torch.allclose(out_full[:, :4, :], out_alt[:, :4, :], atol=1e-5))
+
+
+class TestHeadSplit(unittest.TestCase):
+    def test_split_then_merge_round_trip(self) -&gt; None:
+        torch.manual_seed(0)
+        attn = MultiHeadSelfAttention(d_model=24, n_heads=6, max_context_length=8)
+        x = torch.randn(2, 5, 24)
+        split = attn._split_heads(x)
+        self.assertEqual(split.shape, (2, 6, 5, 4))
+        merged = attn._merge_heads(split)
+        self.assertEqual(merged.shape, x.shape)
+        self.assertTrue(torch.allclose(merged, x))
+
+    def test_qkv_proj_outputs_3d(self) -&gt; None:
+        attn = MultiHeadSelfAttention(d_model=16, n_heads=4, max_context_length=8)
+        x = torch.randn(1, 5, 16)
+        qkv = attn.qkv_proj(x)
+        self.assertEqual(qkv.shape, (1, 5, 48))
+
+
+class TestScalingAndSoftmax(unittest.TestCase):
+    def test_softmax_row_sums(self) -&gt; None:
+        torch.manual_seed(0)
+        attn = MultiHeadSelfAttention(d_model=8, n_heads=2, max_context_length=6)
+        x = torch.randn(3, 4, 8)
+        _, weights = attn(x, return_weights=True)
+        self.assertTrue(
+            torch.allclose(weights.sum(dim=-1), torch.ones_like(weights.sum(dim=-1)), atol=1e-5)
+        )
+
+    def test_weights_non_negative(self) -&gt; None:
+        attn = MultiHeadSelfAttention(d_model=8, n_heads=2, max_context_length=6)
+        x = torch.randn(2, 5, 8)
+        _, weights = attn(x, return_weights=True)
+        self.assertTrue((weights &gt;= 0).all().item())
+
+
+class TestGradientFlow(unittest.TestCase):
+    def test_gradients_reach_qkv_and_out_proj(self) -&gt; None:
+        torch.manual_seed(0)
+        attn = MultiHeadSelfAttention(d_model=8, n_heads=2, max_context_length=4)
+        x = torch.randn(1, 4, 8, requires_grad=False)
+        loss = attn(x).sum()
+        loss.backward()
+        self.assertGreater(attn.qkv_proj.weight.grad.abs().sum().item(), 0.0)
+        self.assertGreater(attn.out_proj.weight.grad.abs().sum().item(), 0.0)
+
+
+class TestTinyTraining(unittest.TestCase):
+    def test_loss_drops_on_repeat_task(self) -&gt; None:
+        torch.manual_seed(123)
+        vocab_size = 32
+        seq_len = 10
+        model = TinyAttentionLM(
+            vocab_size=vocab_size,
+            d_model=16,
+            n_heads=4,
+            max_context_length=seq_len,
+        )
+        optimizer = torch.optim.Adam(model.parameters(), lr=5e-3)
+        gen = torch.Generator()
+        gen.manual_seed(7)
+
+        def step() -&gt; float:
+            base = torch.randint(0, vocab_size, (16, 1), generator=gen, dtype=torch.long)
+            ids = base.expand(16, seq_len + 1).contiguous()
+            inputs, targets = ids[:, :-1], ids[:, 1:]
+            logits = model(inputs)
+            loss = F.cross_entropy(logits.reshape(-1, vocab_size), targets.reshape(-1))
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            return loss.item()
+
+        first = step()
+        for _ in range(150):
+            step()
+        last = step()
+        self.assertLess(last, first / 2)
+
+
+if __name__ == &quot;__main__&quot;:
+    unittest.main()
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. Why does an efficient self-attention block use a single linear layer that outputs 3*D features?</legend><label class="option"><input type="radio" name="q0" value="0"> It is mathematically equivalent to three Linear(D, D) layers and runs as one matmul</label><label class="option"><input type="radio" name="q0" value="1"> It reduces the model parameter count</label><label class="option"><input type="radio" name="q0" value="2"> It enforces weight sharing between Q, K, and V</label><label class="option"><input type="radio" name="q0" value="3"> It avoids the need for a causal mask</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. What is the relationship between d_model, n_heads, and d_head?</legend><label class="option"><input type="radio" name="q1" value="0"> d_head = d_model * n_heads</label><label class="option"><input type="radio" name="q1" value="1"> d_head = d_model + n_heads</label><label class="option"><input type="radio" name="q1" value="2"> d_head is independent of d_model</label><label class="option"><input type="radio" name="q1" value="3"> d_head = d_model // n_heads and d_model must be divisible by n_heads</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. What value goes into the scaling factor of scaled dot-product attention?</legend><label class="option"><input type="radio" name="q2" value="0"> sqrt(d_head)</label><label class="option"><input type="radio" name="q2" value="1"> sqrt(n_heads)</label><label class="option"><input type="radio" name="q2" value="2"> sqrt(d_model)</label><label class="option"><input type="radio" name="q2" value="3"> sqrt(seq_len)</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. How does the causal mask enforce that position t cannot attend to position t+1?</legend><label class="option"><input type="radio" name="q3" value="0"> By multiplying the keys at future positions by zero</label><label class="option"><input type="radio" name="q3" value="1"> By setting score entries above the diagonal to negative infinity before softmax</label><label class="option"><input type="radio" name="q3" value="2"> By removing future tokens from the input</label><label class="option"><input type="radio" name="q3" value="3"> By using a different attention head for the future</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. Why does the block end with a Linear(D, D) output projection after merging heads?</legend><label class="option"><input type="radio" name="q4" value="0"> To allow the model to mix information across heads</label><label class="option"><input type="radio" name="q4" value="1"> To match the model&#39;s vocabulary size</label><label class="option"><input type="radio" name="q4" value="2"> To normalize the activations to mean zero</label><label class="option"><input type="radio" name="q4" value="3"> It is required for autograd to track gradients</label><p data-feedback="4"></p></fieldset><fieldset><legend>6. What does an attention-weight matrix of shape (B, H, T, T) tell you?</legend><label class="option"><input type="radio" name="q5" value="0"> Which key positions each query position attends to, per head, per batch element</label><label class="option"><input type="radio" name="q5" value="1"> The cosine similarity between query and value vectors</label><label class="option"><input type="radio" name="q5" value="2"> The output logits for the next token</label><label class="option"><input type="radio" name="q5" value="3"> How many parameters each head has</label><p data-feedback="5"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/19-capstone-projects/32-token-positional-embeddings/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/19-capstone-projects/34-transformer-block/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/19-capstone-projects/33-multihead-self-attention/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

@@ -1,0 +1,1397 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>&gt; 每一个认真的工程机构在2026年都会进行内部代码搜索, 源图扩展器,Cursor的代码基础答案, Augment的企业图,Aider的重绘图,Pinterest的内部MCP 相同的形状. 取许多回复,用树分析,嵌入函数和类级分类,混合搜索,重新排名,回答引用. 这块顶石要求你构建一个处理2万行代码的代码, · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-19-capstone-projects" data-lesson="19-capstone-projects/02-rag-over-codebase" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/19-capstone-projects/">综合项目</a> / LESSON 02</p><h1 class="lesson-title">&gt; 每一个认真的工程机构在2026年都会进行内部代码搜索, 源图扩展器,Cursor的代码基础答案, Augment的企业图,Aider的重绘图,Pinterest的内部MCP 相同的形状. 取许多回复,用树分析,嵌入函数和类级分类,混合搜索,重新排名,回答引用. 这块顶石要求你构建一个处理2万行代码的代码,</h1><p>Capstone 02 — RAG over Codebase (Cross-Repo Semantic Search)</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1></h1>
+<blockquote>
+<p>每一个认真的工程机构在2026年都会进行内部代码搜索, 源图扩展器,Cursor的代码基础答案, Augment的企业图,Aider的重绘图,Pinterest的内部MCP 相同的形状. 取许多回复,用树分析,嵌入函数和类级分类,混合搜索,重新排名,回答引用. 这块顶石要求你构建一个处理2万行代码的代码,</p>
+</blockquote>
+<p><strong>Type:</strong> Capstone
+<strong>Languages:</strong> Python (ingestion), TypeScript (API + UI)
+<strong>Prerequisites:</strong> Phase 5 (NLP foundations), Phase 7 (transformers), Phase 11 (LLM engineering), Phase 13 (tools), Phase 17 (infrastructure)
+**Phases exercised:**五·七·十一·十三·十七
+<strong>Time:</strong> 30 hours</p>
+<h2>问题</h2>
+<p>到2026年,每个边境编码代理都将运输一个代码基础检索层,因为单独的语境窗口无法解决跨度问题. 克劳德的1M代币背景有助于;它并没有消除排名检索的需要. 简单的搜索原始的毒品, 结果是生成代码, 单体复制, 生产答案是通过重新排名的AST意识的块进行混合 (密度+BM25) 搜索,支持符号引用图.</p>
+<p>通过索引一个真正的机队,而不是一个教程 repo,测量MRR@10,引用忠诚度和增量新鲜度来学习这一点. 失败模式是基础设施的:一个100k文件单元 repo,一个重复一半文件的推力,一个需要跨越四个 repos才能正确回答.</p>
+<h2>概念</h2>
+<p>基于AST的摄入管道通过树座仪分析每个文件,提取函数和类节点,并将节点的块放在节点边界而不是固定的代币窗口. 每个部分都得到了三个表示:密集嵌入 (旅行代码-3或名字嵌入代码),稀缺的BM25术语,以及简短的自然语言摘要. 总结中添加了第三种可检索的模式用户问&quot;X是如何授权的&quot;总结中提到&quot;authz&quot;,即使代码只有<code>check_permission</code>现在,我们要去.</p>
+<p>复苏是混合物. 一个查询会发射密集和BM25搜索,并合并top-k,并将联盟交给一个跨编码重新排名器 (Cohere重排-3或bge-重排-v2-gemma-2b). 重新排名的列表将被转移到长文本合成器 (Claude Sonnet 4.7 与快速缓存,或Llama 3.3 70B自主托管) 没有引用的答案被后过所拒绝.</p>
+<p>增长新鲜性是基础设施问题. Git 推进会引发差异:哪些文件改变,哪些符号改变.只有受影响的块重新嵌入.受影响的跨文件符号边缘 (进口,方法调用) 重新计算.索引保持一致,不需要重新处理2M行.</p>
+<h2>建筑</h2>
+<pre><code>git push --&gt; webhook --&gt; ingest worker (LlamaIndex Workflow)
+                           |
+                           v
+             tree-sitter parse + AST chunk
+                           |
+            +--------------+----------------+
+            v              v                v
+          dense        BM25 index       summary (LLM)
+        (Voyage / bge)  (Tantivy)        (Haiku 4.5)
+            |              |                |
+            +------&gt; Qdrant / pgvector &lt;----+
+                            |
+                            v
+                      symbol graph (Neo4j / kuzu)
+                            |
+  query --&gt; LangGraph agent (retrieve -&gt; rerank -&gt; synth)
+                            |
+                            v
+                 Claude Sonnet 4.7 1M context
+                            |
+                            v
+                 answer + file:line citations
+</code></pre>
+<h2>堆</h2>
+<ul>
+<li>解析:有17种语言语法的树守 (Python,TS,Rust,Go,Java,C++等)</li>
+<li>密集嵌入式: Voyage-code-3 (托管) 或名式嵌入式代码-v1.5 (自主托管), bge-code-v1倒退</li>
+<li>率指数:与BM25F的性 (性),按符号名称与体格进行田径权重</li>
+<li>矢量DB:Qdrant 1.12 混合搜索,或pgvector + pgvector尺度为50M以下的团队</li>
+<li>零件总结模型:克劳德海库4.5或双子 2.5 闪存,即时缓存</li>
+<li>排名重:Cohere排名-3或bge排名重-v2-gemma-2b自主托管</li>
+<li>调整:LlamaIndex 摄入工作流程,查询代理的LangGraph</li>
+<li>合成器:Claude Sonnet 4.7 (1M语境) 随时缓存</li>
+<li>符号图:进口和调用边缘 Neo4j (管理) 或 kuzu (嵌入式)</li>
+<li>观察性:每次检索+合成步骤的长跨度</li>
+</ul>
+<figure><img src="/learn/ai-from-scratch/figures/figure-daa5edad8bf4d855e5d0.png" alt="ce-hybrid-retrieval 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<ol>
+<li>
+<p>**Ingestion walker.**按每一个按上重复 Git 历史记录.收集已更改的文件.每个文件,用树监管器分析,提取函数和类节点,以其全部源跨度. 发送分类记录.<code>{repo, path, start_line, end_line, symbol, body}</code>现在,我们要去.</p>
+</li>
+<li>
+<p>**Chunk summarizer.**按组分分为Haiku 4.5调用,即时缓存系统序言. 提示:&quot;将这个函数总结成一个句子,命名其公开合约和副作用&quot;. 随着部分存储总结.</p>
+</li>
+<li>
+<p>**Embedding pool.**两条平行队列:密集 (旅行代码-3批量128) 和总结 (相同的模型,但在总结字符串上).<code>{repo, path, start_line, end_line, symbol, kind}</code>现在,我们要去.</p>
+</li>
+<li>
+<p>**BM25 index.**字段权重的Tantivy指数:符号名称重量4,符号体重量1,总结重量2. 启用&quot;找到名为X的函数&quot;查询,并加上&quot;找到X的函数&quot;.</p>
+</li>
+<li>
+<p>**Symbol graph.**对于每个部分,记录边缘:进口 (本文件使用 repo Z 的符号 Y),调用 (本函数在 C 类上调用方法 M),继承.存储在 kuzu 中.在查询时用于扩大回收跨 repo 边界.</p>
+</li>
+<li>
+<p>**Query agent.**具有三个节点的兰格格拉夫.<code>retrieve</code>密度火 + BM25平行,乘以 (repo,路径,符号) 倍增.<code>rerank</code>运行跨码器在50上,保持10上.<code>synth</code>调用Claude Sonnet 4.7在文本中重新排名的部分,缓存系统提示,需要文件:行引用.</p>
+</li>
+<li>
+<p>**Citation enforcement.**分析模型输出; 任何没有 <code>(repo/path:start-end)</code>给用户返回只引用答案.</p>
+</li>
+<li>
+<p>**Incremental re-index.**在每个网关上,计算符号级别差异. 只有重新嵌入的部分,其文字发生了变化. 重新计算进口发生了变化的部分的符号边缘. 测量:为2M-LOC舰队,50文件推重索引在60秒内.</p>
+</li>
+<li>
+<p>**Eval.**标签100个跨度问题,以黄金文件:线答. 测量MRR@10,nDCG@10,引用忠实性 (有可验证的杆的索赔的部分) 和p50/p99延迟.</p>
+</li>
+</ol>
+<h2>用它</h2>
+<pre><code>$ code-rag ask &quot;how is S3 multipart abort wired into our retry budget?&quot;
+[retrieve]  12 chunks dense + 7 chunks bm25, 16 unique after dedup
+[rerank]    top-5 kept (cohere rerank-3)
+[synth]     claude-sonnet-4.7, cache hit rate 68%, 2.1s
+answer:
+  Multipart aborts are triggered by `AbortMultipartOnFail` in
+  services/uploader/retry.go:122-148, which decrements the per-bucket
+  retry budget defined in config/budgets.yaml:34-51 ...
+  citations: [services/uploader/retry.go:122-148, config/budgets.yaml:34-51,
+              libs/s3client/multipart.ts:44-61]
+</code></pre>
+<h2>运送它</h2>
+<p>能提供的技能<code>outputs/skill-codebase-rag.md</code>鉴于复制文件,它会查询摄入量管道,混合指数和查询代理,并返回任何复制问题上引用的答案.</p>
+<table>
+<thead>
+<tr>
+<th style="text-align:center">Weight</th>
+<th>Criterion</th>
+<th>How it is measured</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align:center">25</td>
+<td>Retrieval quality</td>
+<td>MRR@10 and nDCG@10 on a 100-question held-out set</td>
+</tr>
+<tr>
+<td style="text-align:center">20</td>
+<td>Citation faithfulness</td>
+<td>Fraction of answer claims with verifiable file:line anchors</td>
+</tr>
+<tr>
+<td style="text-align:center">20</td>
+<td>Latency and scale</td>
+<td>p95 query latency at 10k QPS on the indexed corpus size</td>
+</tr>
+<tr>
+<td style="text-align:center">20</td>
+<td>Incremental indexing correctness</td>
+<td>Time from git push to searchable on a 50-file commit</td>
+</tr>
+<tr>
+<td style="text-align:center">15</td>
+<td>UX and answer formatting</td>
+<td>Citation clickability, snippet previews, follow-up affordance</td>
+</tr>
+<tr>
+<td style="text-align:center"><strong>100</strong></td>
+<td></td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<h2>运动</h2>
+<ol>
+<li>
+<p>换取自主托管的名字嵌入式代码.测量MRR@10三角形.报告是否在重新排名启用时关闭差距.</p>
+</li>
+<li>
+<p>注入20%生成代码 (LLM生产的炉板) 进入体内,重新评估.观察检索中毒.添加&quot;生成&quot;旗到有效载荷中,减轻这些击中.</p>
+</li>
+<li>
+<p>基准测量Qdrant混合搜索与pgvector +pgvectorscale在您的体积. 报告p99在批量1.</p>
+</li>
+<li>
+<p>增加基于样本的漂移检查:每周,重复100个问题评估.</p>
+</li>
+<li>
+<p>扩展到跨语言符号分辨率:一个Python函数,通过gRPC调用Go服务.使用符号图来链接它们.</p>
+</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>AST-aware chunking</td>
+<td>&quot;Function-level splits&quot;</td>
+<td>Cutting code at tree-sitter node boundaries instead of fixed token windows</td>
+</tr>
+<tr>
+<td>Hybrid search</td>
+<td>&quot;Dense + sparse&quot;</td>
+<td>Run BM25 and vector search in parallel, merge top-k, rerank</td>
+</tr>
+<tr>
+<td>Cross-encoder rerank</td>
+<td>&quot;Second-stage rank&quot;</td>
+<td>Model that scores each (query, candidate) pair together, more accurate than cosine</td>
+</tr>
+<tr>
+<td>Prompt caching</td>
+<td>&quot;Cached system prompt&quot;</td>
+<td>2026 Claude / OpenAI feature that discounts repeat prefix tokens up to 90%</td>
+</tr>
+<tr>
+<td>Symbol graph</td>
+<td>&quot;Code graph&quot;</td>
+<td>Edges for imports, calls, inheritance across files and repos</td>
+</tr>
+<tr>
+<td>Citation faithfulness</td>
+<td>&quot;Grounded answer rate&quot;</td>
+<td>Fraction of claims a user can verify by clicking the anchor and reading the referenced span</td>
+</tr>
+<tr>
+<td>Incremental re-index</td>
+<td>&quot;Push-to-search time&quot;</td>
+<td>Wall-clock from git push to the changed symbols being queryable</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://ampcode.com" rel="noreferrer" data-network="true">Sourcegraph Amp <small>↗ 需要联网</small></a>生产跨度报告代码信息</li>
+<li><a href="https://sourcegraph.com/blog/how-cody-understands-your-codebase" rel="noreferrer" data-network="true">Sourcegraph Cody RAG architecture <small>↗ 需要联网</small></a>这个顶石的参考深度潜水</li>
+<li><a href="https://aider.chat/docs/repomap.html" rel="noreferrer" data-network="true">Aider repo-map <small>↗ 需要联网</small></a>树排名的回复视图</li>
+<li><a href="https://www.augmentcode.com" rel="noreferrer" data-network="true">Augment Code enterprise graph <small>↗ 需要联网</small></a>商业象征图RAG</li>
+<li><a href="https://qdrant.tech/documentation/concepts/hybrid-queries/" rel="noreferrer" data-network="true">Qdrant hybrid search docs <small>↗ 需要联网</small></a>参考实施</li>
+<li><a href="https://docs.voyageai.com/docs/embeddings" rel="noreferrer" data-network="true">Voyage AI code embeddings <small>↗ 需要联网</small></a>旅行代码-3详细信息</li>
+<li><a href="https://docs.cohere.com/reference/rerank" rel="noreferrer" data-network="true">Cohere rerank-3 <small>↗ 需要联网</small></a>跨编码器参考</li>
+<li><a href="https://medium.com/pinterest-engineering" rel="noreferrer" data-network="true">Pinterest MCP internal search <small>↗ 需要联网</small></a>内部平台参考</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Capstone 02 — RAG over Codebase (Cross-Repo Semantic Search)</h1>
+<blockquote>
+<p>Every serious engineering org in 2026 runs an internal code search that understands meaning, not just strings. Sourcegraph Amp, Cursor's codebase answers, Augment's enterprise graph, Aider's repomap, Pinterest's internal MCP — same shape. Ingest many repos, parse with tree-sitter, embed function- and class-level chunks, hybrid-search, re-rank, answer with citations. This capstone asks you to build one that handles 2M lines of code across 10 repos and survives incremental re-indexing on every git push.</p>
+</blockquote>
+<p><strong>Type:</strong> Capstone
+<strong>Languages:</strong> Python (ingestion), TypeScript (API + UI)
+<strong>Prerequisites:</strong> Phase 5 (NLP foundations), Phase 7 (transformers), Phase 11 (LLM engineering), Phase 13 (tools), Phase 17 (infrastructure)
+<strong>Phases exercised:</strong> P5 · P7 · P11 · P13 · P17
+<strong>Time:</strong> 30 hours</p>
+<h2>Problem</h2>
+<p>By 2026 every frontier coding agent ships with a codebase retrieval layer because context windows alone do not solve cross-repo questions. Claude's 1M-token context helps; it does not eliminate the need for ranked retrieval. Naive cosine search over raw chunks poisons results on generated code, on monorepo duplication, and on the long tail of rarely-imported symbols. The production answer is a hybrid (dense + BM25) search over AST-aware chunks with a re-ranker, backed by a graph of symbol references.</p>
+<p>You learn this by indexing a real fleet — not one tutorial repo — and measuring MRR@10, citation faithfulness, and incremental freshness. The failure modes are infrastructural: a 100k-file monorepo, a push that retouches half the files, a query that needs to cross four repos to answer correctly.</p>
+<h2>Concept</h2>
+<p>An AST-aware ingestion pipeline parses each file with tree-sitter, extracts function and class nodes, and chunks at node boundaries rather than fixed token windows. Each chunk gets three representations: a dense embedding (Voyage-code-3 or nomic-embed-code), sparse BM25 terms, and a short natural-language summary. The summary adds a third retrievable modality — users ask &quot;how is X authorized&quot; and the summary mentions &quot;authz&quot;, even if the code only has <code>check_permission</code>.</p>
+<p>Retrieval is hybrid. A query fires both dense and BM25 searches, merges top-k, and hands the union to a cross-encoder re-ranker (Cohere rerank-3 or bge-reranker-v2-gemma-2b). The re-ranked list goes to a long-context synthesizer (Claude Sonnet 4.7 with prompt caching, or Llama 3.3 70B self-hosted) with instructions to cite every claim by file and line range. Answers without citations are rejected by a post-filter.</p>
+<p>Incremental freshness is the infrastructure problem. Git push triggers a diff: which files changed, which symbols changed. Only affected chunks re-embed. Affected cross-file symbol edges (imports, method calls) get recomputed. The index stays consistent without reprocessing 2M lines each commit.</p>
+<h2>Architecture</h2>
+<pre><code>git push --&gt; webhook --&gt; ingest worker (LlamaIndex Workflow)
+                           |
+                           v
+             tree-sitter parse + AST chunk
+                           |
+            +--------------+----------------+
+            v              v                v
+          dense        BM25 index       summary (LLM)
+        (Voyage / bge)  (Tantivy)        (Haiku 4.5)
+            |              |                |
+            +------&gt; Qdrant / pgvector &lt;----+
+                            |
+                            v
+                      symbol graph (Neo4j / kuzu)
+                            |
+  query --&gt; LangGraph agent (retrieve -&gt; rerank -&gt; synth)
+                            |
+                            v
+                 Claude Sonnet 4.7 1M context
+                            |
+                            v
+                 answer + file:line citations
+</code></pre>
+<h2>Stack</h2>
+<ul>
+<li>Parsing: tree-sitter with 17 language grammars (Python, TS, Rust, Go, Java, C++, etc.)</li>
+<li>Dense embeddings: Voyage-code-3 (hosted) or nomic-embed-code-v1.5 (self-host), bge-code-v1 fallback</li>
+<li>Sparse index: Tantivy (Rust) with BM25F, field-weighted on symbol name vs body</li>
+<li>Vector DB: Qdrant 1.12 with hybrid search, or pgvector + pgvectorscale for teams under 50M vectors</li>
+<li>Chunk summary model: Claude Haiku 4.5 or Gemini 2.5 Flash, prompt-cached</li>
+<li>Re-ranker: Cohere rerank-3 or bge-reranker-v2-gemma-2b self-hosted</li>
+<li>Orchestration: LlamaIndex Workflows for ingestion, LangGraph for query agent</li>
+<li>Synthesizer: Claude Sonnet 4.7 (1M context) with prompt caching</li>
+<li>Symbol graph: Neo4j (managed) or kuzu (embedded) for import and call edges</li>
+<li>Observability: Langfuse spans per retrieval + synthesis step</li>
+</ul>
+<figure><img src="/learn/ai-from-scratch/figures/figure-daa5edad8bf4d855e5d0.png" alt="ce-hybrid-retrieval 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<ol>
+<li>
+<p><strong>Ingestion walker.</strong> Iterate git history on every push hook. Collect changed files. For each file, parse with tree-sitter, extract function and class nodes with their full source span. Emit chunk records <code>{repo, path, start_line, end_line, symbol, body}</code>.</p>
+</li>
+<li>
+<p><strong>Chunk summarizer.</strong> Batch chunks into Haiku 4.5 calls with prompt caching on the system preamble. Prompt: &quot;Summarize this function in one sentence, naming its public contract and side effects.&quot; Store summary alongside the chunk.</p>
+</li>
+<li>
+<p><strong>Embedding pool.</strong> Two parallel queues: dense (Voyage-code-3 batch 128) and summary (same model, but on the summary string). Write vectors to Qdrant with payload <code>{repo, path, start_line, end_line, symbol, kind}</code>.</p>
+</li>
+<li>
+<p><strong>BM25 index.</strong> Field-weighted Tantivy index: symbol name weight 4, symbol body weight 1, summary weight 2. Enables &quot;find the function named X&quot; queries alongside &quot;find the function that does X&quot;.</p>
+</li>
+<li>
+<p><strong>Symbol graph.</strong> For each chunk, record edges: imports (this file uses symbol Y from repo Z), calls (this function calls method M on class C), inheritance. Store in kuzu. Used at query time to expand retrieval across repo boundaries.</p>
+</li>
+<li>
+<p><strong>Query agent.</strong> LangGraph with three nodes. <code>retrieve</code> fires dense + BM25 in parallel, deduplicates by (repo, path, symbol). <code>rerank</code> runs the cross-encoder on top-50 and keeps top-10. <code>synth</code> calls Claude Sonnet 4.7 with the reranked chunks in context, caches the system prompt, requires file:line citations.</p>
+</li>
+<li>
+<p><strong>Citation enforcement.</strong> Parse the model output; any claim without a <code>(repo/path:start-end)</code> anchor gets flagged for re-ask or dropped. Return cited-only answer to the user.</p>
+</li>
+<li>
+<p><strong>Incremental re-index.</strong> On each webhook, compute the symbol-level diff. Only re-embed chunks whose text changed. Recompute symbol edges for chunks whose imports changed. Measure: a 50-file push re-indexed in under 60 seconds for a 2M-LOC fleet.</p>
+</li>
+<li>
+<p><strong>Eval.</strong> Label 100 cross-repo questions with gold file:line answers. Measure MRR@10, nDCG@10, citation faithfulness (fraction of claims with verifiable anchors), and p50/p99 latency.</p>
+</li>
+</ol>
+<h2>Use It</h2>
+<pre><code>$ code-rag ask &quot;how is S3 multipart abort wired into our retry budget?&quot;
+[retrieve]  12 chunks dense + 7 chunks bm25, 16 unique after dedup
+[rerank]    top-5 kept (cohere rerank-3)
+[synth]     claude-sonnet-4.7, cache hit rate 68%, 2.1s
+answer:
+  Multipart aborts are triggered by `AbortMultipartOnFail` in
+  services/uploader/retry.go:122-148, which decrements the per-bucket
+  retry budget defined in config/budgets.yaml:34-51 ...
+  citations: [services/uploader/retry.go:122-148, config/budgets.yaml:34-51,
+              libs/s3client/multipart.ts:44-61]
+</code></pre>
+<h2>Ship It</h2>
+<p>Deliverable skill <code>outputs/skill-codebase-rag.md</code>. Given a corpus of repos, it stands up the ingestion pipeline, the hybrid index, and the query agent, and returns a cited answer for any cross-repo question. Rubric:</p>
+<table>
+<thead>
+<tr>
+<th style="text-align:center">Weight</th>
+<th>Criterion</th>
+<th>How it is measured</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align:center">25</td>
+<td>Retrieval quality</td>
+<td>MRR@10 and nDCG@10 on a 100-question held-out set</td>
+</tr>
+<tr>
+<td style="text-align:center">20</td>
+<td>Citation faithfulness</td>
+<td>Fraction of answer claims with verifiable file:line anchors</td>
+</tr>
+<tr>
+<td style="text-align:center">20</td>
+<td>Latency and scale</td>
+<td>p95 query latency at 10k QPS on the indexed corpus size</td>
+</tr>
+<tr>
+<td style="text-align:center">20</td>
+<td>Incremental indexing correctness</td>
+<td>Time from git push to searchable on a 50-file commit</td>
+</tr>
+<tr>
+<td style="text-align:center">15</td>
+<td>UX and answer formatting</td>
+<td>Citation clickability, snippet previews, follow-up affordance</td>
+</tr>
+<tr>
+<td style="text-align:center"><strong>100</strong></td>
+<td></td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<h2>Exercises</h2>
+<ol>
+<li>
+<p>Swap Voyage-code-3 for nomic-embed-code self-hosted. Measure the MRR@10 delta. Report whether the gap closes with re-ranking enabled.</p>
+</li>
+<li>
+<p>Inject 20% generated code (LLM-produced boilerplate) into the corpus and re-evaluate. Observe retrieval poisoning. Add a &quot;generated&quot; flag to the payload and down-weight those hits.</p>
+</li>
+<li>
+<p>Benchmark Qdrant hybrid search vs pgvector + pgvectorscale at your corpus size. Report p99 at batch size 1.</p>
+</li>
+<li>
+<p>Add a sampling-based drift check: weekly, rerun the 100-question eval. Alert on MRR@10 drop &gt; 5%.</p>
+</li>
+<li>
+<p>Extend to cross-language symbol resolution: a Python function that calls a Go service over gRPC. Use the symbol graph to link them.</p>
+</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>AST-aware chunking</td>
+<td>&quot;Function-level splits&quot;</td>
+<td>Cutting code at tree-sitter node boundaries instead of fixed token windows</td>
+</tr>
+<tr>
+<td>Hybrid search</td>
+<td>&quot;Dense + sparse&quot;</td>
+<td>Run BM25 and vector search in parallel, merge top-k, rerank</td>
+</tr>
+<tr>
+<td>Cross-encoder rerank</td>
+<td>&quot;Second-stage rank&quot;</td>
+<td>Model that scores each (query, candidate) pair together, more accurate than cosine</td>
+</tr>
+<tr>
+<td>Prompt caching</td>
+<td>&quot;Cached system prompt&quot;</td>
+<td>2026 Claude / OpenAI feature that discounts repeat prefix tokens up to 90%</td>
+</tr>
+<tr>
+<td>Symbol graph</td>
+<td>&quot;Code graph&quot;</td>
+<td>Edges for imports, calls, inheritance across files and repos</td>
+</tr>
+<tr>
+<td>Citation faithfulness</td>
+<td>&quot;Grounded answer rate&quot;</td>
+<td>Fraction of claims a user can verify by clicking the anchor and reading the referenced span</td>
+</tr>
+<tr>
+<td>Incremental re-index</td>
+<td>&quot;Push-to-search time&quot;</td>
+<td>Wall-clock from git push to the changed symbols being queryable</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://ampcode.com" rel="noreferrer" data-network="true">Sourcegraph Amp <small>↗ 需要联网</small></a> — production cross-repo code intelligence</li>
+<li><a href="https://sourcegraph.com/blog/how-cody-understands-your-codebase" rel="noreferrer" data-network="true">Sourcegraph Cody RAG architecture <small>↗ 需要联网</small></a> — the reference deep-dive for this capstone</li>
+<li><a href="https://aider.chat/docs/repomap.html" rel="noreferrer" data-network="true">Aider repo-map <small>↗ 需要联网</small></a> — tree-sitter ranked repo view</li>
+<li><a href="https://www.augmentcode.com" rel="noreferrer" data-network="true">Augment Code enterprise graph <small>↗ 需要联网</small></a> — commercial symbol-graph RAG</li>
+<li><a href="https://qdrant.tech/documentation/concepts/hybrid-queries/" rel="noreferrer" data-network="true">Qdrant hybrid search docs <small>↗ 需要联网</small></a> — reference implementation</li>
+<li><a href="https://docs.voyageai.com/docs/embeddings" rel="noreferrer" data-network="true">Voyage AI code embeddings <small>↗ 需要联网</small></a> — Voyage-code-3 details</li>
+<li><a href="https://docs.cohere.com/reference/rerank" rel="noreferrer" data-network="true">Cohere rerank-3 <small>↗ 需要联网</small></a> — cross-encoder reference</li>
+<li><a href="https://medium.com/pinterest-engineering" rel="noreferrer" data-network="true">Pinterest MCP internal search <small>↗ 需要联网</small></a> — internal-platform reference</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-19-capstone-projects--02-rag-over-codebase.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-19-capstone-projects--02-rag-over-codebase.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/02-rag-over-codebase/code/main.py">phases/19-capstone-projects/02-rag-over-codebase/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Code RAG — AST-aware chunking + hybrid retrieval scaffold.
+
+The hard architectural primitive here is hybrid retrieval with rank fusion:
+two index structures (dense vector, BM25) run in parallel, results are merged
+with reciprocal rank fusion, then a re-ranker picks the final top-k. This
+scaffold implements both halves with stdlib: a naive dense index (hash-based
+fake embeddings so the loop runs deterministically offline) and a real BM25
+from scratch. The fusion + rerank logic is the part that matters.
+
+Run:  python main.py
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import math
+import re
+from collections import Counter, defaultdict
+from dataclasses import dataclass, field
+
+
+# ---------------------------------------------------------------------------
+# chunk shape  --  AST-aware function-level chunks
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Chunk:
+    repo: str
+    path: str
+    start_line: int
+    end_line: int
+    symbol: str
+    body: str
+    summary: str = &quot;&quot;
+
+    def anchor(self) -&gt; str:
+        return f&quot;{self.repo}/{self.path}:{self.start_line}-{self.end_line}&quot;
+
+
+SAMPLE_CORPUS = [
+    Chunk(&quot;uploader&quot;, &quot;services/retry.go&quot;, 122, 148, &quot;AbortMultipartOnFail&quot;,
+          &quot;if ctx.Err() != nil { return abort() }; decrement bucket budget; retry with backoff&quot;,
+          &quot;aborts an in-flight S3 multipart upload and decrements the per-bucket retry budget&quot;),
+    Chunk(&quot;uploader&quot;, &quot;config/budgets.yaml&quot;, 34, 51, &quot;bucket_budget&quot;,
+          &quot;per_bucket_budget: 64; backoff_ms: [100, 500, 2500]; abort_threshold: 3&quot;,
+          &quot;declares the retry budget and exponential backoff schedule per S3 bucket&quot;),
+    Chunk(&quot;client&quot;, &quot;libs/s3client/multipart.ts&quot;, 44, 61, &quot;abortUpload&quot;,
+          &quot;await s3.abortMultipartUpload({Bucket, Key, UploadId}); metrics.inc(&#39;s3.abort&#39;)&quot;,
+          &quot;client-side S3 multipart abort with metrics instrumentation&quot;),
+    Chunk(&quot;auth&quot;, &quot;services/authz/check.py&quot;, 12, 38, &quot;check_permission&quot;,
+          &quot;def check_permission(user, resource, action): return policy.evaluate(user, resource, action)&quot;,
+          &quot;central authorization gateway evaluating an OPA policy for user-resource-action&quot;),
+    Chunk(&quot;auth&quot;, &quot;libs/policy/opa.py&quot;, 88, 110, &quot;evaluate&quot;,
+          &quot;def evaluate(user, resource, action): return self.engine.query(&#39;authz&#39;, input=...)&quot;,
+          &quot;OPA policy engine query wrapper for authorization checks&quot;),
+    Chunk(&quot;catalog&quot;, &quot;services/search/query.rs&quot;, 200, 240, &quot;rank_fusion&quot;,
+          &quot;pub fn rank_fusion(dense: Vec&lt;Hit&gt;, sparse: Vec&lt;Hit&gt;) -&gt; Vec&lt;Hit&gt;&quot;,
+          &quot;reciprocal rank fusion of dense and sparse retrieval results&quot;),
+]
+
+
+# ---------------------------------------------------------------------------
+# naive dense index  --  deterministic fake embeddings for scaffold testing
+# ---------------------------------------------------------------------------
+
+def fake_embed(text: str, dim: int = 64) -&gt; list[float]:
+    &quot;&quot;&quot;Hash-based deterministic embedding; stands in for Voyage-code-3.&quot;&quot;&quot;
+    vec = [0.0] * dim
+    for tok in re.findall(r&quot;\w+&quot;, text.lower()):
+        h = hash(tok)
+        vec[h % dim] += 1.0
+        vec[(h &gt;&gt; 8) % dim] += 0.5
+    norm = math.sqrt(sum(v * v for v in vec)) or 1.0
+    return [v / norm for v in vec]
+
+
+def cosine(a: list[float], b: list[float]) -&gt; float:
+    return sum(x * y for x, y in zip(a, b))
+
+
+@dataclass
+class DenseIndex:
+    vectors: list[tuple[Chunk, list[float]]] = field(default_factory=list)
+
+    def add(self, chunk: Chunk) -&gt; None:
+        text = f&quot;{chunk.symbol}\n{chunk.summary}\n{chunk.body}&quot;
+        self.vectors.append((chunk, fake_embed(text)))
+
+    def search(self, query: str, k: int = 10) -&gt; list[tuple[Chunk, float]]:
+        qv = fake_embed(query)
+        scored = [(c, cosine(qv, v)) for c, v in self.vectors]
+        scored.sort(key=lambda x: -x[1])
+        return scored[:k]
+
+
+# ---------------------------------------------------------------------------
+# BM25 from scratch  --  the real algorithm, documents are Chunks
+# ---------------------------------------------------------------------------
+
+def tokenize(text: str) -&gt; list[str]:
+    return re.findall(r&quot;\w+&quot;, text.lower())
+
+
+@dataclass
+class BM25Index:
+    k1: float = 1.5
+    b: float = 0.75
+    docs: list[Chunk] = field(default_factory=list)
+    doc_lens: list[int] = field(default_factory=list)
+    df: Counter = field(default_factory=Counter)
+    tf: list[Counter] = field(default_factory=list)
+    avgdl: float = 0.0
+
+    def add(self, chunk: Chunk) -&gt; None:
+        # field-weighted: symbol x4, summary x2, body x1
+        tokens = (tokenize(chunk.symbol) * 4 +
+                  tokenize(chunk.summary) * 2 +
+                  tokenize(chunk.body))
+        counts = Counter(tokens)
+        self.docs.append(chunk)
+        self.doc_lens.append(len(tokens))
+        self.tf.append(counts)
+        for term in counts:
+            self.df[term] += 1
+        self.avgdl = sum(self.doc_lens) / len(self.doc_lens)
+
+    def search(self, query: str, k: int = 10) -&gt; list[tuple[Chunk, float]]:
+        q_terms = tokenize(query)
+        n = len(self.docs)
+        scores: list[float] = [0.0] * n
+        for term in q_terms:
+            if term not in self.df:
+                continue
+            idf = math.log((n - self.df[term] + 0.5) / (self.df[term] + 0.5) + 1.0)
+            for i, counts in enumerate(self.tf):
+                if term not in counts:
+                    continue
+                f = counts[term]
+                dl = self.doc_lens[i]
+                denom = f + self.k1 * (1 - self.b + self.b * dl / self.avgdl)
+                scores[i] += idf * f * (self.k1 + 1) / denom
+        ranked = sorted(zip(self.docs, scores), key=lambda x: -x[1])
+        return [(c, s) for c, s in ranked[:k] if s &gt; 0]
+
+
+# ---------------------------------------------------------------------------
+# reciprocal rank fusion  --  the merge step of hybrid retrieval
+# ---------------------------------------------------------------------------
+
+def rrf(dense: list[tuple[Chunk, float]], sparse: list[tuple[Chunk, float]],
+        k_rrf: int = 60) -&gt; list[tuple[Chunk, float]]:
+    score: dict[str, float] = defaultdict(float)
+    by_anchor: dict[str, Chunk] = {}
+    for rank, (c, _) in enumerate(dense):
+        score[c.anchor()] += 1.0 / (k_rrf + rank + 1)
+        by_anchor[c.anchor()] = c
+    for rank, (c, _) in enumerate(sparse):
+        score[c.anchor()] += 1.0 / (k_rrf + rank + 1)
+        by_anchor[c.anchor()] = c
+    fused = sorted(score.items(), key=lambda x: -x[1])
+    return [(by_anchor[a], s) for a, s in fused]
+
+
+# ---------------------------------------------------------------------------
+# stub reranker  --  cross-encoder stand-in; rerank by query-symbol overlap
+# ---------------------------------------------------------------------------
+
+def rerank(query: str, candidates: list[tuple[Chunk, float]],
+           top_k: int = 5) -&gt; list[tuple[Chunk, float]]:
+    q_toks = set(tokenize(query))
+    out: list[tuple[Chunk, float]] = []
+    for c, prior in candidates:
+        symbol_overlap = len(q_toks &amp; set(tokenize(c.symbol))) * 3
+        summary_overlap = len(q_toks &amp; set(tokenize(c.summary)))
+        out.append((c, prior + 0.3 * symbol_overlap + 0.1 * summary_overlap))
+    out.sort(key=lambda x: -x[1])
+    return out[:top_k]
+
+
+# ---------------------------------------------------------------------------
+# orchestrator  --  the full retrieve -&gt; fuse -&gt; rerank flow
+# ---------------------------------------------------------------------------
+
+def answer(query: str, dense: DenseIndex, bm25: BM25Index) -&gt; dict[str, object]:
+    dense_hits = dense.search(query, k=10)
+    sparse_hits = bm25.search(query, k=10)
+    fused = rrf(dense_hits, sparse_hits)
+    top = rerank(query, fused, top_k=5)
+    citations = [c.anchor() for c, _ in top]
+    return {
+        &quot;query&quot;: query,
+        &quot;dense_top&quot;: [c.anchor() for c, _ in dense_hits[:3]],
+        &quot;sparse_top&quot;: [c.anchor() for c, _ in sparse_hits[:3]],
+        &quot;fused_top&quot;: [c.anchor() for c, _ in fused[:5]],
+        &quot;rerank_top&quot;: citations,
+    }
+
+
+def main() -&gt; None:
+    dense = DenseIndex()
+    bm25 = BM25Index()
+    for ch in SAMPLE_CORPUS:
+        dense.add(ch)
+        bm25.add(ch)
+
+    for q in (&quot;how is S3 multipart abort wired into retry budget&quot;,
+              &quot;where is authorization centralized&quot;,
+              &quot;how does rank fusion work&quot;):
+        result = answer(q, dense, bm25)
+        print(f&quot;Q: {result[&#39;query&#39;]}&quot;)
+        print(f&quot;  dense  : {result[&#39;dense_top&#39;]}&quot;)
+        print(f&quot;  sparse : {result[&#39;sparse_top&#39;]}&quot;)
+        print(f&quot;  fused  : {result[&#39;fused_top&#39;]}&quot;)
+        print(f&quot;  rerank : {result[&#39;rerank_top&#39;]}&quot;)
+        print()
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/02-rag-over-codebase/code/ts/README.md">phases/19-capstone-projects/02-rag-over-codebase/code/ts/README.md</a><details><summary>查看原始文本</summary><pre><code># Capstone 19/02 — RAG over Codebase (TypeScript)
+
+Multi-file TypeScript code-search API for the hybrid retrieval pipeline
+described in `../docs/en.md`. Offline, deterministic, six-chunk sample corpus,
+node:http behind a hono fetch handler.
+
+## Layout
+
+```text
+src/
+  index.ts        entry point; boots node:http + self-probe + exits 0
+  server.ts       hono routes (/healthz, /query) with zod-validated POST body
+  retrieval.ts    runQuery + RRF merge over dense and BM25
+  index_store.ts  FNV-1a hash embedder, cosine, field-weighted BM25
+  corpus.ts       six-chunk sample (uploader / auth / client / catalog)
+  types.ts        Chunk, RankedChunk, QueryResponse, anchor()
+tests/
+  index_store.test.ts
+  retrieval.test.ts
+  server.test.ts
+```
+
+## Run
+
+```bash
+npm install
+npm start                # boots api, probes three queries, exits 0
+npm start -- --serve     # keep server up; ctrl-c to stop
+npm test                 # node --test runner via tsx
+npm run typecheck        # tsc --noEmit
+```
+
+The non-interactive `npm start` path asserts that `/healthz` returns 200 and
+that every probe query returns at least one citation. Routes:
+
+- `GET /healthz` — returns `{ok, corpus}`.
+- `GET /query?q=...` — runs a hybrid query.
+- `POST /query` — JSON `{q, topK?}`, validated by zod (`topK` capped at 50).
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/02-rag-over-codebase/code/ts/package.json">phases/19-capstone-projects/02-rag-over-codebase/code/ts/package.json</a><details><summary>查看原始文本</summary><pre><code>{
+  &quot;name&quot;: &quot;phase-19-02-rag-over-codebase&quot;,
+  &quot;version&quot;: &quot;0.1.0&quot;,
+  &quot;private&quot;: true,
+  &quot;type&quot;: &quot;module&quot;,
+  &quot;scripts&quot;: {
+    &quot;start&quot;: &quot;tsx src/index.ts&quot;,
+    &quot;test&quot;: &quot;tsx --test tests/*.test.ts&quot;,
+    &quot;typecheck&quot;: &quot;tsc --noEmit&quot;
+  },
+  &quot;dependencies&quot;: {
+    &quot;hono&quot;: &quot;^4.6.14&quot;,
+    &quot;zod&quot;: &quot;^3.23.8&quot;
+  },
+  &quot;devDependencies&quot;: {
+    &quot;@types/node&quot;: &quot;^20.17.10&quot;,
+    &quot;tsx&quot;: &quot;^4.19.2&quot;,
+    &quot;typescript&quot;: &quot;^5.7.3&quot;
+  }
+}
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/02-rag-over-codebase/code/ts/src/corpus.ts">phases/19-capstone-projects/02-rag-over-codebase/code/ts/src/corpus.ts</a><details><summary>查看原始文本</summary><pre><code>import type { Chunk } from &quot;./types.ts&quot;;
+
+export const SAMPLE_CORPUS: Chunk[] = [
+  {
+    repo: &quot;uploader&quot;,
+    path: &quot;services/retry.go&quot;,
+    startLine: 122,
+    endLine: 148,
+    symbol: &quot;AbortMultipartOnFail&quot;,
+    body: &quot;if ctx.Err() != nil { return abort() }; decrement bucket budget; retry with backoff&quot;,
+    summary:
+      &quot;aborts an in-flight S3 multipart upload and decrements the per-bucket retry budget&quot;,
+  },
+  {
+    repo: &quot;uploader&quot;,
+    path: &quot;config/budgets.yaml&quot;,
+    startLine: 34,
+    endLine: 51,
+    symbol: &quot;bucket_budget&quot;,
+    body: &quot;per_bucket_budget: 64; backoff_ms: [100, 500, 2500]; abort_threshold: 3&quot;,
+    summary:
+      &quot;declares the retry budget and exponential backoff schedule per S3 bucket&quot;,
+  },
+  {
+    repo: &quot;client&quot;,
+    path: &quot;libs/s3client/multipart.ts&quot;,
+    startLine: 44,
+    endLine: 61,
+    symbol: &quot;abortUpload&quot;,
+    body: &quot;await s3.abortMultipartUpload({Bucket, Key, UploadId}); metrics.inc(&#39;s3.abort&#39;)&quot;,
+    summary: &quot;client-side S3 multipart abort with metrics instrumentation&quot;,
+  },
+  {
+    repo: &quot;auth&quot;,
+    path: &quot;services/authz/check.py&quot;,
+    startLine: 12,
+    endLine: 38,
+    symbol: &quot;check_permission&quot;,
+    body: &quot;def check_permission(user, resource, action): return policy.evaluate(user, resource, action)&quot;,
+    summary:
+      &quot;central authorization gateway evaluating an OPA policy for user-resource-action&quot;,
+  },
+  {
+    repo: &quot;auth&quot;,
+    path: &quot;libs/policy/opa.py&quot;,
+    startLine: 88,
+    endLine: 110,
+    symbol: &quot;evaluate&quot;,
+    body: &quot;def evaluate(user, resource, action): return self.engine.query(&#39;authz&#39;, input=...)&quot;,
+    summary: &quot;OPA policy engine query wrapper for authorization checks&quot;,
+  },
+  {
+    repo: &quot;catalog&quot;,
+    path: &quot;services/search/query.rs&quot;,
+    startLine: 200,
+    endLine: 240,
+    symbol: &quot;rank_fusion&quot;,
+    body: &quot;pub fn rank_fusion(dense: Vec&lt;Hit&gt;, sparse: Vec&lt;Hit&gt;) -&gt; Vec&lt;Hit&gt;&quot;,
+    summary: &quot;reciprocal rank fusion of dense and sparse retrieval results&quot;,
+  },
+];
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/02-rag-over-codebase/code/ts/src/index.ts">phases/19-capstone-projects/02-rag-over-codebase/code/ts/src/index.ts</a><details><summary>查看原始文本</summary><pre><code>// Capstone 19/02: code RAG query API (multi-file TypeScript).
+//
+// Sources:
+//   This lesson&#39;s docs/en.md (hybrid retrieval + cited answer API)
+//   Hono web framework           https://hono.dev/docs/
+//   BM25 (Robertson + Zaragoza) https://en.wikipedia.org/wiki/Okapi_BM25
+//   Reciprocal Rank Fusion       https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf
+//
+// Hybrid retrieval API split into modules: index_store.ts (FNV-1a embedder + BM25),
+// retrieval.ts (RRF merge), server.ts (hono routes /healthz, /query), this entry
+// (boots node:http behind the hono fetch handler, runs a self-probe, exits 0).
+
+import * as http from &quot;node:http&quot;;
+import { Readable } from &quot;node:stream&quot;;
+import { buildIndices } from &quot;./retrieval.ts&quot;;
+import { buildApp } from &quot;./server.ts&quot;;
+import type { QueryResponse } from &quot;./types.ts&quot;;
+import { SAMPLE_CORPUS } from &quot;./corpus.ts&quot;;
+
+type FetchLike = (req: Request) =&gt; Response | Promise&lt;Response&gt;;
+
+function nodeListener(fetchHandler: FetchLike) {
+  return (req: http.IncomingMessage, res: http.ServerResponse): void =&gt; {
+    const chunks: Buffer[] = [];
+    req.on(&quot;data&quot;, (c: Buffer) =&gt; chunks.push(c));
+    req.on(&quot;end&quot;, () =&gt; {
+      void (async () =&gt; {
+        try {
+          const url = `http://${req.headers.host ?? &quot;localhost&quot;}${req.url ?? &quot;/&quot;}`;
+          const init: RequestInit = {
+            method: req.method,
+            headers: req.headers as Record&lt;string, string&gt;,
+          };
+          const method = (req.method ?? &quot;GET&quot;).toUpperCase();
+          if (method !== &quot;GET&quot; &amp;&amp; method !== &quot;HEAD&quot; &amp;&amp; chunks.length &gt; 0) {
+            init.body = Buffer.concat(chunks);
+          }
+          const response = await fetchHandler(new Request(url, init));
+          res.statusCode = response.status;
+          response.headers.forEach((v, k) =&gt; res.setHeader(k, v));
+          if (response.body) {
+            Readable.fromWeb(response.body as never).pipe(res);
+          } else {
+            res.end();
+          }
+        } catch (err) {
+          res.statusCode = 500;
+          res.end(JSON.stringify({ error: (err as Error).message }));
+        }
+      })();
+    });
+  };
+}
+
+async function probe(server: http.Server, port: number): Promise&lt;void&gt; {
+  const queries = [
+    &quot;how is S3 multipart abort wired into retry budget&quot;,
+    &quot;where is authorization centralized&quot;,
+    &quot;how does rank fusion work&quot;,
+  ];
+  const get = (p: string): Promise&lt;{ status: number; body: string }&gt; =&gt;
+    new Promise((resolve, reject) =&gt; {
+      const r = http.request(
+        { host: &quot;127.0.0.1&quot;, port, path: p, method: &quot;GET&quot; },
+        (resp) =&gt; {
+          const parts: Buffer[] = [];
+          resp.on(&quot;data&quot;, (c: Buffer) =&gt; parts.push(c));
+          resp.on(&quot;end&quot;, () =&gt;
+            resolve({
+              status: resp.statusCode ?? 0,
+              body: Buffer.concat(parts).toString(&quot;utf8&quot;),
+            }),
+          );
+        },
+      );
+      r.on(&quot;error&quot;, reject);
+      r.end();
+    });
+
+  const health = await get(&quot;/healthz&quot;);
+  console.log(`GET /healthz -&gt; ${health.status} ${health.body}`);
+  if (health.status !== 200) throw new Error(`healthz returned ${health.status}`);
+
+  for (const q of queries) {
+    const r = await get(`/query?q=${encodeURIComponent(q)}`);
+    if (r.status !== 200) throw new Error(`query &#39;${q}&#39; returned ${r.status}`);
+    const parsed = JSON.parse(r.body) as QueryResponse;
+    console.log(`GET /query?q=${JSON.stringify(q)} -&gt; ${r.status}`);
+    console.log(`  dense  : ${JSON.stringify(parsed.denseTop)}`);
+    console.log(`  sparse : ${JSON.stringify(parsed.sparseTop)}`);
+    console.log(`  fused  : ${JSON.stringify(parsed.fusedTop)}`);
+    console.log(
+      `  cites  : ${parsed.citations
+        .map((c) =&gt; `${c.anchor}@${c.score.toFixed(4)}`)
+        .join(&quot;, &quot;)}`,
+    );
+    if (parsed.citations.length === 0) {
+      throw new Error(`query &#39;${q}&#39; returned no citations`);
+    }
+  }
+  await new Promise&lt;void&gt;((resolve) =&gt; server.close(() =&gt; resolve()));
+}
+
+async function main(): Promise&lt;void&gt; {
+  const { dense, bm25 } = buildIndices();
+  console.log(`indexed ${dense.size()} chunks across ${SAMPLE_CORPUS.length} entries`);
+  const app = buildApp(dense, bm25);
+  const server = http.createServer(nodeListener(app.fetch as FetchLike));
+  await new Promise&lt;void&gt;((resolve) =&gt; server.listen(0, &quot;127.0.0.1&quot;, () =&gt; resolve()));
+  const addr = server.address();
+  if (!addr || typeof addr === &quot;string&quot;) throw new Error(&quot;server address unavailable&quot;);
+  const port = addr.port;
+  console.log(`code-rag api listening on http://127.0.0.1:${port}`);
+  if (process.argv.includes(&quot;--serve&quot;)) {
+    process.on(&quot;SIGINT&quot;, () =&gt; server.close(() =&gt; process.exit(0)));
+    return;
+  }
+  await probe(server, port);
+}
+
+main().catch((err) =&gt; {
+  console.error(err);
+  process.exit(1);
+});
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/02-rag-over-codebase/code/ts/src/index_store.ts">phases/19-capstone-projects/02-rag-over-codebase/code/ts/src/index_store.ts</a><details><summary>查看原始文本</summary><pre><code>import type { Chunk, RankedChunk } from &quot;./types.ts&quot;;
+
+const TOKEN_RE = /[a-z0-9_]+/g;
+
+export function tokenize(text: string): string[] {
+  return text.toLowerCase().match(TOKEN_RE) ?? [];
+}
+
+// Tiny deterministic 32-bit hash (FNV-1a) so embeddings are stable across runs.
+export function fnv1a(s: string): number {
+  let h = 0x811c9dc5;
+  for (let i = 0; i &lt; s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return h &gt;&gt;&gt; 0;
+}
+
+export function fakeEmbed(text: string, dim = 64): number[] {
+  const vec = new Array&lt;number&gt;(dim).fill(0);
+  for (const tok of tokenize(text)) {
+    const h = fnv1a(tok);
+    vec[h % dim] += 1.0;
+    vec[(h &gt;&gt;&gt; 8) % dim] += 0.5;
+  }
+  let norm = 0;
+  for (const v of vec) norm += v * v;
+  norm = Math.sqrt(norm) || 1.0;
+  return vec.map((v) =&gt; v / norm);
+}
+
+export function cosine(a: readonly number[], b: readonly number[]): number {
+  if (a.length !== b.length) {
+    throw new Error(
+      `cosine: vector length mismatch (${a.length} vs ${b.length})`,
+    );
+  }
+  let dot = 0;
+  let na = 0;
+  let nb = 0;
+  for (let i = 0; i &lt; a.length; i++) {
+    dot += a[i] * b[i];
+    na += a[i] * a[i];
+    nb += b[i] * b[i];
+  }
+  if (na === 0 || nb === 0) return 0;
+  return dot / (Math.sqrt(na) * Math.sqrt(nb));
+}
+
+export class DenseIndex {
+  private vectors: { chunk: Chunk; vec: number[] }[] = [];
+
+  add(chunk: Chunk): void {
+    const text = `${chunk.symbol}\n${chunk.summary}\n${chunk.body}`;
+    this.vectors.push({ chunk, vec: fakeEmbed(text) });
+  }
+
+  search(query: string, k = 10): RankedChunk[] {
+    const qv = fakeEmbed(query);
+    const scored = this.vectors.map((v) =&gt; ({
+      chunk: v.chunk,
+      score: cosine(qv, v.vec),
+    }));
+    scored.sort((a, b) =&gt; b.score - a.score);
+    return scored.slice(0, k);
+  }
+
+  size(): number {
+    return this.vectors.length;
+  }
+}
+
+export class BM25Index {
+  k1 = 1.5;
+  b = 0.75;
+  private docs: Chunk[] = [];
+  private docLens: number[] = [];
+  private df = new Map&lt;string, number&gt;();
+  private tf: Map&lt;string, number&gt;[] = [];
+  private avgdl = 0;
+
+  add(chunk: Chunk): void {
+    const repeat = (toks: string[], times: number): string[] =&gt; {
+      const out: string[] = [];
+      for (let i = 0; i &lt; times; i++) out.push(...toks);
+      return out;
+    };
+    // Field-weighted tokenization: symbol x4, summary x2, body x1.
+    const tokens = [
+      ...repeat(tokenize(chunk.symbol), 4),
+      ...repeat(tokenize(chunk.summary), 2),
+      ...tokenize(chunk.body),
+    ];
+    const counts = new Map&lt;string, number&gt;();
+    for (const t of tokens) counts.set(t, (counts.get(t) ?? 0) + 1);
+    this.docs.push(chunk);
+    this.docLens.push(tokens.length);
+    this.tf.push(counts);
+    for (const term of counts.keys()) {
+      this.df.set(term, (this.df.get(term) ?? 0) + 1);
+    }
+    this.avgdl = this.docLens.reduce((s, n) =&gt; s + n, 0) / this.docLens.length;
+  }
+
+  search(query: string, k = 10): RankedChunk[] {
+    const qTerms = tokenize(query);
+    const n = this.docs.length;
+    const scores = new Array&lt;number&gt;(n).fill(0);
+    for (const term of qTerms) {
+      const df = this.df.get(term);
+      if (!df) continue;
+      const idf = Math.log((n - df + 0.5) / (df + 0.5) + 1.0);
+      for (let i = 0; i &lt; n; i++) {
+        const f = this.tf[i].get(term) ?? 0;
+        if (!f) continue;
+        const dl = this.docLens[i];
+        const denom = f + this.k1 * (1 - this.b + (this.b * dl) / this.avgdl);
+        scores[i] += (idf * f * (this.k1 + 1)) / denom;
+      }
+    }
+    const ranked = this.docs
+      .map((chunk, i) =&gt; ({ chunk, score: scores[i] }))
+      .filter((r) =&gt; r.score &gt; 0);
+    ranked.sort((a, b) =&gt; b.score - a.score);
+    return ranked.slice(0, k);
+  }
+
+  size(): number {
+    return this.docs.length;
+  }
+}
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/02-rag-over-codebase/code/ts/src/retrieval.ts">phases/19-capstone-projects/02-rag-over-codebase/code/ts/src/retrieval.ts</a><details><summary>查看原始文本</summary><pre><code>import { anchor } from &quot;./types.ts&quot;;
+import type { Chunk, QueryResponse, RankedChunk } from &quot;./types.ts&quot;;
+import { BM25Index, DenseIndex } from &quot;./index_store.ts&quot;;
+import { SAMPLE_CORPUS } from &quot;./corpus.ts&quot;;
+
+export function rrf(
+  dense: RankedChunk[],
+  sparse: RankedChunk[],
+  kRrf = 60,
+): RankedChunk[] {
+  const scoreByAnchor = new Map&lt;string, number&gt;();
+  const byAnchor = new Map&lt;string, Chunk&gt;();
+  dense.forEach(({ chunk }, rank) =&gt; {
+    const a = anchor(chunk);
+    scoreByAnchor.set(a, (scoreByAnchor.get(a) ?? 0) + 1.0 / (kRrf + rank + 1));
+    byAnchor.set(a, chunk);
+  });
+  sparse.forEach(({ chunk }, rank) =&gt; {
+    const a = anchor(chunk);
+    scoreByAnchor.set(a, (scoreByAnchor.get(a) ?? 0) + 1.0 / (kRrf + rank + 1));
+    byAnchor.set(a, chunk);
+  });
+  const fused = [...scoreByAnchor.entries()].sort((a, b) =&gt; b[1] - a[1]);
+  return fused.map(([a, score]) =&gt; ({ chunk: byAnchor.get(a)!, score }));
+}
+
+export function runQuery(
+  q: string,
+  dense: DenseIndex,
+  bm25: BM25Index,
+  topK = 5,
+): QueryResponse {
+  const d = dense.search(q, 10);
+  const s = bm25.search(q, 10);
+  const fused = rrf(d, s);
+  const top = fused.slice(0, topK);
+  return {
+    query: q,
+    denseTop: d.slice(0, 3).map((r) =&gt; anchor(r.chunk)),
+    sparseTop: s.slice(0, 3).map((r) =&gt; anchor(r.chunk)),
+    fusedTop: fused.slice(0, topK).map((r) =&gt; anchor(r.chunk)),
+    citations: top.map((r) =&gt; ({ anchor: anchor(r.chunk), score: r.score })),
+  };
+}
+
+export function buildIndices(): { dense: DenseIndex; bm25: BM25Index } {
+  const dense = new DenseIndex();
+  const bm25 = new BM25Index();
+  for (const c of SAMPLE_CORPUS) {
+    dense.add(c);
+    bm25.add(c);
+  }
+  return { dense, bm25 };
+}
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/02-rag-over-codebase/code/ts/src/server.ts">phases/19-capstone-projects/02-rag-over-codebase/code/ts/src/server.ts</a><details><summary>查看原始文本</summary><pre><code>import { Hono } from &quot;hono&quot;;
+import { z } from &quot;zod&quot;;
+import type { BM25Index, DenseIndex } from &quot;./index_store.ts&quot;;
+import { runQuery } from &quot;./retrieval.ts&quot;;
+import { SAMPLE_CORPUS } from &quot;./corpus.ts&quot;;
+
+export const QueryBody = z.object({
+  q: z
+    .string()
+    .refine((s) =&gt; s.trim().length &gt; 0, {
+      message: &quot;query must not be empty or whitespace&quot;,
+    }),
+  topK: z.number().int().positive().max(50).optional(),
+});
+
+export function buildApp(dense: DenseIndex, bm25: BM25Index): Hono {
+  const app = new Hono();
+
+  app.get(&quot;/healthz&quot;, (c) =&gt; c.json({ ok: true, corpus: SAMPLE_CORPUS.length }));
+
+  app.get(&quot;/query&quot;, (c) =&gt; {
+    const q = c.req.query(&quot;q&quot;);
+    if (!q || q.trim().length === 0) {
+      return c.json({ error: &quot;query must not be empty or whitespace&quot; }, 400);
+    }
+    return c.json(runQuery(q, dense, bm25));
+  });
+
+  app.post(&quot;/query&quot;, async (c) =&gt; {
+    let raw: unknown;
+    try {
+      raw = await c.req.json();
+    } catch (err) {
+      return c.json({ error: (err as Error).message }, 400);
+    }
+    const parsed = QueryBody.safeParse(raw);
+    if (!parsed.success) {
+      return c.json({ error: parsed.error.issues[0]?.message ?? &quot;bad body&quot; }, 400);
+    }
+    const { q, topK = 5 } = parsed.data;
+    return c.json(runQuery(q, dense, bm25, topK));
+  });
+
+  app.notFound((c) =&gt; c.json({ error: &quot;not found&quot;, path: c.req.path }, 404));
+
+  return app;
+}
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/02-rag-over-codebase/code/ts/src/types.ts">phases/19-capstone-projects/02-rag-over-codebase/code/ts/src/types.ts</a><details><summary>查看原始文本</summary><pre><code>export type Chunk = {
+  repo: string;
+  path: string;
+  startLine: number;
+  endLine: number;
+  symbol: string;
+  body: string;
+  summary: string;
+};
+
+export type RankedChunk = { chunk: Chunk; score: number };
+
+export type QueryResponse = {
+  query: string;
+  denseTop: string[];
+  sparseTop: string[];
+  fusedTop: string[];
+  citations: { anchor: string; score: number }[];
+};
+
+export function anchor(c: Chunk): string {
+  return `${c.repo}/${c.path}:${c.startLine}-${c.endLine}`;
+}
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/02-rag-over-codebase/code/ts/tests/index_store.test.ts">phases/19-capstone-projects/02-rag-over-codebase/code/ts/tests/index_store.test.ts</a><details><summary>查看原始文本</summary><pre><code>import { test } from &quot;node:test&quot;;
+import { strict as assert } from &quot;node:assert&quot;;
+import { BM25Index, DenseIndex, cosine, fakeEmbed, fnv1a, tokenize } from &quot;../src/index_store.ts&quot;;
+import { SAMPLE_CORPUS } from &quot;../src/corpus.ts&quot;;
+import { anchor } from &quot;../src/types.ts&quot;;
+
+test(&quot;tokenize: lowercases and splits on non-word characters&quot;, () =&gt; {
+  assert.deepEqual(tokenize(&quot;Abort-Multipart_Upload!&quot;), [&quot;abort&quot;, &quot;multipart_upload&quot;]);
+});
+
+test(&quot;fnv1a: deterministic 32-bit unsigned output&quot;, () =&gt; {
+  const a = fnv1a(&quot;hello&quot;);
+  const b = fnv1a(&quot;hello&quot;);
+  assert.equal(a, b);
+  assert.ok(a &gt;= 0 &amp;&amp; a &lt;= 0xffffffff);
+});
+
+test(&quot;fakeEmbed: returns a unit vector&quot;, () =&gt; {
+  const v = fakeEmbed(&quot;authorization opa check&quot;);
+  let norm = 0;
+  for (const x of v) norm += x * x;
+  assert.ok(Math.abs(Math.sqrt(norm) - 1.0) &lt; 1e-9);
+});
+
+test(&quot;cosine: identical vectors give 1.0&quot;, () =&gt; {
+  const v = fakeEmbed(&quot;rank fusion&quot;);
+  assert.ok(Math.abs(cosine(v, v) - 1.0) &lt; 1e-9);
+});
+
+test(&quot;BM25Index: ranks &#39;authorization&#39; above unrelated S3 chunks&quot;, () =&gt; {
+  const bm25 = new BM25Index();
+  for (const c of SAMPLE_CORPUS) bm25.add(c);
+  const hits = bm25.search(&quot;authorization check&quot;);
+  assert.ok(hits.length &gt; 0);
+  const topAnchor = anchor(hits[0].chunk);
+  assert.ok(
+    topAnchor.startsWith(&quot;auth/&quot;),
+    `expected an auth/* chunk on top, got ${topAnchor}`,
+  );
+});
+
+test(&quot;DenseIndex: returns top-k by cosine score, descending&quot;, () =&gt; {
+  const dense = new DenseIndex();
+  for (const c of SAMPLE_CORPUS) dense.add(c);
+  const hits = dense.search(&quot;multipart upload abort&quot;, 3);
+  assert.equal(hits.length, 3);
+  for (let i = 1; i &lt; hits.length; i++) {
+    assert.ok(hits[i - 1].score &gt;= hits[i].score);
+  }
+});
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/02-rag-over-codebase/code/ts/tests/retrieval.test.ts">phases/19-capstone-projects/02-rag-over-codebase/code/ts/tests/retrieval.test.ts</a><details><summary>查看原始文本</summary><pre><code>import { test } from &quot;node:test&quot;;
+import { strict as assert } from &quot;node:assert&quot;;
+import { buildIndices, rrf, runQuery } from &quot;../src/retrieval.ts&quot;;
+import { SAMPLE_CORPUS } from &quot;../src/corpus.ts&quot;;
+import { anchor } from &quot;../src/types.ts&quot;;
+
+test(&quot;rrf: fuses overlapping ranks above singleton ranks&quot;, () =&gt; {
+  const a = SAMPLE_CORPUS[0];
+  const b = SAMPLE_CORPUS[1];
+  const c = SAMPLE_CORPUS[2];
+  const fused = rrf(
+    [
+      { chunk: a, score: 0.9 },
+      { chunk: b, score: 0.8 },
+    ],
+    [
+      { chunk: a, score: 1.0 },
+      { chunk: c, score: 0.5 },
+    ],
+  );
+  assert.equal(anchor(fused[0].chunk), anchor(a));
+  assert.ok(fused.length === 3);
+});
+
+test(&quot;rrf: rank-1 in both lists beats rank-2 singletons&quot;, () =&gt; {
+  const a = SAMPLE_CORPUS[0];
+  const b = SAMPLE_CORPUS[1];
+  const fused = rrf(
+    [{ chunk: a, score: 1.0 }],
+    [{ chunk: a, score: 1.0 }],
+  );
+  assert.equal(fused.length, 1);
+  const fusedScore = fused[0].score;
+  const single = rrf([{ chunk: b, score: 1.0 }], []);
+  assert.ok(fusedScore &gt; single[0].score);
+});
+
+test(&quot;runQuery: returns citations for a real corpus question&quot;, () =&gt; {
+  const { dense, bm25 } = buildIndices();
+  const r = runQuery(&quot;how is rank fusion implemented&quot;, dense, bm25);
+  assert.ok(r.citations.length &gt; 0);
+  assert.ok(r.fusedTop.length &gt; 0);
+  assert.equal(r.query, &quot;how is rank fusion implemented&quot;);
+});
+
+test(&quot;runQuery: top citation for auth query lands in auth repo&quot;, () =&gt; {
+  const { dense, bm25 } = buildIndices();
+  const r = runQuery(&quot;authorization check_permission&quot;, dense, bm25);
+  assert.ok(r.citations[0].anchor.startsWith(&quot;auth/&quot;));
+});
+
+test(&quot;runQuery: fusedTop honours topK parameter&quot;, () =&gt; {
+  const { dense, bm25 } = buildIndices();
+  const r = runQuery(&quot;authorization&quot;, dense, bm25, 2);
+  assert.ok(r.fusedTop.length &lt;= 2);
+  assert.ok(r.citations.length &lt;= 2);
+});
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/02-rag-over-codebase/code/ts/tests/server.test.ts">phases/19-capstone-projects/02-rag-over-codebase/code/ts/tests/server.test.ts</a><details><summary>查看原始文本</summary><pre><code>import { test } from &quot;node:test&quot;;
+import { strict as assert } from &quot;node:assert&quot;;
+import { buildApp } from &quot;../src/server.ts&quot;;
+import { buildIndices } from &quot;../src/retrieval.ts&quot;;
+import type { QueryResponse } from &quot;../src/types.ts&quot;;
+
+function app() {
+  const { dense, bm25 } = buildIndices();
+  return buildApp(dense, bm25);
+}
+
+test(&quot;GET /healthz: returns ok=true with corpus size&quot;, async () =&gt; {
+  const res = await app().fetch(new Request(&quot;http://x/healthz&quot;));
+  assert.equal(res.status, 200);
+  const body = (await res.json()) as { ok: boolean; corpus: number };
+  assert.equal(body.ok, true);
+  assert.ok(body.corpus &gt; 0);
+});
+
+test(&quot;GET /query: rejects missing q with 400&quot;, async () =&gt; {
+  const res = await app().fetch(new Request(&quot;http://x/query&quot;));
+  assert.equal(res.status, 400);
+});
+
+test(&quot;GET /query?q=...: returns citations&quot;, async () =&gt; {
+  const res = await app().fetch(
+    new Request(&quot;http://x/query?q=&quot; + encodeURIComponent(&quot;rank fusion&quot;)),
+  );
+  assert.equal(res.status, 200);
+  const body = (await res.json()) as QueryResponse;
+  assert.ok(body.citations.length &gt; 0);
+});
+
+test(&quot;POST /query: validates topK bound&quot;, async () =&gt; {
+  const res = await app().fetch(
+    new Request(&quot;http://x/query&quot;, {
+      method: &quot;POST&quot;,
+      headers: { &quot;content-type&quot;: &quot;application/json&quot; },
+      body: JSON.stringify({ q: &quot;auth&quot;, topK: 9999 }),
+    }),
+  );
+  assert.equal(res.status, 400);
+});
+
+test(&quot;POST /query: returns parsed response on valid body&quot;, async () =&gt; {
+  const res = await app().fetch(
+    new Request(&quot;http://x/query&quot;, {
+      method: &quot;POST&quot;,
+      headers: { &quot;content-type&quot;: &quot;application/json&quot; },
+      body: JSON.stringify({ q: &quot;authorization&quot;, topK: 3 }),
+    }),
+  );
+  assert.equal(res.status, 200);
+  const body = (await res.json()) as QueryResponse;
+  assert.ok(body.citations.length &lt;= 3);
+});
+
+test(&quot;GET /query?q=%20: rejects whitespace-only query with 400&quot;, async () =&gt; {
+  const res = await app().fetch(
+    new Request(&quot;http://x/query?q=&quot; + encodeURIComponent(&quot;   &quot;)),
+  );
+  assert.equal(res.status, 400);
+});
+
+test(&quot;POST /query: rejects whitespace-only q with 400&quot;, async () =&gt; {
+  const res = await app().fetch(
+    new Request(&quot;http://x/query&quot;, {
+      method: &quot;POST&quot;,
+      headers: { &quot;content-type&quot;: &quot;application/json&quot; },
+      body: JSON.stringify({ q: &quot;   &quot; }),
+    }),
+  );
+  assert.equal(res.status, 400);
+});
+
+test(&quot;unknown path: returns 404 json&quot;, async () =&gt; {
+  const res = await app().fetch(new Request(&quot;http://x/missing&quot;));
+  assert.equal(res.status, 404);
+});
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/02-rag-over-codebase/code/ts/tsconfig.json">phases/19-capstone-projects/02-rag-over-codebase/code/ts/tsconfig.json</a><details><summary>查看原始文本</summary><pre><code>{
+  &quot;compilerOptions&quot;: {
+    &quot;target&quot;: &quot;ES2022&quot;,
+    &quot;module&quot;: &quot;nodenext&quot;,
+    &quot;moduleResolution&quot;: &quot;nodenext&quot;,
+    &quot;strict&quot;: true,
+    &quot;esModuleInterop&quot;: true,
+    &quot;skipLibCheck&quot;: true,
+    &quot;resolveJsonModule&quot;: true,
+    &quot;forceConsistentCasingInFileNames&quot;: true,
+    &quot;noUnusedLocals&quot;: true,
+    &quot;noUnusedParameters&quot;: true,
+    &quot;noImplicitOverride&quot;: true,
+    &quot;noFallthroughCasesInSwitch&quot;: true,
+    &quot;allowImportingTsExtensions&quot;: true,
+    &quot;noEmit&quot;: true,
+    &quot;isolatedModules&quot;: true
+  },
+  &quot;include&quot;: [&quot;src/**/*.ts&quot;, &quot;tests/**/*.ts&quot;]
+}
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/02-rag-over-codebase/outputs/skill-codebase-rag.md">phases/19-capstone-projects/02-rag-over-codebase/outputs/skill-codebase-rag.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: codebase-rag
+description: Build a cross-repo semantic search system with AST-aware chunking, hybrid retrieval, incremental re-index, and cited answers.
+version: 1.0.0
+phase: 19
+lesson: 02
+tags: [capstone, rag, code-search, tree-sitter, qdrant, bm25, hybrid-retrieval]
+---
+
+Given 10+ repositories totaling at least 2M lines of code, build an ingestion pipeline, a hybrid index, and a citation-enforced query agent that answers cross-repo questions with verifiable file:line anchors.
+
+Build plan:
+
+1. Parse every file with tree-sitter. Chunk at function and class node boundaries. Store `{repo, path, start_line, end_line, symbol, body}`.
+2. Summarize every chunk with Claude Haiku 4.5 or Gemini 2.5 Flash using prompt-cached system prompts. Store the one-sentence summary next to the chunk.
+3. Index into three structures: Qdrant (dense, Voyage-code-3 or nomic-embed-code), Tantivy (BM25 with field weights), and kuzu (symbol graph edges for imports, calls, inheritance).
+4. Build a LangGraph query agent with three nodes: retrieve (dense parallel BM25), rerank (Cohere rerank-3 or bge-reranker-v2-gemma-2b), synth (Claude Sonnet 4.7 with prompt caching and file:line citation requirement).
+5. Post-filter: reject any claim without a verifiable `(repo/path:start-end)` anchor; re-ask or drop.
+6. Wire a git push webhook that computes a symbol-level diff and re-embeds only the changed chunks. Target: 50-file commit searchable in under 60s on a 2M-LOC fleet.
+7. Evaluate with a 100-question held-out set. Report MRR@10, nDCG@10, citation faithfulness, and latency percentiles.
+8. Run a weekly drift job that re-executes the eval and alerts on MRR@10 drop &gt; 5%.
+
+Assessment rubric:
+
+| Weight | Criterion | Measurement |
+|:-:|---|---|
+| 25 | Retrieval quality | MRR@10 and nDCG@10 on a 100-question held-out set |
+| 20 | Citation faithfulness | Fraction of answer claims with verifiable file:line anchors |
+| 20 | Latency and scale | p95 query latency at 10k QPS on the indexed corpus size |
+| 20 | Incremental indexing correctness | Time from git push to searchable on a 50-file commit |
+| 15 | UX and answer formatting | Citation clickability, snippet previews, follow-up affordance |
+
+Hard rejects:
+
+- Fixed-size token chunking instead of AST-aware chunking. Will poison generated-code-heavy corpora.
+- Cosine-only retrieval without BM25 or rerank. Known to fail on exact-symbol-name queries.
+- Answers without mandatory file:line citations.
+- Full-corpus re-embedding on every git push; must be incremental.
+
+Refusal rules:
+
+- Refuse to index repos without reading their license. Some forbid embedding in third-party vector stores.
+- Refuse to answer queries that claim to cite files the index never saw; always verify the anchor before returning.
+- Refuse to serve an answer at p95 above 4s; return a partial result with a follow-up handle instead.
+
+Output: a repo containing the ingestion pipeline, the LangGraph query agent, the 100-question labeled eval set, a Langfuse dashboard link, and a write-up naming the three retrieval failure modes you fixed (generated-code poisoning, long-tail symbol recall, cross-repo symbol resolution) and the exact change that fixed each.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. Why is naive cosine search over raw chunks insufficient for cross-repo code retrieval?</legend><label class="option"><input type="radio" name="q0" value="0"> Vector indexes cannot store payloads larger than 1KB</label><label class="option"><input type="radio" name="q0" value="1"> Cosine similarity is undefined on code embeddings</label><label class="option"><input type="radio" name="q0" value="2"> Embedding models do not see code as tokens</label><label class="option"><input type="radio" name="q0" value="3"> It poisons results on generated code, monorepo duplication, and rarely imported symbols</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. What does AST-aware chunking mean in the ingestion pipeline?</legend><label class="option"><input type="radio" name="q1" value="0"> Splitting code into fixed 256-token windows</label><label class="option"><input type="radio" name="q1" value="1"> Compressing chunks with gzip before storage</label><label class="option"><input type="radio" name="q1" value="2"> Cutting at tree-sitter node boundaries such as function and class spans</label><label class="option"><input type="radio" name="q1" value="3"> Dropping comments and whitespace before embedding</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. Which three retrievable modalities does each chunk get in this pipeline?</legend><label class="option"><input type="radio" name="q2" value="0"> Raw text, gzip, and hash</label><label class="option"><input type="radio" name="q2" value="1"> Token IDs, syntax tree, and call graph</label><label class="option"><input type="radio" name="q2" value="2"> AST, IR, and bytecode</label><label class="option"><input type="radio" name="q2" value="3"> Dense embedding, BM25 terms, and a natural-language summary</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. What is the role of the cross-encoder reranker after the hybrid retrieval step?</legend><label class="option"><input type="radio" name="q3" value="0"> It scores each query-candidate pair together for higher accuracy than cosine alone</label><label class="option"><input type="radio" name="q3" value="1"> It rewrites the chunks to remove generated code</label><label class="option"><input type="radio" name="q3" value="2"> It re-embeds the query in a different model</label><label class="option"><input type="radio" name="q3" value="3"> It compresses the chunks before sending to the synthesizer</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. Why does the synthesizer reject answers without (repo/path:start-end) anchors?</legend><label class="option"><input type="radio" name="q4" value="0"> Citation faithfulness gates the answer so users can verify each claim</label><label class="option"><input type="radio" name="q4" value="1"> Anchors are required by the vector database schema</label><label class="option"><input type="radio" name="q4" value="2"> Anchors reduce token cost on the synthesis call</label><label class="option"><input type="radio" name="q4" value="3"> Anchors are needed for downstream BM25 reranking</label><p data-feedback="4"></p></fieldset><fieldset><legend>6. What does incremental re-index require to stay under 60 seconds on a 50-file push?</legend><label class="option"><input type="radio" name="q5" value="0"> Dropping the symbol graph entirely</label><label class="option"><input type="radio" name="q5" value="1"> Throwing away the BM25 index and rebuilding it from scratch</label><label class="option"><input type="radio" name="q5" value="2"> Re-embedding the full 2M-LOC corpus on each commit</label><label class="option"><input type="radio" name="q5" value="3"> Re-embedding only chunks whose text changed and recomputing affected symbol edges</label><p data-feedback="5"></p></fieldset><fieldset><legend>7. Which metric measures whether retrieved claims are verifiable in the source?</legend><label class="option"><input type="radio" name="q6" value="0"> Citation faithfulness</label><label class="option"><input type="radio" name="q6" value="1"> p95 query latency</label><label class="option"><input type="radio" name="q6" value="2"> nDCG@10</label><label class="option"><input type="radio" name="q6" value="3"> MRR@10</label><p data-feedback="6"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/19-capstone-projects/01-terminal-native-coding-agent/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/19-capstone-projects/03-realtime-voice-assistant/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/19-capstone-projects/02-rag-over-codebase/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

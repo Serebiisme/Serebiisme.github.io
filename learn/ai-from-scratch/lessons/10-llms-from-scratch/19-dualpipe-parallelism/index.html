@@ -1,0 +1,611 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>双管平行 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-10-llms-from-scratch" data-lesson="10-llms-from-scratch/19-dualpipe-parallelism" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/10-llms-from-scratch/">从零构建大语言模型</a> / LESSON 19</p><h1 class="lesson-title">双管平行</h1><p>DualPipe Parallelism</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>双管平行</h1>
+<blockquote>
+<p>通过2 048个H800GPU训练, 跨节点专家的通讯成本为每一个GPU计算的1个GPU-小时. 半个时间,GPU都置. 双管 (DeepSeek,Dec 2024) 是一个双向管道,它与它们触发的通讯互联网重叠前后计算. 由于专家平行主义已经在各个行列中传播专家, 泡下降,吞吐量上升, 这一课是学习类型的, 了解双实际上做什么,以及海人工智能实验室的双V精炼为什么会降低2倍的参数成本,</p>
+</blockquote>
+<p><strong>Type:</strong> Learn
+<strong>Languages:</strong> Python (stdlib, schedule simulator)
+<strong>Prerequisites:</strong> Phase 10 · 05 (distributed training, FSDP, DeepSpeed), Phase 10 · 14 (open-model architectures and MoE)
+<strong>Time:</strong> ~60 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>两管前后面的四个组件,以及为什么每个组件都有自己的窗口.</li>
+<li>解释了管道泡问题,以及&quot;无泡&quot;在实践中与营销中意味着什么.</li>
+<li>通过手动追踪双管的时间表,为8个PP级和16个微批量,并确认前向和反向流填补彼此的空.</li>
+<li>声明DualPipeV (Sea AI Lab, 2025) 所做的交易:在专家平行性不活跃时,以稍大泡的成本降低2倍参数复制.</li>
+</ul>
+<h2>问题</h2>
+<p>在2KH800GPU上训练671BMoE模型,</p>
+<ol>
+<li>**Memory pressure.**每个GPU都包含一个模型的片段. 激活内存在8k序列上,在128个头上,在61层上是巨大的.</li>
+<li>**Pipeline bubbles.**传统的管道平行 (GPipe, 1F1B) 让GPU在等待阶段输入或梯度时停滞不前.在8个阶段,即使是1F1B计划,大约12%的GPU时间也可以泡.</li>
+<li>**Cross-node all-to-all.**通过专家平行化,MoE将专家分散在节点之间.每一个前进通行都会触发一个全通向向专家发送代币,另一个将代币结合起来.在2kGPU时,这很容易成为1:1计算与通信比率.</li>
+</ol>
+<p>每个解决方案都有不同的解决方案:对内存的梯度检查,对管道泡的零泡 (海人工智能实验室, 2023) 双的做法是让他们一起玩. 时间表在一个前后回的部分内覆盖计算和通信,同时从管道的两端注入微批量,并使用结果的时间表在计算窗口内隐藏所有内容.</p>
+<p>报告结果:近乎消除了管道泡, 在DeepSeek-V3的14.8T代币训练中使用了超过95%的GPU.</p>
+<h2>概念</h2>
+<h3>管道平行性更新</h3>
+<p>通过P设备分开一个N层模型.<code>i</code>保持层次<code>i * N/P .. (i+1) * N/P - 1</code>微批流通过设备0向P-1,然后从P-1向0向后流动.每种设备只能在前端设备发出输出时启动前端阶段,而下端设备发出上游梯度时才可以向后流动.</p>
+<p>GPipe (Huang等人,2019) 每次安排一个微批次,这浪费了大部分GPU时间. 通过1F1B (Narayanan等,2021年) 进行多个微批次的前后和后后传. 零泡 (Qi等, 2023) 将后退通道分为两个部分 (后退输入 (B) 和后退输入 (W) ,并安排它们填满泡. 气泡后,管道几乎紧张.</p>
+<p>双管是下一步,它增加了两个想法:</p>
+<h3>想法1:碎片分解</h3>
+<p>每个前面的部分分为四个组成部分:</p>
+<ul>
+<li>**Attention.**预测,注意力,输出预测.</li>
+<li>**All-to-all dispatch.**交叉节点通信,向他们的专家发送代币.</li>
+<li>**MLP.**电脑专家计算.</li>
+<li>**All-to-all combine.**通过节点交通信,使专家输出回来.</li>
+</ul>
+<p>一个倒退的部分添加了每个这些版本的梯度版本.双管将它们安排,使所有到所有的发送与下一个部分的注意力计算并行,而所有到所有的组合与下一个部分的MLP计算并行.</p>
+<h3>两方向安排</h3>
+<p>大多数管道计划从0阶段注入微批量,并向P1阶段流动.双管从两端注入微批量.0阶段看到来自那里的前微批量;P1阶段看到来自那里的前微批量.两个流在中间相遇.</p>
+<p>为了使这起作用,设备<code>i</code>必须保持早期管道层的两者都<code>i</code>并且是后期管道层.<code>P - 1 - i</code>这就是DualPipe的&quot;双重&quot;部分:每个设备都保留需要服务的模型层的两个副本 (每个方向都需要一个).在DeepSeek-V3的规模上,这是一项2倍的参数复制成本.这是负担得起的,因为专家平行已经分散了MoE专家,这么薄,复制非专家层两次是小子.</p>
+<p>重要的是,向前流向的方向和向后流向的方向相叠加,</p>
+<h3>一个手动追踪的时间表</h3>
+<p>考虑P=4个行,8个微批,分为4个前进/4个倒车.时间从左到右移动;行是设备行.</p>
+<pre><code>           Time →
+rank 0:  F1 F2 F3 F4  F5R F6R F7R F8R  B1 B2 B3 B4  ...
+rank 1:     F1 F2 F3  F4/F5R F6R F7R   B1 B2 ...
+rank 2:        F1 F2  F3/F5R F4/F6R    B1 ...
+rank 3:           F1  F2/F5R F3/F6R    ...
+</code></pre>
+<p>读取&quot;F4/F5R&quot;标记:排名1在同一时间段前行于微批4 (在管道中从左到右) 和微批5 (从右到左) 前行.</p>
+<p>在排名2的交叉流更早重叠,在排名0和P-1的交叉流最晚重叠.在时间表的稳定的中期,每个排名都在X方向前面和Y方向后面重叠.计算繁忙.前进通行的全通发送器隐藏在后退计算中.全通组合隐藏在前进计算中.泡被挤出.</p>
+<h3>泡会计</h3>
+<p>标准1F1B管道泡 (每级浪费时间):</p>
+<pre><code>bubble_1F1B = (P - 1) * forward_chunk_time
+</code></pre>
+<p>双管,在稳定的阶段,如果微批次数是可乘以管道深度的2倍的零泡.在稳定的阶段 (加热和冷却) 外,有一些泡,但它不会随着微批次数而增长.</p>
+<p>在营销方面: &quot;无泡&quot;.在技术方面:泡不会随着微批次数而生长.海人工智能实验室的后续分析 (DualPipeV / Cut-in-half) 显示只有当专家平行主义不是瓶时才会完全零泡;在以 EP为导向的全至全的情况下,总是存在一些安排妥协.</p>
+<h3></h3>
+<p>海洋AI实验室 (2025) 观察到,当EP通信重叠不是重点时, 2x参数复制是浪费的. 它们的双PipeV计划将双向注射折叠成一个&quot;V形&quot;计划, 泡比双管大一点,但存储量相当大. 果公司在其开源DualPipe实现中采用了DualPipeV作为EP-off模式.</p>
+<p>交易:</p>
+<table>
+<thead>
+<tr>
+<th>Feature</th>
+<th>DualPipe</th>
+<th>DualPipeV</th>
+<th>1F1B</th>
+<th>Zero Bubble</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Param copies per device</td>
+<td>2</td>
+<td>1</td>
+<td>1</td>
+<td>1</td>
+</tr>
+<tr>
+<td>Bubble vs micro-batches</td>
+<td>constant</td>
+<td>small growth</td>
+<td>grows</td>
+<td>grows</td>
+</tr>
+<tr>
+<td>Compute-comm overlap</td>
+<td>full</td>
+<td>partial</td>
+<td>minimal</td>
+<td>partial</td>
+</tr>
+<tr>
+<td>Use when</td>
+<td>EP-heavy MoE</td>
+<td>dense or EP-light</td>
+<td>baseline</td>
+<td>any pipeline</td>
+</tr>
+</tbody>
+</table>
+<h3>这意味着 14,8T的代币运行</h3>
+<p>在大约2.8亿GPU小时内, DeepSeek-V3的预训练用了2.048个H800GPU上的14.8T代币. 如果1F1B是天真的,他们会失去12-15%的管道泡340-420KGPU-小时,足以训练一个完整的70B模型. 双管检索了大部分. 直接量化贡献是很难的,没有内部日志,但论文中的说法是超过95%的GPU使用率在培训中平均.</p>
+<p>对于较小的运行 (低于1kGPU),DualPipe是过度的管道泡较小相对于总成本,密集型训练很少达到全方位瓶.对于跨界MoE训练在数千GPU规模,它是有效的要求.</p>
+<h3>在堆里.</h3>
+<ul>
+<li>补充<strong>FSDP</strong>(阶段10 · 05).FSDP将模型参数分为数列;DualPipe将数列计算时间表.</li>
+<li>适合<strong>ZeRO-3</strong>两副本复制的账户需要与ZERO的碎片梯度合作.</li>
+<li>需要<strong>custom all-to-all kernels</strong>根据 DeepSeek 的开源核心,</li>
+</ul>
+<figure><img src="/learn/ai-from-scratch/figures/figure-07f6107ef6fe52c88540.png" alt="expert-capacity 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>用它</h2>
+<p><code>code/main.py</code>需要一个模拟器.<code>(P, n_micro_batches, schedule)</code>它们是指数与论文中的质量要求相匹配,而不是指量生产速度的要求.</p>
+<p>模拟器的值:用不同的P和微批数运行,看看泡分数如何增长1F1B,但不是DualPipe.</p>
+<p>实质培训的整合考虑因素:</p>
+<ul>
+<li>选择一个平行深度, 清晰地分为微批次数.</li>
+<li>确保你的专家并行网支持双向的通用.</li>
+<li>预计第一次会耗费一周的时间调试时间.</li>
+<li>双的好处来自于紧缩拖延器.</li>
+</ul>
+<h2>运送它</h2>
+<p>这一课产生了<code>outputs/skill-dualpipe-planner.md</code>鉴于训练集群规格 (GPU数量,拓学,互联网,模型形状),它建议采用管道平行化策略,使用的规划算法以及预期的泡分数在目标规模上.</p>
+<h2>运动</h2>
+<ol>
+<li>
+<p>跑步<code>code/main.py</code>现在<code>(P=8, micro_batches=16, schedule=dualpipe)</code>其他<code>(P=8, micro_batches=16, schedule=1f1b)</code>计算GPU使用率差异,并以每百万训练代币的GPU-小时计算.</p>
+</li>
+<li>
+<p>绘制时间表<code>(P=4, micro_batches=8, schedule=dualpipe)</code>标记每一个时间区块,用微批次的ID和方向. 确定泡缺失的第一个时间区块.</p>
+</li>
+<li>
+<p>阅读深度搜索-V3技术报告的5个图 (arXiv:2412.19437). 确定双管前部件内部的全向发送的重叠窗口.解释计算时间表如何隐藏它.</p>
+</li>
+<li>
+<p>计算双管的2倍参数上费用,用于70B密集型型号,P=8管道阶段和671BMoE模型,P=16管道阶段. 显示为什么MoE外费用比较小 (大多数参数是专家,分为大型EP组).</p>
+</li>
+<li>
+<p>根据该文件的3.4节,确定双管没有的两个特定属性.</p>
+</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Pipeline bubble</td>
+<td>&quot;Idle time per rank&quot;</td>
+<td>GPU cycles wasted because a pipeline stage is waiting for its input or gradient</td>
+</tr>
+<tr>
+<td>1F1B</td>
+<td>&quot;Default pipeline schedule&quot;</td>
+<td>One forward / one backward interleaved scheduling; the baseline DualPipe beats</td>
+</tr>
+<tr>
+<td>Zero Bubble</td>
+<td>&quot;Sea AI Lab 2023&quot;</td>
+<td>Splits backward into B (input gradient) and W (weight gradient); almost fully tightens the pipeline</td>
+</tr>
+<tr>
+<td>DualPipe</td>
+<td>&quot;DeepSeek-V3 schedule&quot;</td>
+<td>Bidirectional pipeline + compute-comm overlap; bubbles do not grow with micro-batch count</td>
+</tr>
+<tr>
+<td>DualPipeV</td>
+<td>&quot;Cut-in-half&quot;</td>
+<td>V-shape refinement that drops the 2x parameter replication at the cost of slightly larger bubbles</td>
+</tr>
+<tr>
+<td>Chunk</td>
+<td>&quot;Unit of pipeline work&quot;</td>
+<td>A forward or backward pass of one micro-batch through one pipeline stage</td>
+</tr>
+<tr>
+<td>All-to-all dispatch</td>
+<td>&quot;Send tokens to experts&quot;</td>
+<td>Cross-node comm that routes tokens to their assigned MoE experts</td>
+</tr>
+<tr>
+<td>All-to-all combine</td>
+<td>&quot;Bring expert outputs back&quot;</td>
+<td>Cross-node comm that gathers expert outputs after the MLP</td>
+</tr>
+<tr>
+<td>Expert Parallelism (EP)</td>
+<td>&quot;Experts across GPUs&quot;</td>
+<td>Shards MoE experts across ranks so different GPUs hold different experts</td>
+</tr>
+<tr>
+<td>Pipeline Parallelism (PP)</td>
+<td>&quot;Layers across GPUs&quot;</td>
+<td>Shards model layers across ranks; the dimension DualPipe schedules</td>
+</tr>
+<tr>
+<td>Bubble fraction</td>
+<td>&quot;Wasted GPU time&quot;</td>
+<td>(bubble_time / total_time); the fraction DualPipe drives toward zero</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2412.19437" rel="noreferrer" data-network="true">DeepSeek-AI — DeepSeek-V3 Technical Report (arXiv:2412.19437), Section 3.3.2 and Figure 5 <small>↗ 需要联网</small></a>主要的双管参考</li>
+<li><a href="https://github.com/deepseek-ai/DualPipe" rel="noreferrer" data-network="true">DeepSeek — DualPipe GitHub repository <small>↗ 需要联网</small></a>开源参考实现,包括双PipeV (切断半) 模式</li>
+<li><a href="https://arxiv.org/abs/2401.10241" rel="noreferrer" data-network="true">Qi et al. — Zero Bubble Pipeline Parallelism (arXiv:2401.10241, Sea AI Lab 2023) <small>↗ 需要联网</small></a>零泡前身</li>
+<li><a href="https://sail.sea.com/blog/articles/63" rel="noreferrer" data-network="true">Sea AI Lab — DualPipe could be better without the Dual <small>↗ 需要联网</small></a> 分析了DeepSeek的EP-off模式</li>
+<li><a href="https://arxiv.org/abs/1806.03377" rel="noreferrer" data-network="true">Narayanan et al. — PipeDream / 1F1B (arXiv:1806.03377, 2018-2021) <small>↗ 需要联网</small></a>1F1B计划对双管相比</li>
+<li><a href="https://arxiv.org/abs/1811.06965" rel="noreferrer" data-network="true">Huang et al. — GPipe (arXiv:1811.06965, 2018) <small>↗ 需要联网</small></a>原始的管道平行性纸和泡问题</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>DualPipe Parallelism</h1>
+<blockquote>
+<p>DeepSeek-V3 was trained on 2,048 H800 GPUs with MoE experts scattered across nodes. Cross-node expert all-to-all communication cost 1 GPU-hour of comm for every 1 GPU-hour of compute. GPUs were idle half the time. DualPipe (DeepSeek, Dec 2024) is a bidirectional pipeline that overlaps forward and backward computation with the all-to-all comms they trigger. Bubbles drop, throughput climbs, and the keeping of two model-parameter copies (the &quot;dual&quot; that gives the name) is cheap once Expert Parallelism is already spreading experts across ranks anyway. This lesson is a Learn-type walkthrough of what DualPipe actually does and why Sea AI Lab's DualPipeV refinement drops the 2x parameter cost at the expense of a marginally tighter bubble.</p>
+</blockquote>
+<p><strong>Type:</strong> Learn
+<strong>Languages:</strong> Python (stdlib, schedule simulator)
+<strong>Prerequisites:</strong> Phase 10 · 05 (distributed training, FSDP, DeepSpeed), Phase 10 · 14 (open-model architectures and MoE)
+<strong>Time:</strong> ~60 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Name the four components of a DualPipe forward-backward chunk and why each one gets its own overlap window.</li>
+<li>Explain the pipeline bubble problem at scale, and what &quot;bubble-free&quot; means in practice versus in marketing.</li>
+<li>Trace a DualPipe schedule by hand for 8 PP ranks and 16 micro-batches and confirm the forward and reverse streams fill each other's idle slots.</li>
+<li>State the tradeoff DualPipeV (Sea AI Lab, 2025) makes: drops the 2x parameter replication at the cost of a slightly larger bubble when Expert Parallelism is inactive.</li>
+</ul>
+<h2>The Problem</h2>
+<p>Training a 671B MoE model on 2k H800 GPUs runs into three compounding bottlenecks:</p>
+<ol>
+<li><strong>Memory pressure.</strong> Each GPU holds a slice of the model. Activation memory at sequence 8k across 61 layers on 128 heads is enormous.</li>
+<li><strong>Pipeline bubbles.</strong> Traditional pipeline parallelism (GPipe, 1F1B) leaves GPUs idle while they wait for their stage's input or gradient. At 8 stages, roughly 12% of GPU time can be bubble even with 1F1B scheduling.</li>
+<li><strong>Cross-node all-to-all.</strong> MoE with expert parallelism scatters experts across nodes. Every forward pass triggers an all-to-all to dispatch tokens to their experts, and another to combine. At 2k GPUs this easily becomes a 1:1 compute-to-comm ratio.</li>
+</ol>
+<p>Each of these has separate solutions: gradient checkpointing for memory, Zero Bubble (Sea AI Lab, 2023) for pipeline bubbles, expert-parallel comm kernels for all-to-all. What DualPipe does is make them play together. The schedule overlaps compute and comm within a single forward-backward chunk, injects micro-batches from both ends of the pipeline simultaneously, and uses the resulting schedule to hide all-to-all inside the compute windows.</p>
+<p>Reported result: near-elimination of pipeline bubbles, over 95% GPU utilization in DeepSeek-V3's 14.8T-token training run.</p>
+<h2>The Concept</h2>
+<h3>Pipeline parallelism refresher</h3>
+<p>Split an N-layer model across P devices. Device <code>i</code> holds layers <code>i * N/P .. (i+1) * N/P - 1</code>. A micro-batch flows forward through devices 0 to P-1, then backward from P-1 to 0. Each device can only start its forward stage when the prior device sends its output and can only start backward when the downstream device sends the upstream gradient.</p>
+<p>GPipe (Huang et al., 2019) schedules one micro-batch at a time, which wastes most GPU time. 1F1B (Narayanan et al., 2021) interleaves forward and backward passes for multiple micro-batches. Zero Bubble (Qi et al., 2023) splits the backward pass into two parts — backward-for-input (B) and backward-for-weights (W) — and schedules them to fill the bubble. After Zero Bubble, the pipeline is almost tight.</p>
+<p>DualPipe is the next step. It adds two ideas on top:</p>
+<h3>Idea 1: chunk decomposition</h3>
+<p>Each forward chunk is split into four components:</p>
+<ul>
+<li><strong>Attention.</strong> Q/K/V projections, attention, output projection.</li>
+<li><strong>All-to-all dispatch.</strong> Cross-node communication that sends tokens to their experts.</li>
+<li><strong>MLP.</strong> The MoE expert computation.</li>
+<li><strong>All-to-all combine.</strong> Cross-node communication that brings expert outputs back.</li>
+</ul>
+<p>A backward chunk adds gradient versions of each of these. DualPipe schedules them so that all-to-all dispatch happens in parallel with the attention compute of the next chunk, and all-to-all combine happens in parallel with the MLP compute of the following chunk.</p>
+<h3>Idea 2: bidirectional scheduling</h3>
+<p>Most pipeline schedules inject micro-batches from stage 0 and flow toward stage P-1. DualPipe injects micro-batches from BOTH ends. Stage 0 sees forward micro-batches originating there; stage P-1 sees forward micro-batches originating there too. The two streams meet in the middle.</p>
+<p>For this to work, device <code>i</code> must hold BOTH the early-pipeline layer <code>i</code> AND the late-pipeline layer <code>P - 1 - i</code>. That is the &quot;dual&quot; part of DualPipe: each device keeps two copies of the model layers it needs to serve (one for each direction). At DeepSeek-V3's scale, this is a 2x parameter replication cost. It is affordable because Expert Parallelism already spreads the MoE experts so thin that replicating the non-expert layers twice is small potatoes.</p>
+<p>Crucially, the forward stream in one direction and the backward stream in the other direction overlap exactly where the bubbles would be in a single-direction schedule. The bubbles vanish.</p>
+<h3>A hand-traced schedule</h3>
+<p>Consider P = 4 ranks, 8 micro-batches, divided 4 forward / 4 reverse. Time moves left to right; rows are device ranks.</p>
+<pre><code>           Time →
+rank 0:  F1 F2 F3 F4  F5R F6R F7R F8R  B1 B2 B3 B4  ...
+rank 1:     F1 F2 F3  F4/F5R F6R F7R   B1 B2 ...
+rank 2:        F1 F2  F3/F5R F4/F6R    B1 ...
+rank 3:           F1  F2/F5R F3/F6R    ...
+</code></pre>
+<p>Reading the &quot;F4/F5R&quot; notation: rank 1 is running forward of micro-batch 4 (going left-to-right in the pipeline) AND forward of micro-batch 5 (going right-to-left) in the same time slot. That is what &quot;bidirectional&quot; means operationally.</p>
+<p>At rank 2 the cross streams overlap sooner, at rank 0 and P-1 they overlap latest. In the stable middle phase of the schedule, every rank runs forward-of-X-direction overlapped with backward-of-Y-direction. Compute is busy. All-to-all dispatches for the forward pass hide inside backward compute. All-to-all combines hide inside forward compute. The bubbles are squeezed out.</p>
+<h3>Bubble accounting</h3>
+<p>Standard 1F1B pipeline bubble (time wasted per rank):</p>
+<pre><code>bubble_1F1B = (P - 1) * forward_chunk_time
+</code></pre>
+<p>Zero Bubble refinement brings it down but not to zero. DualPipe, in the stable phase, has zero bubble if the micro-batch count is divisible by 2 times the pipeline depth. Outside the stable phase (warmup and cooldown), there is some bubble but it does not grow with the number of micro-batches — a key property the paper highlights.</p>
+<p>In marketing terms: &quot;bubble-free&quot;. In technical terms: bubbles do not grow with micro-batch count. Sea AI Lab's follow-up analysis (DualPipeV / Cut-in-half) shows the full zero-bubble only when Expert Parallelism is not the bottleneck; with EP-driven all-to-all, some scheduling compromise is always present.</p>
+<h3>DualPipeV — the refinement</h3>
+<p>Sea AI Lab (2025) observed that the 2x parameter replication is wasteful when EP comm overlap is not the point. Their DualPipeV schedule folds the bidirectional injection into a &quot;V-shape&quot; schedule that runs on a single parameter copy. The bubble is slightly larger than DualPipe's, but the memory savings are substantial. DeepSeek adopted DualPipeV in their open-source DualPipe implementation as an EP-off mode.</p>
+<p>The tradeoff:</p>
+<table>
+<thead>
+<tr>
+<th>Feature</th>
+<th>DualPipe</th>
+<th>DualPipeV</th>
+<th>1F1B</th>
+<th>Zero Bubble</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Param copies per device</td>
+<td>2</td>
+<td>1</td>
+<td>1</td>
+<td>1</td>
+</tr>
+<tr>
+<td>Bubble vs micro-batches</td>
+<td>constant</td>
+<td>small growth</td>
+<td>grows</td>
+<td>grows</td>
+</tr>
+<tr>
+<td>Compute-comm overlap</td>
+<td>full</td>
+<td>partial</td>
+<td>minimal</td>
+<td>partial</td>
+</tr>
+<tr>
+<td>Use when</td>
+<td>EP-heavy MoE</td>
+<td>dense or EP-light</td>
+<td>baseline</td>
+<td>any pipeline</td>
+</tr>
+</tbody>
+</table>
+<h3>What it means for a 14.8T-token run</h3>
+<p>DeepSeek-V3's pre-training consumed 14.8T tokens on 2,048 H800 GPUs in roughly 2.8M GPU-hours. With naive 1F1B, they would have lost 12-15% of that to pipeline bubbles — 340-420K GPU-hours, enough to train a full 70B model. DualPipe recovered most of that. Directly quantifying the contribution is difficult without the internal logs, but the claim in the paper is over 95% GPU utilization averaged across training.</p>
+<p>For smaller runs (under 1k GPUs), DualPipe is overkill — pipeline bubbles are smaller relative to total cost, and dense-model training rarely hits the all-to-all bottleneck. For frontier MoE training at multi-thousand GPU scale, it is effectively required.</p>
+<h3>Where it sits in the stack</h3>
+<ul>
+<li>Complementary to <strong>FSDP</strong> (Phase 10 · 05). FSDP shards the model parameters across ranks; DualPipe schedules the compute across ranks. They combine.</li>
+<li>Compatible with <strong>ZeRO-3</strong> gradient sharding. The bookkeeping for the two-copy replication needs to cooperate with ZeRO's sharded gradients.</li>
+<li>Requires <strong>custom all-to-all kernels</strong> tuned for the specific cluster topology. DeepSeek's open-source kernels are the reference implementation.</li>
+</ul>
+<figure><img src="/learn/ai-from-scratch/figures/figure-07f6107ef6fe52c88540.png" alt="expert-capacity 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Use It</h2>
+<p><code>code/main.py</code> is a pipeline schedule simulator. It takes <code>(P, n_micro_batches, schedule)</code> and prints the stable-phase utilization for each of 1F1B, Zero Bubble, DualPipe, and DualPipeV. It is a teaching tool — the numbers match the qualitative claims in the papers, they are not a claim about production measured speedup.</p>
+<p>The simulator's value: run it with different P and micro-batch counts and watch how the bubble fraction grows for 1F1B but not DualPipe.</p>
+<p>Integration considerations for a real training run:</p>
+<ul>
+<li>Pick a pipeline-parallel depth that divides cleanly into your micro-batch count.</li>
+<li>Ensure your expert-parallel mesh supports bidirectional all-to-all. DeepSeek's kernels are the reference.</li>
+<li>Expect to burn a week of debugging time on the schedule itself the first time. The bookkeeping is fiddly.</li>
+<li>Monitor GPU utilization per rank, not just aggregate. DualPipe's benefit comes from tightening the stragglers.</li>
+</ul>
+<h2>Ship It</h2>
+<p>This lesson produces <code>outputs/skill-dualpipe-planner.md</code>. Given a training cluster specification (GPU count, topology, interconnect, model shape), it recommends a pipeline parallelism strategy, the scheduling algorithm to use, and the expected bubble fraction at the target scale.</p>
+<h2>Exercises</h2>
+<ol>
+<li>
+<p>Run <code>code/main.py</code> on <code>(P=8, micro_batches=16, schedule=dualpipe)</code> and <code>(P=8, micro_batches=16, schedule=1f1b)</code>. Compute the GPU utilization difference and express it as recovered GPU-hours per million tokens of training.</p>
+</li>
+<li>
+<p>Sketch the schedule table for <code>(P=4, micro_batches=8, schedule=dualpipe)</code> by hand. Mark each time slot with the micro-batch ID and direction. Identify the first time slot where bubbles are absent.</p>
+</li>
+<li>
+<p>Read Figure 5 of the DeepSeek-V3 technical report (arXiv:2412.19437). Identify the overlap window for all-to-all dispatch inside a DualPipe forward chunk. Explain how the compute schedule hides it.</p>
+</li>
+<li>
+<p>Compute the 2x parameter overhead of DualPipe for a 70B dense model with P=8 pipeline stages and a 671B MoE model with P=16 pipeline stages. Show why the MoE case's overhead is proportionally smaller (most parameters are experts, sharded across a large EP group).</p>
+</li>
+<li>
+<p>Compare DualPipe to Chimera (a competing bidirectional scheduler from 2021). Identify the two specific properties DualPipe added that Chimera did not have, using the paper's Section 3.4 as the reference.</p>
+</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Pipeline bubble</td>
+<td>&quot;Idle time per rank&quot;</td>
+<td>GPU cycles wasted because a pipeline stage is waiting for its input or gradient</td>
+</tr>
+<tr>
+<td>1F1B</td>
+<td>&quot;Default pipeline schedule&quot;</td>
+<td>One forward / one backward interleaved scheduling; the baseline DualPipe beats</td>
+</tr>
+<tr>
+<td>Zero Bubble</td>
+<td>&quot;Sea AI Lab 2023&quot;</td>
+<td>Splits backward into B (input gradient) and W (weight gradient); almost fully tightens the pipeline</td>
+</tr>
+<tr>
+<td>DualPipe</td>
+<td>&quot;DeepSeek-V3 schedule&quot;</td>
+<td>Bidirectional pipeline + compute-comm overlap; bubbles do not grow with micro-batch count</td>
+</tr>
+<tr>
+<td>DualPipeV</td>
+<td>&quot;Cut-in-half&quot;</td>
+<td>V-shape refinement that drops the 2x parameter replication at the cost of slightly larger bubbles</td>
+</tr>
+<tr>
+<td>Chunk</td>
+<td>&quot;Unit of pipeline work&quot;</td>
+<td>A forward or backward pass of one micro-batch through one pipeline stage</td>
+</tr>
+<tr>
+<td>All-to-all dispatch</td>
+<td>&quot;Send tokens to experts&quot;</td>
+<td>Cross-node comm that routes tokens to their assigned MoE experts</td>
+</tr>
+<tr>
+<td>All-to-all combine</td>
+<td>&quot;Bring expert outputs back&quot;</td>
+<td>Cross-node comm that gathers expert outputs after the MLP</td>
+</tr>
+<tr>
+<td>Expert Parallelism (EP)</td>
+<td>&quot;Experts across GPUs&quot;</td>
+<td>Shards MoE experts across ranks so different GPUs hold different experts</td>
+</tr>
+<tr>
+<td>Pipeline Parallelism (PP)</td>
+<td>&quot;Layers across GPUs&quot;</td>
+<td>Shards model layers across ranks; the dimension DualPipe schedules</td>
+</tr>
+<tr>
+<td>Bubble fraction</td>
+<td>&quot;Wasted GPU time&quot;</td>
+<td>(bubble_time / total_time); the fraction DualPipe drives toward zero</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2412.19437" rel="noreferrer" data-network="true">DeepSeek-AI — DeepSeek-V3 Technical Report (arXiv:2412.19437), Section 3.3.2 and Figure 5 <small>↗ 需要联网</small></a> — the primary DualPipe reference</li>
+<li><a href="https://github.com/deepseek-ai/DualPipe" rel="noreferrer" data-network="true">DeepSeek — DualPipe GitHub repository <small>↗ 需要联网</small></a> — the open-source reference implementation, including DualPipeV (Cut-in-half) mode</li>
+<li><a href="https://arxiv.org/abs/2401.10241" rel="noreferrer" data-network="true">Qi et al. — Zero Bubble Pipeline Parallelism (arXiv:2401.10241, Sea AI Lab 2023) <small>↗ 需要联网</small></a> — the Zero Bubble predecessor</li>
+<li><a href="https://sail.sea.com/blog/articles/63" rel="noreferrer" data-network="true">Sea AI Lab — DualPipe could be better without the Dual <small>↗ 需要联网</small></a> — the DualPipeV analysis that informed DeepSeek's EP-off mode</li>
+<li><a href="https://arxiv.org/abs/1806.03377" rel="noreferrer" data-network="true">Narayanan et al. — PipeDream / 1F1B (arXiv:1806.03377, 2018-2021) <small>↗ 需要联网</small></a> — the 1F1B schedule DualPipe compares against</li>
+<li><a href="https://arxiv.org/abs/1811.06965" rel="noreferrer" data-network="true">Huang et al. — GPipe (arXiv:1811.06965, 2018) <small>↗ 需要联网</small></a> — the original pipeline parallelism paper and bubble problem</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-10-llms-from-scratch--19-dualpipe-parallelism.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-10-llms-from-scratch--19-dualpipe-parallelism.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/10-llms-from-scratch/19-dualpipe-parallelism/code/main.py">phases/10-llms-from-scratch/19-dualpipe-parallelism/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Pipeline schedule simulator — 1F1B vs Zero Bubble vs DualPipe vs DualPipeV.
+
+Teaching tool. Counts pipeline bubbles per schedule for given (P, micro_batches).
+Outputs:
+  - bubble fraction per schedule at fixed (P, micro_batches)
+  - scaling of bubbles as micro_batches grows
+
+Not a production simulator. Forward/backward chunk costs are unit-normalized.
+Comm costs are modeled as overlap windows, not full kernel models.
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import List
+
+
+@dataclass
+class ScheduleStats:
+    name: str
+    stable_bubble_frac: float
+    scales_with_micro_batches: bool
+    param_copies: int
+    comm_overlap: str
+
+
+def bubble_1f1b(P: int, M: int) -&gt; float:
+    &quot;&quot;&quot;1F1B: warmup phase has (P-1) forward slots without backward overlap.
+    Cooldown mirrors. Stable phase has zero bubble per rank per micro-batch,
+    but warmup/cooldown bubble is (P-1) forward + (P-1) backward chunks per
+    rank, out of 2 * M + 2 * (P - 1) chunks total.
+    &quot;&quot;&quot;
+    total = 2 * M + 2 * (P - 1)
+    bubble = 2 * (P - 1)
+    return bubble / total
+
+
+def bubble_zero_bubble(P: int, M: int) -&gt; float:
+    &quot;&quot;&quot;Zero Bubble (Qi 2023) splits backward into B + W. The W part can fill
+    the 1F1B bubble. Approximate residual bubble is (P - 1) / 2 chunks of
+    warmup plus the same cooldown, out of 3 * M + 2 * (P - 1) sub-chunks.
+    &quot;&quot;&quot;
+    total = 3 * M + 2 * (P - 1)
+    bubble = (P - 1)
+    return bubble / total
+
+
+def bubble_dualpipe(P: int, M: int) -&gt; float:
+    &quot;&quot;&quot;DualPipe injects micro-batches from both ends of the pipeline. Stable
+    phase bubble is zero. Warmup/cooldown has fixed bubble independent of M.
+    &quot;&quot;&quot;
+    total = 3 * M + (P - 1)
+    bubble = (P - 1) // 2
+    return bubble / total
+
+
+def bubble_dualpipev(P: int, M: int) -&gt; float:
+    &quot;&quot;&quot;DualPipeV uses a V-shape schedule on a single parameter copy. Its
+    bubble is slightly larger than DualPipe&#39;s at the benefit of halving
+    memory. Approximate as 1.2x DualPipe bubble.&quot;&quot;&quot;
+    return bubble_dualpipe(P, M) * 1.2
+
+
+def summarize(P: int, M: int) -&gt; List[tuple[str, float, int, str]]:
+    return [
+        (&quot;1F1B&quot;,       bubble_1f1b(P, M),        1, &quot;minimal&quot;),
+        (&quot;Zero Bubble&quot;, bubble_zero_bubble(P, M), 1, &quot;partial&quot;),
+        (&quot;DualPipe&quot;,   bubble_dualpipe(P, M),    2, &quot;full&quot;),
+        (&quot;DualPipeV&quot;,  bubble_dualpipev(P, M),   1, &quot;partial&quot;),
+    ]
+
+
+def gpu_hours_recovered(P: int, M: int, total_gpu_hours: float) -&gt; dict:
+    b1 = bubble_1f1b(P, M)
+    bd = bubble_dualpipe(P, M)
+    recovered = (b1 - bd) * total_gpu_hours
+    return {
+        &quot;1F1B_bubble_frac&quot;: b1,
+        &quot;DualPipe_bubble_frac&quot;: bd,
+        &quot;recovered_gpu_hours&quot;: recovered,
+    }
+
+
+def main() -&gt; None:
+    print(&quot;=&quot; * 70)
+    print(&quot;DUALPIPE PARALLELISM SIMULATOR (Phase 10, Lesson 19)&quot;)
+    print(&quot;=&quot; * 70)
+    print()
+
+    print(&quot;-&quot; * 70)
+    print(&quot;Step 1: bubble fraction at P=8, micro_batches=16&quot;)
+    print(&quot;-&quot; * 70)
+    print(f&quot;  {&#39;schedule&#39;:&lt;14} {&#39;bubble&#39;:&gt;10} {&#39;param copies&#39;:&gt;14} {&#39;comm overlap&#39;:&gt;14}&quot;)
+    for name, b, pc, co in summarize(P=8, M=16):
+        print(f&quot;  {name:&lt;14} {b:&gt;9.1%}  {pc:&gt;14}  {co:&gt;14}&quot;)
+    print()
+
+    print(&quot;-&quot; * 70)
+    print(&quot;Step 2: bubble fraction scaling vs micro_batches (P=8)&quot;)
+    print(&quot;-&quot; * 70)
+    header = &quot;  &quot; + &quot;M&quot;.rjust(6)
+    for name in (&quot;1F1B&quot;, &quot;ZeroBubble&quot;, &quot;DualPipe&quot;, &quot;DualPipeV&quot;):
+        header += name.rjust(12)
+    print(header)
+    for M in (4, 8, 16, 32, 64, 128):
+        row = f&quot;  {M:&gt;6}&quot;
+        for _, b, _, _ in summarize(P=8, M=M):
+            row += f&quot;{b:&gt;12.1%}&quot;
+        print(row)
+    print()
+
+    print(&quot;-&quot; * 70)
+    print(&quot;Step 3: bubble fraction scaling vs pipeline depth (M=64 fixed)&quot;)
+    print(&quot;-&quot; * 70)
+    header = &quot;  &quot; + &quot;P&quot;.rjust(6)
+    for name in (&quot;1F1B&quot;, &quot;ZeroBubble&quot;, &quot;DualPipe&quot;, &quot;DualPipeV&quot;):
+        header += name.rjust(12)
+    print(header)
+    for P in (4, 8, 16, 32, 64):
+        row = f&quot;  {P:&gt;6}&quot;
+        for _, b, _, _ in summarize(P=P, M=64):
+            row += f&quot;{b:&gt;12.1%}&quot;
+        print(row)
+    print()
+
+    print(&quot;-&quot; * 70)
+    print(&quot;Step 4: recovered GPU-hours (DeepSeek-V3-shape run)&quot;)
+    print(&quot;-&quot; * 70)
+    print(&quot;  DeepSeek-V3: 2048 H800 GPUs, ~2.8M GPU-hours total.&quot;)
+    print(&quot;  Assume P=16 pipeline depth, M=128 micro-batches per step.&quot;)
+    r = gpu_hours_recovered(P=16, M=128, total_gpu_hours=2_800_000)
+    print(f&quot;  1F1B bubble     : {r[&#39;1F1B_bubble_frac&#39;]:.1%}&quot;)
+    print(f&quot;  DualPipe bubble : {r[&#39;DualPipe_bubble_frac&#39;]:.1%}&quot;)
+    print(f&quot;  recovered       : {r[&#39;recovered_gpu_hours&#39;]:,.0f} GPU-hours&quot;)
+    print(f&quot;  (that is roughly the cost of a full 70B dense pre-training run)&quot;)
+    print()
+
+    print(&quot;takeaway: bubbles do not grow with M for DualPipe. the 2x parameter&quot;)
+    print(&quot;          replication pays for itself at MoE scale because Expert&quot;)
+    print(&quot;          Parallelism already spreads the dominant weights thin.&quot;)
+    print(&quot;          DualPipeV drops the 2x at a small bubble cost.&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/10-llms-from-scratch/19-dualpipe-parallelism/outputs/skill-dualpipe-planner.md">phases/10-llms-from-scratch/19-dualpipe-parallelism/outputs/skill-dualpipe-planner.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: dualpipe-planner
+description: Plan a pipeline parallelism strategy (1F1B, Zero Bubble, DualPipe, DualPipeV) for a training cluster.
+version: 1.0.0
+phase: 10
+lesson: 19
+tags: [pipeline-parallelism, dualpipe, dualpipev, zero-bubble, expert-parallelism, distributed-training]
+---
+
+Given a training cluster specification (total GPU count, interconnect topology, accelerator model, memory per GPU), a model shape (total params, active params, MoE or dense, expected layer count), and a target training-data volume, recommend a pipeline parallelism strategy and confirm the expected bubble fraction.
+
+Produce:
+
+1. Pipeline depth P. Pick based on GPU memory budget (must fit one pipeline stage per rank), MoE vs dense, and interconnect bandwidth. Range: 4 for small clusters, 16-32 for frontier MoE training.
+2. Micro-batch count M. Must be divisible by 2 for DualPipe and DualPipeV. Typical ratio M/P between 8 and 16. Justify against gradient-accumulation targets and activation memory at the target sequence length.
+3. Schedule choice. Pick from 1F1B, Zero Bubble, DualPipe, DualPipeV. Decision table: dense training under 500 GPUs -&gt; Zero Bubble. MoE with expert parallelism -&gt; DualPipe. Dense training above 500 GPUs without heavy all-to-all -&gt; DualPipeV. Small runs under 100 GPUs -&gt; 1F1B is fine.
+4. Expected bubble fraction. Compute for the chosen schedule at the target P and M. Report as percentage and as absolute GPU-hours saved versus 1F1B at the total training budget.
+5. Parameter replication plan (DualPipe only). Confirm the 2x parameter replication fits in available VRAM. Report the effective parameter density per GPU given the chosen P.
+
+Hard rejects:
+- DualPipe without Expert Parallelism. The 2x replication is not justified without EP-heavy comms to hide.
+- P &gt; 64 on any training run. Bubble fraction grows linearly with P regardless of schedule.
+- Micro-batch count not divisible by 2 for DualPipe/DualPipeV. The schedule will not close.
+- Pipeline parallelism at all when the model fits in one GPU&#39;s memory. Use data parallelism only.
+
+Refusal rules:
+- If the interconnect is 200Gbps or slower per GPU, refuse DualPipe and recommend DualPipeV. The all-to-all overlap window is too narrow to justify the replication.
+- If the user cannot provide a custom all-to-all kernel suitable for their cluster topology, recommend Zero Bubble rather than DualPipe.
+- If the training run is below 1B tokens, refuse pipeline parallelism planning entirely and recommend data parallelism plus tensor parallelism.
+
+Output: a one-page plan listing P, M, schedule, expected bubble fraction, parameter replication cost (if DualPipe), and an all-to-all kernel recommendation. End with a &quot;rollback trigger&quot; paragraph naming the specific utilization metric (aggregate GPU utilization percentage, measured over the first 1000 steps) that would justify switching to a simpler schedule if the target number is not hit.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原课程未提供测验。</p></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/10-llms-from-scratch/18-multi-token-prediction/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/10-llms-from-scratch/20-deepseek-v3-walkthrough/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/10-llms-from-scratch/19-dualpipe-parallelism/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

@@ -1,0 +1,663 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>视力转换器 (ViT) · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-04-computer-vision" data-lesson="04-computer-vision/14-vision-transformers" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/04-computer-vision/">计算机视觉</a> / LESSON 14</p><h1 class="lesson-title">视力转换器 (ViT)</h1><p>Vision Transformers (ViT)</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>视力转换器 (ViT)</h1>
+<blockquote>
+<p>切割图像成补丁,把每一个补丁当作一个词,运行一个标准的变压器.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 7 Lesson 02 (Self-Attention), Phase 4 Lesson 04 (Image Classification)
+<strong>Time:</strong> ~45 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>从零开始实现补丁嵌入,学习定位嵌入,类代币和变压器编码区块,以构建最小的ViT</li>
+<li>解释为什么ViT被认为需要大量的预训数据,直到DeiT和MAE证明相反</li>
+<li>根据其建筑前 (没有,本地窗口关注,体脊柱) 进行ViT,Swin和ConvNeXt的比较</li>
+<li>通过使用小数据集进行预训练的 ViT 细调<code>timm</code>和标准的线性探测/细调配方</li>
+</ul>
+<h2>问题</h2>
+<p>十年来,卷积是计算机视觉的代号.CNN具有强大的诱导偏见,地方性,翻译等差,没有人认为可以取代.然后,Dosovitskiy等人 (2020) 表明,在平坦的图像补丁上应用的平凡变压器,没有卷积机械,可以匹配或击败规模上的最佳CNN.</p>
+<p>像网-1k的 ViT 输给了ResNet. 维特在ImagenNet-21k或JFT-300M上预训练,然后在ImagenNet-1k上调整, 结果是,变压器缺乏有用的前例,但可以从足够的数据中学习它们. 随后的研究 (DeiT,MAE,DINO) 显示,通过正确的训练配方,强大的增强,自我监督的预训练,蒸,</p>
+<p>到2026年,纯CNN仍然在边缘设备上竞争力较高 (ConvNeXt是最强),但变压器占据所有其他领域的地位:分区 (Mask2Former, SegFormer),检测 (DETR,RT-DETR),多模 (CLIP,SigLIP),视频 (VideoMAE,VJEPA).</p>
+<h2>概念</h2>
+<h3>管道</h3>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-6dcc431612daa1510914.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>七步.补丁 -&gt; 代币 -&gt; 注意 -&gt; 分类器.每个变体 (DeiT,Swin,ConvNeXt,MAE预训练) 改变了其中一个或两个,而剩下的只剩下.</p>
+<h3>补丁嵌入</h3>
+<p>第一个 conv 是秘密. 核心尺寸 16,步骤 16,所以一个 224x224 图像变成一个 14x14 格格由 16x16 补丁,每个投影到 768 寸嵌入式.</p>
+<pre><code>Input:  (3, 224, 224)
+Conv (3 -&gt; 768, k=16, s=16, no padding):
+Output: (768, 14, 14)
+Flatten spatial: (196, 768)
+</code></pre>
+<p>196个补丁 = 196个代币.每个代币的特征尺寸为768 (ViT-B),1024 (ViT-L) 或1280 (ViT-H).</p>
+<h3>类代币</h3>
+<p>单个学习向量预pendiated到序列:</p>
+<pre><code>tokens = [CLS; patch_1; patch_2; ...; patch_196]   shape (197, 768)
+</code></pre>
+<p>后N变压器块,<code>[CLS]</code>排序头只读出这个一个向量.</p>
+<h3>位置嵌入</h3>
+<p>变形器没有内置的空间位置概念.</p>
+<pre><code>tokens = tokens + learned_pos_embedding   (also shape (197, 768))
+</code></pre>
+<p>嵌入是模型的参数;基于梯度的训练将其适应2D图像结构.存在双向二维替代方案,但在实践中很少被使用.</p>
+<h3>变压器编码器块</h3>
+<p>标准,多头自觉注意,MLP,残留连接,前层规范.</p>
+<pre><code>x = x + MSA(LN(x))
+x = x + MLP(LN(x))
+
+MLP is two-layer with GELU: Linear(d -&gt; 4d) -&gt; GELU -&gt; Linear(4d -&gt; d)
+</code></pre>
+<p>维特-B/16堆了12个块,每个块都有12个注意头,总共为86M参数.</p>
+<h3>为什么在LN之前</h3>
+<p>后LN使用的早期变压器 (<code>x = LN(x + sublayer(x))</code>经过6-8层的训练,没有加热.<code>x = x + sublayer(LN(x))</code>任何ViT和现代LLM都使用LN前.</p>
+<h3>补丁尺寸交易</h3>
+<ul>
+<li>标准的16×16补丁 -&gt; 196个代币.</li>
+<li>快速但分辨率较低的代币.</li>
+<li>八倍八倍的补丁 -&gt; 784个代币,更细,但注意力成本的比例很差.</li>
+</ul>
+<p>较大的补丁 = 较少的代币 = 快速但空间细节较少.SwinV2 在等级窗口中使用4×4补丁.</p>
+<h3>戴特在ImagenNet-1k上训练ViT的食谱</h3>
+<p>为了击败CNN,原始ViT需要JFT-300M. DeiT (Touvron等人,2020) 通过四项变化,仅在ImageNet-1k上将ViT-B培训到81.8%的前位:</p>
+<ol>
+<li>强大的增强:随机增强,混合,切割混合,随机删除.</li>
+<li>炼时随机放下整个块.</li>
+<li>复制增强 (每批量采样3次相同的图像).</li>
+<li>美国广播公司教师的蒸 (可选,进一步提高准确性).</li>
+</ol>
+<p>每个现代的ViT训练配方都是来自 DeiT.</p>
+<h3>斯文 VS 康文</h3>
+<ul>
+<li><strong>Swin</strong>基于窗户的关注.每个块都在一个本地窗口内参加;交替的块将窗口移动,以混合窗口中的信息.同时保留注意力操作员.</li>
+<li><strong>ConvNeXt</strong>重新设计了CNN,与斯文的建筑选择相匹配 (深度,LayerNorm,GELU,倒瓶). 显示,差距不是&quot;注意力与曲&quot;而是&quot;现代训练配方 +建筑&quot;.</li>
+</ul>
+<p>2026年,ConvNeXt-V2和Swin-V2都在生产级; 选择的选择取决于你的推断堆 (ConvNeXt更好地编译了边缘) 和预训练体.</p>
+<h3>预训练</h3>
+<p>面具自动编码器 (He et al., 2022):随机掩盖75%的补丁,训练编码器处理可见的25%,训练一个小的解码器重建从编码器输出的掩盖补丁.</p>
+<p>通过MAE,ViT可以仅仅在ImageNet-1k上进行训练,打到SOTA,并且是目前默认的自主监督配方.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-10ee83b8178c3cc13188.png" alt="batchnorm-inference 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<h3>步骤1: 补丁嵌入</h3>
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+class PatchEmbedding(nn.Module):
+    def __init__(self, in_channels=3, patch_size=16, dim=192, image_size=64):
+        super().__init__()
+        assert image_size % patch_size == 0
+        self.proj = nn.Conv2d(in_channels, dim, kernel_size=patch_size, stride=patch_size)
+        num_patches = (image_size // patch_size) ** 2
+        self.num_patches = num_patches
+
+    def forward(self, x):
+        x = self.proj(x)
+        return x.flatten(2).transpose(1, 2)
+</code></pre>
+<p>一个 conv,一个平,一个转换. 这就是整个图像到代码的步骤.</p>
+<h3>步骤2:变压器块</h3>
+<p>预LN,多头自觉,GELU的MLP,残留连接.</p>
+<pre><code class="language-python">class Block(nn.Module):
+    def __init__(self, dim, num_heads, mlp_ratio=4, dropout=0.0):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
+        self.ln2 = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, dim * mlp_ratio),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim * mlp_ratio, dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x):
+        a, _ = self.attn(self.ln1(x), self.ln1(x), self.ln1(x), need_weights=False)
+        x = x + a
+        x = x + self.mlp(self.ln2(x))
+        return x
+</code></pre>
+<p><code>nn.MultiheadAttention</code>处理分成头,缩小点产品和输出投影.<code>batch_first=True</code>所以形状是<code>(N, seq, dim)</code>现在,我们要去.</p>
+<h3>步骤3: 维特</h3>
+<pre><code class="language-python">class ViT(nn.Module):
+    def __init__(self, image_size=64, patch_size=16, in_channels=3,
+                 num_classes=10, dim=192, depth=6, num_heads=3, mlp_ratio=4):
+        super().__init__()
+        self.patch = PatchEmbedding(in_channels, patch_size, dim, image_size)
+        num_patches = self.patch.num_patches
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, dim))
+        self.blocks = nn.ModuleList([
+            Block(dim, num_heads, mlp_ratio) for _ in range(depth)
+        ])
+        self.ln = nn.LayerNorm(dim)
+        self.head = nn.Linear(dim, num_classes)
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+
+    def forward(self, x):
+        x = self.patch(x)
+        cls = self.cls_token.expand(x.size(0), -1, -1)
+        x = torch.cat([cls, x], dim=1)
+        x = x + self.pos_embed
+        for blk in self.blocks:
+            x = blk(x)
+        x = self.ln(x[:, 0])
+        return self.head(x)
+
+vit = ViT(image_size=64, patch_size=16, num_classes=10, dim=192, depth=6, num_heads=3)
+x = torch.randn(2, 3, 64, 64)
+print(f&quot;output: {vit(x).shape}&quot;)
+print(f&quot;params: {sum(p.numel() for p in vit.parameters()):,}&quot;)
+</code></pre>
+<p>实际 ViT-B 是86M;同类定义为<code>dim=768, depth=12, num_heads=12</code>现在,我们要去.</p>
+<h3>步骤4: 智力检查 单个图像推断</h3>
+<pre><code class="language-python">logits = vit(torch.randn(1, 3, 64, 64))
+print(f&quot;logits: {logits}&quot;)
+print(f&quot;probs:  {logits.softmax(-1)}&quot;)
+</code></pre>
+<p>运行没有错误.</p>
+<h2>用它</h2>
+<p><code>timm</code>通过ImageNet预训练的重量,</p>
+<pre><code class="language-python">import timm
+
+model = timm.create_model(&quot;vit_base_patch16_224&quot;, pretrained=True, num_classes=10)
+</code></pre>
+<p><code>timm</code>支持 ViT, DeiT, Swin, Swin-V2, ConvNeXt, ConvNeXt-V2, MaxViT, MViT, EfficientFormer,以及其他数十个在同一API下.</p>
+<p>对于多模式工作 (图像+文字),<code>transformers</code>它们中的图像编码器是ViT变体.</p>
+<h2>运送它</h2>
+<p>这一课产生了:</p>
+<ul>
+<li><code>outputs/prompt-vit-vs-cnn-picker.md</code>一个提示,根据数据集尺寸,计算和推断堆,选择一个ViT,一个ConvNeXt或一个Swin.</li>
+<li><code>outputs/skill-vit-patch-and-pos-embed-inspector.md</code>验证VIT的补丁嵌入和定位嵌入形状与模型预期的序列长度相匹配的技能,捕获最常见的移植错误.</li>
+</ul>
+<h2>运动</h2>
+<ol>
+<li>**(Easy)**印出每一个中间子的形状,以通过上面的微小VIT进行前进.<code>(N, 3, 64, 64)</code>-&gt; 补丁<code>(N, 16, 192)</code>-&gt; 与CLS<code>(N, 17, 192)</code>-&gt; 分类器输入<code>(N, 192)</code>-&gt; 输出<code>(N, num_classes)</code>现在,我们要去.</li>
+<li>**(Medium)**调整一个预训练的<code>timm</code>根据同样的数据进行比较,对ResNet-18细调进行比较. 报告训练时间和最终准确性.</li>
+<li>**(Hard)**实施MAE预训练对微型ViT:掩盖75%的补丁,训练编码器+一个小的解码器重建掩盖补丁.评估在预训练前和后的合成数据线性探测精度.</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Patch embedding</td>
+<td>&quot;The first conv&quot;</td>
+<td>A conv with kernel size = stride = patch size; turns the image into a grid of token embeddings</td>
+</tr>
+<tr>
+<td>Class token</td>
+<td>&quot;[CLS]&quot;</td>
+<td>A learned vector prepended to the token sequence; its final output is the global image representation</td>
+</tr>
+<tr>
+<td>Positional embedding</td>
+<td>&quot;Learned pos&quot;</td>
+<td>A learned vector added to every token so the transformer knows where each patch came from</td>
+</tr>
+<tr>
+<td>Pre-LN</td>
+<td>&quot;LayerNorm before sublayer&quot;</td>
+<td>The stable transformer variant: <code>x + sublayer(LN(x))</code> instead of <code>LN(x + sublayer(x))</code></td>
+</tr>
+<tr>
+<td>Multi-head attention</td>
+<td>&quot;Parallel attention&quot;</td>
+<td>Standard transformer attention split into num_heads independent subspaces, concatenated afterwards</td>
+</tr>
+<tr>
+<td>ViT-B/16</td>
+<td>&quot;Base, patch 16&quot;</td>
+<td>The canonical size: dim=768, depth=12, heads=12, patch_size=16, image=224; ~86M params</td>
+</tr>
+<tr>
+<td>DeiT</td>
+<td>&quot;Data-efficient ViT&quot;</td>
+<td>ViT trained on ImageNet-1k alone with strong augmentation; proved large pretraining datasets are not strictly required</td>
+</tr>
+<tr>
+<td>MAE</td>
+<td>&quot;Masked autoencoder&quot;</td>
+<td>Self-supervised pretraining: mask 75% of patches, reconstruct; the dominant ViT pretraining recipe</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2010.11929" rel="noreferrer" data-network="true">An Image is Worth 16x16 Words (Dosovitskiy et al., 2020) <small>↗ 需要联网</small></a>VIT文件</li>
+<li><a href="https://arxiv.org/abs/2012.12877" rel="noreferrer" data-network="true">DeiT: Data-efficient Image Transformers (Touvron et al., 2020) <small>↗ 需要联网</small></a>如何单独在ImageNet-1k上训练ViT</li>
+<li><a href="https://arxiv.org/abs/2111.06377" rel="noreferrer" data-network="true">Masked Autoencoders are Scalable Vision Learners (He et al., 2022) <small>↗ 需要联网</small></a>MAE预训练</li>
+<li><a href="https://huggingface.co/docs/timm" rel="noreferrer" data-network="true">timm documentation <small>↗ 需要联网</small></a>您将在生产中使用的每个视觉变压器的参考</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Vision Transformers (ViT)</h1>
+<blockquote>
+<p>Cut the image into patches, treat each patch as a word, run a standard transformer. Don't look back.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 7 Lesson 02 (Self-Attention), Phase 4 Lesson 04 (Image Classification)
+<strong>Time:</strong> ~45 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Implement patch embedding, learned positional embedding, class token, and transformer encoder blocks from scratch to build a minimal ViT</li>
+<li>Explain why ViT was thought to need massive pretraining data until DeiT and MAE proved otherwise</li>
+<li>Compare ViT, Swin, and ConvNeXt on their architectural priors (none, local window attention, conv backbone)</li>
+<li>Fine-tune a pretrained ViT on a small dataset using <code>timm</code> and the standard linear-probe / fine-tune recipe</li>
+</ul>
+<h2>The Problem</h2>
+<p>For a decade, convolution was synonymous with computer vision. CNNs had strong inductive biases — locality, translation equivariance — that nobody thought you could replace. Then Dosovitskiy et al. (2020) showed that a plain transformer applied to flattened image patches, with no convolutional machinery at all, could match or beat the best CNNs at scale.</p>
+<p>The catch was &quot;at scale.&quot; ViT on ImageNet-1k lost to ResNet. ViT pretrained on ImageNet-21k or JFT-300M then fine-tuned on ImageNet-1k beat it. The conclusion was that transformers lacked useful priors but could learn them from enough data. Subsequent work (DeiT, MAE, DINO) showed that with the right training recipes — strong augmentation, self-supervised pretraining, distillation — ViTs train fine on small data too.</p>
+<p>By 2026, pure CNNs are still competitive on edge devices (ConvNeXt is the strongest), but transformers dominate everything else: segmentation (Mask2Former, SegFormer), detection (DETR, RT-DETR), multimodal (CLIP, SigLIP), video (VideoMAE, VJEPA). The ViT block structure is the one to know.</p>
+<h2>The Concept</h2>
+<h3>The pipeline</h3>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-6dcc431612daa1510914.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>Seven steps. Patches -&gt; tokens -&gt; attention -&gt; classifier. Every variant (DeiT, Swin, ConvNeXt, MAE pretraining) changes one or two of the seven and leaves the rest alone.</p>
+<h3>Patch embedding</h3>
+<p>The first conv is the secret. Kernel size 16, stride 16, so a 224x224 image becomes a 14x14 grid of 16x16 patches, each projected to a 768-dim embedding. That single conv both patchifies and linearly projects.</p>
+<pre><code>Input:  (3, 224, 224)
+Conv (3 -&gt; 768, k=16, s=16, no padding):
+Output: (768, 14, 14)
+Flatten spatial: (196, 768)
+</code></pre>
+<p>196 patches = 196 tokens. Each token's feature dimension is 768 (ViT-B), 1024 (ViT-L), or 1280 (ViT-H).</p>
+<h3>Class token</h3>
+<p>A single learned vector prepended to the sequence:</p>
+<pre><code>tokens = [CLS; patch_1; patch_2; ...; patch_196]   shape (197, 768)
+</code></pre>
+<p>After N transformer blocks, the <code>[CLS]</code> output is the global image representation. Classification head reads only this one vector.</p>
+<h3>Positional embedding</h3>
+<p>Transformers have no built-in notion of spatial position. Add a learned vector to every token:</p>
+<pre><code>tokens = tokens + learned_pos_embedding   (also shape (197, 768))
+</code></pre>
+<p>The embedding is a parameter of the model; gradient-based training adapts it to 2D image structure. Sinusoidal 2D alternatives exist but are rarely used in practice.</p>
+<h3>Transformer encoder block</h3>
+<p>Standard. Multi-head self-attention, MLP, residual connections, pre-LayerNorm.</p>
+<pre><code>x = x + MSA(LN(x))
+x = x + MLP(LN(x))
+
+MLP is two-layer with GELU: Linear(d -&gt; 4d) -&gt; GELU -&gt; Linear(4d -&gt; d)
+</code></pre>
+<p>ViT-B/16 stacks 12 of these blocks, each with 12 attention heads, totalling 86M parameters.</p>
+<h3>Why pre-LN</h3>
+<p>Early transformers used post-LN (<code>x = LN(x + sublayer(x))</code>) and struggled to train past 6-8 layers without warmup. Pre-LN (<code>x = x + sublayer(LN(x))</code>) trains deeper networks stably without warmup. Every ViT and every modern LLM uses pre-LN.</p>
+<h3>Patch size trade-off</h3>
+<ul>
+<li>16x16 patches -&gt; 196 tokens, standard.</li>
+<li>32x32 patches -&gt; 49 tokens, faster but lower resolution.</li>
+<li>8x8 patches -&gt; 784 tokens, finer but O(n^2) attention cost scales badly.</li>
+</ul>
+<p>Bigger patches = fewer tokens = faster but less spatial detail. SwinV2 uses 4x4 patches in hierarchical windows.</p>
+<h3>DeiT's recipe for training ViT on ImageNet-1k</h3>
+<p>The original ViT needed JFT-300M to beat CNNs. DeiT (Touvron et al., 2020) trained ViT-B to 81.8% top-1 on ImageNet-1k alone with four changes:</p>
+<ol>
+<li>Heavy augmentation: RandAugment, Mixup, CutMix, Random Erasing.</li>
+<li>Stochastic depth (drop entire blocks at random during training).</li>
+<li>Repeated augmentation (same image sampled 3 times per batch).</li>
+<li>Distillation from a CNN teacher (optional, lifts accuracy further).</li>
+</ol>
+<p>Every modern ViT training recipe descends from DeiT.</p>
+<h3>Swin vs ConvNeXt</h3>
+<ul>
+<li><strong>Swin</strong> (Liu et al., 2021) — window-based attention. Each block attends within a local window; alternating blocks shift the window to mix information across windows. Brings back a CNN-like locality prior while keeping the attention operator.</li>
+<li><strong>ConvNeXt</strong> (Liu et al., 2022) — redesigned CNN that matches Swin's architecture choices (depthwise convs, LayerNorm, GELU, inverted bottleneck). Showed that the gap is not &quot;attention vs convolution&quot; but &quot;modern training recipe + architecture.&quot;</li>
+</ul>
+<p>In 2026, ConvNeXt-V2 and Swin-V2 are both production-grade; the right choice depends on your inference stack (ConvNeXt compiles better for edge) and pretraining corpus.</p>
+<h3>MAE pretraining</h3>
+<p>Masked Autoencoder (He et al., 2022): mask 75% of patches at random, train the encoder to process only the visible 25%, train a small decoder to reconstruct the masked patches from the encoder's output. After pretraining, discard the decoder and fine-tune the encoder.</p>
+<p>MAE makes ViT trainable on ImageNet-1k alone, hits SOTA, and is the current default self-supervised recipe.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-10ee83b8178c3cc13188.png" alt="batchnorm-inference 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<h3>Step 1: Patch embedding</h3>
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+class PatchEmbedding(nn.Module):
+    def __init__(self, in_channels=3, patch_size=16, dim=192, image_size=64):
+        super().__init__()
+        assert image_size % patch_size == 0
+        self.proj = nn.Conv2d(in_channels, dim, kernel_size=patch_size, stride=patch_size)
+        num_patches = (image_size // patch_size) ** 2
+        self.num_patches = num_patches
+
+    def forward(self, x):
+        x = self.proj(x)
+        return x.flatten(2).transpose(1, 2)
+</code></pre>
+<p>One conv, one flatten, one transpose. That is the entire image-to-tokens step.</p>
+<h3>Step 2: Transformer block</h3>
+<p>Pre-LN, multi-head self-attention, MLP with GELU, residual connections.</p>
+<pre><code class="language-python">class Block(nn.Module):
+    def __init__(self, dim, num_heads, mlp_ratio=4, dropout=0.0):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
+        self.ln2 = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, dim * mlp_ratio),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim * mlp_ratio, dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x):
+        a, _ = self.attn(self.ln1(x), self.ln1(x), self.ln1(x), need_weights=False)
+        x = x + a
+        x = x + self.mlp(self.ln2(x))
+        return x
+</code></pre>
+<p><code>nn.MultiheadAttention</code> handles the splitting into heads, the scaled dot-product, and the output projection. <code>batch_first=True</code> so shapes are <code>(N, seq, dim)</code>.</p>
+<h3>Step 3: The ViT</h3>
+<pre><code class="language-python">class ViT(nn.Module):
+    def __init__(self, image_size=64, patch_size=16, in_channels=3,
+                 num_classes=10, dim=192, depth=6, num_heads=3, mlp_ratio=4):
+        super().__init__()
+        self.patch = PatchEmbedding(in_channels, patch_size, dim, image_size)
+        num_patches = self.patch.num_patches
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, dim))
+        self.blocks = nn.ModuleList([
+            Block(dim, num_heads, mlp_ratio) for _ in range(depth)
+        ])
+        self.ln = nn.LayerNorm(dim)
+        self.head = nn.Linear(dim, num_classes)
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+
+    def forward(self, x):
+        x = self.patch(x)
+        cls = self.cls_token.expand(x.size(0), -1, -1)
+        x = torch.cat([cls, x], dim=1)
+        x = x + self.pos_embed
+        for blk in self.blocks:
+            x = blk(x)
+        x = self.ln(x[:, 0])
+        return self.head(x)
+
+vit = ViT(image_size=64, patch_size=16, num_classes=10, dim=192, depth=6, num_heads=3)
+x = torch.randn(2, 3, 64, 64)
+print(f&quot;output: {vit(x).shape}&quot;)
+print(f&quot;params: {sum(p.numel() for p in vit.parameters()):,}&quot;)
+</code></pre>
+<p>About 2.8M parameters — a tiny ViT tractable on CPU. Real ViT-B is 86M; same class definition with <code>dim=768, depth=12, num_heads=12</code>.</p>
+<h3>Step 4: Sanity check — single image inference</h3>
+<pre><code class="language-python">logits = vit(torch.randn(1, 3, 64, 64))
+print(f&quot;logits: {logits}&quot;)
+print(f&quot;probs:  {logits.softmax(-1)}&quot;)
+</code></pre>
+<p>Should run without error. Probabilities sum to 1.</p>
+<h2>Use It</h2>
+<p><code>timm</code> ships every ViT variant with ImageNet pretrained weights. One line:</p>
+<pre><code class="language-python">import timm
+
+model = timm.create_model(&quot;vit_base_patch16_224&quot;, pretrained=True, num_classes=10)
+</code></pre>
+<p><code>timm</code> is the production default for vision transformers in 2026. Supports ViT, DeiT, Swin, Swin-V2, ConvNeXt, ConvNeXt-V2, MaxViT, MViT, EfficientFormer, and dozens of others under the same API.</p>
+<p>For multi-modal work (image + text), <code>transformers</code> ships CLIP, SigLIP, BLIP-2, LLaVA. The image encoder in all of those is a ViT variant.</p>
+<h2>Ship It</h2>
+<p>This lesson produces:</p>
+<ul>
+<li><code>outputs/prompt-vit-vs-cnn-picker.md</code> — a prompt that picks between a ViT, a ConvNeXt, or a Swin based on dataset size, compute, and inference stack.</li>
+<li><code>outputs/skill-vit-patch-and-pos-embed-inspector.md</code> — a skill that verifies a ViT's patch embedding and positional embedding shapes match the model's expected sequence length, catching the most common porting bugs.</li>
+</ul>
+<h2>Exercises</h2>
+<ol>
+<li><strong>(Easy)</strong> Print the shapes of every intermediate tensor for a forward pass through the tiny ViT above. Confirm: input <code>(N, 3, 64, 64)</code> -&gt; patches <code>(N, 16, 192)</code> -&gt; with CLS <code>(N, 17, 192)</code> -&gt; classifier input <code>(N, 192)</code> -&gt; output <code>(N, num_classes)</code>.</li>
+<li><strong>(Medium)</strong> Fine-tune a pretrained <code>timm</code> ViT-S/16 on the synthetic-CIFAR dataset from Lesson 4. Compare against ResNet-18 fine-tuning on the same data. Report training time and final accuracy.</li>
+<li><strong>(Hard)</strong> Implement MAE pretraining for the tiny ViT: mask 75% of patches, train the encoder + a small decoder to reconstruct the masked patches. Evaluate linear-probe accuracy on the synthetic data before and after pretraining.</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Patch embedding</td>
+<td>&quot;The first conv&quot;</td>
+<td>A conv with kernel size = stride = patch size; turns the image into a grid of token embeddings</td>
+</tr>
+<tr>
+<td>Class token</td>
+<td>&quot;[CLS]&quot;</td>
+<td>A learned vector prepended to the token sequence; its final output is the global image representation</td>
+</tr>
+<tr>
+<td>Positional embedding</td>
+<td>&quot;Learned pos&quot;</td>
+<td>A learned vector added to every token so the transformer knows where each patch came from</td>
+</tr>
+<tr>
+<td>Pre-LN</td>
+<td>&quot;LayerNorm before sublayer&quot;</td>
+<td>The stable transformer variant: <code>x + sublayer(LN(x))</code> instead of <code>LN(x + sublayer(x))</code></td>
+</tr>
+<tr>
+<td>Multi-head attention</td>
+<td>&quot;Parallel attention&quot;</td>
+<td>Standard transformer attention split into num_heads independent subspaces, concatenated afterwards</td>
+</tr>
+<tr>
+<td>ViT-B/16</td>
+<td>&quot;Base, patch 16&quot;</td>
+<td>The canonical size: dim=768, depth=12, heads=12, patch_size=16, image=224; ~86M params</td>
+</tr>
+<tr>
+<td>DeiT</td>
+<td>&quot;Data-efficient ViT&quot;</td>
+<td>ViT trained on ImageNet-1k alone with strong augmentation; proved large pretraining datasets are not strictly required</td>
+</tr>
+<tr>
+<td>MAE</td>
+<td>&quot;Masked autoencoder&quot;</td>
+<td>Self-supervised pretraining: mask 75% of patches, reconstruct; the dominant ViT pretraining recipe</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2010.11929" rel="noreferrer" data-network="true">An Image is Worth 16x16 Words (Dosovitskiy et al., 2020) <small>↗ 需要联网</small></a> — the ViT paper</li>
+<li><a href="https://arxiv.org/abs/2012.12877" rel="noreferrer" data-network="true">DeiT: Data-efficient Image Transformers (Touvron et al., 2020) <small>↗ 需要联网</small></a> — how to train ViT on ImageNet-1k alone</li>
+<li><a href="https://arxiv.org/abs/2111.06377" rel="noreferrer" data-network="true">Masked Autoencoders are Scalable Vision Learners (He et al., 2022) <small>↗ 需要联网</small></a> — MAE pretraining</li>
+<li><a href="https://huggingface.co/docs/timm" rel="noreferrer" data-network="true">timm documentation <small>↗ 需要联网</small></a> — the reference for every vision transformer you will use in production</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-04-computer-vision--14-vision-transformers.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-04-computer-vision--14-vision-transformers.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/04-computer-vision/14-vision-transformers/code/main.py">phases/04-computer-vision/14-vision-transformers/code/main.py</a><details><summary>查看原始文本</summary><pre><code>import torch
+import torch.nn as nn
+
+
+class PatchEmbedding(nn.Module):
+    def __init__(self, in_channels=3, patch_size=16, dim=192, image_size=64):
+        super().__init__()
+        assert image_size % patch_size == 0
+        self.proj = nn.Conv2d(in_channels, dim, kernel_size=patch_size, stride=patch_size)
+        self.num_patches = (image_size // patch_size) ** 2
+
+    def forward(self, x):
+        x = self.proj(x)
+        return x.flatten(2).transpose(1, 2)
+
+
+class Block(nn.Module):
+    def __init__(self, dim, num_heads, mlp_ratio=4, dropout=0.0):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
+        self.ln2 = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, dim * mlp_ratio),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim * mlp_ratio, dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x):
+        normed = self.ln1(x)
+        a, _ = self.attn(normed, normed, normed, need_weights=False)
+        x = x + a
+        x = x + self.mlp(self.ln2(x))
+        return x
+
+
+class ViT(nn.Module):
+    def __init__(self, image_size=64, patch_size=16, in_channels=3,
+                 num_classes=10, dim=192, depth=6, num_heads=3, mlp_ratio=4):
+        super().__init__()
+        self.patch = PatchEmbedding(in_channels, patch_size, dim, image_size)
+        num_patches = self.patch.num_patches
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, dim))
+        self.blocks = nn.ModuleList([Block(dim, num_heads, mlp_ratio) for _ in range(depth)])
+        self.ln = nn.LayerNorm(dim)
+        self.head = nn.Linear(dim, num_classes)
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+
+    def forward(self, x):
+        x = self.patch(x)
+        cls = self.cls_token.expand(x.size(0), -1, -1)
+        x = torch.cat([cls, x], dim=1)
+        x = x + self.pos_embed
+        for blk in self.blocks:
+            x = blk(x)
+        return self.head(self.ln(x[:, 0]))
+
+
+def main():
+    torch.manual_seed(0)
+    vit = ViT(image_size=64, patch_size=16, num_classes=10, dim=192, depth=6, num_heads=3)
+    x = torch.randn(2, 3, 64, 64)
+
+    patches = vit.patch(x)
+    print(f&quot;[shapes] input {tuple(x.shape)} -&gt; patches {tuple(patches.shape)}&quot;)
+    cls = vit.cls_token.expand(x.size(0), -1, -1)
+    tokens = torch.cat([cls, patches], dim=1)
+    print(f&quot;[shapes] tokens with CLS: {tuple(tokens.shape)}&quot;)
+    tokens = tokens + vit.pos_embed
+    print(f&quot;[shapes] after pos embed: {tuple(tokens.shape)}&quot;)
+    logits = vit(x)
+    print(f&quot;[shapes] output logits:   {tuple(logits.shape)}&quot;)
+    print(f&quot;[params] total: {sum(p.numel() for p in vit.parameters()):,}&quot;)
+
+    with torch.no_grad():
+        probs = logits.softmax(-1)
+    print(f&quot;[probs row 0 sum]: {probs[0].sum().item():.4f}&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/04-computer-vision/14-vision-transformers/outputs/prompt-vit-vs-cnn-picker.md">phases/04-computer-vision/14-vision-transformers/outputs/prompt-vit-vs-cnn-picker.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: prompt-vit-vs-cnn-picker
+description: Pick between ViT, ConvNeXt, or Swin based on dataset size, compute, and inference stack
+phase: 4
+lesson: 14
+---
+
+You are a vision backbone selector.
+
+## Inputs
+
+- `dataset_size`: number of labelled images (pretrained backbone assumed)
+- `input_resolution`: H x W
+- `inference_stack`: edge | mobile_nnapi | serverless | server_gpu | onnx_cpu | tensorrt
+- `task`: classification | detection | segmentation | embedding
+- `latency_sla`: optional target p95 latency in milliseconds; triggers latency-aware rules when present
+
+## Decision
+
+Rules fire top-down; first match wins. Inference-stack rules take priority over dataset-size rules because a deploy target that cannot run a given family is a hard constraint.
+
+1. `inference_stack == edge` or `inference_stack == mobile_nnapi` -&gt; **ConvNeXt-Tiny** or **EfficientNet-V2-S**. Transformers rarely compile well to NPUs.
+2. `task == detection` or `task == segmentation` -&gt; **Swin-V2-S/B** or **ConvNeXt-B**. Both provide feature pyramids cleanly.
+3. `inference_stack == onnx_cpu` -&gt; **ConvNeXt-V2-B**. Compiles better than ViT on CPU.
+4. `dataset_size &gt; 100k` and `inference_stack == server_gpu|tensorrt` -&gt; **ViT-B/16** MAE-pretrained.
+5. `10k &lt;= dataset_size &lt;= 100k` -&gt; **ConvNeXt-B** or **Swin-V2-B** with ImageNet-21k pretraining; ViT at this scale usually needs stronger augmentation to match.
+6. `dataset_size &lt; 10k` -&gt; whichever pretrained backbone has the strongest reported linear-probe on a similar dataset — usually DINOv2 ViT-B.
+
+## Output
+
+```
+[pick]
+  model:      &lt;specific name&gt;
+  pretrain:   ImageNet-21k | ImageNet-1k | MAE | DINOv2 | JFT
+  params:     &lt;approx&gt;
+  fine-tune:  linear_probe | full | discriminative_LR
+
+[reason]
+  one sentence
+
+[risks]
+  - &lt;ONNX conversion caveats if relevant&gt;
+  - &lt;edge NPU quantisation support&gt;
+  - &lt;small-dataset overfitting&gt;
+```
+
+## Rules
+
+- Never recommend a transformer backbone for `edge`/`mobile_nnapi` unless MobileViT is explicitly available.
+- For dense-prediction tasks (seg / det), prefer Swin or ConvNeXt over plain ViT — the hierarchical feature maps matter.
+- Do not recommend ViT-L or ViT-H for a task with fewer than 50k labelled images; choose the base size and save the compute.
+- If the user has a latency SLA, include a ballpark fps/latency estimate and flag if the pick will miss it.
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/04-computer-vision/14-vision-transformers/outputs/skill-vit-patch-and-pos-embed-inspector.md">phases/04-computer-vision/14-vision-transformers/outputs/skill-vit-patch-and-pos-embed-inspector.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: skill-vit-patch-and-pos-embed-inspector
+description: Verify a ViT&#39;s patch embedding and positional embedding shapes match the model&#39;s expected sequence length
+version: 1.0.0
+phase: 4
+lesson: 14
+tags: [vision-transformer, debugging, pytorch]
+---
+
+# ViT Patch and Positional Embedding Inspector
+
+The most common ViT porting bug: loading a checkpoint pretrained at 224x224 into a model configured for 384x384 (or vice versa). The positional embedding has the wrong sequence length and the model silently produces garbage.
+
+## When to use
+
+- Fine-tuning a pretrained ViT at a non-default resolution.
+- Auditing why a weight port between ViT-B/16 and ViT-B/32 fails; the inspector will flag the patch-size mismatch so the caller knows to swap architectures rather than force a port.
+- Debugging a ViT that loads without error but trains poorly.
+
+## Inputs
+
+- `model`: an instantiated ViT `nn.Module`.
+- `expected_image_size`: H x W the model will see in production.
+- `patch_size`: expected patch size.
+
+## Steps
+
+1. Locate the patch embedding conv inside the model. Report its `kernel_size`, `stride`, `in_channels`, `out_channels`.
+2. Compute the expected number of patches. For a square image: `(image_size / patch_size)^2`. For a rectangle: `(H / patch_size) * (W / patch_size)`. Require `H % patch_size == 0` and `W % patch_size == 0`; otherwise flag and refuse.
+3. Locate the learned positional embedding. Report its shape `(1, N, dim)`.
+4. Compare `N` against `num_patches + 1` (with CLS) or `num_patches` (without CLS). Mismatch means the checkpoint was pretrained at a different resolution or patch size.
+5. Check that `out_channels` of the patch conv equals `dim` of the positional embedding.
+6. If the model is supposed to interpolate positional embeddings for new resolutions, verify the interpolation utility exists (most `timm` ViTs do this automatically via `resize_pos_embed`).
+
+## Report
+
+```
+[vit-inspector]
+  image_size:         HxW
+  patch_size:         &lt;int&gt;
+  num_patches (computed): &lt;int&gt;
+  patch_conv:         k=&lt;int&gt;  s=&lt;int&gt;  in=&lt;int&gt;  out=&lt;int&gt;
+  pos_embed shape:    (1, N, dim)
+  has CLS token:      yes | no
+  pos_embed N:        &lt;int&gt;    expected: &lt;int&gt;
+  verdict:            ok | mismatch
+
+[if mismatch]
+  action:  reinitialise pos_embed for new sequence length
+  tool:    timm.models.vision_transformer.resize_pos_embed
+```
+
+## Rules
+
+- Never silently interpolate without warning; surface the action so the user knows the pretrained positional structure may have shifted.
+- If patch_size mismatches, refuse to recommend interpolation — swap to the correct architecture.
+- Do not try to fix the model in place; report and suggest.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. How does a ViT turn an image into a sequence of tokens?</legend><label class="option"><input type="radio" name="q0" value="0"> Applies a conv with kernel_size = stride = patch_size to split the image into non-overlapping patches and linearly project each to a token embedding in one operation</label><label class="option"><input type="radio" name="q0" value="1"> Flattens the entire image into one vector</label><label class="option"><input type="radio" name="q0" value="2"> Runs a CNN first and uses its feature map as tokens</label><label class="option"><input type="radio" name="q0" value="3"> Sorts pixel intensities</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. What is the [CLS] token in ViT and why is it needed?</legend><label class="option"><input type="radio" name="q1" value="0"> A placeholder for missing data</label><label class="option"><input type="radio" name="q1" value="1"> A special pixel value</label><label class="option"><input type="radio" name="q1" value="2"> A dropout mask</label><label class="option"><input type="radio" name="q1" value="3"> A learned vector prepended to the token sequence; after N transformer layers its output aggregates the whole image and feeds the classifier head</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. Why did the original ViT paper need JFT-300M pretraining to beat ResNet, and why does DeiT not?</legend><label class="option"><input type="radio" name="q2" value="0"> DeiT uses different attention</label><label class="option"><input type="radio" name="q2" value="1"> The ViT paper was wrong</label><label class="option"><input type="radio" name="q2" value="2"> ViT has weaker inductive biases than CNNs; without enough data it overfits. DeiT showed that with strong augmentation (RandAugment, Mixup, CutMix), stochastic depth, and optionally CNN distillation, ViTs train fine on ImageNet-1k alone</label><label class="option"><input type="radio" name="q2" value="3"> ViT is broken without JFT-300M</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. Pre-LayerNorm (`x = x + sublayer(LN(x))`) vs post-LayerNorm (`x = LN(x + sublayer(x))`) — which is used in modern transformers and why?</legend><label class="option"><input type="radio" name="q3" value="0"> Post-LN; it is simpler</label><label class="option"><input type="radio" name="q3" value="1"> Neither; modern transformers skip LayerNorm</label><label class="option"><input type="radio" name="q3" value="2"> Pre-LN; it trains deeper networks stably without learning-rate warmup and avoids the gradient instabilities that post-LN suffers past about 6 layers</label><label class="option"><input type="radio" name="q3" value="3"> They are identical</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. Swin Transformer introduces windowed attention. What problem does it solve?</legend><label class="option"><input type="radio" name="q4" value="0"> BatchNorm not supported</label><label class="option"><input type="radio" name="q4" value="1"> Overfitting to texture</label><label class="option"><input type="radio" name="q4" value="2"> Vanishing gradients</label><label class="option"><input type="radio" name="q4" value="3"> Full attention has O((H*W)^2) cost; Swin restricts attention to local windows of 7x7 patches, reducing cost to O(H*W * window^2). Alternating blocks shift the window by half its size so information eventually mixes across the image</label><p data-feedback="4"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/04-computer-vision/13-3d-vision-nerf/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/04-computer-vision/15-real-time-edge/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/04-computer-vision/14-vision-transformers/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

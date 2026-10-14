@@ -1,0 +1,1595 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>规模化:分布式培训,FSDP,深度速度 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-10-llms-from-scratch" data-lesson="10-llms-from-scratch/05-scaling-distributed" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/10-llms-from-scratch/">从零构建大语言模型</a> / LESSON 05</p><h1 class="lesson-title">规模化:分布式培训,FSDP,深度速度</h1><p>Scaling: Distributed Training, FSDP, DeepSpeed</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>规模化:分布式培训,FSDP,深度速度</h1>
+<blockquote>
+<p>现在试试70亿参数,模型不适合内存,数据需要几周的时间,在单个机器上.分布式训练不是可选的.这是唯一的途径.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 10, Lesson 04 (Pre-Training a Mini GPT)
+<strong>Time:</strong> ~120 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>解释三个类型的平行性 (数据,子,管道) 以及每种类型的必要性,根据模型和集群大小</li>
+<li>使用 PyTorch DDP 实现数据平行训练,并通过多个GPU进行梯度同步</li>
+<li>计算给定模型大小的内存预算 (重量+优化状态+梯度+激活) 确定最小硬件</li>
+<li>配置FSDP或DeepSpeed ZeRO阶段,将模型状态分成GPU和超越单GPU内存的适应模型</li>
+</ul>
+<h2>问题</h2>
+<p>在FP16中,一个7B参数模型只需要14GB的权重.亚当优化器存储每个参数的两个额外副本 (第一和第二时刻估计).这又是28GB.后延的基梯子增加了14GB.在单次激活之前,您在56GB上存储.</p>
+<p>现在,NVIDIA A100的内存是80GB.</p>
+<p>消耗的80GB中56GB.这使得激活的数量24GB,在前进传递过程中计算的中间值,必须保持活跃,以便向后传播.在4096维模型中的2048代币序列中,单层激活的数量约为64MB.在32层中,你需要每样本的2GB.</p>
+<p>现在试试70B参数. 单独的重量:FP16中的140GB. 不适合一个GPU. 仅仅需要保持重量,至少需要2个A100 (2 x 80GB = 160GB). 添加优化状态和梯度,你需要更多的:3+GPU最小,而实际上8-16取决于碎片策略.</p>
+<p>拉马3405B使用了16,384个NVIDIAH100GPU.<span class="katex"><span class="katex-mathml"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>100</mn><mi>m</mi><mi>i</mi><mi>l</mi><mi>l</mi><mi>i</mi><mi>o</mi><mi>n</mi><mi>i</mi><mi>n</mi><mi>c</mi><mi>o</mi><mi>m</mi><mi>p</mi><mi>u</mi><mi>t</mi><mi>e</mi><mi mathvariant="normal">.</mi><mi>D</mi><mi>e</mi><mi>e</mi><mi>p</mi><mi>S</mi><mi>e</mi><mi>e</mi><mi>k</mi><mi>V</mi><mn>3</mn><mi>t</mi><mi>r</mi><mi>a</mi><mi>i</mi><mi>n</mi><mi>e</mi><mi>d</mi><mi>a</mi><mi>c</mi><mi>o</mi><mi>m</mi><mi>p</mi><mi>a</mi><mi>r</mi><mi>a</mi><mi>b</mi><mi>l</mi><mi>e</mi><mi>m</mi><mi>o</mi><mi>d</mi><mi>e</mi><mi>l</mi><mi>f</mi><mi>o</mi><mi>r</mi><mi>r</mi><mi>o</mi><mi>u</mi><mi>g</mi><mi>h</mi><mi>l</mi><mi>y</mi></mrow><annotation encoding="application/x-tex">100 million in compute. DeepSeek V3 trained a comparable model for roughly </annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="katex-base"><span class="katex-strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord">100</span><span class="mord mathnormal">mi</span><span class="mord mathnormal" style="margin-right:0.0197em;">l</span><span class="mord mathnormal" style="margin-right:0.0197em;">l</span><span class="mord mathnormal">i</span><span class="mord mathnormal">o</span><span class="mord mathnormal">nin</span><span class="mord mathnormal">co</span><span class="mord mathnormal">m</span><span class="mord mathnormal">p</span><span class="mord mathnormal">u</span><span class="mord mathnormal">t</span><span class="mord mathnormal">e</span><span class="mord">.</span><span class="mord mathnormal" style="margin-right:0.0278em;">D</span><span class="mord mathnormal">ee</span><span class="mord mathnormal" style="margin-right:0.0576em;">pS</span><span class="mord mathnormal">ee</span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mord mathnormal" style="margin-right:0.2222em;">V</span><span class="mord">3</span><span class="mord mathnormal">t</span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="mord mathnormal">ain</span><span class="mord mathnormal">e</span><span class="mord mathnormal">d</span><span class="mord mathnormal">a</span><span class="mord mathnormal">co</span><span class="mord mathnormal">m</span><span class="mord mathnormal">p</span><span class="mord mathnormal">a</span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="mord mathnormal">ab</span><span class="mord mathnormal" style="margin-right:0.0197em;">l</span><span class="mord mathnormal">e</span><span class="mord mathnormal">m</span><span class="mord mathnormal">o</span><span class="mord mathnormal">d</span><span class="mord mathnormal">e</span><span class="mord mathnormal" style="margin-right:0.0197em;">l</span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="mord mathnormal" style="margin-right:0.0278em;">or</span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="mord mathnormal">o</span><span class="mord mathnormal" style="margin-right:0.0359em;">ug</span><span class="mord mathnormal">h</span><span class="mord mathnormal" style="margin-right:0.0197em;">l</span><span class="mord mathnormal" style="margin-right:0.0359em;">y</span></span></span></span>5,6亿通过对建筑 (专家混合意味着每代币只能激活一小部分参数) 和训练效率.</p>
+<p>本课程涵盖了使大规模训练成为可能的四种策略:数据平行,子平行,管道平行和完全碎片化的数据平行.</p>
+<h2>概念</h2>
+<h3>为什么需要分发</h3>
+<p>现在我们要做的是记忆模型的数学,每个数字都是计算的,而不是估算的.</p>
+<table>
+<thead>
+<tr>
+<th>Model</th>
+<th>Params</th>
+<th>Weights (FP16)</th>
+<th>Adam States</th>
+<th>Gradients (FP16)</th>
+<th>Total (no activations)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GPT-2 Small</td>
+<td>124M</td>
+<td>248 MB</td>
+<td>992 MB</td>
+<td>248 MB</td>
+<td>1.5 GB</td>
+</tr>
+<tr>
+<td>Llama 3 8B</td>
+<td>8B</td>
+<td>16 GB</td>
+<td>64 GB</td>
+<td>16 GB</td>
+<td>96 GB</td>
+</tr>
+<tr>
+<td>Llama 3 70B</td>
+<td>70B</td>
+<td>140 GB</td>
+<td>560 GB</td>
+<td>140 GB</td>
+<td>840 GB</td>
+</tr>
+<tr>
+<td>Llama 3 405B</td>
+<td>405B</td>
+<td>810 GB</td>
+<td>3,240 GB</td>
+<td>810 GB</td>
+<td>4,860 GB</td>
+</tr>
+</tbody>
+</table>
+<p>亚当状态列是杀手.亚当为每个参数存储运行平均值 (m) 和运行变量 (v).对于70B模型,这为70B x 4字节 x 2 = 560GB.</p>
+<p>一个H100拥有80GB.Llama 3 405B需要至少61个H100来控制权重,优化器和梯度.加上激活,数量会进一步增加.Meta使用了16384个GPU,不是因为他们想要,因为他们必须.</p>
+<h3>数据平行</h3>
+<p>简单的分布式策略.将整个模型复制成NGPU.将每个训练批量分为N等部分.每个GPU在数据片段上运行前后传递.后传递后,平均所有GPU的梯度.每个GPU更新其重量副本,保持所有副本的同步.</p>
+<p>**The good:**线性吞吐量扩展.NGPU每步处理N倍的数据.通信仅限于梯度平均值,它与计算重叠.</p>
+<p>**The bad:**每个GPU都包含模型的完整副本,优化状态和梯度.对于70B模型,每个GPU需要840GB.数据平行化没有任何作用,以减少每GPU内存.它只减少了训练时间.</p>
+<p>**The math:**有效批量大小 = per_gpu_batch_size x N.对于每GPU批量为16个GPU的N=64GPU,有效批量为1,024. Llama 3使用了每步的有效批量大小为1600万代币.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-bbf030ef7a02a5855731.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>度平行</h3>
+<p>分开 GPU 之间单个层次.单个矩阵乘法被分为 GPU 之间,每个计算结果的部分.</p>
+<p>考虑一个重量矩阵 (8192,8192) 在一个输送前进层.通过4个方向的子平行性,每个GPU都保持一个 (8192,2048) 片段.每个GPU乘以其片段输入,产生部分结果.部分结果被结合 (通过全部减小或全部收集) 来产生全部输出.</p>
+<p>**The good:**减少模型重量的每GPU内存. 70B模型分为8个GPU,意味着每个GPU都具有8.75B参数的重量.</p>
+<p>**The bad:**每层后都需要快速的GPU间通信.每层后的全减后每 matmul增加延迟.这与NVLink (900GB/s在同一节点的GPU之间) 运作良好,但通过InfiniBand (400GB/s,约50GB/s) 连接的节点之间不太好.紧张平行几乎总是局限于单个节点 (8GPU) 内.</p>
+<p>**Real usage:**梅加特龙-LM是子平行论的先驱.Llama 3 405B使用每个节点内的8个方向子平行论.</p>
+<h3>管道平行</h3>
+<p>按层次分类模型.GPU 1运行层次1-8.GPU 2运行层次9-16.GPU 3运行层次17-24.GPU 4运行层次25-32.数据通过管道流动:GPU 1计算其层次,并发送激活到GPU 2,该层次计算并发送到GPU 3,等.</p>
+<p><strong>The good:</strong> GPU 之间的通信最小,只是在层边界的激活,这些激活与梯度或重量相比较小.</p>
+<p>**The bad:**管道泡.当GPU4计算了微批次1的前进传递时,GPU1,2和3是空置的 (它们已经转发了部分).在后进传递时,模式反转.在天真的管道线下,GPU的使用率为N管道阶段的1/N.</p>
+<p><strong>GPipe and PipeDream</strong>通过分批量为微批量来解决泡问题.GPU 1 在转发微批量完成后就开始在微批量 2 上启动.这在管道阶段之间进行计算重叠.在M微批量和N阶段时,泡分数降至 (N-1) /M.使用M=16个微批量,N=4个阶段,泡为3/16=18.75%的空置时间.</p>
+<h3>FSDP:完全分碎的数据并行</h3>
+<p>FSDP 结合数据平行化的扩展性和碎片化的内存效率.而不是每个GPU都持有模型的完整副本,每个GPU只持有1/N的参数,梯度和优化状态.</p>
+<p>在一个层向前传递之前,FSDP运行一个<strong>all-gather</strong>后续传输后,每个GPU都会丢弃非本地参数.在倒退期间,全集再次运行,以重建梯度计算参数.<strong>reduce-scatter</strong>它们只存储1 N的梯度.</p>
+<p><strong>The math for a 70B model on 8 GPUs:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Without FSDP</th>
+<th>With FSDP</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Weights (FP16)</td>
+<td>140 GB per GPU</td>
+<td>17.5 GB per GPU</td>
+</tr>
+<tr>
+<td>Adam States (FP32)</td>
+<td>560 GB per GPU</td>
+<td>70 GB per GPU</td>
+</tr>
+<tr>
+<td>Gradients (FP16)</td>
+<td>140 GB per GPU</td>
+<td>17.5 GB per GPU</td>
+</tr>
+<tr>
+<td><strong>Total</strong></td>
+<td><strong>840 GB per GPU</strong></td>
+<td><strong>105 GB per GPU</strong></td>
+</tr>
+</tbody>
+</table>
+<p>没有FSDP,你不能安装70B模型在一个80GB的GPU上.在8GB的GPU上,FSDP每个GPU使用105GB - 等,这仍然不合适.你需要至少16个GPU以达到80GB以下的GPU,或者你将FSDP与激活检查组合在一起 (反向的激活度重新计算,而不是存储它们).</p>
+<p>由于每个层前的全部收集,通信成本比尼拉数据平行性更高.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-d8212a29513d7b868c4b.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>极速飞行器</h3>
+<p>根据概念,DeepSpeed的Zero Redundancy Optimizer与FSDP相同,但由微软独立开发.它定义了三个阶段,每个阶段更积极地分化:</p>
+<table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>Shards</th>
+<th>Memory Savings</th>
+<th>Communication</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ZeRO-1</td>
+<td>Optimizer states only</td>
+<td>~4x reduction</td>
+<td>Same as data parallel</td>
+</tr>
+<tr>
+<td>ZeRO-2</td>
+<td>+ Gradients</td>
+<td>~8x reduction</td>
+<td>Slightly more</td>
+</tr>
+<tr>
+<td>ZeRO-3</td>
+<td>+ Parameters</td>
+<td>~Nx reduction (N GPUs)</td>
+<td>All-gather per layer</td>
+</tr>
+</tbody>
+</table>
+<p>泽罗-3与FSDP相当.名称不同,机制相同.PyTorch在DeepSpeed证明了这个概念后,添加了FSDP作为本土实现.</p>
+<p>速也引入了ZERO-Offload (对CPU RAM进行卸载优化状态,这是更便宜和更大的) 和ZERO-Infinity (对NVMe SSD进行卸载).这些交易计算速度用于内存容量 - - 卸载操作更慢,但释放了GPU内存.</p>
+<h3>混合精准训练</h3>
+<p>现代训练同时使用多种浮点格式:</p>
+<ul>
+<li><strong>Forward pass</strong>子在子核上运行速度是两倍.</li>
+<li><strong>Master weights</strong>: FP32 (32位). 在重量更新期间,优化器保持数值精度.</li>
+<li><strong>Loss scaling</strong>乘以后向前一个大常数,以防止FP16梯度下流到零. 在优化步骤前乘以相同的常数.</li>
+</ul>
+<p>BF16 (Brain Float 16) 与 FP32 (8个指数位) 的指数范围相同,但精度降低 (7个 mantissa 位与 FP32 的23).它很少需要损失扩展,因为它可以代表相同的值范围. FP16 有5个指数位和10个 mantissa 位 - 它可以代表细粒度的值,但在极端大小下流过/下流.</p>
+<p>谷歌的TPU使用BF16本土.NVIDIA的A100和H100支持FP16和BF16.该行业已大大转向BF16,因为它消除了损失缩小头痛.</p>
+<p><strong>Memory comparison for a 7B model:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Precision</th>
+<th>Weights</th>
+<th>Optimizer</th>
+<th>Gradients</th>
+<th>Total</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>FP32 everywhere</td>
+<td>28 GB</td>
+<td>56 GB</td>
+<td>28 GB</td>
+<td>112 GB</td>
+</tr>
+<tr>
+<td>Mixed (BF16 + FP32 master)</td>
+<td>14 GB</td>
+<td>56 GB</td>
+<td>14 GB</td>
+<td>84 GB</td>
+</tr>
+</tbody>
+</table>
+<p>混合精度节省了28GB的存储量. 优化器状态不管是32FP,这是大部分内存的位置.</p>
+<h3>光电和3D平行</h3>
+<p>实际的大规模培训结合了三个平行:</p>
+<ul>
+<li><strong>Data parallelism</strong>通过节点组 (批量规模)</li>
+<li><strong>Tensor parallelism</strong>在一个节点内 (分开8个GPU的层)</li>
+<li><strong>Pipeline parallelism</strong>通过节点 (在机器之间分层组)</li>
+</ul>
+<p>拉马3405B在16384辆H100上:</p>
+<ul>
+<li>每个节点内的8个向子平行性 (8个GPU每个节点)</li>
+<li>节点间16个路管道平行性 (16个管道阶段)</li>
+<li>剩余维度的128个方向数据平行 (16,384 / 8 / 16 = 128)</li>
+</ul>
+<p>这种3D分解 (8 x 16 x 128 = 16,384) 是你如何扩展到数千个GPU.每个GPU看到不同的数据片段 (数据平行),保持每个层的一片 (ensor平行),并计算不同的层集 (管道平行).</p>
+<p>它们的专家组合架构每代币只激活了671B参数中的37B.这意味着每个GPU只需要计算 (并存储激活) 活跃参数. 他们训练了2,048个H800GPU - 比Meta的GPU数量少于1/8 -<span class="katex"><span class="katex-mathml"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>5.6</mn><mi>M</mi><mi>v</mi><mi>s</mi><mi>M</mi><mi>e</mi><mi>t</mi><msup><mi>a</mi><mo mathvariant="normal" lspace="0em" rspace="0em">′</mo></msup><mi>s</mi><mi>e</mi><mi>s</mi><mi>t</mi><mi>i</mi><mi>m</mi><mi>a</mi><mi>t</mi><mi>e</mi><mi>d</mi></mrow><annotation encoding="application/x-tex">5.6M vs Meta&#x27;s estimated </annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="katex-base"><span class="katex-strut" style="height:0.7519em;"></span><span class="mord">5.6</span><span class="mord mathnormal" style="margin-right:0.109em;">M</span><span class="mord mathnormal" style="margin-right:0.0359em;">v</span><span class="mord mathnormal">s</span><span class="mord mathnormal" style="margin-right:0.109em;">M</span><span class="mord mathnormal">e</span><span class="mord mathnormal">t</span><span class="mord"><span class="mord mathnormal">a</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.7519em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="katex-sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">′</span></span></span></span></span></span></span></span></span><span class="mord mathnormal">ses</span><span class="mord mathnormal">t</span><span class="mord mathnormal">ima</span><span class="mord mathnormal">t</span><span class="mord mathnormal">e</span><span class="mord mathnormal">d</span></span></span></span>百米.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-955c994286885619593b.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><figure><img src="/learn/ai-from-scratch/figures/figure-cd8d1bc067850ea179f5.png" alt="paged-kv-cache 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<h3>步骤1:模拟数据平行</h3>
+<p>按图像组分成模拟GPU.每个GPU计算其碎片的前进传输.平均&quot;梯度&quot; (我们模拟它们为损失值).</p>
+<pre><code class="language-python">import numpy as np
+
+def simulate_data_parallelism(data, num_gpus, model_fn):
+    batch_size = len(data)
+    shard_size = batch_size // num_gpus
+    remainder = batch_size % num_gpus
+
+    gpu_losses = []
+    gpu_gradients = []
+
+    offset = 0
+    for gpu_id in range(num_gpus):
+        extra = 1 if gpu_id &lt; remainder else 0
+        shard = data[offset:offset + shard_size + extra]
+        offset += shard_size + extra
+
+        loss, grad = model_fn(shard)
+        gpu_losses.append(loss)
+        gpu_gradients.append(grad)
+
+    avg_loss = np.mean(gpu_losses)
+    avg_gradient = np.mean(gpu_gradients, axis=0)
+
+    return avg_loss, avg_gradient
+</code></pre>
+<p>完全降低操作 (平均梯度) 是数据平行性唯一的通信. 在实践中,这使用了NVIDIA GPU上的NCCL库,该系统实现了环全减:每个 GPU 将1/N的梯度发送给邻居,从另一个邻居接收1/N,并在N-1步骤后每个 GPU 得到了完整的平均值. 通信总体: 2 x gradient_size x (N-1)/N,接近大 N 的 gradient 尺寸的 2x</p>
+<h3>步骤 2:模拟度平行</h3>
+<p>每个GPU计算一个部分矩阵乘法. 结合结果.</p>
+<pre><code class="language-python">def simulate_tensor_parallelism(input_data, weight_matrix, num_gpus):
+    d_in, d_out = weight_matrix.shape
+    assert d_out % num_gpus == 0, f&quot;d_out {d_out} not divisible by num_gpus {num_gpus}&quot;
+    shard_size = d_out // num_gpus
+
+    partial_results = []
+    for gpu_id in range(num_gpus):
+        start = gpu_id * shard_size
+        end = start + shard_size
+        weight_shard = weight_matrix[:, start:end]
+
+        partial = input_data @ weight_shard
+        partial_results.append(partial)
+
+    full_output = np.concatenate(partial_results, axis=-1)
+
+    direct_output = input_data @ weight_matrix
+    error = np.abs(full_output - direct_output).max()
+
+    return full_output, error
+</code></pre>
+<p>错误应该是完全零 (或机器的epsilon).电压平行是数学上精确的 - 它产生与计算一个GPU上的全matmul相同的结果. 分裂沿着输出维度,所以每个GPU产生不同的列,和连锁重建完整的结果.</p>
+<p>在一个变压器 FFN 中,第一个线性 (扩展) 使用列式并行,第二个线性 (合同) 使用列式并行. 这避免了两层之间的全部减少.</p>
+<h3>步骤3:模拟管道平行</h3>
+<p>显示泡问题,早期阶段停留在空中,而后期阶段计算.</p>
+<pre><code class="language-python">def simulate_pipeline_parallelism(num_layers, num_stages, num_microbatches):
+    layers_per_stage = num_layers // num_stages
+
+    timeline = {}
+    clock = 0
+
+    for mb in range(num_microbatches):
+        for stage in range(num_stages):
+            start_time = max(
+                timeline.get((stage, mb - 1, &quot;fwd&quot;), (0, 0))[1] if mb &gt; 0 else 0,
+                timeline.get((stage - 1, mb, &quot;fwd&quot;), (0, 0))[1] if stage &gt; 0 else 0,
+            )
+            end_time = start_time + layers_per_stage
+            timeline[(stage, mb, &quot;fwd&quot;)] = (start_time, end_time)
+
+    last_fwd_end = max(v[1] for v in timeline.values())
+
+    for mb in range(num_microbatches - 1, -1, -1):
+        for stage in range(num_stages - 1, -1, -1):
+            deps = [last_fwd_end]
+            if mb &lt; num_microbatches - 1 and (stage, mb + 1, &quot;bwd&quot;) in timeline:
+                deps.append(timeline[(stage, mb + 1, &quot;bwd&quot;)][1])
+            if stage &lt; num_stages - 1 and (stage + 1, mb, &quot;bwd&quot;) in timeline:
+                deps.append(timeline[(stage + 1, mb, &quot;bwd&quot;)][1])
+            start_time = max(deps)
+            end_time = start_time + layers_per_stage
+            timeline[(stage, mb, &quot;bwd&quot;)] = (start_time, end_time)
+
+    total_time = max(v[1] for v in timeline.values())
+    compute_time = num_microbatches * num_stages * layers_per_stage * 2
+    bubble_fraction = 1.0 - compute_time / (total_time * num_stages)
+
+    return timeline, total_time, bubble_fraction
+</code></pre>
+<p>通过4个阶段和1个微批,泡分数为75% - - 每四个GPU中的三个在任何时候都会置. 16个微批,它会下降到19%.消除泡的成本是内存:你必须同时存储所有飞行中的微批的激活.</p>
+<h3>步骤4: 记忆计算器</h3>
+<p>计算训练任何模型尺寸的精确的内存需求.</p>
+<pre><code class="language-python">def memory_calculator(
+    params_billions,
+    precision_bytes=2,
+    optimizer=&quot;adam&quot;,
+    num_gpus=1,
+    sharding=&quot;none&quot;,
+    sequence_length=2048,
+    batch_size_per_gpu=1,
+    hidden_dim=None,
+    num_layers=None,
+):
+    params = params_billions * 1e9
+
+    weight_memory = params * precision_bytes
+
+    if optimizer == &quot;adam&quot;:
+        optimizer_memory = params * 4 * 2
+    elif optimizer == &quot;sgd&quot;:
+        optimizer_memory = params * 4
+    else:
+        optimizer_memory = 0
+
+    gradient_memory = params * precision_bytes
+
+    total_no_activation = weight_memory + optimizer_memory + gradient_memory
+
+    if hidden_dim and num_layers:
+        activation_per_layer = (
+            sequence_length * batch_size_per_gpu * hidden_dim * precision_bytes * 4
+        )
+        activation_memory = activation_per_layer * num_layers
+    else:
+        activation_memory = params * precision_bytes * 0.5
+
+    if sharding == &quot;fsdp&quot; or sharding == &quot;zero3&quot;:
+        weight_memory /= num_gpus
+        optimizer_memory /= num_gpus
+        gradient_memory /= num_gpus
+    elif sharding == &quot;zero2&quot;:
+        optimizer_memory /= num_gpus
+        gradient_memory /= num_gpus
+    elif sharding == &quot;zero1&quot;:
+        optimizer_memory /= num_gpus
+
+    per_gpu_total = weight_memory + optimizer_memory + gradient_memory + activation_memory
+
+    return {
+        &quot;params_billions&quot;: params_billions,
+        &quot;weights_gb&quot;: weight_memory / 1e9,
+        &quot;optimizer_gb&quot;: optimizer_memory / 1e9,
+        &quot;gradients_gb&quot;: gradient_memory / 1e9,
+        &quot;activations_gb&quot;: activation_memory / 1e9,
+        &quot;per_gpu_total_gb&quot;: per_gpu_total / 1e9,
+        &quot;total_across_gpus_gb&quot;: per_gpu_total * num_gpus / 1e9,
+        &quot;fits_on_80gb&quot;: per_gpu_total / 1e9 &lt;= 80,
+        &quot;num_gpus&quot;: num_gpus,
+        &quot;sharding&quot;: sharding,
+    }
+</code></pre>
+<p>这台计算器回答了每一个ML工程师问的问题:&quot;我需要多少GPU?&quot;给它提供模型大小,看看它是否适合. juste 分片策略直到每GPU总量下降到80GB以下.</p>
+<h3>步骤5:混合精密模拟</h3>
+<p>进行FP32,FP16和混合精度训练之间的内存使用比较.</p>
+<pre><code class="language-python">def mixed_precision_comparison(params_billions):
+    params = params_billions * 1e9
+
+    fp32_weights = params * 4
+    fp32_optimizer = params * 4 * 2
+    fp32_gradients = params * 4
+    fp32_total = fp32_weights + fp32_optimizer + fp32_gradients
+
+    fp16_weights = params * 2
+    fp16_master = params * 4
+    fp16_optimizer = params * 4 * 2
+    fp16_gradients = params * 2
+    fp16_total = fp16_weights + fp16_master + fp16_optimizer + fp16_gradients
+
+    mixed_weights = params * 2
+    mixed_optimizer = params * 4 * 2
+    mixed_gradients = params * 2
+    mixed_total = mixed_weights + mixed_optimizer + mixed_gradients
+
+    return {
+        &quot;fp32_total_gb&quot;: fp32_total / 1e9,
+        &quot;fp16_with_master_gb&quot;: fp16_total / 1e9,
+        &quot;mixed_bf16_gb&quot;: mixed_total / 1e9,
+        &quot;savings_vs_fp32&quot;: 1 - mixed_total / fp32_total,
+    }
+</code></pre>
+<p>对于大多数人来说,最大的惊喜是:混合精度不会减半内存.优化器状态 (亚当的m和v) 无论精度如何都保持在FP32.对于7B模型,FP32训练使用112GB.混合精度使用84GB.这意味着25%的减少,而不是50%.优化器占主导地位.</p>
+<h2>用它</h2>
+<h3>运行所有模拟</h3>
+<pre><code class="language-python">def run_all_demos():
+    print(&quot;=&quot; * 70)
+    print(&quot;DATA PARALLELISM SIMULATION&quot;)
+    print(&quot;=&quot; * 70)
+
+    np.random.seed(42)
+    data = np.random.randn(64, 32)
+    weight = np.random.randn(32, 16)
+
+    def model_fn(batch):
+        output = batch @ weight
+        loss = np.mean(output ** 2)
+        grad = 2 * batch.T @ (batch @ weight) / len(batch)
+        return loss, grad
+
+    for n_gpus in [1, 2, 4, 8]:
+        loss, grad = simulate_data_parallelism(data, n_gpus, model_fn)
+        print(f&quot;  {n_gpus} GPUs: loss={loss:.4f}, grad_norm={np.linalg.norm(grad):.4f}&quot;)
+
+    print()
+    print(&quot;=&quot; * 70)
+    print(&quot;TENSOR PARALLELISM SIMULATION&quot;)
+    print(&quot;=&quot; * 70)
+
+    x = np.random.randn(4, 8192)
+    W = np.random.randn(8192, 8192)
+
+    for n_gpus in [1, 2, 4, 8]:
+        output, error = simulate_tensor_parallelism(x, W, n_gpus)
+        print(f&quot;  {n_gpus} GPUs: output_shape={output.shape}, max_error={error:.2e}&quot;)
+
+    print()
+    print(&quot;=&quot; * 70)
+    print(&quot;PIPELINE PARALLELISM SIMULATION&quot;)
+    print(&quot;=&quot; * 70)
+
+    for n_mb in [1, 4, 8, 16, 32]:
+        _, total_t, bubble = simulate_pipeline_parallelism(32, 4, n_mb)
+        print(f&quot;  {n_mb:2d} micro-batches: total_time={total_t:4d}, bubble={bubble:.1%}&quot;)
+
+    print()
+    print(&quot;=&quot; * 70)
+    print(&quot;MEMORY CALCULATOR&quot;)
+    print(&quot;=&quot; * 70)
+
+    configs = [
+        (7, &quot;none&quot;, 1),
+        (7, &quot;fsdp&quot;, 8),
+        (70, &quot;none&quot;, 1),
+        (70, &quot;fsdp&quot;, 8),
+        (70, &quot;fsdp&quot;, 16),
+        (405, &quot;fsdp&quot;, 64),
+        (405, &quot;fsdp&quot;, 128),
+    ]
+
+    print(f&quot;  {'Model':&gt;8} {'Sharding':&gt;8} {'GPUs':&gt;5} {'Per-GPU':&gt;10} {'Fits 80GB':&gt;10}&quot;)
+    print(&quot;  &quot; + &quot;-&quot; * 50)
+    for params, shard, gpus in configs:
+        result = memory_calculator(params, num_gpus=gpus, sharding=shard)
+        fits = &quot;Yes&quot; if result[&quot;fits_on_80gb&quot;] else &quot;No&quot;
+        print(f&quot;  {params:&gt;6}B {shard:&gt;8} {gpus:&gt;5} {result['per_gpu_total_gb']:&gt;8.1f}GB {fits:&gt;10}&quot;)
+
+    print()
+    print(&quot;=&quot; * 70)
+    print(&quot;MIXED PRECISION COMPARISON&quot;)
+    print(&quot;=&quot; * 70)
+
+    for params_b in [7, 13, 70, 405]:
+        result = mixed_precision_comparison(params_b)
+        print(f&quot;  {params_b}B: FP32={result['fp32_total_gb']:.0f}GB, &quot;
+              f&quot;Mixed BF16={result['mixed_bf16_gb']:.0f}GB, &quot;
+              f&quot;Savings={result['savings_vs_fp32']:.0%}&quot;)
+</code></pre>
+<h2>运送它</h2>
+<p>这一课产生了<code>outputs/prompt-distributed-training-planner.md</code>-- 提示需要模型尺寸和可用的硬件,然后生成一个完整的分布式培训计划:平行战略,内存预算,通信总费和预期吞吐量.</p>
+<h2>运动</h2>
+<ol>
+<li>
+<p>修改记忆计算器,以包括激活检查点. 检查点,只在每个K-th层 (典型的K=1,这意味着重新计算所有) 上存活点. 显示记忆-计算的权衡:检查点节省多少记忆,并且它会减慢训练的速度 (大约33%更多的计算为完整的检查点)?</p>
+</li>
+<li>
+<p>扩展管道平行模拟,实现PipeDream使用的1F1B (一向前,一向后) 时间表.将泡分数与4个阶段和8个微批的天真时间表进行比较. 1F1B时间表应该具有较小的峰值内存,因为它更早开始向后传递.</p>
+</li>
+<li>
+<p>实现梯度积累模拟器.在每个微批次之后,不要把梯度全部减少,而是把梯度集中在K步骤中,然后把梯度全部减少.</p>
+</li>
+<li>
+<p>根据模型大小,目标代币数量,GPU类型 (A100在 <span class="katex"><span class="katex-mathml"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>2</mn><mi mathvariant="normal">/</mi><mi>h</mi><mi>r</mi><mo separator="true">,</mo><mi>H</mi><mn>100</mn><mi>a</mi><mi>t</mi></mrow><annotation encoding="application/x-tex">2/hr, H100 at </annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="katex-base"><span class="katex-strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">2/</span><span class="mord mathnormal">h</span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.0813em;">H</span><span class="mord">100</span><span class="mord mathnormal">a</span><span class="mord mathnormal">t</span></span></span></span>根据已知成本的验证:据报道,Llama 3 405B 成本~<span class="katex"><span class="katex-mathml"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>100</mn><mi>M</mi><mo separator="true">,</mo><mi>D</mi><mi>e</mi><mi>e</mi><mi>p</mi><mi>S</mi><mi>e</mi><mi>e</mi><mi>k</mi><mi>V</mi><mn>3</mn><mi>c</mi><mi>o</mi><mi>s</mi><mi>t</mi><mtext> </mtext></mrow><annotation encoding="application/x-tex">100M, DeepSeek V3 cost ~</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="katex-base"><span class="katex-strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord">100</span><span class="mord mathnormal" style="margin-right:0.109em;">M</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">D</span><span class="mord mathnormal">ee</span><span class="mord mathnormal" style="margin-right:0.0576em;">pS</span><span class="mord mathnormal">ee</span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mord mathnormal" style="margin-right:0.2222em;">V</span><span class="mord">3</span><span class="mord mathnormal">cos</span><span class="mord mathnormal">t</span><span class="mspace nobreak"> </span></span></span></span>五,六米.</p>
+</li>
+<li>
+<p>加入ZERO-Offload到内存计算器.假设CPU RAM为每节点512GB,NVMe为2TB. 显示如何将优化器卸载到CPU允许70B模型在16个 GPU的时间里训练4个 GPU,而不是30-50%慢的优化器步骤.</p>
+</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Data parallelism</td>
+<td>&quot;Copy the model to every GPU&quot;</td>
+<td>Each GPU processes a different data shard; gradients are averaged via all-reduce after each step</td>
+</tr>
+<tr>
+<td>Tensor parallelism</td>
+<td>&quot;Split a layer across GPUs&quot;</td>
+<td>Partition weight matrices so each GPU computes part of the matmul; requires fast NVLink interconnect</td>
+</tr>
+<tr>
+<td>Pipeline parallelism</td>
+<td>&quot;Split layers across GPUs&quot;</td>
+<td>Each GPU runs a different group of layers; data flows through the pipeline with micro-batches to reduce bubbles</td>
+</tr>
+<tr>
+<td>FSDP</td>
+<td>&quot;Shard everything&quot;</td>
+<td>Fully Sharded Data Parallel -- each GPU holds 1/N of weights, gradients, and optimizer states; all-gather before compute</td>
+</tr>
+<tr>
+<td>ZeRO</td>
+<td>&quot;DeepSpeed's version of FSDP&quot;</td>
+<td>Zero Redundancy Optimizer with 3 stages: shard optimizer (Stage 1), + gradients (Stage 2), + parameters (Stage 3)</td>
+</tr>
+<tr>
+<td>All-reduce</td>
+<td>&quot;Average across GPUs&quot;</td>
+<td>Collective operation where every GPU ends with the sum (or average) of all GPUs' inputs -- typically implemented as ring all-reduce</td>
+</tr>
+<tr>
+<td>All-gather</td>
+<td>&quot;Collect from all GPUs&quot;</td>
+<td>Collective operation where every GPU ends with the concatenation of all GPUs' data -- used in FSDP to reconstruct full parameters</td>
+</tr>
+<tr>
+<td>Reduce-scatter</td>
+<td>&quot;Sum and distribute&quot;</td>
+<td>Collective operation that reduces (sums) data and scatters different chunks to different GPUs -- used in FSDP for gradient sharding</td>
+</tr>
+<tr>
+<td>Mixed precision</td>
+<td>&quot;Train in half precision&quot;</td>
+<td>Use FP16/BF16 for forward/backward and FP32 for optimizer states -- saves ~25% memory, not 50%, because the optimizer dominates</td>
+</tr>
+<tr>
+<td>Pipeline bubble</td>
+<td>&quot;Idle time in the pipeline&quot;</td>
+<td>Fraction of time GPUs sit idle waiting for data from the previous stage -- reduced by using more micro-batches</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/1910.02054" rel="noreferrer" data-network="true">Rajbhandari et al., 2020 -- &quot;ZeRO: Memory Optimizations Toward Training Trillion Parameter Models&quot; <small>↗ 需要联网</small></a>根据深度速度的Zero论文,</li>
+<li><a href="https://arxiv.org/abs/1909.08053" rel="noreferrer" data-network="true">Shoeybi et al., 2020 -- &quot;Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism&quot; <small>↗ 需要联网</small></a>对于转变器的NVIDIA的子平行性</li>
+<li><a href="https://arxiv.org/abs/2104.04473" rel="noreferrer" data-network="true">Narayanan et al., 2021 -- &quot;Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM&quot; <small>↗ 需要联网</small></a>-- 3D平行结合数据,子和管道</li>
+<li><a href="https://arxiv.org/abs/2304.11277" rel="noreferrer" data-network="true">Zhao et al., 2023 -- &quot;PyTorch FSDP: Experiences on Scaling Fully Sharded Data Parallel&quot; <small>↗ 需要联网</small></a>-- PyTorch 的本地FSDP实现</li>
+<li><a href="https://arxiv.org/abs/2407.21783" rel="noreferrer" data-network="true">Llama 3 Technical Report <small>↗ 需要联网</small></a>-- 16,384个GPU训练, 3D平行细节</li>
+<li><a href="https://arxiv.org/abs/2412.19437" rel="noreferrer" data-network="true">DeepSeek-V3 Technical Report <small>↗ 需要联网</small></a>-- 如何使MoE架构降低培训成本</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Scaling: Distributed Training, FSDP, DeepSpeed</h1>
+<blockquote>
+<p>Your 124M model trained on one GPU. Now try 7 billion parameters. The model doesn't fit in memory. The data takes weeks on a single machine. Distributed training isn't optional at scale. It's the only path forward.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 10, Lesson 04 (Pre-Training a Mini GPT)
+<strong>Time:</strong> ~120 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Explain the three types of parallelism (data, tensor, pipeline) and when each is necessary based on model and cluster size</li>
+<li>Implement data-parallel training using PyTorch DDP with gradient synchronization across multiple GPUs</li>
+<li>Calculate the memory budget for a given model size (weights + optimizer states + gradients + activations) to determine the minimum hardware</li>
+<li>Configure FSDP or DeepSpeed ZeRO stages to shard model states across GPUs and fit models that exceed single-GPU memory</li>
+</ul>
+<h2>The Problem</h2>
+<p>A 7B parameter model in FP16 needs 14GB just for the weights. Adam optimizer stores two additional copies of every parameter (first and second moment estimates). That is another 28GB. Gradients during backpropagation add 14GB more. You are at 56GB before a single activation is stored.</p>
+<p>An NVIDIA A100 has 80GB of memory.</p>
+<p>56GB out of 80GB consumed. That leaves 24GB for activations -- the intermediate values computed during the forward pass that must be kept alive for backpropagation. For a 2048-token sequence with a 4096-dimensional model, a single layer's activations use about 64MB. With 32 layers, you need 2GB per sample. A batch size of 8 requires 16GB. You have 24GB. A batch size of 12 blows up.</p>
+<p>Now try 70B parameters. Weights alone: 140GB in FP16. Does not fit on one GPU. You need at least 2 A100s (2 x 80GB = 160GB) just to hold the weights. Add optimizer states and gradients and you need far more: 3+ GPUs minimum, and realistically 8-16 depending on sharding strategy.</p>
+<p>Llama 3 405B was trained on 16,384 NVIDIA H100 GPUs. The training run cost an estimated <span class="katex"><span class="katex-mathml"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>100</mn><mi>m</mi><mi>i</mi><mi>l</mi><mi>l</mi><mi>i</mi><mi>o</mi><mi>n</mi><mi>i</mi><mi>n</mi><mi>c</mi><mi>o</mi><mi>m</mi><mi>p</mi><mi>u</mi><mi>t</mi><mi>e</mi><mi mathvariant="normal">.</mi><mi>D</mi><mi>e</mi><mi>e</mi><mi>p</mi><mi>S</mi><mi>e</mi><mi>e</mi><mi>k</mi><mi>V</mi><mn>3</mn><mi>t</mi><mi>r</mi><mi>a</mi><mi>i</mi><mi>n</mi><mi>e</mi><mi>d</mi><mi>a</mi><mi>c</mi><mi>o</mi><mi>m</mi><mi>p</mi><mi>a</mi><mi>r</mi><mi>a</mi><mi>b</mi><mi>l</mi><mi>e</mi><mi>m</mi><mi>o</mi><mi>d</mi><mi>e</mi><mi>l</mi><mi>f</mi><mi>o</mi><mi>r</mi><mi>r</mi><mi>o</mi><mi>u</mi><mi>g</mi><mi>h</mi><mi>l</mi><mi>y</mi></mrow><annotation encoding="application/x-tex">100 million in compute. DeepSeek V3 trained a comparable model for roughly </annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="katex-base"><span class="katex-strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord">100</span><span class="mord mathnormal">mi</span><span class="mord mathnormal" style="margin-right:0.0197em;">l</span><span class="mord mathnormal" style="margin-right:0.0197em;">l</span><span class="mord mathnormal">i</span><span class="mord mathnormal">o</span><span class="mord mathnormal">nin</span><span class="mord mathnormal">co</span><span class="mord mathnormal">m</span><span class="mord mathnormal">p</span><span class="mord mathnormal">u</span><span class="mord mathnormal">t</span><span class="mord mathnormal">e</span><span class="mord">.</span><span class="mord mathnormal" style="margin-right:0.0278em;">D</span><span class="mord mathnormal">ee</span><span class="mord mathnormal" style="margin-right:0.0576em;">pS</span><span class="mord mathnormal">ee</span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mord mathnormal" style="margin-right:0.2222em;">V</span><span class="mord">3</span><span class="mord mathnormal">t</span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="mord mathnormal">ain</span><span class="mord mathnormal">e</span><span class="mord mathnormal">d</span><span class="mord mathnormal">a</span><span class="mord mathnormal">co</span><span class="mord mathnormal">m</span><span class="mord mathnormal">p</span><span class="mord mathnormal">a</span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="mord mathnormal">ab</span><span class="mord mathnormal" style="margin-right:0.0197em;">l</span><span class="mord mathnormal">e</span><span class="mord mathnormal">m</span><span class="mord mathnormal">o</span><span class="mord mathnormal">d</span><span class="mord mathnormal">e</span><span class="mord mathnormal" style="margin-right:0.0197em;">l</span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="mord mathnormal" style="margin-right:0.0278em;">or</span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="mord mathnormal">o</span><span class="mord mathnormal" style="margin-right:0.0359em;">ug</span><span class="mord mathnormal">h</span><span class="mord mathnormal" style="margin-right:0.0197em;">l</span><span class="mord mathnormal" style="margin-right:0.0359em;">y</span></span></span></span>5.6 million by being clever about architecture (Mixture of Experts means only a fraction of parameters activate per token) and training efficiency.</p>
+<p>This lesson covers the four strategies that make large-scale training possible: data parallelism, tensor parallelism, pipeline parallelism, and fully sharded data parallelism. You will simulate each one in pure Python to understand the mechanics before ever touching a distributed training framework.</p>
+<h2>The Concept</h2>
+<h3>Why Distribution is Required</h3>
+<p>Here is the memory math for real models. Every number is calculated, not estimated.</p>
+<table>
+<thead>
+<tr>
+<th>Model</th>
+<th>Params</th>
+<th>Weights (FP16)</th>
+<th>Adam States</th>
+<th>Gradients (FP16)</th>
+<th>Total (no activations)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GPT-2 Small</td>
+<td>124M</td>
+<td>248 MB</td>
+<td>992 MB</td>
+<td>248 MB</td>
+<td>1.5 GB</td>
+</tr>
+<tr>
+<td>Llama 3 8B</td>
+<td>8B</td>
+<td>16 GB</td>
+<td>64 GB</td>
+<td>16 GB</td>
+<td>96 GB</td>
+</tr>
+<tr>
+<td>Llama 3 70B</td>
+<td>70B</td>
+<td>140 GB</td>
+<td>560 GB</td>
+<td>140 GB</td>
+<td>840 GB</td>
+</tr>
+<tr>
+<td>Llama 3 405B</td>
+<td>405B</td>
+<td>810 GB</td>
+<td>3,240 GB</td>
+<td>810 GB</td>
+<td>4,860 GB</td>
+</tr>
+</tbody>
+</table>
+<p>The &quot;Adam States&quot; column is the killer. Adam stores a running mean (m) and a running variance (v) for every parameter, both in FP32. For a 70B model, that is 70B x 4 bytes x 2 = 560GB. The optimizer alone needs seven A100s.</p>
+<p>A single H100 has 80GB. Llama 3 405B needs at least 61 H100s to hold the weights, optimizer, and gradients. Add activations and the number grows further. Meta used 16,384 GPUs not because they wanted to -- because they had to.</p>
+<h3>Data Parallelism</h3>
+<p>The simplest distributed strategy. Copy the entire model to N GPUs. Split each training batch into N equal parts. Each GPU runs a forward and backward pass on its shard of the data. After the backward pass, average the gradients across all GPUs. Every GPU updates its copy of the weights with the same averaged gradients, keeping all copies in sync.</p>
+<p><strong>The good:</strong> Linear throughput scaling. N GPUs process N times more data per step. Communication is limited to gradient averaging, which overlaps with computation.</p>
+<p><strong>The bad:</strong> Every GPU holds a complete copy of the model, optimizer states, and gradients. For a 70B model, each GPU needs 840GB. Data parallelism does nothing to reduce per-GPU memory. It only reduces training time.</p>
+<p><strong>The math:</strong> Effective batch size = per_gpu_batch_size x N. For N=64 GPUs with per-GPU batch of 16, the effective batch is 1,024. Llama 3 used an effective batch size of 16 million tokens per step.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-bbf030ef7a02a5855731.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>Tensor Parallelism</h3>
+<p>Split individual layers across GPUs. A single matrix multiplication is divided among GPUs, each computing part of the result.</p>
+<p>Consider a weight matrix of shape (8192, 8192) in a feedforward layer. With 4-way tensor parallelism, each GPU holds a (8192, 2048) shard. Each GPU multiplies the input by its shard, producing a partial result. The partial results are combined (via all-reduce or all-gather) to produce the full output.</p>
+<p><strong>The good:</strong> Reduces per-GPU memory for model weights. A 70B model split across 8 GPUs means each GPU holds ~8.75B parameters worth of weights.</p>
+<p><strong>The bad:</strong> Requires fast inter-GPU communication after every layer. The all-reduce after each matmul adds latency. This works well with NVLink (900 GB/s between GPUs on the same node) but poorly across nodes connected by InfiniBand (400 Gb/s, about 50 GB/s). Tensor parallelism is almost always limited to within a single node (8 GPUs).</p>
+<p><strong>Real usage:</strong> Megatron-LM pioneered tensor parallelism. Llama 3 405B uses 8-way tensor parallelism within each node.</p>
+<h3>Pipeline Parallelism</h3>
+<p>Split the model by layers. GPU 1 runs layers 1-8. GPU 2 runs layers 9-16. GPU 3 runs layers 17-24. GPU 4 runs layers 25-32. Data flows through the pipeline: GPU 1 computes its layers and sends activations to GPU 2, which computes its layers and sends to GPU 3, and so on.</p>
+<p><strong>The good:</strong> Minimal communication between GPUs -- just the activations at layer boundaries, which are small compared to gradients or weights. Works across nodes because bandwidth requirements are low.</p>
+<p><strong>The bad:</strong> Pipeline bubbles. When GPU 4 is computing the forward pass on micro-batch 1, GPUs 1, 2, and 3 are idle (they have already forwarded their portion). During backward pass, the pattern reverses. With naive pipelining, GPU utilization is only 1/N for N pipeline stages.</p>
+<p><strong>GPipe and PipeDream</strong> solve the bubble problem by splitting the batch into micro-batches. GPU 1 starts on micro-batch 2 as soon as it finishes forwarding micro-batch 1. This overlaps computation across pipeline stages. With M micro-batches and N stages, the bubble fraction drops to (N-1)/M. Use M=16 micro-batches with N=4 stages and the bubble is 3/16 = 18.75% idle time.</p>
+<h3>FSDP: Fully Sharded Data Parallel</h3>
+<p>FSDP combines the scalability of data parallelism with the memory efficiency of sharding. Instead of each GPU holding a complete copy of the model, each GPU holds only 1/N of the parameters, gradients, and optimizer states.</p>
+<p>Before a layer's forward pass, FSDP runs an <strong>all-gather</strong> to collect the full parameters from all GPUs into each GPU's memory. After the forward pass, each GPU discards the non-local parameters. During backward, the all-gather runs again to reconstruct parameters for gradient computation. After the backward pass, a <strong>reduce-scatter</strong> distributes gradient shards so each GPU only stores 1/N of the gradients.</p>
+<p><strong>The math for a 70B model on 8 GPUs:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Without FSDP</th>
+<th>With FSDP</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Weights (FP16)</td>
+<td>140 GB per GPU</td>
+<td>17.5 GB per GPU</td>
+</tr>
+<tr>
+<td>Adam States (FP32)</td>
+<td>560 GB per GPU</td>
+<td>70 GB per GPU</td>
+</tr>
+<tr>
+<td>Gradients (FP16)</td>
+<td>140 GB per GPU</td>
+<td>17.5 GB per GPU</td>
+</tr>
+<tr>
+<td><strong>Total</strong></td>
+<td><strong>840 GB per GPU</strong></td>
+<td><strong>105 GB per GPU</strong></td>
+</tr>
+</tbody>
+</table>
+<p>Without FSDP, you cannot fit a 70B model on a single 80GB GPU. With FSDP on 8 GPUs, each GPU uses 105GB -- wait, that still does not fit. You need at least 16 GPUs to get under 80GB per GPU, or you combine FSDP with activation checkpointing (recompute activations during backward instead of storing them).</p>
+<p>The communication cost is higher than vanilla data parallelism because of the all-gather before each layer. But the memory savings make previously impossible training runs possible.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-d8212a29513d7b868c4b.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>DeepSpeed ZeRO</h3>
+<p>DeepSpeed's ZeRO (Zero Redundancy Optimizer) is conceptually identical to FSDP but was developed independently by Microsoft. It defines three stages, each sharding more aggressively:</p>
+<table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>Shards</th>
+<th>Memory Savings</th>
+<th>Communication</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ZeRO-1</td>
+<td>Optimizer states only</td>
+<td>~4x reduction</td>
+<td>Same as data parallel</td>
+</tr>
+<tr>
+<td>ZeRO-2</td>
+<td>+ Gradients</td>
+<td>~8x reduction</td>
+<td>Slightly more</td>
+</tr>
+<tr>
+<td>ZeRO-3</td>
+<td>+ Parameters</td>
+<td>~Nx reduction (N GPUs)</td>
+<td>All-gather per layer</td>
+</tr>
+</tbody>
+</table>
+<p>ZeRO-3 is equivalent to FSDP. The naming is different, the mechanism is the same. PyTorch added FSDP as a native implementation after DeepSpeed proved the concept.</p>
+<p>DeepSpeed also introduced ZeRO-Offload (offload optimizer states to CPU RAM, which is cheaper and larger) and ZeRO-Infinity (offload to NVMe SSDs). These trade compute speed for memory capacity -- the offloaded operations are slower but free up GPU memory.</p>
+<h3>Mixed Precision Training</h3>
+<p>Modern training uses multiple floating-point formats simultaneously:</p>
+<ul>
+<li><strong>Forward pass</strong>: FP16 or BF16 (16-bit). Half the memory of FP32. Matmuls run 2x faster on tensor cores.</li>
+<li><strong>Master weights</strong>: FP32 (32-bit). Maintained by the optimizer for numerical precision during weight updates.</li>
+<li><strong>Loss scaling</strong>: Multiply the loss by a large constant before backward pass to prevent FP16 gradients from underflowing to zero. Divide by the same constant before the optimizer step.</li>
+</ul>
+<p>BF16 (Brain Float 16) has the same exponent range as FP32 (8 exponent bits) but reduced precision (7 mantissa bits vs FP32's 23). It rarely needs loss scaling because it can represent the same range of values. FP16 has 5 exponent bits and 10 mantissa bits -- it can represent fine-grained values but overflows/underflows at extreme magnitudes.</p>
+<p>Google's TPUs use BF16 natively. NVIDIA's A100 and H100 support both FP16 and BF16. The industry has largely moved to BF16 because it eliminates loss scaling headaches.</p>
+<p><strong>Memory comparison for a 7B model:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Precision</th>
+<th>Weights</th>
+<th>Optimizer</th>
+<th>Gradients</th>
+<th>Total</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>FP32 everywhere</td>
+<td>28 GB</td>
+<td>56 GB</td>
+<td>28 GB</td>
+<td>112 GB</td>
+</tr>
+<tr>
+<td>Mixed (BF16 + FP32 master)</td>
+<td>14 GB</td>
+<td>56 GB</td>
+<td>14 GB</td>
+<td>84 GB</td>
+</tr>
+</tbody>
+</table>
+<p>Mixed precision saves 28GB on this model. The optimizer states stay in FP32 regardless -- this is where most of the memory goes.</p>
+<h3>Megatron-LM and 3D Parallelism</h3>
+<p>Real large-scale training combines all three parallelisms:</p>
+<ul>
+<li><strong>Data parallelism</strong> across groups of nodes (scale batch size)</li>
+<li><strong>Tensor parallelism</strong> within a node (split layers across 8 GPUs)</li>
+<li><strong>Pipeline parallelism</strong> across nodes (split layer groups across machines)</li>
+</ul>
+<p>Llama 3 405B on 16,384 H100s:</p>
+<ul>
+<li>8-way tensor parallelism within each node (8 GPUs per node)</li>
+<li>16-way pipeline parallelism across nodes (16 pipeline stages)</li>
+<li>128-way data parallelism across the remaining dimension (16,384 / 8 / 16 = 128)</li>
+</ul>
+<p>This 3D decomposition (8 x 16 x 128 = 16,384) is how you scale to thousands of GPUs. Each GPU sees a different data shard (data parallel), holds one slice of each layer (tensor parallel), and computes a different set of layers (pipeline parallel).</p>
+<p>DeepSeek V3 took a different approach. Their Mixture of Experts architecture activates only 37B out of 671B parameters per token. This means each GPU only needs to compute (and store activations for) the active parameters. They trained on 2,048 H800 GPUs -- less than 1/8 of Meta's GPU count -- for <span class="katex"><span class="katex-mathml"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>5.6</mn><mi>M</mi><mi>v</mi><mi>s</mi><mi>M</mi><mi>e</mi><mi>t</mi><msup><mi>a</mi><mo mathvariant="normal" lspace="0em" rspace="0em">′</mo></msup><mi>s</mi><mi>e</mi><mi>s</mi><mi>t</mi><mi>i</mi><mi>m</mi><mi>a</mi><mi>t</mi><mi>e</mi><mi>d</mi></mrow><annotation encoding="application/x-tex">5.6M vs Meta&#x27;s estimated </annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="katex-base"><span class="katex-strut" style="height:0.7519em;"></span><span class="mord">5.6</span><span class="mord mathnormal" style="margin-right:0.109em;">M</span><span class="mord mathnormal" style="margin-right:0.0359em;">v</span><span class="mord mathnormal">s</span><span class="mord mathnormal" style="margin-right:0.109em;">M</span><span class="mord mathnormal">e</span><span class="mord mathnormal">t</span><span class="mord"><span class="mord mathnormal">a</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.7519em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="katex-sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">′</span></span></span></span></span></span></span></span></span><span class="mord mathnormal">ses</span><span class="mord mathnormal">t</span><span class="mord mathnormal">ima</span><span class="mord mathnormal">t</span><span class="mord mathnormal">e</span><span class="mord mathnormal">d</span></span></span></span>100M.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-955c994286885619593b.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><figure><img src="/learn/ai-from-scratch/figures/figure-cd8d1bc067850ea179f5.png" alt="paged-kv-cache 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<h3>Step 1: Simulate Data Parallelism</h3>
+<p>Split a batch across simulated GPUs. Each GPU computes a forward pass on its shard. Average the &quot;gradients&quot; (we simulate them as the loss values).</p>
+<pre><code class="language-python">import numpy as np
+
+def simulate_data_parallelism(data, num_gpus, model_fn):
+    batch_size = len(data)
+    shard_size = batch_size // num_gpus
+    remainder = batch_size % num_gpus
+
+    gpu_losses = []
+    gpu_gradients = []
+
+    offset = 0
+    for gpu_id in range(num_gpus):
+        extra = 1 if gpu_id &lt; remainder else 0
+        shard = data[offset:offset + shard_size + extra]
+        offset += shard_size + extra
+
+        loss, grad = model_fn(shard)
+        gpu_losses.append(loss)
+        gpu_gradients.append(grad)
+
+    avg_loss = np.mean(gpu_losses)
+    avg_gradient = np.mean(gpu_gradients, axis=0)
+
+    return avg_loss, avg_gradient
+</code></pre>
+<p>The all-reduce operation (averaging gradients) is the only communication in data parallelism. In practice, this uses the NCCL library on NVIDIA GPUs, which implements ring all-reduce: each GPU sends 1/N of its gradients to its neighbor, receives 1/N from the other neighbor, and after N-1 steps every GPU has the complete average. Total communication volume: 2 x gradient_size x (N-1)/N, approaching 2x the gradient size for large N.</p>
+<h3>Step 2: Simulate Tensor Parallelism</h3>
+<p>Split a weight matrix across GPUs. Each GPU computes a partial matrix multiplication. Combine the results.</p>
+<pre><code class="language-python">def simulate_tensor_parallelism(input_data, weight_matrix, num_gpus):
+    d_in, d_out = weight_matrix.shape
+    assert d_out % num_gpus == 0, f&quot;d_out {d_out} not divisible by num_gpus {num_gpus}&quot;
+    shard_size = d_out // num_gpus
+
+    partial_results = []
+    for gpu_id in range(num_gpus):
+        start = gpu_id * shard_size
+        end = start + shard_size
+        weight_shard = weight_matrix[:, start:end]
+
+        partial = input_data @ weight_shard
+        partial_results.append(partial)
+
+    full_output = np.concatenate(partial_results, axis=-1)
+
+    direct_output = input_data @ weight_matrix
+    error = np.abs(full_output - direct_output).max()
+
+    return full_output, error
+</code></pre>
+<p>The error should be exactly zero (or machine epsilon). Tensor parallelism is mathematically exact -- it produces the same result as computing the full matmul on one GPU. The split is along the output dimension, so each GPU produces a different chunk of columns, and concatenation reconstructs the full result.</p>
+<p>For column-parallel linear layers (splitting the output dimension), you concatenate. For row-parallel (splitting the input dimension), you sum. In a transformer FFN, the first linear (expand) uses column-parallel and the second linear (contract) uses row-parallel. This avoids an all-reduce between the two layers.</p>
+<h3>Step 3: Simulate Pipeline Parallelism</h3>
+<p>Split a model's layers across virtual GPUs. Show the bubble problem where early stages sit idle while later stages compute.</p>
+<pre><code class="language-python">def simulate_pipeline_parallelism(num_layers, num_stages, num_microbatches):
+    layers_per_stage = num_layers // num_stages
+
+    timeline = {}
+    clock = 0
+
+    for mb in range(num_microbatches):
+        for stage in range(num_stages):
+            start_time = max(
+                timeline.get((stage, mb - 1, &quot;fwd&quot;), (0, 0))[1] if mb &gt; 0 else 0,
+                timeline.get((stage - 1, mb, &quot;fwd&quot;), (0, 0))[1] if stage &gt; 0 else 0,
+            )
+            end_time = start_time + layers_per_stage
+            timeline[(stage, mb, &quot;fwd&quot;)] = (start_time, end_time)
+
+    last_fwd_end = max(v[1] for v in timeline.values())
+
+    for mb in range(num_microbatches - 1, -1, -1):
+        for stage in range(num_stages - 1, -1, -1):
+            deps = [last_fwd_end]
+            if mb &lt; num_microbatches - 1 and (stage, mb + 1, &quot;bwd&quot;) in timeline:
+                deps.append(timeline[(stage, mb + 1, &quot;bwd&quot;)][1])
+            if stage &lt; num_stages - 1 and (stage + 1, mb, &quot;bwd&quot;) in timeline:
+                deps.append(timeline[(stage + 1, mb, &quot;bwd&quot;)][1])
+            start_time = max(deps)
+            end_time = start_time + layers_per_stage
+            timeline[(stage, mb, &quot;bwd&quot;)] = (start_time, end_time)
+
+    total_time = max(v[1] for v in timeline.values())
+    compute_time = num_microbatches * num_stages * layers_per_stage * 2
+    bubble_fraction = 1.0 - compute_time / (total_time * num_stages)
+
+    return timeline, total_time, bubble_fraction
+</code></pre>
+<p>With 4 stages and 1 micro-batch, the bubble fraction is 75% -- three out of four GPUs idle at any time. With 16 micro-batches, it drops to about 19%. The cost of eliminating bubbles is memory: you must store activations for all in-flight micro-batches simultaneously.</p>
+<h3>Step 4: Memory Calculator</h3>
+<p>Compute the exact memory requirements for training any model size.</p>
+<pre><code class="language-python">def memory_calculator(
+    params_billions,
+    precision_bytes=2,
+    optimizer=&quot;adam&quot;,
+    num_gpus=1,
+    sharding=&quot;none&quot;,
+    sequence_length=2048,
+    batch_size_per_gpu=1,
+    hidden_dim=None,
+    num_layers=None,
+):
+    params = params_billions * 1e9
+
+    weight_memory = params * precision_bytes
+
+    if optimizer == &quot;adam&quot;:
+        optimizer_memory = params * 4 * 2
+    elif optimizer == &quot;sgd&quot;:
+        optimizer_memory = params * 4
+    else:
+        optimizer_memory = 0
+
+    gradient_memory = params * precision_bytes
+
+    total_no_activation = weight_memory + optimizer_memory + gradient_memory
+
+    if hidden_dim and num_layers:
+        activation_per_layer = (
+            sequence_length * batch_size_per_gpu * hidden_dim * precision_bytes * 4
+        )
+        activation_memory = activation_per_layer * num_layers
+    else:
+        activation_memory = params * precision_bytes * 0.5
+
+    if sharding == &quot;fsdp&quot; or sharding == &quot;zero3&quot;:
+        weight_memory /= num_gpus
+        optimizer_memory /= num_gpus
+        gradient_memory /= num_gpus
+    elif sharding == &quot;zero2&quot;:
+        optimizer_memory /= num_gpus
+        gradient_memory /= num_gpus
+    elif sharding == &quot;zero1&quot;:
+        optimizer_memory /= num_gpus
+
+    per_gpu_total = weight_memory + optimizer_memory + gradient_memory + activation_memory
+
+    return {
+        &quot;params_billions&quot;: params_billions,
+        &quot;weights_gb&quot;: weight_memory / 1e9,
+        &quot;optimizer_gb&quot;: optimizer_memory / 1e9,
+        &quot;gradients_gb&quot;: gradient_memory / 1e9,
+        &quot;activations_gb&quot;: activation_memory / 1e9,
+        &quot;per_gpu_total_gb&quot;: per_gpu_total / 1e9,
+        &quot;total_across_gpus_gb&quot;: per_gpu_total * num_gpus / 1e9,
+        &quot;fits_on_80gb&quot;: per_gpu_total / 1e9 &lt;= 80,
+        &quot;num_gpus&quot;: num_gpus,
+        &quot;sharding&quot;: sharding,
+    }
+</code></pre>
+<p>This calculator answers the question every ML engineer asks: &quot;How many GPUs do I need?&quot; Feed it the model size and see whether it fits. Adjust sharding strategy until the per-GPU total drops below 80GB.</p>
+<h3>Step 5: Mixed Precision Simulation</h3>
+<p>Compare memory usage between FP32, FP16, and mixed precision training.</p>
+<pre><code class="language-python">def mixed_precision_comparison(params_billions):
+    params = params_billions * 1e9
+
+    fp32_weights = params * 4
+    fp32_optimizer = params * 4 * 2
+    fp32_gradients = params * 4
+    fp32_total = fp32_weights + fp32_optimizer + fp32_gradients
+
+    fp16_weights = params * 2
+    fp16_master = params * 4
+    fp16_optimizer = params * 4 * 2
+    fp16_gradients = params * 2
+    fp16_total = fp16_weights + fp16_master + fp16_optimizer + fp16_gradients
+
+    mixed_weights = params * 2
+    mixed_optimizer = params * 4 * 2
+    mixed_gradients = params * 2
+    mixed_total = mixed_weights + mixed_optimizer + mixed_gradients
+
+    return {
+        &quot;fp32_total_gb&quot;: fp32_total / 1e9,
+        &quot;fp16_with_master_gb&quot;: fp16_total / 1e9,
+        &quot;mixed_bf16_gb&quot;: mixed_total / 1e9,
+        &quot;savings_vs_fp32&quot;: 1 - mixed_total / fp32_total,
+    }
+</code></pre>
+<p>The biggest surprise for most people: mixed precision does not halve the memory. The optimizer states (Adam's m and v) stay in FP32 regardless of precision. For a 7B model, FP32 training uses 112GB. Mixed precision uses 84GB. That is a 25% reduction, not 50%. The optimizer dominates.</p>
+<h2>Use It</h2>
+<h3>Run All Simulations</h3>
+<pre><code class="language-python">def run_all_demos():
+    print(&quot;=&quot; * 70)
+    print(&quot;DATA PARALLELISM SIMULATION&quot;)
+    print(&quot;=&quot; * 70)
+
+    np.random.seed(42)
+    data = np.random.randn(64, 32)
+    weight = np.random.randn(32, 16)
+
+    def model_fn(batch):
+        output = batch @ weight
+        loss = np.mean(output ** 2)
+        grad = 2 * batch.T @ (batch @ weight) / len(batch)
+        return loss, grad
+
+    for n_gpus in [1, 2, 4, 8]:
+        loss, grad = simulate_data_parallelism(data, n_gpus, model_fn)
+        print(f&quot;  {n_gpus} GPUs: loss={loss:.4f}, grad_norm={np.linalg.norm(grad):.4f}&quot;)
+
+    print()
+    print(&quot;=&quot; * 70)
+    print(&quot;TENSOR PARALLELISM SIMULATION&quot;)
+    print(&quot;=&quot; * 70)
+
+    x = np.random.randn(4, 8192)
+    W = np.random.randn(8192, 8192)
+
+    for n_gpus in [1, 2, 4, 8]:
+        output, error = simulate_tensor_parallelism(x, W, n_gpus)
+        print(f&quot;  {n_gpus} GPUs: output_shape={output.shape}, max_error={error:.2e}&quot;)
+
+    print()
+    print(&quot;=&quot; * 70)
+    print(&quot;PIPELINE PARALLELISM SIMULATION&quot;)
+    print(&quot;=&quot; * 70)
+
+    for n_mb in [1, 4, 8, 16, 32]:
+        _, total_t, bubble = simulate_pipeline_parallelism(32, 4, n_mb)
+        print(f&quot;  {n_mb:2d} micro-batches: total_time={total_t:4d}, bubble={bubble:.1%}&quot;)
+
+    print()
+    print(&quot;=&quot; * 70)
+    print(&quot;MEMORY CALCULATOR&quot;)
+    print(&quot;=&quot; * 70)
+
+    configs = [
+        (7, &quot;none&quot;, 1),
+        (7, &quot;fsdp&quot;, 8),
+        (70, &quot;none&quot;, 1),
+        (70, &quot;fsdp&quot;, 8),
+        (70, &quot;fsdp&quot;, 16),
+        (405, &quot;fsdp&quot;, 64),
+        (405, &quot;fsdp&quot;, 128),
+    ]
+
+    print(f&quot;  {'Model':&gt;8} {'Sharding':&gt;8} {'GPUs':&gt;5} {'Per-GPU':&gt;10} {'Fits 80GB':&gt;10}&quot;)
+    print(&quot;  &quot; + &quot;-&quot; * 50)
+    for params, shard, gpus in configs:
+        result = memory_calculator(params, num_gpus=gpus, sharding=shard)
+        fits = &quot;Yes&quot; if result[&quot;fits_on_80gb&quot;] else &quot;No&quot;
+        print(f&quot;  {params:&gt;6}B {shard:&gt;8} {gpus:&gt;5} {result['per_gpu_total_gb']:&gt;8.1f}GB {fits:&gt;10}&quot;)
+
+    print()
+    print(&quot;=&quot; * 70)
+    print(&quot;MIXED PRECISION COMPARISON&quot;)
+    print(&quot;=&quot; * 70)
+
+    for params_b in [7, 13, 70, 405]:
+        result = mixed_precision_comparison(params_b)
+        print(f&quot;  {params_b}B: FP32={result['fp32_total_gb']:.0f}GB, &quot;
+              f&quot;Mixed BF16={result['mixed_bf16_gb']:.0f}GB, &quot;
+              f&quot;Savings={result['savings_vs_fp32']:.0%}&quot;)
+</code></pre>
+<h2>Ship It</h2>
+<p>This lesson produces <code>outputs/prompt-distributed-training-planner.md</code> -- a prompt that takes a model size and available hardware, then produces a complete distributed training plan: parallelism strategy, memory budget, communication overhead, and expected throughput.</p>
+<h2>Exercises</h2>
+<ol>
+<li>
+<p>Modify the memory calculator to include activation checkpointing. With checkpointing, only store activations at every K-th layer (typical K=1, meaning recompute all). Show the memory-compute tradeoff: how much memory does checkpointing save, and how much does it slow down training (roughly 33% more compute for full checkpointing)?</p>
+</li>
+<li>
+<p>Extend the pipeline parallelism simulation to implement the 1F1B (one forward, one backward) schedule used by PipeDream. Compare the bubble fraction against the naive schedule for 4 stages and 8 micro-batches. The 1F1B schedule should have a smaller peak memory because it starts backward passes earlier.</p>
+</li>
+<li>
+<p>Implement a gradient accumulation simulator. Instead of all-reducing after every micro-batch, accumulate gradients locally for K steps, then all-reduce. Show how this reduces communication by K times but produces identical final gradients (and thus identical training).</p>
+</li>
+<li>
+<p>Build a cost estimator. Given a model size, target token count, GPU type (A100 at <span class="katex"><span class="katex-mathml"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>2</mn><mi mathvariant="normal">/</mi><mi>h</mi><mi>r</mi><mo separator="true">,</mo><mi>H</mi><mn>100</mn><mi>a</mi><mi>t</mi></mrow><annotation encoding="application/x-tex">2/hr, H100 at </annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="katex-base"><span class="katex-strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">2/</span><span class="mord mathnormal">h</span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.0813em;">H</span><span class="mord">100</span><span class="mord mathnormal">a</span><span class="mord mathnormal">t</span></span></span></span>3.50/hr), and parallelism strategy, estimate the total training cost in dollars. Validate against known costs: Llama 3 405B reportedly cost ~<span class="katex"><span class="katex-mathml"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>100</mn><mi>M</mi><mo separator="true">,</mo><mi>D</mi><mi>e</mi><mi>e</mi><mi>p</mi><mi>S</mi><mi>e</mi><mi>e</mi><mi>k</mi><mi>V</mi><mn>3</mn><mi>c</mi><mi>o</mi><mi>s</mi><mi>t</mi><mtext> </mtext></mrow><annotation encoding="application/x-tex">100M, DeepSeek V3 cost ~</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="katex-base"><span class="katex-strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord">100</span><span class="mord mathnormal" style="margin-right:0.109em;">M</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.0278em;">D</span><span class="mord mathnormal">ee</span><span class="mord mathnormal" style="margin-right:0.0576em;">pS</span><span class="mord mathnormal">ee</span><span class="mord mathnormal" style="margin-right:0.0315em;">k</span><span class="mord mathnormal" style="margin-right:0.2222em;">V</span><span class="mord">3</span><span class="mord mathnormal">cos</span><span class="mord mathnormal">t</span><span class="mspace nobreak"> </span></span></span></span>5.6M.</p>
+</li>
+<li>
+<p>Add ZeRO-Offload to the memory calculator. Assume CPU RAM is 512GB per node and NVMe is 2TB. Show how offloading optimizer states to CPU allows a 70B model to train on 4 GPUs instead of 16, at the cost of 30-50% slower optimizer steps.</p>
+</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Data parallelism</td>
+<td>&quot;Copy the model to every GPU&quot;</td>
+<td>Each GPU processes a different data shard; gradients are averaged via all-reduce after each step</td>
+</tr>
+<tr>
+<td>Tensor parallelism</td>
+<td>&quot;Split a layer across GPUs&quot;</td>
+<td>Partition weight matrices so each GPU computes part of the matmul; requires fast NVLink interconnect</td>
+</tr>
+<tr>
+<td>Pipeline parallelism</td>
+<td>&quot;Split layers across GPUs&quot;</td>
+<td>Each GPU runs a different group of layers; data flows through the pipeline with micro-batches to reduce bubbles</td>
+</tr>
+<tr>
+<td>FSDP</td>
+<td>&quot;Shard everything&quot;</td>
+<td>Fully Sharded Data Parallel -- each GPU holds 1/N of weights, gradients, and optimizer states; all-gather before compute</td>
+</tr>
+<tr>
+<td>ZeRO</td>
+<td>&quot;DeepSpeed's version of FSDP&quot;</td>
+<td>Zero Redundancy Optimizer with 3 stages: shard optimizer (Stage 1), + gradients (Stage 2), + parameters (Stage 3)</td>
+</tr>
+<tr>
+<td>All-reduce</td>
+<td>&quot;Average across GPUs&quot;</td>
+<td>Collective operation where every GPU ends with the sum (or average) of all GPUs' inputs -- typically implemented as ring all-reduce</td>
+</tr>
+<tr>
+<td>All-gather</td>
+<td>&quot;Collect from all GPUs&quot;</td>
+<td>Collective operation where every GPU ends with the concatenation of all GPUs' data -- used in FSDP to reconstruct full parameters</td>
+</tr>
+<tr>
+<td>Reduce-scatter</td>
+<td>&quot;Sum and distribute&quot;</td>
+<td>Collective operation that reduces (sums) data and scatters different chunks to different GPUs -- used in FSDP for gradient sharding</td>
+</tr>
+<tr>
+<td>Mixed precision</td>
+<td>&quot;Train in half precision&quot;</td>
+<td>Use FP16/BF16 for forward/backward and FP32 for optimizer states -- saves ~25% memory, not 50%, because the optimizer dominates</td>
+</tr>
+<tr>
+<td>Pipeline bubble</td>
+<td>&quot;Idle time in the pipeline&quot;</td>
+<td>Fraction of time GPUs sit idle waiting for data from the previous stage -- reduced by using more micro-batches</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/1910.02054" rel="noreferrer" data-network="true">Rajbhandari et al., 2020 -- &quot;ZeRO: Memory Optimizations Toward Training Trillion Parameter Models&quot; <small>↗ 需要联网</small></a> -- the DeepSpeed ZeRO paper that defined the three sharding stages</li>
+<li><a href="https://arxiv.org/abs/1909.08053" rel="noreferrer" data-network="true">Shoeybi et al., 2020 -- &quot;Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism&quot; <small>↗ 需要联网</small></a> -- NVIDIA's tensor parallelism for transformers</li>
+<li><a href="https://arxiv.org/abs/2104.04473" rel="noreferrer" data-network="true">Narayanan et al., 2021 -- &quot;Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM&quot; <small>↗ 需要联网</small></a> -- 3D parallelism combining data, tensor, and pipeline</li>
+<li><a href="https://arxiv.org/abs/2304.11277" rel="noreferrer" data-network="true">Zhao et al., 2023 -- &quot;PyTorch FSDP: Experiences on Scaling Fully Sharded Data Parallel&quot; <small>↗ 需要联网</small></a> -- PyTorch's native FSDP implementation</li>
+<li><a href="https://arxiv.org/abs/2407.21783" rel="noreferrer" data-network="true">Llama 3 Technical Report <small>↗ 需要联网</small></a> -- 16,384 GPU training with 3D parallelism details</li>
+<li><a href="https://arxiv.org/abs/2412.19437" rel="noreferrer" data-network="true">DeepSeek-V3 Technical Report <small>↗ 需要联网</small></a> -- how MoE architecture reduces training cost by an order of magnitude</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-10-llms-from-scratch--05-scaling-distributed.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-10-llms-from-scratch--05-scaling-distributed.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/10-llms-from-scratch/05-scaling-distributed/code/main.py">phases/10-llms-from-scratch/05-scaling-distributed/code/main.py</a><details><summary>查看原始文本</summary><pre><code>import numpy as np
+from collections import defaultdict
+
+
+def simulate_data_parallelism(data, num_gpus, model_fn):
+    batch_size = len(data)
+    shard_size = batch_size // num_gpus
+    remainder = batch_size % num_gpus
+
+    gpu_losses = []
+    gpu_gradients = []
+
+    offset = 0
+    for gpu_id in range(num_gpus):
+        extra = 1 if gpu_id &lt; remainder else 0
+        shard = data[offset:offset + shard_size + extra]
+        offset += shard_size + extra
+
+        loss, grad = model_fn(shard)
+        gpu_losses.append(loss)
+        gpu_gradients.append(grad)
+
+    avg_loss = np.mean(gpu_losses)
+    avg_gradient = np.mean(gpu_gradients, axis=0)
+
+    return avg_loss, avg_gradient
+
+
+def simulate_tensor_parallelism(input_data, weight_matrix, num_gpus):
+    d_in, d_out = weight_matrix.shape
+    assert d_out % num_gpus == 0, f&quot;d_out {d_out} not divisible by num_gpus {num_gpus}&quot;
+    shard_size = d_out // num_gpus
+
+    partial_results = []
+    for gpu_id in range(num_gpus):
+        start = gpu_id * shard_size
+        end = start + shard_size
+        weight_shard = weight_matrix[:, start:end]
+
+        partial = input_data @ weight_shard
+        partial_results.append(partial)
+
+    full_output = np.concatenate(partial_results, axis=-1)
+
+    direct_output = input_data @ weight_matrix
+    error = np.abs(full_output - direct_output).max()
+
+    return full_output, error
+
+
+def simulate_pipeline_parallelism(num_layers, num_stages, num_microbatches):
+    layers_per_stage = num_layers // num_stages
+
+    timeline = {}
+
+    for mb in range(num_microbatches):
+        for stage in range(num_stages):
+            start_time = max(
+                timeline.get((stage, mb - 1, &quot;fwd&quot;), (0, 0))[1] if mb &gt; 0 else 0,
+                timeline.get((stage - 1, mb, &quot;fwd&quot;), (0, 0))[1] if stage &gt; 0 else 0,
+            )
+            end_time = start_time + layers_per_stage
+            timeline[(stage, mb, &quot;fwd&quot;)] = (start_time, end_time)
+
+    last_fwd_end = max(v[1] for v in timeline.values())
+
+    for mb in range(num_microbatches - 1, -1, -1):
+        for stage in range(num_stages - 1, -1, -1):
+            deps = [last_fwd_end]
+            if mb &lt; num_microbatches - 1 and (stage, mb + 1, &quot;bwd&quot;) in timeline:
+                deps.append(timeline[(stage, mb + 1, &quot;bwd&quot;)][1])
+            if stage &lt; num_stages - 1 and (stage + 1, mb, &quot;bwd&quot;) in timeline:
+                deps.append(timeline[(stage + 1, mb, &quot;bwd&quot;)][1])
+            start_time = max(deps)
+            end_time = start_time + layers_per_stage
+            timeline[(stage, mb, &quot;bwd&quot;)] = (start_time, end_time)
+
+    total_time = max(v[1] for v in timeline.values())
+    compute_time = num_microbatches * num_stages * layers_per_stage * 2
+    bubble_fraction = 1.0 - compute_time / (total_time * num_stages)
+
+    return timeline, total_time, bubble_fraction
+
+
+def memory_calculator(
+    params_billions,
+    precision_bytes=2,
+    optimizer=&quot;adam&quot;,
+    num_gpus=1,
+    sharding=&quot;none&quot;,
+    sequence_length=2048,
+    batch_size_per_gpu=1,
+    hidden_dim=None,
+    num_layers=None,
+):
+    params = params_billions * 1e9
+
+    weight_memory = params * precision_bytes
+
+    if optimizer == &quot;adam&quot;:
+        optimizer_memory = params * 4 * 2
+    elif optimizer == &quot;sgd&quot;:
+        optimizer_memory = params * 4
+    else:
+        optimizer_memory = 0
+
+    gradient_memory = params * precision_bytes
+
+    if hidden_dim and num_layers:
+        activation_per_layer = (
+            sequence_length * batch_size_per_gpu * hidden_dim * precision_bytes * 4
+        )
+        activation_memory = activation_per_layer * num_layers
+    else:
+        activation_memory = params * precision_bytes * 0.5
+
+    if sharding == &quot;fsdp&quot; or sharding == &quot;zero3&quot;:
+        weight_memory /= num_gpus
+        optimizer_memory /= num_gpus
+        gradient_memory /= num_gpus
+    elif sharding == &quot;zero2&quot;:
+        optimizer_memory /= num_gpus
+        gradient_memory /= num_gpus
+    elif sharding == &quot;zero1&quot;:
+        optimizer_memory /= num_gpus
+
+    per_gpu_total = weight_memory + optimizer_memory + gradient_memory + activation_memory
+
+    return {
+        &quot;params_billions&quot;: params_billions,
+        &quot;weights_gb&quot;: weight_memory / 1e9,
+        &quot;optimizer_gb&quot;: optimizer_memory / 1e9,
+        &quot;gradients_gb&quot;: gradient_memory / 1e9,
+        &quot;activations_gb&quot;: activation_memory / 1e9,
+        &quot;per_gpu_total_gb&quot;: per_gpu_total / 1e9,
+        &quot;total_across_gpus_gb&quot;: per_gpu_total * num_gpus / 1e9,
+        &quot;fits_on_80gb&quot;: per_gpu_total / 1e9 &lt;= 80,
+        &quot;num_gpus&quot;: num_gpus,
+        &quot;sharding&quot;: sharding,
+    }
+
+
+def mixed_precision_comparison(params_billions):
+    params = params_billions * 1e9
+
+    fp32_weights = params * 4
+    fp32_optimizer = params * 4 * 2
+    fp32_gradients = params * 4
+    fp32_total = fp32_weights + fp32_optimizer + fp32_gradients
+
+    fp16_weights = params * 2
+    fp16_master = params * 4
+    fp16_optimizer = params * 4 * 2
+    fp16_gradients = params * 2
+    fp16_total = fp16_weights + fp16_master + fp16_optimizer + fp16_gradients
+
+    mixed_weights = params * 2
+    mixed_optimizer = params * 4 * 2
+    mixed_gradients = params * 2
+    mixed_total = mixed_weights + mixed_optimizer + mixed_gradients
+
+    return {
+        &quot;fp32_total_gb&quot;: fp32_total / 1e9,
+        &quot;fp16_with_master_gb&quot;: fp16_total / 1e9,
+        &quot;mixed_bf16_gb&quot;: mixed_total / 1e9,
+        &quot;savings_vs_fp32&quot;: 1 - mixed_total / fp32_total,
+    }
+
+
+def communication_volume_calculator(params_billions, num_gpus, strategy):
+    params = params_billions * 1e9
+    gradient_size_gb = params * 2 / 1e9
+
+    if strategy == &quot;data_parallel&quot;:
+        allreduce_volume = 2 * gradient_size_gb * (num_gpus - 1) / num_gpus
+        return {
+            &quot;strategy&quot;: &quot;Data Parallel (Ring AllReduce)&quot;,
+            &quot;per_step_gb&quot;: allreduce_volume,
+            &quot;ops_per_step&quot;: 1,
+        }
+    elif strategy == &quot;fsdp&quot;:
+        allgather_volume = params * 2 / 1e9 * (num_gpus - 1) / num_gpus
+        reducescatter_volume = gradient_size_gb * (num_gpus - 1) / num_gpus
+        return {
+            &quot;strategy&quot;: &quot;FSDP (AllGather + ReduceScatter per layer)&quot;,
+            &quot;per_step_gb&quot;: allgather_volume + reducescatter_volume,
+            &quot;ops_per_step&quot;: 2,
+        }
+    elif strategy == &quot;tensor_parallel&quot;:
+        return {
+            &quot;strategy&quot;: &quot;Tensor Parallel (AllReduce per layer)&quot;,
+            &quot;per_step_gb&quot;: gradient_size_gb * 0.01,
+            &quot;ops_per_step&quot;: &quot;2 x num_layers&quot;,
+        }
+
+    return {}
+
+
+def training_cost_estimator(
+    params_billions,
+    target_tokens_trillions,
+    gpu_type=&quot;h100&quot;,
+    num_gpus=None,
+    utilization=0.4,
+):
+    gpu_specs = {
+        &quot;a100&quot;: {&quot;tflops_bf16&quot;: 312, &quot;cost_per_hour&quot;: 2.00, &quot;memory_gb&quot;: 80},
+        &quot;h100&quot;: {&quot;tflops_bf16&quot;: 990, &quot;cost_per_hour&quot;: 3.50, &quot;memory_gb&quot;: 80},
+        &quot;h200&quot;: {&quot;tflops_bf16&quot;: 990, &quot;cost_per_hour&quot;: 4.50, &quot;memory_gb&quot;: 141},
+    }
+
+    spec = gpu_specs[gpu_type]
+    params = params_billions * 1e9
+    tokens = target_tokens_trillions * 1e12
+
+    flops_total = 6 * params * tokens
+
+    flops_per_gpu_per_sec = spec[&quot;tflops_bf16&quot;] * 1e12 * utilization
+
+    if num_gpus is None:
+        mem = memory_calculator(params_billions, sharding=&quot;fsdp&quot;, num_gpus=1)
+        num_gpus = max(1, int(np.ceil(mem[&quot;per_gpu_total_gb&quot;] / spec[&quot;memory_gb&quot;])) * 2)
+
+    verify = memory_calculator(params_billions, sharding=&quot;fsdp&quot;, num_gpus=num_gpus)
+    while verify[&quot;per_gpu_total_gb&quot;] &gt; spec[&quot;memory_gb&quot;]:
+        if verify[&quot;activations_gb&quot;] &gt;= spec[&quot;memory_gb&quot;]:
+            break
+        num_gpus *= 2
+        verify = memory_calculator(params_billions, sharding=&quot;fsdp&quot;, num_gpus=num_gpus)
+    fits_in_gpu_memory = verify[&quot;per_gpu_total_gb&quot;] &lt;= spec[&quot;memory_gb&quot;]
+
+    total_gpu_seconds = flops_total / (flops_per_gpu_per_sec * num_gpus)
+    total_gpu_hours = total_gpu_seconds / 3600
+    wall_clock_hours = total_gpu_hours
+    total_cost = wall_clock_hours * num_gpus * spec[&quot;cost_per_hour&quot;]
+
+    return {
+        &quot;model_size&quot;: f&quot;{params_billions}B&quot;,
+        &quot;tokens&quot;: f&quot;{target_tokens_trillions}T&quot;,
+        &quot;gpu_type&quot;: gpu_type,
+        &quot;num_gpus&quot;: num_gpus,
+        &quot;total_flops&quot;: f&quot;{flops_total:.2e}&quot;,
+        &quot;wall_clock_days&quot;: wall_clock_hours / 24,
+        &quot;total_gpu_hours&quot;: total_gpu_hours * num_gpus,
+        &quot;estimated_cost&quot;: total_cost,
+        &quot;fits_in_gpu_memory&quot;: fits_in_gpu_memory,
+    }
+
+
+if __name__ == &quot;__main__&quot;:
+    np.random.seed(42)
+
+    print(&quot;=&quot; * 70)
+    print(&quot;DATA PARALLELISM SIMULATION&quot;)
+    print(&quot;=&quot; * 70)
+
+    data = np.random.randn(64, 32)
+    weight = np.random.randn(32, 16)
+
+    def model_fn(batch):
+        output = batch @ weight
+        loss = np.mean(output ** 2)
+        grad = 2 * batch.T @ (batch @ weight) / len(batch)
+        return loss, grad
+
+    for n_gpus in [1, 2, 4, 8]:
+        loss, grad = simulate_data_parallelism(data, n_gpus, model_fn)
+        print(f&quot;  {n_gpus} GPUs: loss={loss:.4f}, grad_norm={np.linalg.norm(grad):.4f}&quot;)
+
+    print()
+    print(&quot;=&quot; * 70)
+    print(&quot;TENSOR PARALLELISM SIMULATION&quot;)
+    print(&quot;=&quot; * 70)
+
+    x = np.random.randn(4, 8192)
+    W = np.random.randn(8192, 8192)
+
+    for n_gpus in [1, 2, 4, 8]:
+        output, error = simulate_tensor_parallelism(x, W, n_gpus)
+        print(f&quot;  {n_gpus} GPUs: output_shape={output.shape}, max_error={error:.2e}&quot;)
+
+    print()
+    print(&quot;=&quot; * 70)
+    print(&quot;PIPELINE PARALLELISM SIMULATION&quot;)
+    print(&quot;=&quot; * 70)
+
+    for n_mb in [1, 4, 8, 16, 32]:
+        _, total_t, bubble = simulate_pipeline_parallelism(32, 4, n_mb)
+        print(f&quot;  {n_mb:2d} micro-batches: total_time={total_t:4d}, bubble={bubble:.1%}&quot;)
+
+    print()
+    print(&quot;=&quot; * 70)
+    print(&quot;MEMORY CALCULATOR&quot;)
+    print(&quot;=&quot; * 70)
+
+    configs = [
+        (7, &quot;none&quot;, 1),
+        (7, &quot;fsdp&quot;, 8),
+        (70, &quot;none&quot;, 1),
+        (70, &quot;fsdp&quot;, 8),
+        (70, &quot;fsdp&quot;, 16),
+        (405, &quot;fsdp&quot;, 64),
+        (405, &quot;fsdp&quot;, 128),
+    ]
+
+    print(f&quot;  {&#39;Model&#39;:&gt;8} {&#39;Sharding&#39;:&gt;8} {&#39;GPUs&#39;:&gt;5} {&#39;Per-GPU&#39;:&gt;10} {&#39;Fits 80GB&#39;:&gt;10}&quot;)
+    print(&quot;  &quot; + &quot;-&quot; * 50)
+    for params, shard, gpus in configs:
+        result = memory_calculator(params, num_gpus=gpus, sharding=shard)
+        fits = &quot;Yes&quot; if result[&quot;fits_on_80gb&quot;] else &quot;No&quot;
+        print(f&quot;  {params:&gt;6}B {shard:&gt;8} {gpus:&gt;5} {result[&#39;per_gpu_total_gb&#39;]:&gt;8.1f}GB {fits:&gt;10}&quot;)
+
+    print()
+    print(&quot;=&quot; * 70)
+    print(&quot;MIXED PRECISION COMPARISON&quot;)
+    print(&quot;=&quot; * 70)
+
+    for params_b in [7, 13, 70, 405]:
+        result = mixed_precision_comparison(params_b)
+        print(f&quot;  {params_b}B: FP32={result[&#39;fp32_total_gb&#39;]:.0f}GB, &quot;
+              f&quot;Mixed BF16={result[&#39;mixed_bf16_gb&#39;]:.0f}GB, &quot;
+              f&quot;Savings={result[&#39;savings_vs_fp32&#39;]:.0%}&quot;)
+
+    print()
+    print(&quot;=&quot; * 70)
+    print(&quot;COMMUNICATION VOLUME&quot;)
+    print(&quot;=&quot; * 70)
+
+    for strategy in [&quot;data_parallel&quot;, &quot;fsdp&quot;, &quot;tensor_parallel&quot;]:
+        result = communication_volume_calculator(70, 8, strategy)
+        print(f&quot;  {result[&#39;strategy&#39;]}&quot;)
+        print(f&quot;    Per-step volume: {result[&#39;per_step_gb&#39;]:.1f} GB&quot;)
+        print()
+
+    print(&quot;=&quot; * 70)
+    print(&quot;TRAINING COST ESTIMATES&quot;)
+    print(&quot;=&quot; * 70)
+
+    estimates = [
+        (8, 15.0, &quot;h100&quot;, 512),
+        (70, 15.0, &quot;h100&quot;, 2048),
+        (405, 15.0, &quot;h100&quot;, 16384),
+        (671, 14.8, &quot;h100&quot;, 2048),
+    ]
+
+    print(f&quot;  {&#39;Model&#39;:&gt;8} {&#39;Tokens&#39;:&gt;8} {&#39;GPUs&#39;:&gt;6} {&#39;Days&#39;:&gt;8} {&#39;Cost&#39;:&gt;14}&quot;)
+    print(&quot;  &quot; + &quot;-&quot; * 55)
+    for params, tokens, gpu, n_gpus in estimates:
+        result = training_cost_estimator(params, tokens, gpu, n_gpus)
+        cost_str = f&quot;${result[&#39;estimated_cost&#39;]:,.0f}&quot;
+        print(f&quot;  {params:&gt;6}B {tokens:&gt;6.1f}T {n_gpus:&gt;6} {result[&#39;wall_clock_days&#39;]:&gt;7.0f}d {cost_str:&gt;14}&quot;)
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/10-llms-from-scratch/05-scaling-distributed/outputs/prompt-distributed-training-planner.md">phases/10-llms-from-scratch/05-scaling-distributed/outputs/prompt-distributed-training-planner.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: prompt-distributed-training-planner
+description: Plan a distributed training run given model size and available hardware
+version: 1.0.0
+phase: 10
+lesson: 5
+tags: [distributed-training, fsdp, deepspeed, tensor-parallelism, pipeline-parallelism, scaling]
+---
+
+# Distributed Training Planner
+
+When planning a distributed training run for a large language model, use this framework to determine the parallelism strategy, memory budget, communication overhead, and expected throughput.
+
+## Input Requirements
+
+Provide:
+- **Model size** (parameters in billions)
+- **Target training tokens** (in trillions)
+- **Available GPUs** (type: A100/H100/H200, count, interconnect: NVLink/InfiniBand)
+- **GPU memory** (80GB for A100/H100, 141GB for H200)
+- **Nodes** (GPUs per node, number of nodes)
+- **Budget constraints** (max cost in dollars, max wall-clock time)
+
+## Step 1: Memory Budget
+
+Calculate per-GPU memory for each component:
+
+| Component | Formula | FP16 | FP32 |
+|-----------|---------|------|------|
+| Weights | params x bytes_per_param | params x 2 | params x 4 |
+| Adam optimizer (m + v) | params x 4 x 2 | 8 bytes/param always | 8 bytes/param |
+| Gradients | params x bytes_per_param | params x 2 | params x 4 |
+| Activations (estimate) | seq_len x batch x hidden x layers x 2 | varies | varies |
+
+If total exceeds GPU memory, sharding is required. Try in order:
+1. ZeRO-1 (shard optimizer only) -- cheapest communication
+2. ZeRO-2 (+ gradients) -- moderate communication
+3. FSDP/ZeRO-3 (+ weights) -- highest communication but maximum memory savings
+4. Add activation checkpointing if activations still too large
+5. Add tensor parallelism if a single layer does not fit on one GPU
+
+## Step 2: Parallelism Strategy
+
+### Decision Tree
+
+1. **Does one layer fit on one GPU?**
+   - No: You need tensor parallelism. Set TP = 2, 4, or 8 (within a node).
+   - Yes: Skip tensor parallelism.
+
+2. **Does the full model (with sharding) fit on GPUs within one node?**
+   - No: You need pipeline parallelism. Set PP = number of nodes / groups.
+   - Yes: Skip pipeline parallelism.
+
+3. **How many remaining GPUs for data parallelism?**
+   - DP = total_gpus / (TP x PP)
+
+4. **What sharding level within the data parallel group?**
+   - Start with FSDP (ZeRO-3). Reduce to ZeRO-2 or ZeRO-1 if communication is bottleneck.
+
+### Typical Configurations
+
+| Model Size | Total GPUs | TP | PP | DP | Sharding |
+|-----------|-----------|----|----|-----|----------|
+| 7B | 8 | 1 | 1 | 8 | FSDP |
+| 13B | 16 | 2 | 1 | 8 | FSDP |
+| 70B | 64 | 8 | 1 | 8 | FSDP |
+| 70B | 128 | 8 | 2 | 8 | FSDP |
+| 405B | 16,384 | 8 | 16 | 128 | FSDP |
+
+## Step 3: Communication Analysis
+
+Estimate communication volume per training step:
+
+- **Data parallel (all-reduce)**: 2 x gradient_size x (N-1)/N per step
+- **FSDP (all-gather + reduce-scatter)**: ~3 x weight_size x (N-1)/N per step (higher than DP)
+- **Tensor parallel (all-reduce per layer)**: 2 x activation_size x num_layers per step (needs NVLink)
+- **Pipeline parallel (point-to-point)**: activation_size per stage boundary (minimal)
+
+If communication time exceeds 20% of compute time, the strategy is communication-bound. Solutions:
+- Gradient accumulation (reduce all-reduce frequency)
+- Overlap communication with computation (FSDP does this by default)
+- Increase micro-batch size (better compute-to-communication ratio)
+- Switch to a less communication-heavy sharding stage
+
+## Step 4: Throughput and Cost Estimate
+
+**FLOPS per training step:**
+- Forward: ~2 x params x tokens_per_batch
+- Backward: ~4 x params x tokens_per_batch (2x forward)
+- Total: ~6 x params x tokens_per_batch
+
+**Training time:**
+- total_flops = 6 x params x total_tokens
+- time_seconds = total_flops / (num_gpus x gpu_tflops x 1e12 x utilization)
+- Typical utilization: 35-45% (accounting for communication, pipeline bubbles, memory overhead)
+
+**Cost:**
+- total_gpu_hours = num_gpus x time_seconds / 3600
+- cost = total_gpu_hours x cost_per_gpu_hour
+
+## Step 5: Validation Checklist
+
+Before launching:
+
+1. Per-GPU memory fits within hardware limit (with 10% headroom)
+2. Effective batch size matches target (per_gpu_batch x DP x gradient_accumulation_steps)
+3. Communication-to-compute ratio is below 20%
+4. Pipeline bubble fraction is below 15% (enough micro-batches)
+5. Learning rate is scaled for the effective batch size
+6. Checkpointing frequency accounts for failure probability (save every 1-2 hours for large runs)
+7. Gradient clipping is set (typically 1.0 for large models)
+8. Warmup steps are proportional to total steps (typically 0.1-1% of total)
+
+## Red Flags
+
+- **TP &gt; 8**: Tensor parallelism across nodes (over InfiniBand) is almost always slower than pipeline parallelism
+- **Pipeline stages &gt; 32**: Bubble overhead becomes significant even with many micro-batches
+- **Effective batch size &gt; 10M tokens**: Diminishing returns; may harm convergence
+- **Utilization below 30%**: Communication-bound -- re-evaluate parallelism strategy
+- **No activation checkpointing above 13B**: You will run out of memory during the backward pass
+- **No gradient accumulation with small per-GPU batch**: Gradient noise increases; accumulate to effective batch of 256+ samples
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. A 7B parameter model in FP16 needs how much VRAM just for weights?</legend><label class="option"><input type="radio" name="q0" value="0"> 14 GB</label><label class="option"><input type="radio" name="q0" value="1"> 28 GB</label><label class="option"><input type="radio" name="q0" value="2"> 7 GB</label><label class="option"><input type="radio" name="q0" value="3"> 56 GB</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. What are the three types of parallelism used in distributed training?</legend><label class="option"><input type="radio" name="q1" value="0"> Batch, sequence, and token parallelism</label><label class="option"><input type="radio" name="q1" value="1"> Forward, backward, and optimizer parallelism</label><label class="option"><input type="radio" name="q1" value="2"> Data parallelism, tensor parallelism, and pipeline parallelism</label><label class="option"><input type="radio" name="q1" value="3"> CPU, GPU, and TPU parallelism</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. What does FSDP (Fully Sharded Data Parallel) do that standard DDP does not?</legend><label class="option"><input type="radio" name="q2" value="0"> It uses a different optimizer</label><label class="option"><input type="radio" name="q2" value="1"> It processes data faster</label><label class="option"><input type="radio" name="q2" value="2"> It supports more GPUs</label><label class="option"><input type="radio" name="q2" value="3"> It shards model parameters, gradients, and optimizer states across GPUs instead of replicating the full model on each</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. What is DeepSpeed ZeRO Stage 3?</legend><label class="option"><input type="radio" name="q3" value="0"> A learning rate schedule</label><label class="option"><input type="radio" name="q3" value="1"> It partitions optimizer states, gradients, AND model parameters across GPUs, achieving maximum memory efficiency</label><label class="option"><input type="radio" name="q3" value="2"> A quantization method</label><label class="option"><input type="radio" name="q3" value="3"> A data preprocessing pipeline</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. Why is gradient synchronization necessary in data-parallel training?</legend><label class="option"><input type="radio" name="q4" value="0"> To speed up the forward pass</label><label class="option"><input type="radio" name="q4" value="1"> Each GPU computes gradients on different data; averaging gradients across GPUs ensures all replicas update identically</label><label class="option"><input type="radio" name="q4" value="2"> To reduce memory usage</label><label class="option"><input type="radio" name="q4" value="3"> To prevent overfitting</label><p data-feedback="4"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/10-llms-from-scratch/04-pre-training-mini-gpt/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/10-llms-from-scratch/06-instruction-tuning-sft/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/10-llms-from-scratch/05-scaling-distributed/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

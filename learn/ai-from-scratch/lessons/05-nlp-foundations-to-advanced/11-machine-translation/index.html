@@ -1,0 +1,538 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>机器翻译 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-05-nlp-foundations-to-advanced" data-lesson="05-nlp-foundations-to-advanced/11-machine-translation" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/05-nlp-foundations-to-advanced/">自然语言处理</a> / LESSON 11</p><h1 class="lesson-title">机器翻译</h1><p>Machine Translation</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>机器翻译</h1>
+<blockquote>
+<p>翻译是为30年来支付了NLP研究的任务,</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 5 · 10 (Attention Mechanism), Phase 5 · 04 (GloVe, FastText, Subword)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>问题</h2>
+<p>一个模型在一个语言中读出句子,并在另一个语言中生成句子.长度不同.词序不同.一些源词的地图为多个目标词和相反.语法拒绝单对单地图.法语中的&quot;我想念你&quot;是&quot;tu me manques&quot;字面上&quot;你是我缺少的&quot;.没有单词级的排列可以存活下来.</p>
+<p>机器翻译是迫使NLP发明编码解码器,注意力,变换器,最终整个LLM范式的任务.每一步都会进步,因为翻译质量是可测量的,人类和机器之间的差距是固执的.</p>
+<p>这一课跳过历史课程,并教导2026年的工作管道:预训练的多语言编码器-解码器 (NLLB-200或 mBART),字体代码化,光束搜索,BLEU和 chrF评估,以及数量未被捕的失败模式.</p>
+<h2>概念</h2>
+<p><img src="/learn/ai-from-scratch/files/phases/05-nlp-foundations-to-advanced/11-machine-translation/assets/mt-pipeline.svg" alt="MT pipeline: tokenize → encode → decode with attention → detokenize" loading="lazy"></p>
+<p>现代MT是一个以平行文本训练的变压器编码器-解码器.编码器在语言的标记中读取源头.解码器一次生成目标,一次一个字段,通过跨度注意力 (课10) 使用编码器输出.解码使用光束搜索以避免贪的解码陷.输出被解代,被破坏,并与参考进行分数.</p>
+<p>实际的MT质量是由三个操作选择来实现的.</p>
+<ul>
+<li>**Tokenizer.**语句Piece BPE 训练基于混合语言的语文. 语言之间的共享词汇是使NLLB中零射对成为可能的.</li>
+<li>**Model size.**电脑上可以安装NLLB-200蒸600M.NLLB-200 3.3B是公布的生产默认标准.54.5B是研究上限.</li>
+<li>**Decoding.**对于一般内容,光束宽度为4-5; 长度罚款以避免输出太短; 需要语法一致时限制解码.</li>
+</ul>
+<figure><img src="/learn/ai-from-scratch/figures/figure-6677f226c73c4d83d7af.png" alt="seq2seq-alignment 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<h3>步骤1:预训练式MT调用</h3>
+<pre><code class="language-python">from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+
+model_id = &quot;facebook/nllb-200-distilled-600M&quot;
+tok = AutoTokenizer.from_pretrained(model_id, src_lang=&quot;eng_Latn&quot;)
+model = AutoModelForSeq2SeqLM.from_pretrained(model_id)
+
+src = &quot;The cats are running.&quot;
+inputs = tok(src, return_tensors=&quot;pt&quot;)
+
+out = model.generate(
+    **inputs,
+    forced_bos_token_id=tok.convert_tokens_to_ids(&quot;fra_Latn&quot;),
+    num_beams=5,
+    length_penalty=1.0,
+    max_new_tokens=64,
+)
+print(tok.batch_decode(out, skip_special_tokens=True)[0])
+</code></pre>
+<pre><code class="language-text">Les chats courent.
+</code></pre>
+<p>这里有三个重要的事情.<code>src_lang</code>告诉代币器应使用哪个脚本和细分. <code>forced_bos_token_id</code>它们都是NLLB特定的技巧; mBART和M2M-100使用自己的规范,它们不能互换.</p>
+<h3>步骤2:蓝色和色</h3>
+<p>蓝色测量输出和参考之间的 n-gram重叠.四个参考 n-gram尺寸 (1-4),精度的几何平均值,过短输出的短暂处罚. 积分在 [0, 100].通常使用. 解释时令人丧: 30 蓝色是&quot;可用&quot;; 40 是&quot;好&quot;; 50 是&quot;例外&quot;; 1 蓝色的差异是噪音.</p>
+<p>chrF测量字符级F分. 对于蓝色字母不足的语言更敏感. 通常与蓝色字母一起报告.</p>
+<pre><code class="language-python">import sacrebleu
+
+hypotheses = [&quot;Les chats courent.&quot;]
+references = [[&quot;Les chats courent.&quot;]]
+
+bleu = sacrebleu.corpus_bleu(hypotheses, references)
+chrf = sacrebleu.corpus_chrf(hypotheses, references)
+print(f&quot;BLEU: {bleu.score:.1f}  chrF: {chrf.score:.1f}&quot;)
+</code></pre>
+<p>总是使用<code>sacrebleu</code>通过将自己的蓝色计算进行调整,误导性基准会发生.</p>
+<h3>三层次评估层次 (2026)</h3>
+<p>现代MT评估使用了三个互补的指标组.</p>
+<ul>
+<li><strong>Heuristic</strong>快速,基于参考,可解释,对抛词无关.用于传统的比较和回归检测.</li>
+<li><strong>Learned</strong>根据人类判断训练的神经模型;对译文与源和参考的语义相似性进行比较.自2023年以来,COMET与MT研究有着最高的关联,在质量方面是2026年生产默认.</li>
+<li><strong>LLM-as-judge</strong>提供一个大型模型,以评分翻译的流利性,足够性,语调,文化适用性.GPT-4作为法官与人同意相匹配~80%的时间,当标题设计得很好.在没有引用的情况下,用于开放式内容.</li>
+</ul>
+<p>实际的2026堆:<code>sacrebleu</code>对于BLEU和chRF,<code>unbabel-comet</code>在依靠生产数据之前,将每一个指标与50-100个标记的人类示例进行校准.</p>
+<p>没有引用的指标 (COMET-QE,BLEURT-QE,LLM-as-judge) 允许您评估没有引用的翻译,这对于没有引用翻译的长尾语言对象是重要的.</p>
+<h3>步骤3:生产中什么断</h3>
+<p>上面的工作管道将在80%的时间流动地翻译,剩余20%的时间默默地失败.</p>
+<ul>
+<li>**Hallucination.**模型发明内容不存在源头.在未熟悉的域词汇中很常见. 症状:输出流动,但声称来源没有声明的事实. 缓解:域名术语上的限制解码,监管的内容的人类审查,输出的监测时间远远超过输入.</li>
+<li>**Off-target generation.**模特翻译成错误的语言.NLLB在罕见的语言对象上有惊人的倾向.<code>forced_bos_token_id</code>并且总是使用语言ID模型检查输出.</li>
+<li><strong>Terminology drift.</strong>&quot;登录&quot;成为doc1中的&quot;s'inscribe&quot;和doc2中的&quot;creer un compte&quot;.对于UI文本和面向用户的字符串,一致性比原始质量更重要.减轻:词典限制式解码或后编辑词典.</li>
+<li>**Formality mismatch.**简单的&quot;你&quot;与&quot;你&quot;的法语,日本礼貌水平.模型选择了训练中最常见的形式.对于面向客户的内容,这通常是错误的.减轻:提示前,如果模型支持它,或在正式的体验中调整一个小模型.</li>
+<li>**Length explosion on short input.**非常短的输入句子通常产生过长的翻译,因为长度罚款落在源代币低于5个悬崖.减轻:硬最大长度盖相对应于源长度.</li>
+</ul>
+<h3>步骤4:为域进行细节调整</h3>
+<p>预训练的模型是一般主义者. 法律,医学或游戏对话翻译可以通过对域的并行数据进行微调来得到相当大的好处.</p>
+<pre><code class="language-python">from transformers import Trainer, TrainingArguments
+from datasets import Dataset
+
+pairs = [
+    {&quot;src&quot;: &quot;The defendant pleaded guilty.&quot;, &quot;tgt&quot;: &quot;L'accusé a plaidé coupable.&quot;},
+]
+
+ds = Dataset.from_list(pairs)
+
+
+def preprocess(ex):
+    return tok(
+        ex[&quot;src&quot;],
+        text_target=ex[&quot;tgt&quot;],
+        truncation=True,
+        max_length=128,
+        padding=&quot;max_length&quot;,
+    )
+
+
+ds = ds.map(preprocess, remove_columns=[&quot;src&quot;, &quot;tgt&quot;])
+
+args = TrainingArguments(output_dir=&quot;out&quot;, per_device_train_batch_size=4, num_train_epochs=3, learning_rate=3e-5)
+Trainer(model=model, args=args, train_dataset=ds).train()
+</code></pre>
+<p>几千个高质量的平行例子比几百万个有噪音的网页剪辑比较高.</p>
+<h2>用它</h2>
+<p>对于MT的2026年生产堆:</p>
+<table>
+<thead>
+<tr>
+<th>Use case</th>
+<th>Recommended starting point</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Any-to-any, 200 languages</td>
+<td><code>facebook/nllb-200-distilled-600M</code> (laptop) or <code>nllb-200-3.3B</code> (production)</td>
+</tr>
+<tr>
+<td>English-centric, high quality, 50 languages</td>
+<td><code>facebook/mbart-large-50-many-to-many-mmt</code></td>
+</tr>
+<tr>
+<td>Short runs, cheap inference, English-French/German/Spanish</td>
+<td>Helsinki-NLP / Marian models</td>
+</tr>
+<tr>
+<td>Latency-critical browser-side</td>
+<td>ONNX-quantized Marian (~50 MB)</td>
+</tr>
+<tr>
+<td>Maximum quality, willing to pay</td>
+<td>GPT-4 / Claude / Gemini with translation prompts</td>
+</tr>
+</tbody>
+</table>
+<p>现在,从2026年开始,LLM在几种语言对上超过了专业的MT模型,特别是在语法内容和长文本上.交易是每代币成本和延迟.当环境长度,风格一致性或域名适应性通过提示问题超过吞吐量时选择LLM.</p>
+<h2>运送它</h2>
+<p>保存如<code>outputs/skill-mt-evaluator.md</code>其他:</p>
+<pre><code class="language-markdown">---
+name: mt-evaluator
+description: Evaluate a machine translation output for shipping.
+version: 1.0.0
+phase: 5
+lesson: 11
+tags: [nlp, translation, evaluation]
+---
+
+Given a source text and a candidate translation, output:
+
+1. Automatic score estimate. BLEU and chrF ranges you would expect. State whether a reference is available.
+2. Five-point human-verifiable check list: (a) content preservation (no hallucinations), (b) correct language, (c) register / formality match, (d) terminology consistency with glossary if provided, (e) no truncation or length explosion.
+3. One domain-specific issue to probe. E.g., for legal: named entities and statute citations. For medical: drug names and dosages. For UI: placeholder variables `{name}`.
+4. Confidence flag. &quot;Ship&quot; / &quot;Ship with review&quot; / &quot;Do not ship&quot;. Tie to the severity of issues found in step 2.
+
+Refuse to ship a translation without a language-ID check on output. Refuse to evaluate without a reference unless the user explicitly opts in to reference-free scoring (COMET-QE, BLEURT-QE). Flag any content over 1000 tokens as likely needing chunked translation.
+</code></pre>
+<h2>运动</h2>
+<ol>
+<li>**Easy.**通过使用 翻译5句的英语段落到法语,然后再转到英语<code>nllb-200-distilled-600M</code>测量回路与原始的距离. 你应该看到语义保存与词选择漂移.</li>
+<li>**Medium.**通过使用 <code>fasttext lid.176</code>或<code>langdetect</code>集成到MT调用中,以便在返回之前,</li>
+<li>**Hard.**精细调节<code>nllb-200-distilled-600M</code>在您选择的5000对域名体内测量BLEEU在细调之前和后的延长集.报告哪些句子改善了,哪些退缩.</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>BLEU</td>
+<td>Translation score</td>
+<td>N-gram precision with brevity penalty. [0, 100].</td>
+</tr>
+<tr>
+<td>chrF</td>
+<td>Character F-score</td>
+<td>Character-level F-score. More sensitive for morphologically rich languages.</td>
+</tr>
+<tr>
+<td>NMT</td>
+<td>Neural MT</td>
+<td>Transformer encoder-decoder trained on parallel text. The 2017+ default.</td>
+</tr>
+<tr>
+<td>NLLB</td>
+<td>No Language Left Behind</td>
+<td>Meta's 200-language MT model family.</td>
+</tr>
+<tr>
+<td>Constrained decoding</td>
+<td>Controlled output</td>
+<td>Force specific tokens or n-grams to appear / not appear in the output.</td>
+</tr>
+<tr>
+<td>Hallucination</td>
+<td>Invented content</td>
+<td>Model output that is not supported by the source.</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2207.04672" rel="noreferrer" data-network="true">Costa-jussà et al. (2022). No Language Left Behind: Scaling Human-Centered Machine Translation <small>↗ 需要联网</small></a>NLLB论文.</li>
+<li><a href="https://aclanthology.org/W18-6319/" rel="noreferrer" data-network="true">Post (2018). A Call for Clarity in Reporting BLEU Scores <small>↗ 需要联网</small></a>为什么<code>sacrebleu</code>报告 BLEU的唯一正确方式.</li>
+<li><a href="https://aclanthology.org/W15-3049/" rel="noreferrer" data-network="true">Popović (2015). chrF: character n-gram F-score for automatic MT evaluation <small>↗ 需要联网</small></a>   纸</li>
+<li><a href="https://huggingface.co/docs/transformers/tasks/translation" rel="noreferrer" data-network="true">Hugging Face MT guide <small>↗ 需要联网</small></a>实用细调步行.</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Machine Translation</h1>
+<blockquote>
+<p>Translation is the task that paid for NLP research for thirty years and keeps paying now.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 5 · 10 (Attention Mechanism), Phase 5 · 04 (GloVe, FastText, Subword)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>The Problem</h2>
+<p>A model reads a sentence in one language and produces a sentence in another. Length varies. Word order varies. Some source words map to multiple target words and vice versa. Idioms refuse one-to-one mapping. &quot;I miss you&quot; in French is &quot;tu me manques&quot; — literally &quot;you are lacking to me.&quot; No word-level alignment survives that.</p>
+<p>Machine translation is the task that forced NLP to invent encoder-decoders, attention, transformers, and eventually the whole LLM paradigm. Every step forward arrived because translation quality was measurable and the gap between human and machine was stubborn.</p>
+<p>This lesson skips the history lesson and teaches the working pipeline of 2026: pretrained multilingual encoder-decoder (NLLB-200 or mBART), subword tokenization, beam search, BLEU and chrF evaluation, and the handful of failure modes that still ship to production uncaught.</p>
+<h2>The Concept</h2>
+<p><img src="/learn/ai-from-scratch/files/phases/05-nlp-foundations-to-advanced/11-machine-translation/assets/mt-pipeline.svg" alt="MT pipeline: tokenize → encode → decode with attention → detokenize" loading="lazy"></p>
+<p>Modern MT is a transformer encoder-decoder trained on parallel text. The encoder reads the source in its language's tokenization. The decoder generates the target, one subword at a time, using the encoder's output via cross-attention (lesson 10). Decoding uses beam search to avoid the greedy-decoding trap. The output is detokenized, detruecased, and scored against a reference.</p>
+<p>Three operational choices drive real-world MT quality.</p>
+<ul>
+<li><strong>Tokenizer.</strong> SentencePiece BPE trained on a mixed-language corpus. Shared vocabulary across languages is what enables zero-shot pairs in NLLB.</li>
+<li><strong>Model size.</strong> NLLB-200 distilled 600M fits on a laptop. NLLB-200 3.3B is the published production default. 54.5B is the research ceiling.</li>
+<li><strong>Decoding.</strong> Beam width 4-5 for general content. Length penalty to avoid too-short output. Constrained decoding when you need terminology consistency.</li>
+</ul>
+<figure><img src="/learn/ai-from-scratch/figures/figure-6677f226c73c4d83d7af.png" alt="seq2seq-alignment 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<h3>Step 1: a pretrained MT call</h3>
+<pre><code class="language-python">from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+
+model_id = &quot;facebook/nllb-200-distilled-600M&quot;
+tok = AutoTokenizer.from_pretrained(model_id, src_lang=&quot;eng_Latn&quot;)
+model = AutoModelForSeq2SeqLM.from_pretrained(model_id)
+
+src = &quot;The cats are running.&quot;
+inputs = tok(src, return_tensors=&quot;pt&quot;)
+
+out = model.generate(
+    **inputs,
+    forced_bos_token_id=tok.convert_tokens_to_ids(&quot;fra_Latn&quot;),
+    num_beams=5,
+    length_penalty=1.0,
+    max_new_tokens=64,
+)
+print(tok.batch_decode(out, skip_special_tokens=True)[0])
+</code></pre>
+<pre><code class="language-text">Les chats courent.
+</code></pre>
+<p>Three things matter here. <code>src_lang</code> tells the tokenizer which script and segmentation to apply. <code>forced_bos_token_id</code> tells the decoder which language to generate. Both are NLLB-specific tricks; mBART and M2M-100 use their own conventions and they are not interchangeable.</p>
+<h3>Step 2: BLEU and chrF</h3>
+<p>BLEU measures n-gram overlap between output and reference. Four reference n-gram sizes (1-4), geometric mean of precisions, brevity penalty for too-short output. The score is in [0, 100]. Commonly used. Frustrating to interpret: 30 BLEU is &quot;usable&quot;; 40 is &quot;good&quot;; 50 is &quot;exceptional&quot;; differences under 1 BLEU are noise.</p>
+<p>chrF measures character-level F-score. More sensitive to morphologically rich languages where BLEU undercounts matches. Often reported alongside BLEU.</p>
+<pre><code class="language-python">import sacrebleu
+
+hypotheses = [&quot;Les chats courent.&quot;]
+references = [[&quot;Les chats courent.&quot;]]
+
+bleu = sacrebleu.corpus_bleu(hypotheses, references)
+chrf = sacrebleu.corpus_chrf(hypotheses, references)
+print(f&quot;BLEU: {bleu.score:.1f}  chrF: {chrf.score:.1f}&quot;)
+</code></pre>
+<p>Always use <code>sacrebleu</code>. It normalizes tokenization so scores are comparable across papers. Rolling your own BLEU computation is how misleading benchmarks happen.</p>
+<h3>The three-tier evaluation hierarchy (2026)</h3>
+<p>Modern MT evaluation uses three complementary metric families. Ship with at least two.</p>
+<ul>
+<li><strong>Heuristic</strong> (BLEU, chrF). Fast, reference-based, interpretable, insensitive to paraphrase. Use for legacy comparison and regression detection.</li>
+<li><strong>Learned</strong> (COMET, BLEURT, BERTScore). Neural models trained on human judgment; compare semantic similarity of translation to source and reference. COMET has the highest association with MT research since 2023 and is the 2026 production default where quality matters.</li>
+<li><strong>LLM-as-judge</strong> (reference-free). Prompt a large model to score translations on fluency, adequacy, tone, cultural appropriateness. GPT-4-as-judge matches human agreement ~80% of the time when the rubric is well designed. Use for open-ended content where no reference exists.</li>
+</ul>
+<p>Practical 2026 stack: <code>sacrebleu</code> for BLEU and chrF, <code>unbabel-comet</code> for COMET, and a prompted LLM for the final human-facing signal. Calibrate every metric against 50-100 human-labeled examples before trusting it on production data.</p>
+<p>Reference-free metrics (COMET-QE, BLEURT-QE, LLM-as-judge) let you evaluate translations without a reference, which matters for long-tail language pairs where reference translations do not exist.</p>
+<h3>Step 3: what breaks in production</h3>
+<p>The working pipeline above will translate fluently 80% of the time and silently fail the remaining 20%. Named failure modes:</p>
+<ul>
+<li><strong>Hallucination.</strong> Model invents content that was not in the source. Common in unfamiliar domain vocabulary. Symptom: output is fluent but claims facts the source did not state. Mitigation: constrained decoding on domain terms, human review on regulated content, monitoring for output much longer than input.</li>
+<li><strong>Off-target generation.</strong> Model translates into the wrong language. NLLB is surprisingly prone to this on rare language pairs. Mitigation: verify <code>forced_bos_token_id</code> and always decode with a language-ID model check on output.</li>
+<li><strong>Terminology drift.</strong> &quot;Sign up&quot; becomes &quot;s'inscrire&quot; in doc 1 and &quot;créer un compte&quot; in doc 2. For UI text and user-facing strings, consistency matters more than raw quality. Mitigation: glossary-constrained decoding or post-edit dictionary.</li>
+<li><strong>Formality mismatch.</strong> French &quot;tu&quot; vs &quot;vous&quot;, Japanese politeness levels. The model picks whichever form was more common in training. For customer-facing content this is usually wrong. Mitigation: prompt prefix with a formality token if the model supports it, or fine-tune a small model on formal-only corpora.</li>
+<li><strong>Length explosion on short input.</strong> Very short input sentences often produce overlong translations because the length penalty falls off a cliff below ~5 source tokens. Mitigation: hard max-length cap proportional to source length.</li>
+</ul>
+<h3>Step 4: fine-tuning for a domain</h3>
+<p>Pretrained models are generalists. Legal, medical, or game-dialog translation benefits measurably from fine-tuning on domain parallel data. The recipe is not exotic:</p>
+<pre><code class="language-python">from transformers import Trainer, TrainingArguments
+from datasets import Dataset
+
+pairs = [
+    {&quot;src&quot;: &quot;The defendant pleaded guilty.&quot;, &quot;tgt&quot;: &quot;L'accusé a plaidé coupable.&quot;},
+]
+
+ds = Dataset.from_list(pairs)
+
+
+def preprocess(ex):
+    return tok(
+        ex[&quot;src&quot;],
+        text_target=ex[&quot;tgt&quot;],
+        truncation=True,
+        max_length=128,
+        padding=&quot;max_length&quot;,
+    )
+
+
+ds = ds.map(preprocess, remove_columns=[&quot;src&quot;, &quot;tgt&quot;])
+
+args = TrainingArguments(output_dir=&quot;out&quot;, per_device_train_batch_size=4, num_train_epochs=3, learning_rate=3e-5)
+Trainer(model=model, args=args, train_dataset=ds).train()
+</code></pre>
+<p>A few thousand high-quality parallel examples beats a few hundred thousand noisy web-scraped ones. Quality of training data is the single largest production lever.</p>
+<h2>Use It</h2>
+<p>The 2026 production stack for MT:</p>
+<table>
+<thead>
+<tr>
+<th>Use case</th>
+<th>Recommended starting point</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Any-to-any, 200 languages</td>
+<td><code>facebook/nllb-200-distilled-600M</code> (laptop) or <code>nllb-200-3.3B</code> (production)</td>
+</tr>
+<tr>
+<td>English-centric, high quality, 50 languages</td>
+<td><code>facebook/mbart-large-50-many-to-many-mmt</code></td>
+</tr>
+<tr>
+<td>Short runs, cheap inference, English-French/German/Spanish</td>
+<td>Helsinki-NLP / Marian models</td>
+</tr>
+<tr>
+<td>Latency-critical browser-side</td>
+<td>ONNX-quantized Marian (~50 MB)</td>
+</tr>
+<tr>
+<td>Maximum quality, willing to pay</td>
+<td>GPT-4 / Claude / Gemini with translation prompts</td>
+</tr>
+</tbody>
+</table>
+<p>LLMs now outperform specialized MT models on several language pairs as of 2026, particularly on idiomatic content and long context. The tradeoff is per-token cost and latency. Pick an LLM when context length, stylistic consistency, or domain adaptation via prompting matters more than throughput.</p>
+<h2>Ship It</h2>
+<p>Save as <code>outputs/skill-mt-evaluator.md</code>:</p>
+<pre><code class="language-markdown">---
+name: mt-evaluator
+description: Evaluate a machine translation output for shipping.
+version: 1.0.0
+phase: 5
+lesson: 11
+tags: [nlp, translation, evaluation]
+---
+
+Given a source text and a candidate translation, output:
+
+1. Automatic score estimate. BLEU and chrF ranges you would expect. State whether a reference is available.
+2. Five-point human-verifiable check list: (a) content preservation (no hallucinations), (b) correct language, (c) register / formality match, (d) terminology consistency with glossary if provided, (e) no truncation or length explosion.
+3. One domain-specific issue to probe. E.g., for legal: named entities and statute citations. For medical: drug names and dosages. For UI: placeholder variables `{name}`.
+4. Confidence flag. &quot;Ship&quot; / &quot;Ship with review&quot; / &quot;Do not ship&quot;. Tie to the severity of issues found in step 2.
+
+Refuse to ship a translation without a language-ID check on output. Refuse to evaluate without a reference unless the user explicitly opts in to reference-free scoring (COMET-QE, BLEURT-QE). Flag any content over 1000 tokens as likely needing chunked translation.
+</code></pre>
+<h2>Exercises</h2>
+<ol>
+<li><strong>Easy.</strong> Translate a 5-sentence English paragraph to French and back to English using <code>nllb-200-distilled-600M</code>. Measure how close the round-trip is to the original. You should see semantic preservation with word-choice drift.</li>
+<li><strong>Medium.</strong> Implement a language-ID check on translation outputs using <code>fasttext lid.176</code> or <code>langdetect</code>. Integrate into the MT call so off-target generations are caught before returning.</li>
+<li><strong>Hard.</strong> Fine-tune <code>nllb-200-distilled-600M</code> on a 5,000-pair domain corpus of your choice. Measure BLEU on a held-out set before and after fine-tuning. Report which kinds of sentences improved and which regressed.</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>BLEU</td>
+<td>Translation score</td>
+<td>N-gram precision with brevity penalty. [0, 100].</td>
+</tr>
+<tr>
+<td>chrF</td>
+<td>Character F-score</td>
+<td>Character-level F-score. More sensitive for morphologically rich languages.</td>
+</tr>
+<tr>
+<td>NMT</td>
+<td>Neural MT</td>
+<td>Transformer encoder-decoder trained on parallel text. The 2017+ default.</td>
+</tr>
+<tr>
+<td>NLLB</td>
+<td>No Language Left Behind</td>
+<td>Meta's 200-language MT model family.</td>
+</tr>
+<tr>
+<td>Constrained decoding</td>
+<td>Controlled output</td>
+<td>Force specific tokens or n-grams to appear / not appear in the output.</td>
+</tr>
+<tr>
+<td>Hallucination</td>
+<td>Invented content</td>
+<td>Model output that is not supported by the source.</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2207.04672" rel="noreferrer" data-network="true">Costa-jussà et al. (2022). No Language Left Behind: Scaling Human-Centered Machine Translation <small>↗ 需要联网</small></a> — the NLLB paper.</li>
+<li><a href="https://aclanthology.org/W18-6319/" rel="noreferrer" data-network="true">Post (2018). A Call for Clarity in Reporting BLEU Scores <small>↗ 需要联网</small></a> — why <code>sacrebleu</code> is the only correct way to report BLEU.</li>
+<li><a href="https://aclanthology.org/W15-3049/" rel="noreferrer" data-network="true">Popović (2015). chrF: character n-gram F-score for automatic MT evaluation <small>↗ 需要联网</small></a> — the chrF paper.</li>
+<li><a href="https://huggingface.co/docs/transformers/tasks/translation" rel="noreferrer" data-network="true">Hugging Face MT guide <small>↗ 需要联网</small></a> — practical fine-tuning walkthrough.</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-05-nlp-foundations-to-advanced--11-machine-translation.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-05-nlp-foundations-to-advanced--11-machine-translation.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/05-nlp-foundations-to-advanced/11-machine-translation/code/main.py">phases/05-nlp-foundations-to-advanced/11-machine-translation/code/main.py</a><details><summary>查看原始文本</summary><pre><code>import math
+from collections import Counter
+
+
+def tokenize(text):
+    return text.lower().replace(&quot;.&quot;, &quot; .&quot;).replace(&quot;,&quot;, &quot; ,&quot;).split()
+
+
+def ngrams(tokens, n):
+    return [tuple(tokens[i:i + n]) for i in range(len(tokens) - n + 1)]
+
+
+def ngram_precision(hyp_tokens, ref_tokens, n):
+    hyp_counts = Counter(ngrams(hyp_tokens, n))
+    ref_counts = Counter(ngrams(ref_tokens, n))
+    clipped = 0
+    total = 0
+    for ngram, count in hyp_counts.items():
+        clipped += min(count, ref_counts.get(ngram, 0))
+        total += count
+    if total == 0:
+        return 0.0
+    return clipped / total
+
+
+def brevity_penalty(hyp_len, ref_len):
+    if hyp_len &gt;= ref_len:
+        return 1.0
+    if hyp_len == 0:
+        return 0.0
+    return math.exp(1 - ref_len / hyp_len)
+
+
+def simple_bleu(hypothesis, reference, max_n=4):
+    hyp = tokenize(hypothesis)
+    ref = tokenize(reference)
+    precisions = [ngram_precision(hyp, ref, n) for n in range(1, max_n + 1)]
+    if any(p == 0 for p in precisions):
+        return 0.0
+    log_mean = sum(math.log(p) for p in precisions) / max_n
+    bp = brevity_penalty(len(hyp), len(ref))
+    return 100 * bp * math.exp(log_mean)
+
+
+def simple_bleu_note():
+    return (
+        &quot;simple_bleu above has no smoothing: one zero-precision n-gram drops &quot;
+        &quot;the score to 0.0. This punishes short hypotheses; production uses &quot;
+        &quot;epsilon / NIST / add-k smoothing via sacrebleu.&quot;
+    )
+
+
+def chrf(hypothesis, reference, n=6, beta=2):
+    def char_ngrams(text, k):
+        return [text[i:i + k] for i in range(len(text) - k + 1)]
+
+    hyp = hypothesis.lower()
+    ref = reference.lower()
+    precisions = []
+    recalls = []
+    for k in range(1, n + 1):
+        hyp_c = Counter(char_ngrams(hyp, k))
+        ref_c = Counter(char_ngrams(ref, k))
+        match = sum((hyp_c &amp; ref_c).values())
+        if sum(hyp_c.values()) == 0 or sum(ref_c.values()) == 0:
+            continue
+        precisions.append(match / sum(hyp_c.values()))
+        recalls.append(match / sum(ref_c.values()))
+    if not precisions:
+        return 0.0
+    p = sum(precisions) / len(precisions)
+    r = sum(recalls) / len(recalls)
+    if p + r == 0:
+        return 0.0
+    beta2 = beta * beta
+    return 100 * (1 + beta2) * p * r / (beta2 * p + r)
+
+
+def main():
+    cases = [
+        (&quot;Les chats courent.&quot;, &quot;Les chats courent.&quot;),
+        (&quot;Les chats sont en train de courir.&quot;, &quot;Les chats courent.&quot;),
+        (&quot;Les chiens mangent.&quot;, &quot;Les chats courent.&quot;),
+        (&quot;Les&quot;, &quot;Les chats courent.&quot;),
+    ]
+    print(f&quot;{&#39;hypothesis&#39;:40s}  {&#39;reference&#39;:25s}  {&#39;BLEU&#39;:&gt;6}  {&#39;chrF&#39;:&gt;6}&quot;)
+    for hyp, ref in cases:
+        b = simple_bleu(hyp, ref)
+        c = chrf(hyp, ref)
+        print(f&quot;{hyp:40s}  {ref:25s}  {b:6.1f}  {c:6.1f}&quot;)
+    print()
+    print(simple_bleu_note())
+    print(&quot;BLEU under 1 point is noise. chrF catches morphological partials BLEU misses.&quot;)
+    print(&quot;For real work, use sacrebleu (pip install sacrebleu) instead of this teaching version.&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/05-nlp-foundations-to-advanced/11-machine-translation/outputs/.gitkeep">phases/05-nlp-foundations-to-advanced/11-machine-translation/outputs/.gitkeep</a><details><summary>查看原始文本</summary><pre><code></code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/05-nlp-foundations-to-advanced/11-machine-translation/outputs/skill-mt-evaluator.md">phases/05-nlp-foundations-to-advanced/11-machine-translation/outputs/skill-mt-evaluator.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: mt-evaluator
+description: Evaluate a machine translation output for shipping.
+version: 1.0.0
+phase: 5
+lesson: 11
+tags: [nlp, translation, evaluation]
+---
+
+Given a source text and a candidate translation, output:
+
+1. Automatic score estimate. BLEU and chrF ranges you would expect. State whether a reference is available.
+2. Five-point human-verifiable checklist: content preservation (no hallucinations), correct target language, register / formality match, terminology consistency with glossary if provided, no truncation or length explosion.
+3. One domain-specific issue to probe. Legal: named entities, statute citations. Medical: drug names, dosages. UI: placeholder variables like `{name}`.
+4. Confidence flag. &quot;Ship&quot; / &quot;Ship with review&quot; / &quot;Do not ship&quot;. Tie to severity of issues found.
+
+Refuse to ship without a language-ID check on output. Refuse to evaluate without a reference unless the user explicitly opts in to reference-free scoring (COMET-QE, BLEURT-QE). Flag any content over 1000 tokens as likely needing chunked translation.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. What does BLEU measure?</legend><label class="option"><input type="radio" name="q0" value="0"> N-gram precision (typically 1-4) between hypothesis and reference, with a brevity penalty</label><label class="option"><input type="radio" name="q0" value="1"> Embedding cosine similarity</label><label class="option"><input type="radio" name="q0" value="2"> Language identification accuracy</label><label class="option"><input type="radio" name="q0" value="3"> Character-level F-score</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. Why use sacrebleu instead of rolling your own BLEU?</legend><label class="option"><input type="radio" name="q1" value="0"> It runs on GPU</label><label class="option"><input type="radio" name="q1" value="1"> It is more accurate</label><label class="option"><input type="radio" name="q1" value="2"> It normalizes tokenization so scores are comparable across papers and runs</label><label class="option"><input type="radio" name="q1" value="3"> It supports streaming</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. Which NLLB-specific setting controls the target language during decoding?</legend><label class="option"><input type="radio" name="q2" value="0"> src_lang</label><label class="option"><input type="radio" name="q2" value="1"> forced_bos_token_id set to the target language code&#39;s token id</label><label class="option"><input type="radio" name="q2" value="2"> num_beams</label><label class="option"><input type="radio" name="q2" value="3"> length_penalty</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. Which metric family is the 2026 default for production MT quality where labeled data exists?</legend><label class="option"><input type="radio" name="q3" value="0"> Token edit distance</label><label class="option"><input type="radio" name="q3" value="1"> Latency</label><label class="option"><input type="radio" name="q3" value="2"> BLEU alone</label><label class="option"><input type="radio" name="q3" value="3"> Learned metrics such as COMET (and BERTScore/BLEURT) trained on human judgment</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. When does chrF tend to be more informative than BLEU?</legend><label class="option"><input type="radio" name="q4" value="0"> For morphologically rich languages where character-level matches catch inflectional variants BLEU misses</label><label class="option"><input type="radio" name="q4" value="1"> When using beam search</label><label class="option"><input type="radio" name="q4" value="2"> On very short sentences</label><label class="option"><input type="radio" name="q4" value="3"> Whenever a reference exists</label><p data-feedback="4"></p></fieldset><fieldset><legend>6. What is off-target generation in multilingual MT?</legend><label class="option"><input type="radio" name="q5" value="0"> Output that drops named entities</label><label class="option"><input type="radio" name="q5" value="1"> The model decodes into the wrong target language (e.g. NLLB outputting Spanish when French was requested)</label><label class="option"><input type="radio" name="q5" value="2"> Output that is too short</label><label class="option"><input type="radio" name="q5" value="3"> Output that misses punctuation</label><p data-feedback="5"></p></fieldset><fieldset><legend>7. Why does fine-tuning on a few thousand high-quality domain pairs often beat much larger noisy web data?</legend><label class="option"><input type="radio" name="q6" value="0"> Quality and domain match dominate volume; noisy parallel data introduces drift and hallucination</label><label class="option"><input type="radio" name="q6" value="1"> Smaller datasets train faster</label><label class="option"><input type="radio" name="q6" value="2"> Web data is illegal to use</label><label class="option"><input type="radio" name="q6" value="3"> Larger data overflows GPU memory</label><p data-feedback="6"></p></fieldset><fieldset><legend>8. When is an LLM (e.g. GPT-4) likely to outperform a specialized MT model in 2026?</legend><label class="option"><input type="radio" name="q7" value="0"> Latency-critical browser translation</label><label class="option"><input type="radio" name="q7" value="1"> Idiomatic content, long context, stylistic adaptation via prompting, or content requiring tone control</label><label class="option"><input type="radio" name="q7" value="2"> Highest throughput batch translation</label><label class="option"><input type="radio" name="q7" value="3"> Small-language pairs with millions of parallel sentences</label><p data-feedback="7"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/05-nlp-foundations-to-advanced/10-attention-mechanism/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/05-nlp-foundations-to-advanced/12-text-summarization/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/05-nlp-foundations-to-advanced/11-machine-translation/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

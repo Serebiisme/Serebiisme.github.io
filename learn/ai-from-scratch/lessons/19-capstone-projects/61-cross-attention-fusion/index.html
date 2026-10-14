@@ -1,0 +1,697 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>跨注意力融合 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-19-capstone-projects" data-lesson="19-capstone-projects/61-cross-attention-fusion" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/19-capstone-projects/">综合项目</a> / LESSON 61</p><h1 class="lesson-title">跨注意力融合</h1><p>Cross-Attention Fusion</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>跨注意力融合</h1>
+<blockquote>
+<p>投影层将一个图像向量与一个标题向量对齐. 实际的视觉语言解码器需要每个文本代码来关注每个补丁代码, 通过注意力来实现这种地定. 文本问答;视觉关键和价值 这一课建立了跨越注意力区块,因果性文本自我注意力,</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 19 lessons 30-37 (Track B foundations)
+<strong>Time:</strong> ~90 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>实现多头交叉注意力,其中查询流是文本,键/值流是视觉.</li>
+<li>编写一个解码器块:因果自我注意+横向注意+传递.</li>
+<li>按正确的面具形状:因果性面具用于自我注意力,没有面具用于横向注意力.</li>
+<li>运行一个前进通行,包含批量文字代币和固定的图像代币池.</li>
+</ul>
+<h2>问题</h2>
+<p>结合图像代币和文本代币成一个序列是一个融合选项 (早期融合,Chameleon和Emu3走路).交叉注意力是另一种 (后期融合,Flamingo引入的路径,并且自此以来每个Flamingo形的解码器都复制了).在后期融合中,文本解码器仅使用文本代币运行,通过交叉注意力在每个层中进入图像流.</p>
+<p>后期融合有两个优势.一是,文本流保持清洁,模型保留仅为文本的功能.二是,图像流每图像计算一次,每次解码步骤都会再使用,因此生成即使是长片标题便宜.成本是每块额外的注意次层.</p>
+<h2>概念</h2>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-81b231b237a7815a0111.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><figure><img src="/learn/ai-from-scratch/figures/mermaid-8d802e2b7045c00c20bd.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>面具的形状</h3>
+<p>解码器区内的两个注意力需要不同的面具:</p>
+<table>
+<thead>
+<tr>
+<th>Attention</th>
+<th>Query length</th>
+<th>Key length</th>
+<th>Mask</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Self-attention</td>
+<td><code>Nt</code> (text)</td>
+<td><code>Nt</code> (text)</td>
+<td>Causal: lower-triangular <code>(Nt, Nt)</code></td>
+<td>Text tokens may not look ahead during autoregression</td>
+</tr>
+<tr>
+<td>Cross-attention</td>
+<td><code>Nt</code> (text)</td>
+<td><code>Nv</code> (vision)</td>
+<td>No mask</td>
+<td>The whole image is visible to every text position</td>
+</tr>
+</tbody>
+</table>
+<p>课程包括一个形状验证函数,所以混合它们的错误是<code>ValueError</code>而不是一个然破碎的损失曲线.</p>
+<h3>为什么没有面具在跨注意力</h3>
+<p>在生成任何文本之前,图像会被完全观察.<code>t</code>某些Flamingo变体在交织多个图像和文本段时添加一个样本按模式,但对于单个图像加上一个标题,交叉注意力可以看到一切.</p>
+<h3>密钥/值缓存</h3>
+<p>图像密钥和值在解码开始时计算一次,并存储在缓存中.每个新文本代币都使用缓存,而不需要重新计算.这就是导致标题快速推断的原因:重量 ViT一次运行;跨重视频每一步都会重新使用其密钥和值.课程暴露缓存并测试缓存击中的路径.</p>
+<h3>组合</h3>
+<p>解码器区块运行:LN前 -&gt;自我注意 -&gt;残留 -&gt;LN前 -&gt;横向注意 -&gt;残留 -&gt;LN前 -&gt;向前 -&gt;残留.三个子层,每个层都有自己的LayerNorm.Flamingo论文增加了学习的跨向注意的门,以便模型可以选择在训练时间稳定成本下退出图像路径;正规的基线 (在这里使用) 没有门.</p>
+<pre><code class="language-python">class DecoderBlock:
+  def forward(self, text_tokens, image_tokens, text_mask, cross_mask):
+      text_tokens = text_tokens + self.self_attn(self.ln1(text_tokens),
+                                                 mask=text_mask)
+      text_tokens = text_tokens + self.cross_attn(self.ln2(text_tokens),
+                                                  image_tokens,
+                                                  mask=cross_mask)
+      text_tokens = text_tokens + self.ffn(self.ln3(text_tokens))
+      return text_tokens
+</code></pre>
+<figure><img src="/learn/ai-from-scratch/figures/figure-0719f47c4fdd3eab6c50.png" alt="ch-crossattn-fan 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<p><code>code/main.py</code>执行:</p>
+<ul>
+<li><code>CrossAttention(hidden, heads)</code>双头交叉注意力,<code>q</code>其他<code>kv</code>预测</li>
+<li><code>CausalSelfAttention(hidden, heads)</code>通过标准解码器来隐藏自我注意.</li>
+<li><code>DecoderBlock</code>组建三个子层,含有LN前残留物.</li>
+<li><code>VisionLanguageDecoder</code>通过假视觉编码器输出和一个小的文本嵌入表提供四层解码器.</li>
+<li><code>causal_mask(length)</code>返回一个<code>(length, length)</code>低三角形的布尔尔子.</li>
+<li>显示一个节目,以长度10的两个文本序列提供一个节目,具有长度197的图像内存,并打印出口形,自我注意力面具形状,每个位置的跨注意力输出标准.</li>
+</ul>
+<p>运行它:</p>
+<pre><code class="language-bash">python3 code/main.py
+</code></pre>
+<p>输出:解码器产生一个<code>(2, 10, text_vocab)</code>子的形状是<code>(10, 10)</code>缓存和未缓存的路径之间的相同的登录.</p>
+<h2>用它</h2>
+<p>两种生产家庭中出现了交叉关注:</p>
+<ul>
+<li>**Flamingo and IDEFICS.**每个K语言模型块都插入一个跨注意次层,并使用一个结的LM.视觉语言适配器是跨注意区块加上它的门.</li>
+<li>**BLIP-2.**图像功能中使用32个查询代币的固定集合的交叉注意力,然后将查询投射到LM嵌入空间中.</li>
+</ul>
+<p>面具纪律 (因子自在,没有因子交叉) 是相同的.</p>
+<h2>测试</h2>
+<p><code>code/test_main.py</code>覆盖:</p>
+<ul>
+<li>原因面膜是下方三角形,与预期的布尔形状相匹配</li>
+<li>交叉注意力输出形状是<code>(B, Nt, hidden)</code>无论钥匙长度如何</li>
+<li>基动机缓存路径与未缓存路径和浮动耐受性相匹配</li>
+<li>文字和图像流之间的形状不匹配,<code>ValueError</code></li>
+<li>一个完整的解码器前传输产生了正确的批量和序列形状</li>
+</ul>
+<p>运行它们:</p>
+<pre><code class="language-bash">python3 -m unittest code/test_main.py
+</code></pre>
+<h2>运动</h2>
+<ol>
+<li>
+<p>加入一个学习的门,并验证训练从接近零的初始门汇聚.门开始于0;模型在混合图像流之前恢复仅仅是文本的行为.</p>
+</li>
+<li>
+<p>实现交叉关注,当同一解码器使用多个图像和多个文本段时. 构建每样本交叉关注面具,防止文本段 2 加入图像 1.</p>
+</li>
+<li>
+<p>介绍跨注意与自我注意层<code>Nt=64, Nv=576</code>跨重视成本是 <code>Nt * Nv</code>它们的图像分辨率很高.</p>
+</li>
+<li>
+<p>在交叉注意力地图上添加查询侧的置,并在演示中测量标题多样性 (随着交叉地图中置,标题样本差异增加).</p>
+</li>
+<li>
+<p>交换跨注意层,以Q-Former式的注意区块,其中一个固定的32代币查询池每层一次关注图像功能.</p>
+</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What it means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Late fusion</td>
+<td>Text and vision stay in separate streams; cross-attention bridges them at every block</td>
+</tr>
+<tr>
+<td>Cross-attention</td>
+<td>Q comes from one stream, K and V from another</td>
+</tr>
+<tr>
+<td>Causal mask</td>
+<td>Lower-triangular boolean mask that prevents looking ahead during autoregression</td>
+</tr>
+<tr>
+<td>KV cache</td>
+<td>Image keys and values stored once and reused for every decode step</td>
+</tr>
+<tr>
+<td>Memory tokens</td>
+<td>The frozen image tokens that the decoder reaches into</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li>弗拉明戈 (2022) 用于加нони化后期融合设计,具有门口交叉注意力.</li>
+<li>对于Q-Former来说,BLIP-2 (2023) 是一个穿着学习查询池的跨注意区块.</li>
+<li>为了对&quot;弗拉门戈&quot;配方进行公重复制,IDEFICS (2023)</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Cross-Attention Fusion</h1>
+<blockquote>
+<p>The projection layer aligns one image vector with one caption vector. A real vision-language decoder needs every text token to attend to every patch token, so the model can ground each word in a region. Cross-attention is how that grounding happens. The text queries; the vision keys and values answer. This lesson builds the cross-attention block, the causal text self-attention, and the mask shapes that keep both legal.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 19 lessons 30-37 (Track B foundations)
+<strong>Time:</strong> ~90 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Implement multi-head cross-attention where the query stream is text and the key/value stream is vision.</li>
+<li>Compose a decoder block: causal self-attention + cross-attention + feed-forward.</li>
+<li>Get the mask shapes right: causal mask for self-attention, no mask for cross-attention.</li>
+<li>Run a forward pass with batched text tokens and a fixed pool of image tokens.</li>
+</ul>
+<h2>The Problem</h2>
+<p>Concatenating image tokens and text tokens into one sequence is one fusion option (early fusion, the path Chameleon and Emu3 take). Cross-attention is the other (late fusion, the path Flamingo introduced and that every Flamingo-shaped decoder since has copied). In late fusion, the text decoder runs on text-only tokens and reaches over into the image stream through cross-attention at every layer.</p>
+<p>Late fusion has two advantages. First, the text stream stays clean and the model preserves text-only capabilities. Second, the image stream is computed once per image and reused for every decode step, so generation is cheap even for long captions. The cost is one extra attention sub-layer per block.</p>
+<h2>The Concept</h2>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-81b231b237a7815a0111.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><figure><img src="/learn/ai-from-scratch/figures/mermaid-8d802e2b7045c00c20bd.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>Mask shapes</h3>
+<p>The two attentions inside a decoder block need different masks:</p>
+<table>
+<thead>
+<tr>
+<th>Attention</th>
+<th>Query length</th>
+<th>Key length</th>
+<th>Mask</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Self-attention</td>
+<td><code>Nt</code> (text)</td>
+<td><code>Nt</code> (text)</td>
+<td>Causal: lower-triangular <code>(Nt, Nt)</code></td>
+<td>Text tokens may not look ahead during autoregression</td>
+</tr>
+<tr>
+<td>Cross-attention</td>
+<td><code>Nt</code> (text)</td>
+<td><code>Nv</code> (vision)</td>
+<td>No mask</td>
+<td>The whole image is visible to every text position</td>
+</tr>
+</tbody>
+</table>
+<p>The lesson includes one shape-validation function so the mistake of mixing them up surfaces as a <code>ValueError</code> instead of a silently broken loss curve.</p>
+<h3>Why no mask on cross-attention</h3>
+<p>The image is fully observed before any text is generated. Token <code>t</code> of the caption may attend to any patch of the image; there is no temporal order on image patches. Some Flamingo variants add a per-sample masking pattern when interleaving multiple images and text segments, but for a single image plus a caption, cross-attention sees everything.</p>
+<h3>Key/value caching</h3>
+<p>The image keys and values are computed once at the start of the decode and held in a cache. Each new text token uses the cache without recomputation. This is what makes captioning fast at inference: the heavy ViT runs once; the cross-attention reuses its keys and values for every step. The lesson exposes the cache and tests the cache-hit path.</p>
+<h3>Block composition</h3>
+<p>A decoder block runs: pre-LN -&gt; self-attention -&gt; residual -&gt; pre-LN -&gt; cross-attention -&gt; residual -&gt; pre-LN -&gt; feed-forward -&gt; residual. Three sub-layers, each with its own LayerNorm. The Flamingo paper added a learned gate on cross-attention so the model could opt out of the image path at training-time stability cost; the canonical baseline (used here) has no gate.</p>
+<pre><code class="language-python">class DecoderBlock:
+  def forward(self, text_tokens, image_tokens, text_mask, cross_mask):
+      text_tokens = text_tokens + self.self_attn(self.ln1(text_tokens),
+                                                 mask=text_mask)
+      text_tokens = text_tokens + self.cross_attn(self.ln2(text_tokens),
+                                                  image_tokens,
+                                                  mask=cross_mask)
+      text_tokens = text_tokens + self.ffn(self.ln3(text_tokens))
+      return text_tokens
+</code></pre>
+<figure><img src="/learn/ai-from-scratch/figures/figure-0719f47c4fdd3eab6c50.png" alt="ch-crossattn-fan 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<p><code>code/main.py</code> implements:</p>
+<ul>
+<li><code>CrossAttention(hidden, heads)</code>, multi-head cross-attention with separate <code>q</code> and <code>kv</code> projections.</li>
+<li><code>CausalSelfAttention(hidden, heads)</code>, the masked self-attention from a standard decoder.</li>
+<li><code>DecoderBlock</code>, composing the three sub-layers with pre-LN residuals.</li>
+<li><code>VisionLanguageDecoder</code>, four-layer decoder fed by a mock vision encoder output and a small text embedding table.</li>
+<li><code>causal_mask(length)</code> returning a <code>(length, length)</code> lower-triangular boolean tensor.</li>
+<li>A demo that feeds a batch of two text sequences of length 10 with image memory of length 197 and prints output shape, the self-attention mask shape, and the cross-attention output norm per position.</li>
+</ul>
+<p>Run it:</p>
+<pre><code class="language-bash">python3 code/main.py
+</code></pre>
+<p>Output: decoder produces a <code>(2, 10, text_vocab)</code> logits tensor. Mask shape is <code>(10, 10)</code>. The KV-cache reuse check confirms identical logits between the cached and uncached paths.</p>
+<h2>Use It</h2>
+<p>Cross-attention shows up in two production families:</p>
+<ul>
+<li><strong>Flamingo and IDEFICS.</strong> Insert a cross-attention sub-layer every K language model blocks, with a frozen LM. The vision-language adapter is the cross-attention block plus its gate.</li>
+<li><strong>BLIP-2.</strong> The Q-Former uses cross-attention from a fixed set of 32 query tokens into the image features, then projects the queries into the LM embedding space.</li>
+</ul>
+<p>The shape of the block in this lesson maps directly onto both. The mask discipline (causal on self, none on cross) is the same.</p>
+<h2>Tests</h2>
+<p><code>code/test_main.py</code> covers:</p>
+<ul>
+<li>causal mask is lower-triangular and matches expected boolean shape</li>
+<li>cross-attention output shape is <code>(B, Nt, hidden)</code> regardless of key length</li>
+<li>KV-cache path matches uncached path to float tolerance</li>
+<li>shape mismatch between text and image streams raises a clear <code>ValueError</code></li>
+<li>a full decoder forward pass produces the right batch and sequence shape</li>
+</ul>
+<p>Run them:</p>
+<pre><code class="language-bash">python3 -m unittest code/test_main.py
+</code></pre>
+<h2>Exercises</h2>
+<ol>
+<li>
+<p>Add a learned tanh gate to the cross-attention residual (the Flamingo trick) and verify training converges from a near-zero initial gate. The gate starts at 0; the model recovers text-only behavior before mixing the image stream in.</p>
+</li>
+<li>
+<p>Implement interleaved attention where the same decoder consumes multiple images plus multiple text segments. Build the per-sample cross-attention mask that prevents text segment 2 from attending to image 1.</p>
+</li>
+<li>
+<p>Profile the cross-attention vs the self-attention layer at <code>Nt=64, Nv=576</code> (a 24x24 grid at higher resolution). The cross-attention cost is <code>Nt * Nv</code> and dominates at high image resolution.</p>
+</li>
+<li>
+<p>Add a query-side dropout on the cross-attention map and measure caption diversity on the demo (caption sample variance increases with dropout in the cross map).</p>
+</li>
+<li>
+<p>Swap the cross-attention layer for a Q-Former-style attention block where a fixed 32-token query pool attends to image features once per layer.</p>
+</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What it means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Late fusion</td>
+<td>Text and vision stay in separate streams; cross-attention bridges them at every block</td>
+</tr>
+<tr>
+<td>Cross-attention</td>
+<td>Q comes from one stream, K and V from another</td>
+</tr>
+<tr>
+<td>Causal mask</td>
+<td>Lower-triangular boolean mask that prevents looking ahead during autoregression</td>
+</tr>
+<tr>
+<td>KV cache</td>
+<td>Image keys and values stored once and reused for every decode step</td>
+</tr>
+<tr>
+<td>Memory tokens</td>
+<td>The frozen image tokens that the decoder reaches into</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li>Flamingo (2022) for the canonical late-fusion design with gated cross-attention.</li>
+<li>BLIP-2 (2023) for the Q-Former, which is a cross-attention block dressed as a learned query pool.</li>
+<li>IDEFICS (2023) for an open-weight reproduction of the Flamingo recipe.</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-19-capstone-projects--61-cross-attention-fusion.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-19-capstone-projects--61-cross-attention-fusion.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/61-cross-attention-fusion/code/main.py">phases/19-capstone-projects/61-cross-attention-fusion/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Cross-attention fusion for a vision-language decoder.
+
+The decoder block runs:
+  1. causal self-attention over text tokens
+  2. cross-attention with queries from text and keys/values from image memory
+  3. feed-forward MLP
+
+Mask discipline:
+  - self-attention uses a (Nt, Nt) lower-triangular causal mask
+  - cross-attention uses no mask; the whole image is visible to every text
+    position
+
+Run with: python3 main.py
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+@dataclass(frozen=True)
+class DecoderConfig:
+    hidden: int = 256
+    heads: int = 8
+    depth: int = 4
+    mlp_ratio: float = 4.0
+    text_vocab: int = 1024
+    max_text_len: int = 32
+    vision_dim: int = 256
+    vision_tokens: int = 197
+    dropout: float = 0.0
+
+    @property
+    def head_dim(self) -&gt; int:
+        if self.hidden % self.heads != 0:
+            raise ValueError(f&quot;hidden {self.hidden} not divisible by heads {self.heads}&quot;)
+        return self.hidden // self.heads
+
+
+def causal_mask(length: int) -&gt; torch.Tensor:
+    &quot;&quot;&quot;Lower-triangular boolean mask of shape (length, length).
+
+    Cell [i, j] is True if token i may attend to token j (j &lt;= i).
+    &quot;&quot;&quot;
+    return torch.tril(torch.ones(length, length, dtype=torch.bool))
+
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, cfg: DecoderConfig) -&gt; None:
+        super().__init__()
+        self.cfg = cfg
+        self.qkv = nn.Linear(cfg.hidden, cfg.hidden * 3, bias=True)
+        self.out = nn.Linear(cfg.hidden, cfg.hidden, bias=True)
+        self.drop = nn.Dropout(cfg.dropout)
+        self.scale = 1.0 / math.sqrt(cfg.head_dim)
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -&gt; torch.Tensor:
+        b, n, d = x.shape
+        h, hd = self.cfg.heads, self.cfg.head_dim
+        qkv = self.qkv(x).reshape(b, n, 3, h, hd).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        scores = (q @ k.transpose(-2, -1)) * self.scale
+        if mask is not None:
+            if mask.shape != (n, n):
+                raise ValueError(
+                    f&quot;causal mask shape {tuple(mask.shape)} does not match (n, n) = ({n}, {n})&quot;
+                )
+            scores = scores.masked_fill(~mask.unsqueeze(0).unsqueeze(0), float(&quot;-inf&quot;))
+        attn = F.softmax(scores, dim=-1)
+        out = (attn @ v).transpose(1, 2).reshape(b, n, d)
+        return self.drop(self.out(out))
+
+
+class CrossAttention(nn.Module):
+    &quot;&quot;&quot;Multi-head cross-attention.
+
+    Query comes from text tokens; key and value come from image memory.
+    Supports a kv_cache argument so the projection of image memory can be
+    computed once and reused across decode steps.
+    &quot;&quot;&quot;
+
+    def __init__(self, cfg: DecoderConfig) -&gt; None:
+        super().__init__()
+        self.cfg = cfg
+        self.q_proj = nn.Linear(cfg.hidden, cfg.hidden, bias=True)
+        self.kv_proj = nn.Linear(cfg.vision_dim, cfg.hidden * 2, bias=True)
+        self.out = nn.Linear(cfg.hidden, cfg.hidden, bias=True)
+        self.drop = nn.Dropout(cfg.dropout)
+        self.scale = 1.0 / math.sqrt(cfg.head_dim)
+
+    def project_memory(self, memory: torch.Tensor) -&gt; tuple[torch.Tensor, torch.Tensor]:
+        if memory.dim() != 3:
+            raise ValueError(f&quot;expected (B, Nv, vision_dim), got {tuple(memory.shape)}&quot;)
+        b, nv, _ = memory.shape
+        h, hd = self.cfg.heads, self.cfg.head_dim
+        kv = self.kv_proj(memory).reshape(b, nv, 2, h, hd).permute(2, 0, 3, 1, 4)
+        return kv[0], kv[1]
+
+    def forward(self, x: torch.Tensor, memory: torch.Tensor,
+                kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None
+                ) -&gt; torch.Tensor:
+        if x.dim() != 3:
+            raise ValueError(f&quot;expected (B, Nt, hidden), got {tuple(x.shape)}&quot;)
+        if memory.shape[0] != x.shape[0]:
+            raise ValueError(
+                f&quot;batch mismatch: text {x.shape[0]} vs memory {memory.shape[0]}&quot;
+            )
+        b, nt, d = x.shape
+        h, hd = self.cfg.heads, self.cfg.head_dim
+
+        q = self.q_proj(x).reshape(b, nt, h, hd).transpose(1, 2)
+        if kv_cache is None:
+            k, v = self.project_memory(memory)
+        else:
+            k, v = kv_cache
+            expected = (b, h, memory.shape[1], hd)
+            if k.shape != expected or v.shape != expected:
+                raise ValueError(
+                    f&quot;kv_cache must be (B,H,Nv,hd)={expected}, got &quot;
+                    f&quot;k={tuple(k.shape)} v={tuple(v.shape)}&quot;
+                )
+
+        scores = (q @ k.transpose(-2, -1)) * self.scale
+        attn = F.softmax(scores, dim=-1)
+        out = (attn @ v).transpose(1, 2).reshape(b, nt, d)
+        return self.drop(self.out(out))
+
+
+class FeedForward(nn.Module):
+    def __init__(self, cfg: DecoderConfig) -&gt; None:
+        super().__init__()
+        inner = int(cfg.hidden * cfg.mlp_ratio)
+        self.fc1 = nn.Linear(cfg.hidden, inner)
+        self.fc2 = nn.Linear(inner, cfg.hidden)
+
+    def forward(self, x: torch.Tensor) -&gt; torch.Tensor:
+        return self.fc2(F.gelu(self.fc1(x)))
+
+
+class DecoderBlock(nn.Module):
+    def __init__(self, cfg: DecoderConfig) -&gt; None:
+        super().__init__()
+        self.ln1 = nn.LayerNorm(cfg.hidden, eps=1e-6)
+        self.self_attn = CausalSelfAttention(cfg)
+        self.ln2 = nn.LayerNorm(cfg.hidden, eps=1e-6)
+        self.cross_attn = CrossAttention(cfg)
+        self.ln3 = nn.LayerNorm(cfg.hidden, eps=1e-6)
+        self.ffn = FeedForward(cfg)
+
+    def forward(self, x: torch.Tensor, memory: torch.Tensor,
+                text_mask: torch.Tensor,
+                kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
+                ) -&gt; torch.Tensor:
+        x = x + self.self_attn(self.ln1(x), mask=text_mask)
+        x = x + self.cross_attn(self.ln2(x), memory, kv_cache=kv_cache)
+        x = x + self.ffn(self.ln3(x))
+        return x
+
+
+class VisionLanguageDecoder(nn.Module):
+    def __init__(self, cfg: DecoderConfig) -&gt; None:
+        super().__init__()
+        self.cfg = cfg
+        self.tok_emb = nn.Embedding(cfg.text_vocab, cfg.hidden)
+        self.pos_emb = nn.Embedding(cfg.max_text_len, cfg.hidden)
+        self.blocks = nn.ModuleList([DecoderBlock(cfg) for _ in range(cfg.depth)])
+        self.norm = nn.LayerNorm(cfg.hidden, eps=1e-6)
+        self.head = nn.Linear(cfg.hidden, cfg.text_vocab, bias=False)
+
+    def build_kv_cache(self, memory: torch.Tensor) -&gt; list[tuple[torch.Tensor, torch.Tensor]]:
+        cache = []
+        for block in self.blocks:
+            k, v = block.cross_attn.project_memory(memory)
+            cache.append((k, v))
+        return cache
+
+    def forward(self, text_ids: torch.Tensor, memory: torch.Tensor,
+                use_cache: bool = False) -&gt; torch.Tensor:
+        if text_ids.dim() != 2:
+            raise ValueError(f&quot;expected (B, Nt) ids, got {tuple(text_ids.shape)}&quot;)
+        b, nt = text_ids.shape
+        if nt &gt; self.cfg.max_text_len:
+            raise ValueError(f&quot;text length {nt} exceeds max {self.cfg.max_text_len}&quot;)
+
+        positions = torch.arange(nt, device=text_ids.device)
+        x = self.tok_emb(text_ids) + self.pos_emb(positions).unsqueeze(0)
+
+        mask = causal_mask(nt).to(text_ids.device)
+
+        cache = self.build_kv_cache(memory) if use_cache else [None] * len(self.blocks)
+
+        for block, kv in zip(self.blocks, cache):
+            x = block(x, memory=memory, text_mask=mask, kv_cache=kv)
+
+        x = self.norm(x)
+        return self.head(x)
+
+
+def synth_memory(batch: int, n_tokens: int, dim: int, seed: int) -&gt; torch.Tensor:
+    gen = torch.Generator().manual_seed(seed)
+    return torch.randn(batch, n_tokens, dim, generator=gen)
+
+
+def synth_text(batch: int, length: int, vocab: int, seed: int) -&gt; torch.Tensor:
+    gen = torch.Generator().manual_seed(seed + 1)
+    return torch.randint(low=0, high=vocab, size=(batch, length), generator=gen)
+
+
+def main() -&gt; None:
+    print(&quot;=&quot; * 60)
+    print(&quot;CROSS-ATTENTION FUSION DECODER&quot;)
+    print(&quot;=&quot; * 60)
+
+    cfg = DecoderConfig()
+    print(f&quot;  hidden          : {cfg.hidden}&quot;)
+    print(f&quot;  heads           : {cfg.heads} (head dim {cfg.head_dim})&quot;)
+    print(f&quot;  depth           : {cfg.depth}&quot;)
+    print(f&quot;  text vocab      : {cfg.text_vocab}&quot;)
+    print(f&quot;  max text length : {cfg.max_text_len}&quot;)
+    print(f&quot;  vision tokens   : {cfg.vision_tokens}&quot;)
+    print(f&quot;  vision dim      : {cfg.vision_dim}&quot;)
+
+    torch.manual_seed(0)
+    decoder = VisionLanguageDecoder(cfg).eval()
+    n_params = sum(p.numel() for p in decoder.parameters())
+    print(f&quot;\ndecoder params  : {n_params:,}&quot;)
+
+    text_ids = synth_text(batch=2, length=10, vocab=cfg.text_vocab, seed=0)
+    memory = synth_memory(batch=2, n_tokens=cfg.vision_tokens, dim=cfg.vision_dim, seed=1)
+    print(f&quot;\ntext_ids shape  : {tuple(text_ids.shape)}&quot;)
+    print(f&quot;memory shape    : {tuple(memory.shape)}&quot;)
+
+    mask = causal_mask(10)
+    print(f&quot;\ncausal mask shape : {tuple(mask.shape)}&quot;)
+    print(&quot;causal mask top-left 5x5:&quot;)
+    for row in mask[:5, :5].int().tolist():
+        print(&quot;  &quot; + &quot; &quot;.join(str(v) for v in row))
+
+    with torch.no_grad():
+        logits = decoder(text_ids, memory, use_cache=False)
+        logits_cached = decoder(text_ids, memory, use_cache=True)
+    print(f&quot;\nlogits shape    : {tuple(logits.shape)}&quot;)
+    print(f&quot;logits cached   : {tuple(logits_cached.shape)}&quot;)
+    drift = (logits - logits_cached).abs().max().item()
+    print(f&quot;max drift cache vs uncached : {drift:.6e}&quot;)
+    if drift &lt; 1e-4:
+        print(&quot;  ok: KV cache path matches uncached&quot;)
+    else:
+        print(&quot;  FAIL: cache drift exceeds tolerance&quot;)
+
+    print(&quot;\ncross-attention output norm per text position (head 0, sample 0):&quot;)
+    block = decoder.blocks[0]
+    ln_x = block.ln2(decoder.tok_emb(text_ids) + decoder.pos_emb(torch.arange(10)))
+    with torch.no_grad():
+        cross_out = block.cross_attn(ln_x, memory)
+    norms = cross_out[0].norm(dim=-1).tolist()
+    for i, val in enumerate(norms):
+        print(f&quot;  pos {i:2d}  norm {val:.3f}&quot;)
+
+    print(&quot;\ndone.&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/61-cross-attention-fusion/code/test_main.py">phases/19-capstone-projects/61-cross-attention-fusion/code/test_main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Unit tests for cross-attention fusion.&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import unittest
+
+import torch
+
+from main import (
+    CausalSelfAttention,
+    CrossAttention,
+    DecoderBlock,
+    DecoderConfig,
+    VisionLanguageDecoder,
+    causal_mask,
+    synth_memory,
+    synth_text,
+)
+
+
+def small_cfg() -&gt; DecoderConfig:
+    return DecoderConfig(
+        hidden=64,
+        heads=4,
+        depth=2,
+        mlp_ratio=2.0,
+        text_vocab=128,
+        max_text_len=16,
+        vision_dim=64,
+        vision_tokens=20,
+    )
+
+
+class TestCausalMask(unittest.TestCase):
+    def test_shape(self) -&gt; None:
+        m = causal_mask(7)
+        self.assertEqual(m.shape, (7, 7))
+        self.assertEqual(m.dtype, torch.bool)
+
+    def test_lower_triangular(self) -&gt; None:
+        m = causal_mask(5).int()
+        expected = torch.tril(torch.ones(5, 5, dtype=torch.int32))
+        self.assertTrue(torch.equal(m, expected))
+
+
+class TestCrossAttention(unittest.TestCase):
+    def test_output_shape_independent_of_key_length(self) -&gt; None:
+        cfg = small_cfg()
+        cross = CrossAttention(cfg)
+        text = torch.randn(2, 6, cfg.hidden)
+        mem_short = torch.randn(2, 10, cfg.vision_dim)
+        mem_long = torch.randn(2, 50, cfg.vision_dim)
+        out_short = cross(text, mem_short)
+        out_long = cross(text, mem_long)
+        self.assertEqual(out_short.shape, (2, 6, cfg.hidden))
+        self.assertEqual(out_long.shape, (2, 6, cfg.hidden))
+
+    def test_kv_cache_matches_uncached(self) -&gt; None:
+        cfg = small_cfg()
+        torch.manual_seed(11)
+        cross = CrossAttention(cfg).eval()
+        text = torch.randn(2, 4, cfg.hidden)
+        memory = torch.randn(2, 12, cfg.vision_dim)
+        with torch.no_grad():
+            ref = cross(text, memory)
+            cache = cross.project_memory(memory)
+            cached = cross(text, memory, kv_cache=cache)
+        self.assertTrue(torch.allclose(ref, cached, atol=1e-5))
+
+    def test_batch_mismatch_raises(self) -&gt; None:
+        cfg = small_cfg()
+        cross = CrossAttention(cfg)
+        text = torch.randn(2, 4, cfg.hidden)
+        memory = torch.randn(3, 12, cfg.vision_dim)
+        with self.assertRaises(ValueError):
+            cross(text, memory)
+
+
+class TestSelfAttention(unittest.TestCase):
+    def test_rejects_wrong_mask_shape(self) -&gt; None:
+        cfg = small_cfg()
+        attn = CausalSelfAttention(cfg)
+        x = torch.randn(1, 5, cfg.hidden)
+        bad = torch.ones(4, 4, dtype=torch.bool)
+        with self.assertRaises(ValueError):
+            attn(x, mask=bad)
+
+
+class TestDecoder(unittest.TestCase):
+    def test_forward_shape(self) -&gt; None:
+        cfg = small_cfg()
+        dec = VisionLanguageDecoder(cfg).eval()
+        ids = synth_text(2, 8, cfg.text_vocab, seed=0)
+        memory = synth_memory(2, cfg.vision_tokens, cfg.vision_dim, seed=1)
+        with torch.no_grad():
+            logits = dec(ids, memory)
+        self.assertEqual(logits.shape, (2, 8, cfg.text_vocab))
+
+    def test_cache_path_matches(self) -&gt; None:
+        cfg = small_cfg()
+        torch.manual_seed(0)
+        dec = VisionLanguageDecoder(cfg).eval()
+        ids = synth_text(2, 6, cfg.text_vocab, seed=0)
+        memory = synth_memory(2, cfg.vision_tokens, cfg.vision_dim, seed=1)
+        with torch.no_grad():
+            a = dec(ids, memory, use_cache=False)
+            b = dec(ids, memory, use_cache=True)
+        self.assertTrue(torch.allclose(a, b, atol=1e-5))
+
+    def test_rejects_too_long_input(self) -&gt; None:
+        cfg = small_cfg()
+        dec = VisionLanguageDecoder(cfg)
+        ids = torch.zeros(1, cfg.max_text_len + 1, dtype=torch.long)
+        memory = synth_memory(1, cfg.vision_tokens, cfg.vision_dim, seed=0)
+        with self.assertRaises(ValueError):
+            dec(ids, memory)
+
+
+if __name__ == &quot;__main__&quot;:
+    unittest.main()
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. What is the operational difference between early fusion and late fusion in vision-language modeling?</legend><label class="option"><input type="radio" name="q0" value="0"> Late fusion uses more memory</label><label class="option"><input type="radio" name="q0" value="1"> Early fusion is illegal</label><label class="option"><input type="radio" name="q0" value="2"> Early fusion concatenates image and text tokens into one sequence; late fusion keeps them separate and bridges via cross-attention at each block</label><label class="option"><input type="radio" name="q0" value="3"> Early fusion runs first in wall-clock time</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. In a decoder block with both self-attention and cross-attention, which one uses a causal mask?</legend><label class="option"><input type="radio" name="q1" value="0"> Neither</label><label class="option"><input type="radio" name="q1" value="1"> Both</label><label class="option"><input type="radio" name="q1" value="2"> Cross-attention only</label><label class="option"><input type="radio" name="q1" value="3"> Self-attention only; the image is fully observed and cross-attention has no temporal order</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. Why is the cross-attention KV cache built once per image?</legend><label class="option"><input type="radio" name="q2" value="0"> Image keys and values do not change as text is decoded, so projecting memory once and reusing the K and V across all decode steps is the whole inference speedup</label><label class="option"><input type="radio" name="q2" value="1"> It avoids using the GPU</label><label class="option"><input type="radio" name="q2" value="2"> PyTorch requires caching</label><label class="option"><input type="radio" name="q2" value="3"> Caching saves disk space</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. What is the output shape of cross-attention when text length is Nt=10 and image length is Nv=197 with hidden=256?</legend><label class="option"><input type="radio" name="q3" value="0"> (B, 10, 256)</label><label class="option"><input type="radio" name="q3" value="1"> (B, 207, 256)</label><label class="option"><input type="radio" name="q3" value="2"> (B, 10, 197)</label><label class="option"><input type="radio" name="q3" value="3"> (B, 197, 256)</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. Why is no mask used on cross-attention?</legend><label class="option"><input type="radio" name="q4" value="0"> Masks always cause NaN</label><label class="option"><input type="radio" name="q4" value="1"> Masks are too expensive</label><label class="option"><input type="radio" name="q4" value="2"> The image is fully observed before text generation begins; every text position may attend to every patch</label><label class="option"><input type="radio" name="q4" value="3"> PyTorch does not support cross masks</label><p data-feedback="4"></p></fieldset><fieldset><legend>6. Which extension would you add to recover Flamingo-style stability during training?</legend><label class="option"><input type="radio" name="q5" value="0"> Remove the FFN</label><label class="option"><input type="radio" name="q5" value="1"> Insert a learned tanh gate on the cross-attention residual so the model can start from text-only behavior and grow into the image stream</label><label class="option"><input type="radio" name="q5" value="2"> Drop the self-attention layer</label><label class="option"><input type="radio" name="q5" value="3"> Use only one attention head</label><p data-feedback="5"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/19-capstone-projects/60-projection-layer-modality-align/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/19-capstone-projects/62-vision-language-pretraining/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/19-capstone-projects/61-cross-attention-fusion/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

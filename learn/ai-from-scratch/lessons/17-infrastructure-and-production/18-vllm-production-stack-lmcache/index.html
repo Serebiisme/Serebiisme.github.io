@@ -1,0 +1,431 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>生产服务堆  KV卸载和缓存知路线 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-17-infrastructure-and-production" data-lesson="17-infrastructure-and-production/18-vllm-production-stack-lmcache" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/17-infrastructure-and-production/">基础设施与生产</a> / LESSON 18</p><h1 class="lesson-title">生产服务堆  KV卸载和缓存知路线</h1><p>Production Serving Stack — KV Offloading and Cache-Aware Routing</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>生产服务堆  KV卸载和缓存知路线</h1>
+<blockquote>
+<p>提供堆线路由器,引擎和可观察性在一个Kubernetes部署中,并将KV缓存作为可以离开GPU的资源. 脱载KV将KV缓存从GPU内存中提取出来,并在查询和引擎中重复使用 (CPUDRAM,然后是磁盘/Ceph).  vLLM的生产堆是参考部署; LMCache是卸载层. 通过连接器API (v0.9.0+) 实现了无同步和可插入的 vLLM 0.11.0 KV脱载连接器 (2026年1月). 脱载路径通常隐藏于请求路径,尽管缓存错失和促销可以增加端到端延迟. LMCache即使没有共享的预写,也很有价值. 当GPU没有KV插槽时,预先请求可以从CPU恢复,而不是重新计算预填. 发布的 16x H100 (80GB HBM) 基准值在 4 a3-highgpu-4g:当KV缓存超过HBM时,本土CPU脱载和LMCache都会显著提高吞吐量;在低KV足迹时,所有配置都与小的上空成本相匹配.</p>
+</blockquote>
+<p><strong>Type:</strong> Learn
+<strong>Languages:</strong> Python (stdlib, toy KV-spill simulator)
+<strong>Prerequisites:</strong> Phase 17 · 04 (Serving Engine Internals), Phase 17 · 06 (SGLang/RadixAttention)
+<strong>Time:</strong> ~60 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>图表vLLM生产堆层:路由器,发动机,KV脱载,可观测性.</li>
+<li>解释KV脱载连接器API (v0.9.0+) 以及如何隐藏0.11.0异步路径脱载延迟.</li>
+<li>量化LMCache CPU-DRAM帮助 (KV &gt; HBM) 与增加上 (KV足够小以适合HBM) 的时间.</li>
+<li>根据部署限制,选择原生vLLM CPU脱载和LMCache连接器.</li>
+</ul>
+<h2>问题</h2>
+<p>您的vLLM服务显示 GPU 处于100%HBM,随着同步升级时都会出现预先事件.请求被驱逐出境,排队,并在一分钟内重新填写相同的2K代码提示. GPU 计算用于冗余的预填;产量远低于原始产量.</p>
+<p>增加更多的GPU成本是线性的.增加更多的HBM是不可能的.但CPUDRAM便宜一个插座的延迟量比HBM差于512GB+但对于&quot;暂时热&quot;KV缓存很好.</p>
+<p>LMCache 将KV缓存提取到CPUDRAM,以使先发请求快速恢复,并且在发动机中重复的预先设在不需要每一个发动机重新填充的情况下共享缓存.</p>
+<h2>概念</h2>
+<h3>机生产堆</h3>
+<p><code>github.com/vllm-project/production-stack</code>是参考库伯尼特斯部署:</p>
+<ul>
+<li><strong>Router</strong>缓存意识 (阶段17 · 11) 消耗KV事件.</li>
+<li><strong>Engines</strong>vLLM工作者:每一个GPU或每一个TP/PP组.</li>
+<li><strong>KV cache offload</strong> LMCache部署或本地连接器.</li>
+<li><strong>Observability</strong>普罗梅蒂乌斯的痕,格拉法纳仪表板,OTel的痕迹.</li>
+<li><strong>Control plane</strong>服务发现,配置,不断更新.</li>
+</ul>
+<p>作为Helm图+运营商.</p>
+<h3>电动电源脱载连接器API (v0.9.0+)</h3>
+<p>vLLM 0.9.0 引入了可插入的KV缓存后端的连接器API.你的引擎将块放入连接器;连接器存储它们 (RAM,磁盘,对象存储,LMCache).请求需要一个块,连接器将其重新加载.</p>
+<p>vLLM 0.11.0 (2026年1月) 增加了一个异步的脱载路径 脱载可以发生在背景下,因此在普通情况下,引擎不会被阻塞. 端到端延迟和吞吐量仍然取决于工作负载形状,KV缓存击率和系统压力;vLLM自己的笔记指出,自定义核脱载可以降低低击率的吞吐量,以及异步调度已有熟悉的互动问题.</p>
+<h3>原产CPU脱载对 LMCache</h3>
+<p><strong>Native vLLM CPU offload</strong>存储KV块在主机内存器内.快速实现,零网络跳转.不交叉引擎.</p>
+<p><strong>LMCache connector</strong>库存区块在共享的LMCache服务器 (CPU DRAM + Ceph/S3级). 区块可访问任何引擎. 16x H100基准发布.</p>
+<p>当一个发动机具有HBM压力时选择本机.当多个发动机共享预写时选择LMCache (RAG与共同的系统提示,多租户共享模板).</p>
+<h3>基准行为</h3>
+<p>测试的16xH100 (80GBHBM) 分布在4a3-highgpu-4g测试中:</p>
+<ul>
+<li>低KV足迹 (短提示,低同步性):所有配置都匹配基线,LMCache增加了3-5%的总费用.</li>
+<li>适度足迹:LMCache开始帮助在引擎中重复使用前.</li>
+<li>基动力超过HBM:原产CPU脱载和LMCache都大幅提高吞吐量;由于跨引擎共享,LMCache更大收益.</li>
+</ul>
+<h3>当LMCache是决定性的时</h3>
+<ul>
+<li>服务多租户,系统提示将被租户共享.</li>
+<li>在文件块中重复查询.</li>
+<li>基型KV重用减少过剩工作的相同基础上的细调变体 (LoRA).</li>
+<li>预先加重工作负载:从CPU恢复比重装更便宜.</li>
+</ul>
+<h3>什么时候 NOT 启用</h3>
+<ul>
+<li>低压的HBM 你支付的费用没有福利.</li>
+<li>短文本 (&lt;1K代币) 转移时间 &gt; 重新填写.</li>
+<li>单租户单次工作量 没有再利用</li>
+</ul>
+<h3>集成与分类分类服务</h3>
+<p>17 期 · 17 分类分组服务 + LMCache 化合物:KV从预填池转移到未使用 LMCache 中的池地解码;随后的查询从 LMCache 拉开. 17 期 · 11 缓存意识的路由器可以向与本地 OR LMCache 共享缓存匹配的引擎进行路由.</p>
+<h3>你应该记住的数字</h3>
+<ul>
+<li>连接器API已发送.</li>
+<li>无机载荷路径;端到端延迟影响取决于工作负载,KV击速率和系统压力 (不是绝对的保证).</li>
+<li>16x H100基准:KV足迹超过HBM时,LMCache有助于.</li>
+<li>低压HBM:3-5%的上层费用,没有效益.</li>
+</ul>
+<figure><img src="/learn/ai-from-scratch/figures/figure-6d0cde6c1ce8119a5ceb.png" alt="zero-sharding 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>用它</h2>
+<p><code>code/main.py</code>报告避免过度填充,吞吐量增加和破解式HBM使用.</p>
+<h2>运送它</h2>
+<p>这一课产生了<code>outputs/skill-vllm-stack-decider.md</code>鉴于工作负载的形状和vLLM部署,决定原生对LMCache对任何一个.</p>
+<h2>运动</h2>
+<ol>
+<li>跑步<code>code/main.py</code>什么时候使用HBM开始付钱?</li>
+<li>租户共享6K代币系统提示,每小时查询200个.</li>
+<li>设计HA策略 (复制,返回原始).</li>
+<li>对于4K标记KV的70BFP8 (500MB),读取时间与重新填充时间是多少?</li>
+<li>辩论vLLM 0.11.0异步路径是否&quot;自由&quot; 顶部路径藏在哪里?</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Production-stack</td>
+<td>&quot;the reference deployment&quot;</td>
+<td>vLLM's Kubernetes Helm chart + operator</td>
+</tr>
+<tr>
+<td>Connector API</td>
+<td>&quot;KV backend interface&quot;</td>
+<td>vLLM 0.9.0+ pluggable KV store interface</td>
+</tr>
+<tr>
+<td>Native CPU offload</td>
+<td>&quot;engine-local spill&quot;</td>
+<td>Store KV in host RAM of same engine</td>
+</tr>
+<tr>
+<td>LMCache</td>
+<td>&quot;cluster KV cache&quot;</td>
+<td>Cross-engine KV cache server on CPU DRAM + disk</td>
+</tr>
+<tr>
+<td>0.11.0 async</td>
+<td>&quot;non-blocking offload&quot;</td>
+<td>Offload hidden behind engine stream</td>
+</tr>
+<tr>
+<td>Preemption</td>
+<td>&quot;evict to make room&quot;</td>
+<td>KV cache shuffle when HBM full</td>
+</tr>
+<tr>
+<td>Prefix reuse</td>
+<td>&quot;same system prompt&quot;</td>
+<td>Multiple queries share beginning; cache hit</td>
+</tr>
+<tr>
+<td>Ceph tier</td>
+<td>&quot;disk tier&quot;</td>
+<td>Durable storage below DRAM in the cache hierarchy</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://blog.vllm.ai/2026/01/08/kv-offloading-connector.html" rel="noreferrer" data-network="true">vLLM Blog — KV Offloading Connector (Jan 2026) <small>↗ 需要联网</small></a></li>
+<li><a href="https://github.com/vllm-project/production-stack" rel="noreferrer" data-network="true">vLLM Production Stack GitHub <small>↗ 需要联网</small></a> 头盔图+操作员</li>
+<li><a href="https://arxiv.org/html/2510.09665v2" rel="noreferrer" data-network="true">LMCache for Enterprise-Scale LLM Inference (arXiv:2510.09665) <small>↗ 需要联网</small></a></li>
+<li><a href="https://github.com/LMCache/LMCache" rel="noreferrer" data-network="true">LMCache GitHub <small>↗ 需要联网</small></a>连接器的实施</li>
+<li><a href="https://github.com/vllm-project/vllm/releases" rel="noreferrer" data-network="true">vLLM 0.11.0 release notes <small>↗ 需要联网</small></a>异步路径细节.</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Production Serving Stack — KV Offloading and Cache-Aware Routing</h1>
+<blockquote>
+<p>A production serving stack wires router, engines, and observability into one Kubernetes deployment — and treats KV cache as a resource that can leave the GPU. KV offloading extracts KV cache out of GPU memory and reuses it across queries and engines (CPU DRAM, then disk/Ceph). vLLM's production-stack is the reference deployment; LMCache is the offloading layer. The vLLM 0.11.0 KV Offloading Connector (January 2026) makes this asynchronous and pluggable via the Connector API (v0.9.0+). The offload path is usually hidden from the request path, though cache misses and promotions can add end-to-end latency. LMCache is valuable even without shared prefixes — when a GPU runs out of KV slots, preempted requests can be restored from CPU instead of recomputing prefill. Published benchmarks on 16x H100 (80GB HBM) across 4 a3-highgpu-4g: when KV cache exceeds HBM, both native CPU offload and LMCache substantially improve throughput; at low KV footprint, all configs match baseline with small overhead.</p>
+</blockquote>
+<p><strong>Type:</strong> Learn
+<strong>Languages:</strong> Python (stdlib, toy KV-spill simulator)
+<strong>Prerequisites:</strong> Phase 17 · 04 (Serving Engine Internals), Phase 17 · 06 (SGLang/RadixAttention)
+<strong>Time:</strong> ~60 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Diagram the vLLM production-stack layers: router, engines, KV offload, observability.</li>
+<li>Explain the KV Offloading Connector API (v0.9.0+) and how the 0.11.0 asynchronous path hides offload latency.</li>
+<li>Quantify when LMCache CPU-DRAM helps (KV &gt; HBM) vs adds overhead (KV small enough to fit HBM).</li>
+<li>Pick between native vLLM CPU offload and LMCache connector given deployment constraints.</li>
+</ul>
+<h2>The Problem</h2>
+<p>Your vLLM serving shows GPUs at 100% HBM with preemption events whenever concurrency climbs. Requests get evicted, requeued, and you re-prefill the same 2K-token prompt four times in a minute. GPU compute is spent on redundant prefills; goodput is well below raw throughput.</p>
+<p>Adding more GPUs costs linearly. Adding more HBM is not possible. But CPU DRAM is cheap — one socket has 512 GB+ at latency orders of magnitude worse than HBM but fine for &quot;temporarily warm&quot; KV cache.</p>
+<p>LMCache extracts KV cache to CPU DRAM so preempted requests recover fast, and repeated prefixes across engines share cache without each engine re-prefilling.</p>
+<h2>The Concept</h2>
+<h3>vLLM production-stack</h3>
+<p><code>github.com/vllm-project/production-stack</code> is the reference Kubernetes deployment:</p>
+<ul>
+<li><strong>Router</strong> — cache-aware (Phase 17 · 11). Consumes KV events.</li>
+<li><strong>Engines</strong> — vLLM workers. One per GPU or per TP/PP group.</li>
+<li><strong>KV cache offload</strong> — LMCache deployment or native connector.</li>
+<li><strong>Observability</strong> — Prometheus scrape, Grafana dashboards, OTel traces.</li>
+<li><strong>Control plane</strong> — service discovery, config, rolling updates.</li>
+</ul>
+<p>Shipped as Helm chart + operator.</p>
+<h3>The KV Offloading Connector API (v0.9.0+)</h3>
+<p>vLLM 0.9.0 introduced a Connector API for pluggable KV cache backends. Your engine offloads blocks to the connector; connector stores them (RAM, disk, object storage, LMCache). Request needs a block, connector loads it back.</p>
+<p>vLLM 0.11.0 (January 2026) adds an asynchronous offload path — offload can happen in the background so the engine does not block on it in the common case. End-to-end latency and throughput still depend on workload shape, KV cache hit rate, and system pressure; vLLM's own notes call out that custom-kernel offload can degrade throughput at low hit rates and that async scheduling has known interaction issues with speculative decoding.</p>
+<h3>Native CPU offload vs LMCache</h3>
+<p><strong>Native vLLM CPU offload</strong>: engine-local. Stores KV blocks in host RAM. Fast to implement, zero network hop. Does not cross engines.</p>
+<p><strong>LMCache connector</strong>: cluster-scale. Stores blocks in a shared LMCache server (CPU DRAM + Ceph/S3 tier). Blocks are accessible to any engine. 16x H100 benchmarks published.</p>
+<p>Pick native when a single engine has HBM pressure. Pick LMCache when multiple engines share prefixes (RAG with common system prompts, multi-tenant with shared templates).</p>
+<h3>Benchmark behavior</h3>
+<p>The 16x H100 (80 GB HBM) spread across 4 a3-highgpu-4g test:</p>
+<ul>
+<li>Low KV footprint (short prompts, low concurrency): all configs match baseline, LMCache adds ~3-5% overhead.</li>
+<li>Moderate footprint: LMCache starts to help on prefix reuse across engines.</li>
+<li>KV exceeds HBM: native CPU offload and LMCache both improve throughput substantially; LMCache larger gain because cross-engine sharing.</li>
+</ul>
+<h3>When LMCache is decisive</h3>
+<ul>
+<li>Multi-tenant serving where system prompts are shared across tenants.</li>
+<li>RAG where document chunks repeat across queries.</li>
+<li>Fine-tuned variants (LoRA) on the same base where base-model KV reuse cuts redundant work.</li>
+<li>Preemption-heavy workloads: restore from CPU cheaper than re-prefill.</li>
+</ul>
+<h3>When NOT to enable</h3>
+<ul>
+<li>Small HBM pressure — you pay overhead without benefit.</li>
+<li>Short contexts (&lt;1K tokens) — transfer time &gt; re-prefill.</li>
+<li>Single-tenant single-prompt workload — no reuse to capture.</li>
+</ul>
+<h3>Integration with disaggregated serving</h3>
+<p>Phase 17 · 17 disaggregated serving + LMCache compounds: KV transfers from prefill pool to decode pool land in LMCache if not used; subsequent queries pull from LMCache. Phase 17 · 11 cache-aware router can route to the engine whose local OR LMCache-shared cache matches.</p>
+<h3>Numbers you should remember</h3>
+<ul>
+<li>vLLM 0.9.0: Connector API shipped.</li>
+<li>vLLM 0.11.0 (Jan 2026): asynchronous offload path; end-to-end latency impact depends on workload, KV hit rate, and system pressure (not an absolute guarantee).</li>
+<li>16x H100 benchmark: LMCache helps when KV footprint exceeds HBM.</li>
+<li>Small HBM pressure: 3-5% overhead without benefit.</li>
+</ul>
+<figure><img src="/learn/ai-from-scratch/figures/figure-6d0cde6c1ce8119a5ceb.png" alt="zero-sharding 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Use It</h2>
+<p><code>code/main.py</code> simulates a preemption-heavy workload with and without LMCache. Reports re-prefills avoided, throughput gain, and the break-even HBM utilization.</p>
+<h2>Ship It</h2>
+<p>This lesson produces <code>outputs/skill-vllm-stack-decider.md</code>. Given workload shape and vLLM deployment, decides native vs LMCache vs neither.</p>
+<h2>Exercises</h2>
+<ol>
+<li>Run <code>code/main.py</code>. At what HBM utilization does LMCache start paying?</li>
+<li>A tenant shares a 6K-token system prompt across 200 queries/hour. Compute expected LMCache savings per tenant.</li>
+<li>The LMCache server is a single point of failure. Design the HA strategy (replicas, fallback to native).</li>
+<li>LMCache stores to Ceph on spinning disk. For a 4K-token KV at 70B FP8 (500 MB), what's the read time vs re-prefill?</li>
+<li>Argue whether the vLLM 0.11.0 asynchronous path is &quot;free&quot; — where does the overhead hide?</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Production-stack</td>
+<td>&quot;the reference deployment&quot;</td>
+<td>vLLM's Kubernetes Helm chart + operator</td>
+</tr>
+<tr>
+<td>Connector API</td>
+<td>&quot;KV backend interface&quot;</td>
+<td>vLLM 0.9.0+ pluggable KV store interface</td>
+</tr>
+<tr>
+<td>Native CPU offload</td>
+<td>&quot;engine-local spill&quot;</td>
+<td>Store KV in host RAM of same engine</td>
+</tr>
+<tr>
+<td>LMCache</td>
+<td>&quot;cluster KV cache&quot;</td>
+<td>Cross-engine KV cache server on CPU DRAM + disk</td>
+</tr>
+<tr>
+<td>0.11.0 async</td>
+<td>&quot;non-blocking offload&quot;</td>
+<td>Offload hidden behind engine stream</td>
+</tr>
+<tr>
+<td>Preemption</td>
+<td>&quot;evict to make room&quot;</td>
+<td>KV cache shuffle when HBM full</td>
+</tr>
+<tr>
+<td>Prefix reuse</td>
+<td>&quot;same system prompt&quot;</td>
+<td>Multiple queries share beginning; cache hit</td>
+</tr>
+<tr>
+<td>Ceph tier</td>
+<td>&quot;disk tier&quot;</td>
+<td>Durable storage below DRAM in the cache hierarchy</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://blog.vllm.ai/2026/01/08/kv-offloading-connector.html" rel="noreferrer" data-network="true">vLLM Blog — KV Offloading Connector (Jan 2026) <small>↗ 需要联网</small></a></li>
+<li><a href="https://github.com/vllm-project/production-stack" rel="noreferrer" data-network="true">vLLM Production Stack GitHub <small>↗ 需要联网</small></a> — Helm chart + operator.</li>
+<li><a href="https://arxiv.org/html/2510.09665v2" rel="noreferrer" data-network="true">LMCache for Enterprise-Scale LLM Inference (arXiv:2510.09665) <small>↗ 需要联网</small></a></li>
+<li><a href="https://github.com/LMCache/LMCache" rel="noreferrer" data-network="true">LMCache GitHub <small>↗ 需要联网</small></a> — Connector implementation.</li>
+<li><a href="https://github.com/vllm-project/vllm/releases" rel="noreferrer" data-network="true">vLLM 0.11.0 release notes <small>↗ 需要联网</small></a> — asynchronous path details.</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-17-infrastructure-and-production--18-vllm-production-stack-lmcache.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-17-infrastructure-and-production--18-vllm-production-stack-lmcache.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/17-infrastructure-and-production/18-vllm-production-stack-lmcache/code/main.py">phases/17-infrastructure-and-production/18-vllm-production-stack-lmcache/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;vLLM production stack + LMCache simulator — stdlib Python.
+
+Compares three configs on a preemption-heavy workload:
+  NATIVE_ONLY   : vLLM with no offload, requests re-prefill on preemption
+  CPU_OFFLOAD   : native CPU offload, engine-local
+  LMCACHE       : cluster LMCache shared across 4 engines
+
+Reports re-prefill count avoided, throughput gain, and break-even HBM utilization.
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import random
+
+
+PREFILL_TOK_PER_MS = 40.0
+DECODE_TOK_PER_MS = 0.15
+CPU_OFFLOAD_TIME_MS_PER_BLOCK = 1.5
+LMCACHE_TIME_MS_PER_BLOCK = 3.0
+KV_BLOCK_TOKENS = 16
+
+
+@dataclass
+class Request:
+    prompt_tokens: int
+    output_tokens: int
+    prefix_id: str  # for reuse across engines
+
+
+def make_workload(n: int = 200, seed: int = 7) -&gt; list[Request]:
+    rng = random.Random(seed)
+    prefixes = [f&quot;tpl_{i}&quot; for i in range(6)]  # small set = high reuse
+    reqs = []
+    for _ in range(n):
+        prompt = rng.choice([2000, 4000, 8000])
+        reqs.append(Request(prompt, rng.randint(150, 400), rng.choice(prefixes)))
+    return reqs
+
+
+def simulate(config: str, reqs: list[Request]) -&gt; dict:
+    &quot;&quot;&quot;Model a small cluster under HBM pressure.&quot;&quot;&quot;
+    engines_state: list[set[str]] = [set() for _ in range(4)]
+    shared_cache: set[str] = set()
+    hbm_capacity_blocks_per_engine = 900
+    total_time_ms = 0.0
+    re_prefills_avoided = 0
+    prefill_work = 0
+    rng = random.Random(11)
+
+    for r in reqs:
+        eng = rng.randrange(len(engines_state))
+        blocks = (r.prompt_tokens + KV_BLOCK_TOKENS - 1) // KV_BLOCK_TOKENS
+        cached_local = r.prefix_id in engines_state[eng]
+        cached_lmcache = r.prefix_id in shared_cache
+
+        if config == &quot;NATIVE_ONLY&quot;:
+            if cached_local:
+                prefill_ms = 0
+                re_prefills_avoided += 1
+            else:
+                prefill_ms = r.prompt_tokens / PREFILL_TOK_PER_MS
+                engines_state[eng].add(r.prefix_id)
+                if len(engines_state[eng]) &gt; 4:
+                    engines_state[eng].pop()
+        elif config == &quot;CPU_OFFLOAD&quot;:
+            if cached_local:
+                prefill_ms = 0
+                re_prefills_avoided += 1
+            else:
+                prefill_ms = r.prompt_tokens / PREFILL_TOK_PER_MS
+                engines_state[eng].add(r.prefix_id)
+                prefill_ms += blocks * CPU_OFFLOAD_TIME_MS_PER_BLOCK * 0.1
+        elif config == &quot;LMCACHE&quot;:
+            if cached_local:
+                prefill_ms = 0
+                re_prefills_avoided += 1
+            elif cached_lmcache:
+                prefill_ms = blocks * LMCACHE_TIME_MS_PER_BLOCK
+                engines_state[eng].add(r.prefix_id)
+                re_prefills_avoided += 1
+            else:
+                prefill_ms = r.prompt_tokens / PREFILL_TOK_PER_MS
+                shared_cache.add(r.prefix_id)
+                engines_state[eng].add(r.prefix_id)
+
+        decode_ms = r.output_tokens / DECODE_TOK_PER_MS
+        total_time_ms += prefill_ms + decode_ms
+        prefill_work += prefill_ms
+
+    return {
+        &quot;config&quot;: config,
+        &quot;total_ms&quot;: total_time_ms,
+        &quot;prefill_ms&quot;: prefill_work,
+        &quot;re_prefills_avoided&quot;: re_prefills_avoided,
+    }
+
+
+def report(row: dict, baseline: float) -&gt; None:
+    speedup = baseline / row[&quot;total_ms&quot;] if row[&quot;total_ms&quot;] else 1
+    print(f&quot;{row[&#39;config&#39;]:14}  total={row[&#39;total_ms&#39;]:8.0f} ms  &quot;
+          f&quot;prefill={row[&#39;prefill_ms&#39;]:7.0f} ms  &quot;
+          f&quot;avoided_re_prefill={row[&#39;re_prefills_avoided&#39;]:4}  &quot;
+          f&quot;speedup={speedup:4.2f}x&quot;)
+
+
+def main() -&gt; None:
+    print(&quot;=&quot; * 80)
+    print(&quot;vLLM PRODUCTION STACK + LMCACHE — preemption-heavy, 4 engines, shared prefixes&quot;)
+    print(&quot;=&quot; * 80)
+    base = make_workload()
+    baseline = simulate(&quot;NATIVE_ONLY&quot;, [Request(r.prompt_tokens, r.output_tokens, r.prefix_id) for r in base])[&quot;total_ms&quot;]
+    for cfg in (&quot;NATIVE_ONLY&quot;, &quot;CPU_OFFLOAD&quot;, &quot;LMCACHE&quot;):
+        report(simulate(cfg, [Request(r.prompt_tokens, r.output_tokens, r.prefix_id) for r in base]), baseline)
+    print(&quot;\nRead: when prefixes repeat across engines, LMCache avoids redundant prefills&quot;)
+    print(&quot;even when each engine individually evicted the cache.&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/17-infrastructure-and-production/18-vllm-production-stack-lmcache/outputs/skill-vllm-stack-decider.md">phases/17-infrastructure-and-production/18-vllm-production-stack-lmcache/outputs/skill-vllm-stack-decider.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: vllm-stack-decider
+description: Decide vLLM deployment layout — production-stack Helm chart, KV offload (native CPU or LMCache), router/observability integration — given workload and fleet size.
+version: 1.0.0
+phase: 17
+lesson: 18
+tags: [vllm, production-stack, lmcache, kv-offload, connector-api]
+---
+
+Given workload (prompt shape, concurrency, prefix reuse pattern), fleet (engines, GPU type), and operational context (Kubernetes-native, multi-tenant, budget), produce a vLLM stack plan.
+
+Produce:
+
+1. Stack. Use vLLM production-stack Helm chart (recommended for new deployments) or roll your own. State which operators/CRDs apply.
+2. KV offload. Choose:
+   - None (short prompts, low concurrency — overhead exceeds benefit).
+   - Native vLLM CPU offload (single-engine HBM pressure, simple).
+   - LMCache connector (multi-engine prefix reuse, preemption-heavy, or multi-tenant shared prompts).
+3. HBM utilization monitoring. Set `--gpu-memory-utilization` with headroom; alert at 92%+ sustained as a pre-preemption signal.
+4. Router integration. Cache-aware router (Phase 17 · 11). Confirm KV-event channel configured.
+5. Observability. Prometheus scrape per engine, OTel GenAI attributes (Phase 17 · 13), Grafana dashboard template from production-stack.
+6. Expected impact. Quantify expected throughput gain vs current — reference the 16x H100 benchmark shape (LMCache helps when KV footprint exceeds HBM).
+
+Hard rejects:
+- Deploying LMCache without shared prefixes or preemption. Refuse — overhead, no benefit.
+- Running vLLM without HBM-pressure monitoring. Refuse — first preemption will be a surprise.
+- Hand-rolling production-stack when the Helm chart covers the use case. Refuse — reinvent cost.
+
+Refusal rules:
+- If the fleet has &lt;2 engines, refuse LMCache — cross-engine reuse is the point; single-engine use native.
+- If the workload has prompts &lt; 1K tokens and &lt; 100 concurrency, refuse offload of any kind — HBM headroom suffices.
+- If the team doesn&#39;t have K8s capability, refuse production-stack — start with a single-engine vLLM + simple proxy.
+
+Output: a one-page plan naming stack, KV offload choice, HBM monitoring, router integration, observability, expected impact. End with the single gate: HBM utilization P99 over last 24h.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. What problem does LMCache primarily address in a vLLM deployment?</legend><label class="option"><input type="radio" name="q0" value="0"> Tokenizer GIL contention</label><label class="option"><input type="radio" name="q0" value="1"> Network egress filtering</label><label class="option"><input type="radio" name="q0" value="2"> Cold-start image pull</label><label class="option"><input type="radio" name="q0" value="3"> KV cache pressure in HBM causing preemption and re-prefill of the same prefixes</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. What vLLM API introduced pluggable KV cache backends?</legend><label class="option"><input type="radio" name="q1" value="0"> Prefix-caching flag</label><label class="option"><input type="radio" name="q1" value="1"> Connector API in vLLM v0.9.0</label><label class="option"><input type="radio" name="q1" value="2"> PagedAttention v2</label><label class="option"><input type="radio" name="q1" value="3"> ChunkedPrefill API</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. What does the vLLM 0.11.0 (January 2026) release add to the KV offload path?</legend><label class="option"><input type="radio" name="q2" value="0"> Removal of LMCache support</label><label class="option"><input type="radio" name="q2" value="1"> Mandatory FP8 KV cache</label><label class="option"><input type="radio" name="q2" value="2"> An asynchronous offload path so the engine does not block on offload in the common case</label><label class="option"><input type="radio" name="q2" value="3"> Synchronous-only offload</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. When should you pick LMCache over native CPU offload?</legend><label class="option"><input type="radio" name="q3" value="0"> When you are running on CPU only</label><label class="option"><input type="radio" name="q3" value="1"> When multiple engines share prefixes across tenants, LoRA variants, or repeated RAG context, so cross-engine reuse pays</label><label class="option"><input type="radio" name="q3" value="2"> When a single engine has HBM pressure and no prefix sharing</label><label class="option"><input type="radio" name="q3" value="3"> When you want to disable KV caching entirely</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. What happens to LMCache benefit when KV footprint stays well below HBM?</legend><label class="option"><input type="radio" name="q4" value="0"> LMCache automatically disables</label><label class="option"><input type="radio" name="q4" value="1"> Configs match baseline with roughly 3-5% overhead and no real benefit</label><label class="option"><input type="radio" name="q4" value="2"> Engine crashes</label><label class="option"><input type="radio" name="q4" value="3"> It still doubles throughput</label><p data-feedback="4"></p></fieldset><fieldset><legend>6. Why does LMCache compose with disaggregated serving (Phase 17 · 17)?</legend><label class="option"><input type="radio" name="q5" value="0"> KV transferred from prefill to decode lands in LMCache; later queries can pull from LMCache and skip prefill, so the cache-aware router can pick an engine whose local or LMCache-shared cache matches</label><label class="option"><input type="radio" name="q5" value="1"> It does not — they are mutually exclusive</label><label class="option"><input type="radio" name="q5" value="2"> Because LMCache replaces NIXL</label><label class="option"><input type="radio" name="q5" value="3"> Because LMCache runs on the same GPU as the engine</label><p data-feedback="5"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/17-infrastructure-and-production/17-disaggregated-prefill-decode/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/17-infrastructure-and-production/19-ai-gateways/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/17-infrastructure-and-production/18-vllm-production-stack-lmcache/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

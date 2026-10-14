@@ -1,0 +1,1892 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>文本工程:Windows,预算,内存和检索 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-11-llm-engineering" data-lesson="11-llm-engineering/05-context-engineering" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/11-llm-engineering/">大语言模型工程</a> / LESSON 05</p><h1 class="lesson-title">文本工程:Windows,预算,内存和检索</h1><p>Context Engineering: Windows, Budgets, Memory, and Retrieval</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>文本工程:Windows,预算,内存和检索</h1>
+<blockquote>
+<p>提示工程是一个子集.语境工程是整个游戏.提示是你输入的字符串.背景是所有进入模型窗口的东西:系统说明,检索的文件,工具定义,对话历史,几次示例,以及提示本身.2026年最好的人工智能工程师是语境工程师.他们决定什么进去,什么留下,以及什么顺序.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 10 (LLMs from Scratch), Phase 11 Lesson 01-02
+<strong>Time:</strong> ~90 minutes
+**Related:**阶段11 · 15 (即时缓存) 缓存友好的布局是文本工程的延伸. 5 · 28 (长文本评估) 阶段是如何使用NIAH/RULER测量中途丢失.</p>
+<h2>学习目标</h2>
+<ul>
+<li>计算所有语境窗口组件 (系统提示,工具,历史记录,检索文件,生成头空间) 的代币预算</li>
+<li>实现文本窗口管理策略:截图,总结和对话历史滑动窗口</li>
+<li>优先考虑和排序文本组件,以最大限度地使模型关注最相关的信息</li>
+<li>建立一个基于查询类型和可用窗口空间的语境组装器,</li>
+</ul>
+<h2>问题</h2>
+<p>克劳德·奥普斯 4.7 有200K的代币窗口 (1M在beta). GPT-5 有400K. 双子座 3 Pro 有2M. Llama 4 声称10M. 这些数字听起来很大,直到你填充它们.</p>
+<p>系统提示:500个代码. 50个工具的工具定义:8,000个代码. 获取的文档:4,000个代码. 对话历史 (10轮):6,000个代码. 当前用户查询:200个代码. 代码预算 (最大输出):4,000个代码. 总数: 22,700个代码. 这仅占128K窗口的18%.</p>
+<p>但注意力并不是按照背景长度进行线性扩展. 一种拥有128K语境代币的模型在尼拉变压器中支付了四方形注意力成本 (O(n^2),尽管大多数生产模型使用高效的注意力变体. 更重要的是,检索的精度会降低. 模型在长文本中难以找到信息. 等人研究 (2023) 显示,在长文本开始和结束时,LLM几乎完全准确地获取信息,但在中间的信息 (文本中的位置为40-70%) 的准确度下降了10-20%. 这种&quot;中途失落&quot;效果因模型而异,但影响了所有当前的建筑.</p>
+<p>实际的教训:拥有200K代币并不意味着使用200K代币是有效的.一个精心策划的10K代币背景通常比一个倾倒的100K代币背景更高. 语境工程是在语境窗口内最大化信号-噪音比率的学科.</p>
+<p>每个你放入窗口的代币都会取代一个可能带有更多相关信息的代币. 每个无关的工具定义,每一个过时的对话转,每一个不回答问题的检索文本,</p>
+<h2>概念</h2>
+<h3>文本窗口是稀缺的资源</h3>
+<p>设想文本窗口是RAM,而不是磁盘. 它快速,直接访问,但有限. 你不能容纳一切. 你必须选择.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-a67e1e9efc5a2828c80f.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>每个组件都在争夺空间.添加更多工具定义意味着对话历史的空间减少.添加更多获取的文本意味着少量示例的空间.文本工程是分配这个预算的艺术,以最大限度地提高任务性能.</p>
+<h3>迷失在中间</h3>
+<p>环境工程中最重要的实验发现.模型更好地关注文本的开始和结束时的信息.中间的信息获得了较低的注意力分数,更有可能被忽视.</p>
+<p>等人 (2023) 系统地测试了这一点.他们将相关文件放在20个无关的文件中,并测量了答案的准确性.当相关文件是第一个或最后的时,准确性为85-90%.当它在中间时 (20个位置的10个),准确性下降到60-70%.</p>
+<p>这对工程业产生了直接影响:</p>
+<ul>
+<li>首先要把最重要的信息放在第一位 (系统提示,关键指令)</li>
+<li>关键词: 关键词: 关键词: 关键词:</li>
+<li>处理环境中部为最低优先级区域</li>
+<li>如果要在中间包含信息,最后重复关键点</li>
+</ul>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-434774a2d06e4750ab6e.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>文本组件</h3>
+<p><strong>System prompt</strong>克劳德代码使用大约6,000个代币用于系统提示,包括工具定义和行为说明.保持紧密.系统提示中的每个字都在每个API调用中重复.</p>
+<p><strong>Tool definitions</strong>每个工具都会添加50-200个代币 (名称,描述,参数方案).每一个50个代币的50个工具在任何对话发生之前,每个代币都会达到7,500个代币.</p>
+<p><strong>Retrieved context</strong>检索的质量直接决定了响应的质量. 检索不良比没有检索更糟糕 - - 它会填满窗口的噪音,并积极误导模型.</p>
+<p><strong>Conversation history</strong>交换时间:每次用户消息和助理响应. 交谈长度随着交谈时间的推移而增长. 每次交换时50次交谈的200个代币相当于10,000个历史代币. 大多数是与当前查询无关的.</p>
+<p><strong>Few-shot examples</strong>输入/输出对,证明所需的行为. 两到三个精心选择的例子通常会提高输出质量,超过数千个指令代币.</p>
+<p><strong>Generation budget</strong>模型的代币为模型的响应保留. 如果填充到容量的窗口,模型就没有答案的空间. 储备至少2000至4,000代币用于生成.</p>
+<h3>环境压缩策略</h3>
+<p><strong>History summarization</strong>总结对话的时间: &quot;我们讨论了X,决定了Y,用户想要Z&quot;在100代币中取代了2000代币的10次转换. 运行总结时历史超过门 (例如5000代币).</p>
+<p><strong>Relevance filtering</strong>您的文件在一个门以下. 如果您检索了10个块,但只有3个是相关的,则丢弃其他7.比10个中等的部分更好有3个非常相关的块.</p>
+<p><strong>Tool pruning</strong>编码问题不需要日历工具.编程问题不需要文件系统工具. 这可以将工具定义从8,000个代币降至1,000个.</p>
+<p><strong>Recursive summarization</strong>首先要总结每个部分,然后要总结.一个50页的文档变成一个500个代币的摘要,捕捉到关键点.</p>
+<h3>记忆系统</h3>
+<p>文本工程跨越了三个时间视野.</p>
+<p><strong>Short-term memory</strong>直接存储在文本窗口中.随着每次转折而增长.通过总结和缩短来管理.</p>
+<p><strong>Long-term memory</strong>文件:在对话中持续存在的事实和偏好. &quot;用户更喜欢TypeScript&quot;. &quot;项目使用PostgreSQL.&quot;存储在数据库中,在会议开始时获取.Claude Code将这些存储在CLAUDE.md文件中.ChatGPT将其存储在其内存功能中.</p>
+<p><strong>Episodic memory</strong>通过&quot;Auth&quot;模块调试了类似的问题. 存储为嵌入式,当当前对话与过去事件匹配时获取.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-73ad5633f77e227fe4be.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>动态语境组件</h3>
+<p>关键见解:不同的查询需要不同的语境.静态系统提示 +静态工具 +静态历史是浪费的.最好的系统每一个查询动态组装语境.</p>
+<ol>
+<li>分类查询意图</li>
+<li>选择相关工具 (不是所有工具)</li>
+<li>检索相关文件 (不是固定集)</li>
+<li>包含相关历史转折 (不是全部历史)</li>
+<li>添加与任务类型相匹配的几次示例</li>
+<li>按重要点排序:最先关键,最后重要,中间是可选的</li>
+</ol>
+<p>这就是区分一个好的人工智能应用程序和一个伟大的应用程序的原因.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-ef63148cfba40213edd6.png" alt="lost-in-the-middle 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<h3>步骤1: 代币计数器</h3>
+<p>构建一个简单的代币计数 (使用白空分数的近似,因为确切的计数取决于代币表).</p>
+<pre><code class="language-python">import json
+import numpy as np
+from collections import OrderedDict
+
+def count_tokens(text):
+    if not text:
+        return 0
+    return int(len(text.split()) * 1.3)
+
+def count_tokens_json(obj):
+    return count_tokens(json.dumps(obj))
+</code></pre>
+<h3>步骤2: 环境预算管理员</h3>
+<p>预算管理员会追踪每个组件使用多少代币,并执行限制.</p>
+<pre><code class="language-python">class ContextBudget:
+    def __init__(self, max_tokens=128000, generation_reserve=4000):
+        self.max_tokens = max_tokens
+        self.generation_reserve = generation_reserve
+        self.available = max_tokens - generation_reserve
+        self.allocations = OrderedDict()
+
+    def allocate(self, component, content, max_tokens=None):
+        tokens = count_tokens(content)
+        if max_tokens and tokens &gt; max_tokens:
+            words = content.split()
+            target_words = int(max_tokens / 1.3)
+            content = &quot; &quot;.join(words[:target_words])
+            tokens = count_tokens(content)
+
+        used = sum(self.allocations.values())
+        if used + tokens &gt; self.available:
+            allowed = self.available - used
+            if allowed &lt;= 0:
+                return None, 0
+            words = content.split()
+            target_words = int(allowed / 1.3)
+            content = &quot; &quot;.join(words[:target_words])
+            tokens = count_tokens(content)
+
+        self.allocations[component] = tokens
+        return content, tokens
+
+    def remaining(self):
+        used = sum(self.allocations.values())
+        return self.available - used
+
+    def utilization(self):
+        used = sum(self.allocations.values())
+        return used / self.max_tokens
+
+    def report(self):
+        total_used = sum(self.allocations.values())
+        lines = []
+        lines.append(f&quot;Context Budget Report ({self.max_tokens:,} token window)&quot;)
+        lines.append(&quot;-&quot; * 50)
+        for component, tokens in self.allocations.items():
+            pct = tokens / self.max_tokens * 100
+            bar = &quot;#&quot; * int(pct / 2)
+            lines.append(f&quot;  {component:&lt;25} {tokens:&gt;6} tokens ({pct:&gt;5.1f}%) {bar}&quot;)
+        lines.append(&quot;-&quot; * 50)
+        lines.append(f&quot;  {'Used':&lt;25} {total_used:&gt;6} tokens ({total_used/self.max_tokens*100:.1f}%)&quot;)
+        lines.append(f&quot;  {'Generation reserve':&lt;25} {self.generation_reserve:&gt;6} tokens&quot;)
+        lines.append(f&quot;  {'Remaining':&lt;25} {self.remaining():&gt;6} tokens&quot;)
+        return &quot;\n&quot;.join(lines)
+</code></pre>
+<h3>步骤3: 失落的中部重组</h3>
+<p>实施重组策略:最重要的项目首先和最后,最不重要的项目在中间.</p>
+<pre><code class="language-python">def reorder_lost_in_middle(items, scores):
+    paired = sorted(zip(scores, items), reverse=True)
+    sorted_items = [item for _, item in paired]
+
+    if len(sorted_items) &lt;= 2:
+        return sorted_items
+
+    first_half = sorted_items[::2]
+    second_half = sorted_items[1::2]
+    second_half.reverse()
+
+    return first_half + second_half
+
+def score_relevance(query, documents):
+    query_words = set(query.lower().split())
+    scores = []
+    for doc in documents:
+        doc_words = set(doc.lower().split())
+        if not query_words:
+            scores.append(0.0)
+            continue
+        overlap = len(query_words &amp; doc_words) / len(query_words)
+        scores.append(round(overlap, 3))
+    return scores
+</code></pre>
+<h3>步骤4:对话历史压缩机</h3>
+<p>总结一下,老话语回归,回归代币预算.</p>
+<pre><code class="language-python">class ConversationManager:
+    def __init__(self, max_history_tokens=5000):
+        self.turns = []
+        self.summaries = []
+        self.max_history_tokens = max_history_tokens
+
+    def add_turn(self, role, content):
+        self.turns.append({&quot;role&quot;: role, &quot;content&quot;: content})
+        self._compress_if_needed()
+
+    def _compress_if_needed(self):
+        total = sum(count_tokens(t[&quot;content&quot;]) for t in self.turns)
+        if total &lt;= self.max_history_tokens:
+            return
+
+        while total &gt; self.max_history_tokens and len(self.turns) &gt; 4:
+            old_turns = self.turns[:2]
+            summary = self._summarize_turns(old_turns)
+            self.summaries.append(summary)
+            self.turns = self.turns[2:]
+            total = sum(count_tokens(t[&quot;content&quot;]) for t in self.turns)
+
+    def _summarize_turns(self, turns):
+        parts = []
+        for t in turns:
+            content = t[&quot;content&quot;]
+            if len(content) &gt; 100:
+                content = content[:100] + &quot;...&quot;
+            parts.append(f&quot;{t['role']}: {content}&quot;)
+        return &quot;Previous: &quot; + &quot; | &quot;.join(parts)
+
+    def get_context(self):
+        parts = []
+        if self.summaries:
+            parts.append(&quot;[Conversation Summary]&quot;)
+            for s in self.summaries:
+                parts.append(s)
+        parts.append(&quot;[Recent Conversation]&quot;)
+        for t in self.turns:
+            parts.append(f&quot;{t['role']}: {t['content']}&quot;)
+        return &quot;\n&quot;.join(parts)
+
+    def token_count(self):
+        return count_tokens(self.get_context())
+</code></pre>
+<h3>步骤5:动态工具选择器</h3>
+<p>仅包括与当前查询相关的工具. 分类意图,然后过.</p>
+<pre><code class="language-python">TOOL_REGISTRY = {
+    &quot;read_file&quot;: {
+        &quot;description&quot;: &quot;Read contents of a file&quot;,
+        &quot;tokens&quot;: 120,
+        &quot;categories&quot;: [&quot;code&quot;, &quot;files&quot;],
+    },
+    &quot;write_file&quot;: {
+        &quot;description&quot;: &quot;Write content to a file&quot;,
+        &quot;tokens&quot;: 150,
+        &quot;categories&quot;: [&quot;code&quot;, &quot;files&quot;],
+    },
+    &quot;search_code&quot;: {
+        &quot;description&quot;: &quot;Search for patterns in codebase&quot;,
+        &quot;tokens&quot;: 130,
+        &quot;categories&quot;: [&quot;code&quot;],
+    },
+    &quot;run_command&quot;: {
+        &quot;description&quot;: &quot;Execute a shell command&quot;,
+        &quot;tokens&quot;: 140,
+        &quot;categories&quot;: [&quot;code&quot;, &quot;system&quot;],
+    },
+    &quot;create_calendar_event&quot;: {
+        &quot;description&quot;: &quot;Create a new calendar event&quot;,
+        &quot;tokens&quot;: 180,
+        &quot;categories&quot;: [&quot;calendar&quot;],
+    },
+    &quot;list_emails&quot;: {
+        &quot;description&quot;: &quot;List recent emails&quot;,
+        &quot;tokens&quot;: 160,
+        &quot;categories&quot;: [&quot;email&quot;],
+    },
+    &quot;send_email&quot;: {
+        &quot;description&quot;: &quot;Send an email message&quot;,
+        &quot;tokens&quot;: 200,
+        &quot;categories&quot;: [&quot;email&quot;],
+    },
+    &quot;web_search&quot;: {
+        &quot;description&quot;: &quot;Search the web for information&quot;,
+        &quot;tokens&quot;: 140,
+        &quot;categories&quot;: [&quot;research&quot;],
+    },
+    &quot;query_database&quot;: {
+        &quot;description&quot;: &quot;Run a SQL query on the database&quot;,
+        &quot;tokens&quot;: 170,
+        &quot;categories&quot;: [&quot;code&quot;, &quot;data&quot;],
+    },
+    &quot;generate_chart&quot;: {
+        &quot;description&quot;: &quot;Generate a chart from data&quot;,
+        &quot;tokens&quot;: 190,
+        &quot;categories&quot;: [&quot;data&quot;, &quot;visualization&quot;],
+    },
+}
+
+def classify_intent(query):
+    query_lower = query.lower()
+
+    intent_keywords = {
+        &quot;code&quot;: [&quot;code&quot;, &quot;function&quot;, &quot;bug&quot;, &quot;error&quot;, &quot;file&quot;, &quot;implement&quot;, &quot;refactor&quot;, &quot;debug&quot;, &quot;test&quot;],
+        &quot;calendar&quot;: [&quot;meeting&quot;, &quot;schedule&quot;, &quot;calendar&quot;, &quot;appointment&quot;, &quot;event&quot;],
+        &quot;email&quot;: [&quot;email&quot;, &quot;mail&quot;, &quot;send&quot;, &quot;inbox&quot;, &quot;message&quot;],
+        &quot;research&quot;: [&quot;search&quot;, &quot;find&quot;, &quot;what is&quot;, &quot;how does&quot;, &quot;explain&quot;, &quot;look up&quot;],
+        &quot;data&quot;: [&quot;data&quot;, &quot;query&quot;, &quot;database&quot;, &quot;chart&quot;, &quot;graph&quot;, &quot;analytics&quot;, &quot;sql&quot;],
+    }
+
+    scores = {}
+    for intent, keywords in intent_keywords.items():
+        score = sum(1 for kw in keywords if kw in query_lower)
+        if score &gt; 0:
+            scores[intent] = score
+
+    if not scores:
+        return [&quot;code&quot;]
+
+    max_score = max(scores.values())
+    return [intent for intent, score in scores.items() if score &gt;= max_score * 0.5]
+
+def select_tools(query, token_budget=2000):
+    intents = classify_intent(query)
+    relevant = {}
+    total_tokens = 0
+
+    for name, tool in TOOL_REGISTRY.items():
+        if any(cat in intents for cat in tool[&quot;categories&quot;]):
+            if total_tokens + tool[&quot;tokens&quot;] &lt;= token_budget:
+                relevant[name] = tool
+                total_tokens += tool[&quot;tokens&quot;]
+
+    return relevant, total_tokens
+</code></pre>
+<h3>步骤 6: 完整的环境组合管道</h3>
+<p>根据查询,动态组装最佳的文本.</p>
+<pre><code class="language-python">class ContextEngine:
+    def __init__(self, max_tokens=128000, generation_reserve=4000):
+        self.budget = ContextBudget(max_tokens, generation_reserve)
+        self.conversation = ConversationManager(max_history_tokens=5000)
+        self.system_prompt = (
+            &quot;You are a helpful AI assistant. You have access to tools for &quot;
+            &quot;code editing, file management, web search, and data analysis. &quot;
+            &quot;Use the appropriate tools for each task. Be concise and accurate.&quot;
+        )
+        self.knowledge_base = [
+            &quot;Python 3.12 introduced type parameter syntax for generic classes using bracket notation.&quot;,
+            &quot;The project uses PostgreSQL 16 with pgvector for embedding storage.&quot;,
+            &quot;Authentication is handled by Supabase Auth with JWT tokens.&quot;,
+            &quot;The frontend is built with Next.js 15 using the App Router.&quot;,
+            &quot;API rate limits are set to 100 requests per minute per user.&quot;,
+            &quot;The deployment pipeline uses GitHub Actions with Docker multi-stage builds.&quot;,
+            &quot;Test coverage must be above 80% for all new modules.&quot;,
+            &quot;The codebase follows the repository pattern for data access.&quot;,
+        ]
+
+    def assemble(self, query):
+        self.budget = ContextBudget(self.budget.max_tokens, self.budget.generation_reserve)
+
+        system_content, _ = self.budget.allocate(&quot;system_prompt&quot;, self.system_prompt, max_tokens=1000)
+
+        tools, tool_tokens = select_tools(query, token_budget=2000)
+        tool_text = json.dumps(list(tools.keys()))
+        tool_content, _ = self.budget.allocate(&quot;tools&quot;, tool_text, max_tokens=2000)
+
+        relevance = score_relevance(query, self.knowledge_base)
+        threshold = 0.1
+        relevant_docs = [
+            doc for doc, score in zip(self.knowledge_base, relevance)
+            if score &gt;= threshold
+        ]
+
+        if relevant_docs:
+            doc_scores = [s for s in relevance if s &gt;= threshold]
+            reordered = reorder_lost_in_middle(relevant_docs, doc_scores)
+            doc_text = &quot;\n&quot;.join(reordered)
+            doc_content, _ = self.budget.allocate(&quot;retrieved_context&quot;, doc_text, max_tokens=3000)
+
+        history_text = self.conversation.get_context()
+        if history_text.strip():
+            history_content, _ = self.budget.allocate(&quot;conversation_history&quot;, history_text, max_tokens=5000)
+
+        query_content, _ = self.budget.allocate(&quot;user_query&quot;, query, max_tokens=500)
+
+        return self.budget
+
+    def chat(self, query):
+        self.conversation.add_turn(&quot;user&quot;, query)
+        budget = self.assemble(query)
+        response = f&quot;[Response to: {query[:50]}...]&quot;
+        self.conversation.add_turn(&quot;assistant&quot;, response)
+        return budget
+
+
+def run_demo():
+    print(&quot;=&quot; * 60)
+    print(&quot;  Context Engineering Pipeline Demo&quot;)
+    print(&quot;=&quot; * 60)
+
+    engine = ContextEngine(max_tokens=128000, generation_reserve=4000)
+
+    print(&quot;\n--- Query 1: Code task ---&quot;)
+    budget = engine.chat(&quot;Fix the bug in the authentication module where JWT tokens expire too early&quot;)
+    print(budget.report())
+
+    print(&quot;\n--- Query 2: Research task ---&quot;)
+    budget = engine.chat(&quot;What is the best approach for implementing vector search in PostgreSQL?&quot;)
+    print(budget.report())
+
+    print(&quot;\n--- Query 3: After conversation history builds up ---&quot;)
+    for i in range(8):
+        engine.conversation.add_turn(&quot;user&quot;, f&quot;Follow-up question number {i+1} about the implementation details of the system&quot;)
+        engine.conversation.add_turn(&quot;assistant&quot;, f&quot;Here is the response to follow-up {i+1} with technical details about the architecture&quot;)
+
+    budget = engine.chat(&quot;Now implement the changes we discussed&quot;)
+    print(budget.report())
+
+    print(&quot;\n--- Tool Selection Examples ---&quot;)
+    test_queries = [
+        &quot;Fix the bug in auth.py&quot;,
+        &quot;Schedule a meeting with the team for Tuesday&quot;,
+        &quot;Show me the database query performance stats&quot;,
+        &quot;Search for best practices on error handling&quot;,
+    ]
+
+    for q in test_queries:
+        tools, tokens = select_tools(q)
+        intents = classify_intent(q)
+        print(f&quot;\n  Query: {q}&quot;)
+        print(f&quot;  Intents: {intents}&quot;)
+        print(f&quot;  Tools: {list(tools.keys())} ({tokens} tokens)&quot;)
+
+    print(&quot;\n--- Lost-in-the-Middle Reordering ---&quot;)
+    docs = [&quot;Doc A (most relevant)&quot;, &quot;Doc B (somewhat relevant)&quot;, &quot;Doc C (least relevant)&quot;,
+            &quot;Doc D (relevant)&quot;, &quot;Doc E (moderately relevant)&quot;]
+    scores = [0.95, 0.60, 0.20, 0.80, 0.50]
+    reordered = reorder_lost_in_middle(docs, scores)
+    print(f&quot;  Original order: {docs}&quot;)
+    print(f&quot;  Scores:         {scores}&quot;)
+    print(f&quot;  Reordered:      {reordered}&quot;)
+    print(f&quot;  (Most relevant at start and end, least relevant in middle)&quot;)
+</code></pre>
+<h2>用它</h2>
+<h3>带管理的环境</h3>
+<p>克劳德代码使用层次方法管理文本.系统提示包含行为规则和工具定义 (~6K代币).当您打开文件时,其内容被注入为文本.当您搜索时,结果被添加.旧对话转换总结.CLAUDE.md提供长期内存,持续在整个会议中.</p>
+<p>关键的工程决定:Claude Code不把整个代码库放入文本中. 它在需求上检索相关文件.</p>
+<h3>动态文本加载</h3>
+<p>库尔索将整个代码库索引成嵌入式.当你输入查询时,它会使用向量相似性检索最相关的文件和代码块.只有这些块进入文本窗口. 500K 行的代码库被压缩成5到10个最相关的代码块.</p>
+<p>现在,我们需要的东西,</p>
+<h3>长期记忆助理</h3>
+<p>聊天GPT将用户的偏好和事实存储为长期内存.每次对话开始,相关的记忆都会被检索到系统提示中. &quot;用户更喜欢Python&quot;的代价为5个代币,但在对话中保存了数百个重复指令的代币.</p>
+<h3>作为文本工程的RAG</h3>
+<p>复苏增强的生成是文本工程正式化. 您在查询时检索相关文件,并将它们注入文本窗口. 整个RAG管道-- 碎片化,嵌入,检索,重新排名-- 存在于解决一个问题:将正确的信息放入文本窗口.</p>
+<h2>运送它</h2>
+<p>这一课产生了<code>outputs/prompt-context-optimizer.md</code>-- 复用提示,审计一个语境组装策略并建议优化. 给它提供系统提示,工具数量,平均历史长度和检索策略,</p>
+<p>它还产生了<code>outputs/skill-context-engineering.md</code>--基于任务类型,背景窗口大小和延迟预算的决策框架.</p>
+<h2>运动</h2>
+<ol>
+<li>
+<p>加入一个&quot;代币废物检测器&quot;到 ContextBudget类. 它应该标记使用超过30%的预算的组件,并建议针对每个组件类型的压缩策略 (概括历史,剪切工具,重新排名文件).</p>
+</li>
+<li>
+<p>实现检索文本的语义排序.如果两个检索文档80%以上相似 (通过词汇重叠或嵌入式相似性),只保留更高分数的文本.测量这项文本的恢复额.</p>
+</li>
+<li>
+<p>建立一个&quot;语境重播&quot;工具. 给出对话转录,通过语境引擎重播它,并可视化预算分配如何随时变化. 随着时间的推移,绘制每个组件的代币使用情况. 确定文本开始压缩的转折.</p>
+</li>
+<li>
+<p>实现基于优先级的工具选择器. 取而代之的是,将每个工具分配到当前查询中的相关性分数. 包含工具在下降相关性顺序中,直到工具预算被耗尽. 与 5, 10, 20 和 50 个工具的任务性能进行比较.</p>
+</li>
+<li>
+<p>建立一个多策略背景压缩机. 实施三种压缩策略 (缩小,总结,取取出关键句子) 并根据20份文件进行比较. 测量压缩比和信息保留之间的权衡 (压缩版本是否仍然包含查询答案?).</p>
+</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Context window</td>
+<td>&quot;How much the model can read&quot;</td>
+<td>The maximum number of tokens (input + output) the model processes in a single forward pass -- 400K for GPT-5, 200K (1M beta) for Claude Opus 4.7, 2M for Gemini 3 Pro</td>
+</tr>
+<tr>
+<td>Context engineering</td>
+<td>&quot;Advanced prompt engineering&quot;</td>
+<td>The discipline of deciding what goes into the context window, in what order, and at what priority -- encompasses retrieval, compression, tool selection, and memory management</td>
+</tr>
+<tr>
+<td>Lost-in-the-middle</td>
+<td>&quot;Models forget stuff in the middle&quot;</td>
+<td>Empirical finding that LLMs attend better to the beginning and end of context, with 10-20% accuracy drop for information placed in the middle</td>
+</tr>
+<tr>
+<td>Token budget</td>
+<td>&quot;How many tokens you have left&quot;</td>
+<td>An explicit allocation of context window capacity across components (system prompt, tools, history, retrieval, generation) with per-component limits</td>
+</tr>
+<tr>
+<td>Dynamic context</td>
+<td>&quot;Loading stuff on the fly&quot;</td>
+<td>Assembling the context window differently for each query based on intent classification, relevant tool selection, and retrieval results</td>
+</tr>
+<tr>
+<td>History summarization</td>
+<td>&quot;Compressing the conversation&quot;</td>
+<td>Replacing verbatim old conversation turns with a concise summary, reducing token cost while preserving key information</td>
+</tr>
+<tr>
+<td>Tool pruning</td>
+<td>&quot;Only including relevant tools&quot;</td>
+<td>Classifying query intent and only including tool definitions that match, reducing tool token cost by 60-80%</td>
+</tr>
+<tr>
+<td>Long-term memory</td>
+<td>&quot;Remembering across sessions&quot;</td>
+<td>Facts and preferences stored in a database and retrieved at session start -- CLAUDE.md, ChatGPT Memory, and similar systems</td>
+</tr>
+<tr>
+<td>Episodic memory</td>
+<td>&quot;Remembering specific past events&quot;</td>
+<td>Past interactions stored as embeddings and retrieved when the current query is similar to a past conversation</td>
+</tr>
+<tr>
+<td>Generation budget</td>
+<td>&quot;Room for the answer&quot;</td>
+<td>Tokens reserved for the model's output -- if the context fills the window completely, the model has no room to respond</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2307.03172" rel="noreferrer" data-network="true">Liu et al., 2023 -- &quot;Lost in the Middle: How Language Models Use Long Contexts&quot; <small>↗ 需要联网</small></a>模型在长时间的背景下与信息扎</li>
+<li><a href="https://www.anthropic.com/news/contextual-retrieval" rel="noreferrer" data-network="true">Anthropic's Contextual Retrieval blog post <small>↗ 需要联网</small></a>-- 如何让人类对文本意识的部分检索进行处理,</li>
+<li><a href="https://simonwillison.net/2025/Jun/27/context-engineering/" rel="noreferrer" data-network="true">Simon Willison's &quot;Context Engineering&quot; <small>↗ 需要联网</small></a>-- 博客文章命名了该学科,</li>
+<li><a href="https://python.langchain.com/docs/tutorials/rag/" rel="noreferrer" data-network="true">LangChain documentation on RAG <small>↗ 需要联网</small></a>-- 实际实施以检索增强发电作为文本工程模式</li>
+<li><a href="https://github.com/gkamradt/LLMTest_NeedleInAHaystack" rel="noreferrer" data-network="true">Greg Kamradt's Needle in a Haystack test <small>↗ 需要联网</small></a>-- 标志显示所有主要模型中存在位置依赖的检索失败</li>
+<li><a href="https://arxiv.org/abs/2211.05102" rel="noreferrer" data-network="true">Pope et al., &quot;Efficiently Scaling Transformer Inference&quot; (2022) <small>↗ 需要联网</small></a>背景长度为什么驱动内存和延迟,以及KV缓存,MQA和GQA如何改变预算计算.</li>
+<li><a href="https://arxiv.org/abs/2308.16369" rel="noreferrer" data-network="true">Agrawal et al., &quot;SARATHI: Efficient LLM Inference by Piggybacking Decodes with Chunked Prefills&quot; (2023) <small>↗ 需要联网</small></a>两个期的推断,使得长时间的提示在TTFT中昂贵,但在TPOT中便宜;</li>
+<li><a href="https://arxiv.org/abs/2305.13245" rel="noreferrer" data-network="true">Ainslie et al., &quot;GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints&quot; (EMNLP 2023) <small>↗ 需要联网</small></a>通过集成的查询注意力纸, 无损质量, 切断了生产解码器中的KV内存8倍.</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Context Engineering: Windows, Budgets, Memory, and Retrieval</h1>
+<blockquote>
+<p>Prompt engineering is a subset. Context engineering is the whole game. A prompt is a string you type. Context is everything that goes into the model's window: system instructions, retrieved documents, tool definitions, conversation history, few-shot examples, and the prompt itself. The best AI engineers in 2026 are context engineers. They decide what goes in, what stays out, and in what order.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 10 (LLMs from Scratch), Phase 11 Lesson 01-02
+<strong>Time:</strong> ~90 minutes
+<strong>Related:</strong> Phase 11 · 15 (Prompt Caching) — the cache-friendly layout is an extension of context engineering. Phase 5 · 28 (Long-Context Evaluation) for how to measure lost-in-the-middle with NIAH/RULER.</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Calculate token budgets across all context window components (system prompt, tools, history, retrieved docs, generation headroom)</li>
+<li>Implement context window management strategies: truncation, summarization, and sliding window for conversation history</li>
+<li>Prioritize and order context components to maximize the model's attention on the most relevant information</li>
+<li>Build a context assembler that dynamically allocates tokens based on query type and available window space</li>
+</ul>
+<h2>The Problem</h2>
+<p>Claude Opus 4.7 has a 200K token window (1M in beta). GPT-5 has 400K. Gemini 3 Pro has 2M. Llama 4 claims 10M. These numbers sound enormous until you fill them.</p>
+<p>Here is a real breakdown for a coding assistant. System prompt: 500 tokens. Tool definitions for 50 tools: 8,000 tokens. Retrieved documentation: 4,000 tokens. Conversation history (10 turns): 6,000 tokens. Current user query: 200 tokens. Generation budget (max output): 4,000 tokens. Total: 22,700 tokens. That is only 18% of a 128K window.</p>
+<p>But attention does not scale linearly with context length. A model with 128K tokens of context pays quadratic attention cost (O(n^2) in vanilla transformers, though most production models use efficient attention variants). More importantly, retrieval accuracy degrades. The &quot;Needle in a Haystack&quot; test shows that models struggle to find information placed in the middle of long contexts. Research by Liu et al. (2023) showed that LLMs retrieve information at the start and end of long contexts with near-perfect accuracy, but accuracy drops 10-20% for information placed in the middle (positions 40-70% of the context). This &quot;lost-in-the-middle&quot; effect varies by model but affects all current architectures.</p>
+<p>The practical lesson: having 200K tokens available does not mean using 200K tokens is effective. A carefully curated 10K token context often outperforms a dumped 100K token context. Context engineering is the discipline of maximizing signal-to-noise ratio within the context window.</p>
+<p>Every token you put in the window displaces a token that could carry more relevant information. Every irrelevant tool definition, every stale conversation turn, every chunk of retrieved text that does not answer the question -- each one makes the model slightly worse at the task.</p>
+<h2>The Concept</h2>
+<h3>The Context Window is a Scarce Resource</h3>
+<p>Think of the context window as RAM, not disk. It is fast and directly accessible, but limited. You cannot fit everything. You must choose.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-a67e1e9efc5a2828c80f.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>Each component competes for space. Adding more tool definitions means less room for conversation history. Adding more retrieved context means less room for few-shot examples. Context engineering is the art of allocating this budget to maximize task performance.</p>
+<h3>Lost-in-the-Middle</h3>
+<p>The most important empirical finding in context engineering. Models attend better to information at the beginning and end of the context. Information in the middle gets lower attention scores and is more likely to be ignored.</p>
+<p>Liu et al. (2023) tested this systematically. They placed a relevant document among 20 irrelevant documents at various positions and measured answer accuracy. When the relevant document was first or last, accuracy was 85-90%. When it was in the middle (position 10 of 20), accuracy dropped to 60-70%.</p>
+<p>This has direct engineering implications:</p>
+<ul>
+<li>Put the most important information first (system prompt, critical instructions)</li>
+<li>Put the current query and most relevant context last (recency bias helps)</li>
+<li>Treat the middle of the context as the lowest-priority zone</li>
+<li>If you must include information in the middle, duplicate the key point at the end</li>
+</ul>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-434774a2d06e4750ab6e.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>Context Components</h3>
+<p><strong>System prompt</strong>: sets the persona, constraints, and behavioral rules. This goes first and stays constant across turns. Claude Code uses roughly 6,000 tokens for its system prompt including tool definitions and behavioral instructions. Keep it tight. Every word in the system prompt is repeated on every API call.</p>
+<p><strong>Tool definitions</strong>: each tool adds 50-200 tokens (name, description, parameter schema). 50 tools at 150 tokens each is 7,500 tokens before any conversation happens. Dynamic tool selection -- only including tools relevant to the current query -- can reduce this by 60-80%.</p>
+<p><strong>Retrieved context</strong>: documents from a vector database, search results, file contents. The quality of retrieval directly determines the quality of the response. Bad retrieval is worse than no retrieval -- it fills the window with noise and actively misleads the model.</p>
+<p><strong>Conversation history</strong>: every previous user message and assistant response. Grows linearly with conversation length. A 50-turn conversation at 200 tokens per turn is 10,000 tokens of history. Most of it is irrelevant to the current query.</p>
+<p><strong>Few-shot examples</strong>: input/output pairs that demonstrate the desired behavior. Two to three well-chosen examples often improve output quality more than thousands of tokens of instructions. But they cost space.</p>
+<p><strong>Generation budget</strong>: the tokens reserved for the model's response. If you fill the window to capacity, the model has no room to answer. Reserve at least 2,000-4,000 tokens for generation.</p>
+<h3>Context Compression Strategies</h3>
+<p><strong>History summarization</strong>: instead of keeping all previous turns verbatim, periodically summarize the conversation. &quot;We discussed X, decided Y, and the user wants Z&quot; in 100 tokens replaces 10 turns that took 2,000 tokens. Run summarization when history exceeds a threshold (e.g., 5,000 tokens).</p>
+<p><strong>Relevance filtering</strong>: score each retrieved document against the current query and drop documents below a threshold. If you retrieved 10 chunks but only 3 are relevant, discard the other 7. Better to have 3 highly relevant chunks than 10 mediocre ones.</p>
+<p><strong>Tool pruning</strong>: classify the user's query intent and only include tools relevant to that intent. A code question does not need calendar tools. A scheduling question does not need file system tools. This can reduce tool definitions from 8,000 tokens to 1,000.</p>
+<p><strong>Recursive summarization</strong>: for very long documents, summarize in stages. First summarize each section, then summarize the summaries. A 50-page document becomes a 500-token digest that captures the key points.</p>
+<h3>Memory Systems</h3>
+<p>Context engineering spans three time horizons.</p>
+<p><strong>Short-term memory</strong>: the current conversation. Stored in the context window directly. Grows with each turn. Managed by summarization and truncation.</p>
+<p><strong>Long-term memory</strong>: facts and preferences that persist across conversations. &quot;The user prefers TypeScript.&quot; &quot;The project uses PostgreSQL.&quot; Stored in a database, retrieved on session start. Claude Code stores this in CLAUDE.md files. ChatGPT stores it in its memory feature.</p>
+<p><strong>Episodic memory</strong>: specific past interactions that might be relevant. &quot;Last Tuesday, we debugged a similar issue in the auth module.&quot; Stored as embeddings, retrieved when the current conversation matches a past episode.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-73ad5633f77e227fe4be.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>Dynamic Context Assembly</h3>
+<p>The key insight: different queries need different context. A static system prompt + static tools + static history is wasteful. The best systems dynamically assemble context per query.</p>
+<ol>
+<li>Classify the query intent</li>
+<li>Select relevant tools (not all tools)</li>
+<li>Retrieve relevant documents (not a fixed set)</li>
+<li>Include relevant history turns (not all history)</li>
+<li>Add few-shot examples that match the task type</li>
+<li>Order everything by importance: critical first, important last, optional in the middle</li>
+</ol>
+<p>This is what separates a good AI application from a great one. The model is the same. The context is the differentiator.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-ef63148cfba40213edd6.png" alt="lost-in-the-middle 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<h3>Step 1: Token Counter</h3>
+<p>You cannot budget what you cannot measure. Build a simple token counter (approximation using whitespace splitting, since the exact count depends on the tokenizer).</p>
+<pre><code class="language-python">import json
+import numpy as np
+from collections import OrderedDict
+
+def count_tokens(text):
+    if not text:
+        return 0
+    return int(len(text.split()) * 1.3)
+
+def count_tokens_json(obj):
+    return count_tokens(json.dumps(obj))
+</code></pre>
+<h3>Step 2: Context Budget Manager</h3>
+<p>The core abstraction. A budget manager tracks how many tokens each component uses and enforces limits.</p>
+<pre><code class="language-python">class ContextBudget:
+    def __init__(self, max_tokens=128000, generation_reserve=4000):
+        self.max_tokens = max_tokens
+        self.generation_reserve = generation_reserve
+        self.available = max_tokens - generation_reserve
+        self.allocations = OrderedDict()
+
+    def allocate(self, component, content, max_tokens=None):
+        tokens = count_tokens(content)
+        if max_tokens and tokens &gt; max_tokens:
+            words = content.split()
+            target_words = int(max_tokens / 1.3)
+            content = &quot; &quot;.join(words[:target_words])
+            tokens = count_tokens(content)
+
+        used = sum(self.allocations.values())
+        if used + tokens &gt; self.available:
+            allowed = self.available - used
+            if allowed &lt;= 0:
+                return None, 0
+            words = content.split()
+            target_words = int(allowed / 1.3)
+            content = &quot; &quot;.join(words[:target_words])
+            tokens = count_tokens(content)
+
+        self.allocations[component] = tokens
+        return content, tokens
+
+    def remaining(self):
+        used = sum(self.allocations.values())
+        return self.available - used
+
+    def utilization(self):
+        used = sum(self.allocations.values())
+        return used / self.max_tokens
+
+    def report(self):
+        total_used = sum(self.allocations.values())
+        lines = []
+        lines.append(f&quot;Context Budget Report ({self.max_tokens:,} token window)&quot;)
+        lines.append(&quot;-&quot; * 50)
+        for component, tokens in self.allocations.items():
+            pct = tokens / self.max_tokens * 100
+            bar = &quot;#&quot; * int(pct / 2)
+            lines.append(f&quot;  {component:&lt;25} {tokens:&gt;6} tokens ({pct:&gt;5.1f}%) {bar}&quot;)
+        lines.append(&quot;-&quot; * 50)
+        lines.append(f&quot;  {'Used':&lt;25} {total_used:&gt;6} tokens ({total_used/self.max_tokens*100:.1f}%)&quot;)
+        lines.append(f&quot;  {'Generation reserve':&lt;25} {self.generation_reserve:&gt;6} tokens&quot;)
+        lines.append(f&quot;  {'Remaining':&lt;25} {self.remaining():&gt;6} tokens&quot;)
+        return &quot;\n&quot;.join(lines)
+</code></pre>
+<h3>Step 3: Lost-in-the-Middle Reordering</h3>
+<p>Implement the reordering strategy: most important items go first and last, least important go in the middle.</p>
+<pre><code class="language-python">def reorder_lost_in_middle(items, scores):
+    paired = sorted(zip(scores, items), reverse=True)
+    sorted_items = [item for _, item in paired]
+
+    if len(sorted_items) &lt;= 2:
+        return sorted_items
+
+    first_half = sorted_items[::2]
+    second_half = sorted_items[1::2]
+    second_half.reverse()
+
+    return first_half + second_half
+
+def score_relevance(query, documents):
+    query_words = set(query.lower().split())
+    scores = []
+    for doc in documents:
+        doc_words = set(doc.lower().split())
+        if not query_words:
+            scores.append(0.0)
+            continue
+        overlap = len(query_words &amp; doc_words) / len(query_words)
+        scores.append(round(overlap, 3))
+    return scores
+</code></pre>
+<h3>Step 4: Conversation History Compressor</h3>
+<p>Summarize old conversation turns to reclaim token budget.</p>
+<pre><code class="language-python">class ConversationManager:
+    def __init__(self, max_history_tokens=5000):
+        self.turns = []
+        self.summaries = []
+        self.max_history_tokens = max_history_tokens
+
+    def add_turn(self, role, content):
+        self.turns.append({&quot;role&quot;: role, &quot;content&quot;: content})
+        self._compress_if_needed()
+
+    def _compress_if_needed(self):
+        total = sum(count_tokens(t[&quot;content&quot;]) for t in self.turns)
+        if total &lt;= self.max_history_tokens:
+            return
+
+        while total &gt; self.max_history_tokens and len(self.turns) &gt; 4:
+            old_turns = self.turns[:2]
+            summary = self._summarize_turns(old_turns)
+            self.summaries.append(summary)
+            self.turns = self.turns[2:]
+            total = sum(count_tokens(t[&quot;content&quot;]) for t in self.turns)
+
+    def _summarize_turns(self, turns):
+        parts = []
+        for t in turns:
+            content = t[&quot;content&quot;]
+            if len(content) &gt; 100:
+                content = content[:100] + &quot;...&quot;
+            parts.append(f&quot;{t['role']}: {content}&quot;)
+        return &quot;Previous: &quot; + &quot; | &quot;.join(parts)
+
+    def get_context(self):
+        parts = []
+        if self.summaries:
+            parts.append(&quot;[Conversation Summary]&quot;)
+            for s in self.summaries:
+                parts.append(s)
+        parts.append(&quot;[Recent Conversation]&quot;)
+        for t in self.turns:
+            parts.append(f&quot;{t['role']}: {t['content']}&quot;)
+        return &quot;\n&quot;.join(parts)
+
+    def token_count(self):
+        return count_tokens(self.get_context())
+</code></pre>
+<h3>Step 5: Dynamic Tool Selector</h3>
+<p>Only include tools relevant to the current query. Classify intent, then filter.</p>
+<pre><code class="language-python">TOOL_REGISTRY = {
+    &quot;read_file&quot;: {
+        &quot;description&quot;: &quot;Read contents of a file&quot;,
+        &quot;tokens&quot;: 120,
+        &quot;categories&quot;: [&quot;code&quot;, &quot;files&quot;],
+    },
+    &quot;write_file&quot;: {
+        &quot;description&quot;: &quot;Write content to a file&quot;,
+        &quot;tokens&quot;: 150,
+        &quot;categories&quot;: [&quot;code&quot;, &quot;files&quot;],
+    },
+    &quot;search_code&quot;: {
+        &quot;description&quot;: &quot;Search for patterns in codebase&quot;,
+        &quot;tokens&quot;: 130,
+        &quot;categories&quot;: [&quot;code&quot;],
+    },
+    &quot;run_command&quot;: {
+        &quot;description&quot;: &quot;Execute a shell command&quot;,
+        &quot;tokens&quot;: 140,
+        &quot;categories&quot;: [&quot;code&quot;, &quot;system&quot;],
+    },
+    &quot;create_calendar_event&quot;: {
+        &quot;description&quot;: &quot;Create a new calendar event&quot;,
+        &quot;tokens&quot;: 180,
+        &quot;categories&quot;: [&quot;calendar&quot;],
+    },
+    &quot;list_emails&quot;: {
+        &quot;description&quot;: &quot;List recent emails&quot;,
+        &quot;tokens&quot;: 160,
+        &quot;categories&quot;: [&quot;email&quot;],
+    },
+    &quot;send_email&quot;: {
+        &quot;description&quot;: &quot;Send an email message&quot;,
+        &quot;tokens&quot;: 200,
+        &quot;categories&quot;: [&quot;email&quot;],
+    },
+    &quot;web_search&quot;: {
+        &quot;description&quot;: &quot;Search the web for information&quot;,
+        &quot;tokens&quot;: 140,
+        &quot;categories&quot;: [&quot;research&quot;],
+    },
+    &quot;query_database&quot;: {
+        &quot;description&quot;: &quot;Run a SQL query on the database&quot;,
+        &quot;tokens&quot;: 170,
+        &quot;categories&quot;: [&quot;code&quot;, &quot;data&quot;],
+    },
+    &quot;generate_chart&quot;: {
+        &quot;description&quot;: &quot;Generate a chart from data&quot;,
+        &quot;tokens&quot;: 190,
+        &quot;categories&quot;: [&quot;data&quot;, &quot;visualization&quot;],
+    },
+}
+
+def classify_intent(query):
+    query_lower = query.lower()
+
+    intent_keywords = {
+        &quot;code&quot;: [&quot;code&quot;, &quot;function&quot;, &quot;bug&quot;, &quot;error&quot;, &quot;file&quot;, &quot;implement&quot;, &quot;refactor&quot;, &quot;debug&quot;, &quot;test&quot;],
+        &quot;calendar&quot;: [&quot;meeting&quot;, &quot;schedule&quot;, &quot;calendar&quot;, &quot;appointment&quot;, &quot;event&quot;],
+        &quot;email&quot;: [&quot;email&quot;, &quot;mail&quot;, &quot;send&quot;, &quot;inbox&quot;, &quot;message&quot;],
+        &quot;research&quot;: [&quot;search&quot;, &quot;find&quot;, &quot;what is&quot;, &quot;how does&quot;, &quot;explain&quot;, &quot;look up&quot;],
+        &quot;data&quot;: [&quot;data&quot;, &quot;query&quot;, &quot;database&quot;, &quot;chart&quot;, &quot;graph&quot;, &quot;analytics&quot;, &quot;sql&quot;],
+    }
+
+    scores = {}
+    for intent, keywords in intent_keywords.items():
+        score = sum(1 for kw in keywords if kw in query_lower)
+        if score &gt; 0:
+            scores[intent] = score
+
+    if not scores:
+        return [&quot;code&quot;]
+
+    max_score = max(scores.values())
+    return [intent for intent, score in scores.items() if score &gt;= max_score * 0.5]
+
+def select_tools(query, token_budget=2000):
+    intents = classify_intent(query)
+    relevant = {}
+    total_tokens = 0
+
+    for name, tool in TOOL_REGISTRY.items():
+        if any(cat in intents for cat in tool[&quot;categories&quot;]):
+            if total_tokens + tool[&quot;tokens&quot;] &lt;= token_budget:
+                relevant[name] = tool
+                total_tokens += tool[&quot;tokens&quot;]
+
+    return relevant, total_tokens
+</code></pre>
+<h3>Step 6: Full Context Assembly Pipeline</h3>
+<p>Wire everything together. Given a query, dynamically assemble the optimal context.</p>
+<pre><code class="language-python">class ContextEngine:
+    def __init__(self, max_tokens=128000, generation_reserve=4000):
+        self.budget = ContextBudget(max_tokens, generation_reserve)
+        self.conversation = ConversationManager(max_history_tokens=5000)
+        self.system_prompt = (
+            &quot;You are a helpful AI assistant. You have access to tools for &quot;
+            &quot;code editing, file management, web search, and data analysis. &quot;
+            &quot;Use the appropriate tools for each task. Be concise and accurate.&quot;
+        )
+        self.knowledge_base = [
+            &quot;Python 3.12 introduced type parameter syntax for generic classes using bracket notation.&quot;,
+            &quot;The project uses PostgreSQL 16 with pgvector for embedding storage.&quot;,
+            &quot;Authentication is handled by Supabase Auth with JWT tokens.&quot;,
+            &quot;The frontend is built with Next.js 15 using the App Router.&quot;,
+            &quot;API rate limits are set to 100 requests per minute per user.&quot;,
+            &quot;The deployment pipeline uses GitHub Actions with Docker multi-stage builds.&quot;,
+            &quot;Test coverage must be above 80% for all new modules.&quot;,
+            &quot;The codebase follows the repository pattern for data access.&quot;,
+        ]
+
+    def assemble(self, query):
+        self.budget = ContextBudget(self.budget.max_tokens, self.budget.generation_reserve)
+
+        system_content, _ = self.budget.allocate(&quot;system_prompt&quot;, self.system_prompt, max_tokens=1000)
+
+        tools, tool_tokens = select_tools(query, token_budget=2000)
+        tool_text = json.dumps(list(tools.keys()))
+        tool_content, _ = self.budget.allocate(&quot;tools&quot;, tool_text, max_tokens=2000)
+
+        relevance = score_relevance(query, self.knowledge_base)
+        threshold = 0.1
+        relevant_docs = [
+            doc for doc, score in zip(self.knowledge_base, relevance)
+            if score &gt;= threshold
+        ]
+
+        if relevant_docs:
+            doc_scores = [s for s in relevance if s &gt;= threshold]
+            reordered = reorder_lost_in_middle(relevant_docs, doc_scores)
+            doc_text = &quot;\n&quot;.join(reordered)
+            doc_content, _ = self.budget.allocate(&quot;retrieved_context&quot;, doc_text, max_tokens=3000)
+
+        history_text = self.conversation.get_context()
+        if history_text.strip():
+            history_content, _ = self.budget.allocate(&quot;conversation_history&quot;, history_text, max_tokens=5000)
+
+        query_content, _ = self.budget.allocate(&quot;user_query&quot;, query, max_tokens=500)
+
+        return self.budget
+
+    def chat(self, query):
+        self.conversation.add_turn(&quot;user&quot;, query)
+        budget = self.assemble(query)
+        response = f&quot;[Response to: {query[:50]}...]&quot;
+        self.conversation.add_turn(&quot;assistant&quot;, response)
+        return budget
+
+
+def run_demo():
+    print(&quot;=&quot; * 60)
+    print(&quot;  Context Engineering Pipeline Demo&quot;)
+    print(&quot;=&quot; * 60)
+
+    engine = ContextEngine(max_tokens=128000, generation_reserve=4000)
+
+    print(&quot;\n--- Query 1: Code task ---&quot;)
+    budget = engine.chat(&quot;Fix the bug in the authentication module where JWT tokens expire too early&quot;)
+    print(budget.report())
+
+    print(&quot;\n--- Query 2: Research task ---&quot;)
+    budget = engine.chat(&quot;What is the best approach for implementing vector search in PostgreSQL?&quot;)
+    print(budget.report())
+
+    print(&quot;\n--- Query 3: After conversation history builds up ---&quot;)
+    for i in range(8):
+        engine.conversation.add_turn(&quot;user&quot;, f&quot;Follow-up question number {i+1} about the implementation details of the system&quot;)
+        engine.conversation.add_turn(&quot;assistant&quot;, f&quot;Here is the response to follow-up {i+1} with technical details about the architecture&quot;)
+
+    budget = engine.chat(&quot;Now implement the changes we discussed&quot;)
+    print(budget.report())
+
+    print(&quot;\n--- Tool Selection Examples ---&quot;)
+    test_queries = [
+        &quot;Fix the bug in auth.py&quot;,
+        &quot;Schedule a meeting with the team for Tuesday&quot;,
+        &quot;Show me the database query performance stats&quot;,
+        &quot;Search for best practices on error handling&quot;,
+    ]
+
+    for q in test_queries:
+        tools, tokens = select_tools(q)
+        intents = classify_intent(q)
+        print(f&quot;\n  Query: {q}&quot;)
+        print(f&quot;  Intents: {intents}&quot;)
+        print(f&quot;  Tools: {list(tools.keys())} ({tokens} tokens)&quot;)
+
+    print(&quot;\n--- Lost-in-the-Middle Reordering ---&quot;)
+    docs = [&quot;Doc A (most relevant)&quot;, &quot;Doc B (somewhat relevant)&quot;, &quot;Doc C (least relevant)&quot;,
+            &quot;Doc D (relevant)&quot;, &quot;Doc E (moderately relevant)&quot;]
+    scores = [0.95, 0.60, 0.20, 0.80, 0.50]
+    reordered = reorder_lost_in_middle(docs, scores)
+    print(f&quot;  Original order: {docs}&quot;)
+    print(f&quot;  Scores:         {scores}&quot;)
+    print(f&quot;  Reordered:      {reordered}&quot;)
+    print(f&quot;  (Most relevant at start and end, least relevant in middle)&quot;)
+</code></pre>
+<h2>Use It</h2>
+<h3>Harness-Managed Context</h3>
+<p>Claude Code manages context with a layered approach. The system prompt includes behavioral rules and tool definitions (~6K tokens). When you open a file, its contents are injected as context. When you search, results are added. Old conversation turns are summarized. CLAUDE.md provides long-term memory that persists across sessions.</p>
+<p>The key engineering decision: Claude Code does not dump your entire codebase into the context. It retrieves relevant files on demand. This is context engineering in practice.</p>
+<h3>Dynamic Context Loading</h3>
+<p>Cursor indexes your entire codebase into embeddings. When you type a query, it retrieves the most relevant files and code blocks using vector similarity. Only those pieces go into the context window. A 500K-line codebase is compressed into the 5-10 most relevant code blocks.</p>
+<p>This is the pattern: embed everything, retrieve on demand, include only what matters.</p>
+<h3>Assistant Long-Term Memory</h3>
+<p>ChatGPT stores user preferences and facts as long-term memory. On each conversation start, relevant memories are retrieved and included in the system prompt. &quot;The user prefers Python&quot; costs 5 tokens but saves hundreds of tokens of repeated instructions across conversations.</p>
+<h3>RAG as Context Engineering</h3>
+<p>Retrieval-Augmented Generation is context engineering formalized. Instead of stuffing knowledge into the model's weights (training) or the system prompt (static context), you retrieve relevant documents at query time and inject them into the context window. The entire RAG pipeline -- chunking, embedding, retrieval, reranking -- exists to solve one problem: putting the right information in the context window.</p>
+<h2>Ship It</h2>
+<p>This lesson produces <code>outputs/prompt-context-optimizer.md</code> -- a reusable prompt that audits a context assembly strategy and recommends optimizations. Feed it your system prompt, tool count, average history length, and retrieval strategy, and it identifies token waste and suggests improvements.</p>
+<p>It also produces <code>outputs/skill-context-engineering.md</code> -- a decision framework for designing context assembly pipelines based on task type, context window size, and latency budget.</p>
+<h2>Exercises</h2>
+<ol>
+<li>
+<p>Add a &quot;token waste detector&quot; to the ContextBudget class. It should flag components using more than 30% of the budget and suggest compression strategies specific to each component type (summarize history, prune tools, re-rank documents).</p>
+</li>
+<li>
+<p>Implement semantic deduplication for retrieved context. If two retrieved documents are more than 80% similar (by word overlap or cosine similarity of their embeddings), keep only the higher-scored one. Measure how much token budget this recovers.</p>
+</li>
+<li>
+<p>Build a &quot;context replay&quot; tool. Given a conversation transcript, replay it through the ContextEngine and visualize how the budget allocation changes turn by turn. Plot token usage per component over time. Identify the turn where context starts getting compressed.</p>
+</li>
+<li>
+<p>Implement a priority-based tool selector. Instead of binary include/exclude, assign each tool a relevance score to the current query. Include tools in descending relevance order until the tool budget is exhausted. Compare task performance with 5, 10, 20, and 50 tools included.</p>
+</li>
+<li>
+<p>Build a multi-strategy context compressor. Implement three compression strategies (truncation, summarization, extraction of key sentences) and benchmark them on a set of 20 documents. Measure the tradeoff between compression ratio and information retention (does the compressed version still contain the answer to the query?).</p>
+</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Context window</td>
+<td>&quot;How much the model can read&quot;</td>
+<td>The maximum number of tokens (input + output) the model processes in a single forward pass -- 400K for GPT-5, 200K (1M beta) for Claude Opus 4.7, 2M for Gemini 3 Pro</td>
+</tr>
+<tr>
+<td>Context engineering</td>
+<td>&quot;Advanced prompt engineering&quot;</td>
+<td>The discipline of deciding what goes into the context window, in what order, and at what priority -- encompasses retrieval, compression, tool selection, and memory management</td>
+</tr>
+<tr>
+<td>Lost-in-the-middle</td>
+<td>&quot;Models forget stuff in the middle&quot;</td>
+<td>Empirical finding that LLMs attend better to the beginning and end of context, with 10-20% accuracy drop for information placed in the middle</td>
+</tr>
+<tr>
+<td>Token budget</td>
+<td>&quot;How many tokens you have left&quot;</td>
+<td>An explicit allocation of context window capacity across components (system prompt, tools, history, retrieval, generation) with per-component limits</td>
+</tr>
+<tr>
+<td>Dynamic context</td>
+<td>&quot;Loading stuff on the fly&quot;</td>
+<td>Assembling the context window differently for each query based on intent classification, relevant tool selection, and retrieval results</td>
+</tr>
+<tr>
+<td>History summarization</td>
+<td>&quot;Compressing the conversation&quot;</td>
+<td>Replacing verbatim old conversation turns with a concise summary, reducing token cost while preserving key information</td>
+</tr>
+<tr>
+<td>Tool pruning</td>
+<td>&quot;Only including relevant tools&quot;</td>
+<td>Classifying query intent and only including tool definitions that match, reducing tool token cost by 60-80%</td>
+</tr>
+<tr>
+<td>Long-term memory</td>
+<td>&quot;Remembering across sessions&quot;</td>
+<td>Facts and preferences stored in a database and retrieved at session start -- CLAUDE.md, ChatGPT Memory, and similar systems</td>
+</tr>
+<tr>
+<td>Episodic memory</td>
+<td>&quot;Remembering specific past events&quot;</td>
+<td>Past interactions stored as embeddings and retrieved when the current query is similar to a past conversation</td>
+</tr>
+<tr>
+<td>Generation budget</td>
+<td>&quot;Room for the answer&quot;</td>
+<td>Tokens reserved for the model's output -- if the context fills the window completely, the model has no room to respond</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2307.03172" rel="noreferrer" data-network="true">Liu et al., 2023 -- &quot;Lost in the Middle: How Language Models Use Long Contexts&quot; <small>↗ 需要联网</small></a> -- the definitive study on position-dependent attention, showing that models struggle with information in the middle of long contexts</li>
+<li><a href="https://www.anthropic.com/news/contextual-retrieval" rel="noreferrer" data-network="true">Anthropic's Contextual Retrieval blog post <small>↗ 需要联网</small></a> -- how Anthropic approaches context-aware chunk retrieval, reducing retrieval failure by 49%</li>
+<li><a href="https://simonwillison.net/2025/Jun/27/context-engineering/" rel="noreferrer" data-network="true">Simon Willison's &quot;Context Engineering&quot; <small>↗ 需要联网</small></a> -- the blog post that named the discipline and distinguished it from prompt engineering</li>
+<li><a href="https://python.langchain.com/docs/tutorials/rag/" rel="noreferrer" data-network="true">LangChain documentation on RAG <small>↗ 需要联网</small></a> -- practical implementation of retrieval-augmented generation as a context engineering pattern</li>
+<li><a href="https://github.com/gkamradt/LLMTest_NeedleInAHaystack" rel="noreferrer" data-network="true">Greg Kamradt's Needle in a Haystack test <small>↗ 需要联网</small></a> -- the benchmark that revealed position-dependent retrieval failures across all major models</li>
+<li><a href="https://arxiv.org/abs/2211.05102" rel="noreferrer" data-network="true">Pope et al., &quot;Efficiently Scaling Transformer Inference&quot; (2022) <small>↗ 需要联网</small></a> -- why context length drives memory and latency, and how KV cache, MQA, and GQA change the budget calculation.</li>
+<li><a href="https://arxiv.org/abs/2308.16369" rel="noreferrer" data-network="true">Agrawal et al., &quot;SARATHI: Efficient LLM Inference by Piggybacking Decodes with Chunked Prefills&quot; (2023) <small>↗ 需要联网</small></a> -- the two phases of inference that make long prompts expensive in TTFT but cheap in TPOT; the ground truth behind context-packing tradeoffs.</li>
+<li><a href="https://arxiv.org/abs/2305.13245" rel="noreferrer" data-network="true">Ainslie et al., &quot;GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints&quot; (EMNLP 2023) <small>↗ 需要联网</small></a> -- the grouped-query attention paper that cut KV memory 8× in production decoders without quality loss.</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-11-llm-engineering--05-context-engineering.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-11-llm-engineering--05-context-engineering.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/11-llm-engineering/05-context-engineering/code/main.py">phases/11-llm-engineering/05-context-engineering/code/main.py</a><details><summary>查看原始文本</summary><pre><code>import json
+import numpy as np
+from collections import OrderedDict
+
+
+def count_tokens(text):
+    if not text:
+        return 0
+    return int(len(text.split()) * 1.3)
+
+
+def count_tokens_json(obj):
+    return count_tokens(json.dumps(obj))
+
+
+class ContextBudget:
+    def __init__(self, max_tokens=128000, generation_reserve=4000):
+        self.max_tokens = max_tokens
+        self.generation_reserve = generation_reserve
+        self.available = max_tokens - generation_reserve
+        self.allocations = OrderedDict()
+
+    def allocate(self, component, content, max_tokens=None):
+        tokens = count_tokens(content)
+        if max_tokens and tokens &gt; max_tokens:
+            words = content.split()
+            target_words = int(max_tokens / 1.3)
+            content = &quot; &quot;.join(words[:target_words])
+            tokens = count_tokens(content)
+
+        used = sum(self.allocations.values())
+        if used + tokens &gt; self.available:
+            allowed = self.available - used
+            if allowed &lt;= 0:
+                return None, 0
+            words = content.split()
+            target_words = int(allowed / 1.3)
+            content = &quot; &quot;.join(words[:target_words])
+            tokens = count_tokens(content)
+
+        self.allocations[component] = tokens
+        return content, tokens
+
+    def remaining(self):
+        used = sum(self.allocations.values())
+        return self.available - used
+
+    def utilization(self):
+        used = sum(self.allocations.values())
+        return used / self.max_tokens
+
+    def report(self):
+        total_used = sum(self.allocations.values())
+        lines = []
+        lines.append(f&quot;\n  Context Budget Report ({self.max_tokens:,} token window)&quot;)
+        lines.append(&quot;  &quot; + &quot;-&quot; * 55)
+        for component, tokens in self.allocations.items():
+            pct = tokens / self.max_tokens * 100
+            bar = &quot;#&quot; * int(pct * 2) if pct &gt;= 0.5 else &quot;&quot;
+            lines.append(f&quot;    {component:&lt;25} {tokens:&gt;6} tokens ({pct:&gt;5.1f}%) {bar}&quot;)
+        lines.append(&quot;  &quot; + &quot;-&quot; * 55)
+        lines.append(f&quot;    {&#39;Used&#39;:&lt;25} {total_used:&gt;6} tokens ({total_used/self.max_tokens*100:.1f}%)&quot;)
+        lines.append(f&quot;    {&#39;Generation reserve&#39;:&lt;25} {self.generation_reserve:&gt;6} tokens&quot;)
+        lines.append(f&quot;    {&#39;Remaining&#39;:&lt;25} {self.remaining():&gt;6} tokens&quot;)
+        return &quot;\n&quot;.join(lines)
+
+
+def reorder_lost_in_middle(items, scores):
+    paired = sorted(zip(scores, items), reverse=True)
+    sorted_items = [item for _, item in paired]
+
+    if len(sorted_items) &lt;= 2:
+        return sorted_items
+
+    first_half = sorted_items[::2]
+    second_half = sorted_items[1::2]
+    second_half.reverse()
+
+    return first_half + second_half
+
+
+def score_relevance(query, documents):
+    query_words = set(query.lower().split())
+    scores = []
+    for doc in documents:
+        doc_words = set(doc.lower().split())
+        if not query_words:
+            scores.append(0.0)
+            continue
+        overlap = len(query_words &amp; doc_words) / len(query_words)
+        scores.append(round(overlap, 3))
+    return scores
+
+
+class ConversationManager:
+    def __init__(self, max_history_tokens=5000):
+        self.turns = []
+        self.summaries = []
+        self.max_history_tokens = max_history_tokens
+
+    def add_turn(self, role, content):
+        self.turns.append({&quot;role&quot;: role, &quot;content&quot;: content})
+        self._compress_if_needed()
+
+    def _compress_if_needed(self):
+        total = sum(count_tokens(t[&quot;content&quot;]) for t in self.turns)
+        if total &lt;= self.max_history_tokens:
+            return
+
+        while total &gt; self.max_history_tokens and len(self.turns) &gt; 4:
+            old_turns = self.turns[:2]
+            summary = self._summarize_turns(old_turns)
+            self.summaries.append(summary)
+            self.turns = self.turns[2:]
+            total = sum(count_tokens(t[&quot;content&quot;]) for t in self.turns)
+
+    def _summarize_turns(self, turns):
+        parts = []
+        for t in turns:
+            content = t[&quot;content&quot;]
+            if len(content) &gt; 100:
+                content = content[:100] + &quot;...&quot;
+            parts.append(f&quot;{t[&#39;role&#39;]}: {content}&quot;)
+        return &quot;Previous: &quot; + &quot; | &quot;.join(parts)
+
+    def get_context(self):
+        parts = []
+        if self.summaries:
+            parts.append(&quot;[Conversation Summary]&quot;)
+            for s in self.summaries:
+                parts.append(s)
+        if self.turns:
+            parts.append(&quot;[Recent Conversation]&quot;)
+            for t in self.turns:
+                parts.append(f&quot;{t[&#39;role&#39;]}: {t[&#39;content&#39;]}&quot;)
+        return &quot;\n&quot;.join(parts)
+
+    def token_count(self):
+        return count_tokens(self.get_context())
+
+    def stats(self):
+        return {
+            &quot;live_turns&quot;: len(self.turns),
+            &quot;summaries&quot;: len(self.summaries),
+            &quot;tokens&quot;: self.token_count(),
+        }
+
+
+TOOL_REGISTRY = {
+    &quot;read_file&quot;: {
+        &quot;description&quot;: &quot;Read contents of a file from disk&quot;,
+        &quot;tokens&quot;: 120,
+        &quot;categories&quot;: [&quot;code&quot;, &quot;files&quot;],
+    },
+    &quot;write_file&quot;: {
+        &quot;description&quot;: &quot;Write content to a file on disk&quot;,
+        &quot;tokens&quot;: 150,
+        &quot;categories&quot;: [&quot;code&quot;, &quot;files&quot;],
+    },
+    &quot;search_code&quot;: {
+        &quot;description&quot;: &quot;Search for patterns across the codebase&quot;,
+        &quot;tokens&quot;: 130,
+        &quot;categories&quot;: [&quot;code&quot;],
+    },
+    &quot;run_command&quot;: {
+        &quot;description&quot;: &quot;Execute a shell command and return output&quot;,
+        &quot;tokens&quot;: 140,
+        &quot;categories&quot;: [&quot;code&quot;, &quot;system&quot;],
+    },
+    &quot;create_calendar_event&quot;: {
+        &quot;description&quot;: &quot;Create a new event on the calendar&quot;,
+        &quot;tokens&quot;: 180,
+        &quot;categories&quot;: [&quot;calendar&quot;],
+    },
+    &quot;list_emails&quot;: {
+        &quot;description&quot;: &quot;List recent emails from inbox&quot;,
+        &quot;tokens&quot;: 160,
+        &quot;categories&quot;: [&quot;email&quot;],
+    },
+    &quot;send_email&quot;: {
+        &quot;description&quot;: &quot;Compose and send an email message&quot;,
+        &quot;tokens&quot;: 200,
+        &quot;categories&quot;: [&quot;email&quot;],
+    },
+    &quot;web_search&quot;: {
+        &quot;description&quot;: &quot;Search the web for information&quot;,
+        &quot;tokens&quot;: 140,
+        &quot;categories&quot;: [&quot;research&quot;],
+    },
+    &quot;query_database&quot;: {
+        &quot;description&quot;: &quot;Run a SQL query against the database&quot;,
+        &quot;tokens&quot;: 170,
+        &quot;categories&quot;: [&quot;code&quot;, &quot;data&quot;],
+    },
+    &quot;generate_chart&quot;: {
+        &quot;description&quot;: &quot;Generate a visualization from data&quot;,
+        &quot;tokens&quot;: 190,
+        &quot;categories&quot;: [&quot;data&quot;, &quot;visualization&quot;],
+    },
+}
+
+
+def classify_intent(query):
+    query_lower = query.lower()
+
+    intent_keywords = {
+        &quot;code&quot;: [&quot;code&quot;, &quot;function&quot;, &quot;bug&quot;, &quot;error&quot;, &quot;file&quot;, &quot;implement&quot;, &quot;refactor&quot;, &quot;debug&quot;, &quot;test&quot;, &quot;fix&quot;, &quot;class&quot;, &quot;module&quot;],
+        &quot;calendar&quot;: [&quot;meeting&quot;, &quot;schedule&quot;, &quot;calendar&quot;, &quot;appointment&quot;, &quot;event&quot;, &quot;tuesday&quot;, &quot;tomorrow&quot;],
+        &quot;email&quot;: [&quot;email&quot;, &quot;mail&quot;, &quot;send&quot;, &quot;inbox&quot;, &quot;message&quot;, &quot;reply&quot;],
+        &quot;research&quot;: [&quot;search&quot;, &quot;find&quot;, &quot;what is&quot;, &quot;how does&quot;, &quot;explain&quot;, &quot;look up&quot;, &quot;documentation&quot;],
+        &quot;data&quot;: [&quot;data&quot;, &quot;query&quot;, &quot;database&quot;, &quot;chart&quot;, &quot;graph&quot;, &quot;analytics&quot;, &quot;sql&quot;, &quot;stats&quot;],
+    }
+
+    scores = {}
+    for intent, keywords in intent_keywords.items():
+        score = sum(1 for kw in keywords if kw in query_lower)
+        if score &gt; 0:
+            scores[intent] = score
+
+    if not scores:
+        return [&quot;code&quot;]
+
+    max_score = max(scores.values())
+    return [intent for intent, score in scores.items() if score &gt;= max_score * 0.5]
+
+
+def select_tools(query, token_budget=2000):
+    intents = classify_intent(query)
+    relevant = {}
+    total_tokens = 0
+
+    for name, tool in TOOL_REGISTRY.items():
+        if any(cat in intents for cat in tool[&quot;categories&quot;]):
+            if total_tokens + tool[&quot;tokens&quot;] &lt;= token_budget:
+                relevant[name] = tool
+                total_tokens += tool[&quot;tokens&quot;]
+
+    return relevant, total_tokens
+
+
+class ContextEngine:
+    def __init__(self, max_tokens=128000, generation_reserve=4000):
+        self.max_tokens = max_tokens
+        self.generation_reserve = generation_reserve
+        self.conversation = ConversationManager(max_history_tokens=5000)
+        self.system_prompt = (
+            &quot;You are a helpful AI assistant. You have access to tools for &quot;
+            &quot;code editing, file management, web search, and data analysis. &quot;
+            &quot;Use the appropriate tools for each task. Be concise and accurate.&quot;
+        )
+        self.knowledge_base = [
+            &quot;Python 3.12 introduced type parameter syntax for generic classes using bracket notation.&quot;,
+            &quot;The project uses PostgreSQL 16 with pgvector for embedding storage.&quot;,
+            &quot;Authentication is handled by Supabase Auth with JWT tokens.&quot;,
+            &quot;The frontend is built with Next.js 15 using the App Router.&quot;,
+            &quot;API rate limits are set to 100 requests per minute per user.&quot;,
+            &quot;The deployment pipeline uses GitHub Actions with Docker multi-stage builds.&quot;,
+            &quot;Test coverage must be above 80% for all new modules.&quot;,
+            &quot;The codebase follows the repository pattern for data access.&quot;,
+            &quot;Error logging uses structured JSON format with correlation IDs.&quot;,
+            &quot;The vector search index uses HNSW with 128 dimensions and cosine distance.&quot;,
+        ]
+
+    def assemble(self, query):
+        budget = ContextBudget(self.max_tokens, self.generation_reserve)
+
+        budget.allocate(&quot;system_prompt&quot;, self.system_prompt, max_tokens=1000)
+
+        tools, tool_tokens = select_tools(query, token_budget=2000)
+        tool_text = json.dumps(list(tools.keys()))
+        budget.allocate(&quot;tools&quot;, tool_text, max_tokens=2000)
+
+        relevance = score_relevance(query, self.knowledge_base)
+        threshold = 0.05
+        relevant_docs = [
+            doc for doc, score in zip(self.knowledge_base, relevance)
+            if score &gt;= threshold
+        ]
+
+        if relevant_docs:
+            doc_scores = [s for s in relevance if s &gt;= threshold]
+            reordered = reorder_lost_in_middle(relevant_docs, doc_scores)
+            doc_text = &quot;\n&quot;.join(reordered)
+            budget.allocate(&quot;retrieved_context&quot;, doc_text, max_tokens=3000)
+
+        history_text = self.conversation.get_context()
+        if history_text.strip():
+            budget.allocate(&quot;conversation_history&quot;, history_text, max_tokens=5000)
+
+        budget.allocate(&quot;user_query&quot;, query, max_tokens=500)
+
+        return budget
+
+    def chat(self, query):
+        self.conversation.add_turn(&quot;user&quot;, query)
+        budget = self.assemble(query)
+        response = f&quot;[Simulated response to: {query[:50]}...]&quot;
+        self.conversation.add_turn(&quot;assistant&quot;, response)
+        return budget
+
+
+def run_budget_demo():
+    print(&quot;=&quot; * 60)
+    print(&quot;  STEP 1: Context Budget Manager&quot;)
+    print(&quot;=&quot; * 60)
+
+    budget = ContextBudget(max_tokens=128000, generation_reserve=4000)
+    budget.allocate(&quot;system_prompt&quot;, &quot;You are a helpful assistant. &quot; * 20, max_tokens=500)
+    budget.allocate(&quot;tools&quot;, json.dumps(list(TOOL_REGISTRY.keys())), max_tokens=2000)
+    budget.allocate(&quot;retrieved_docs&quot;, &quot;The project uses PostgreSQL. &quot; * 50, max_tokens=3000)
+    budget.allocate(&quot;history&quot;, &quot;user: How do I fix this?\nassistant: Check the logs.&quot; * 10, max_tokens=5000)
+    budget.allocate(&quot;query&quot;, &quot;Fix the authentication bug in the JWT validation module&quot;, max_tokens=500)
+    print(budget.report())
+
+
+def run_reorder_demo():
+    print(f&quot;\n{&#39;=&#39; * 60}&quot;)
+    print(&quot;  STEP 2: Lost-in-the-Middle Reordering&quot;)
+    print(&quot;=&quot; * 60)
+
+    docs = [
+        &quot;Doc A: PostgreSQL connection pooling (most relevant)&quot;,
+        &quot;Doc B: Redis caching layer (somewhat relevant)&quot;,
+        &quot;Doc C: CSS styling guide (not relevant)&quot;,
+        &quot;Doc D: Database migration scripts (relevant)&quot;,
+        &quot;Doc E: CI/CD pipeline config (slightly relevant)&quot;,
+        &quot;Doc F: API authentication flow (relevant)&quot;,
+        &quot;Doc G: Frontend routing (not relevant)&quot;,
+    ]
+    scores = [0.95, 0.60, 0.05, 0.80, 0.30, 0.75, 0.10]
+
+    reordered = reorder_lost_in_middle(docs, scores)
+
+    print(f&quot;\n  Original order (by insertion):&quot;)
+    for doc, score in zip(docs, scores):
+        print(f&quot;    {score:.2f}  {doc}&quot;)
+
+    print(f&quot;\n  Reordered (high relevance at start + end, low in middle):&quot;)
+    for i, doc in enumerate(reordered):
+        position = &quot;START&quot; if i &lt; 2 else &quot;END&quot; if i &gt;= len(reordered) - 2 else &quot;middle&quot;
+        print(f&quot;    [{position:&gt;6}]  {doc}&quot;)
+
+
+def run_conversation_demo():
+    print(f&quot;\n{&#39;=&#39; * 60}&quot;)
+    print(&quot;  STEP 3: Conversation History Compression&quot;)
+    print(&quot;=&quot; * 60)
+
+    conv = ConversationManager(max_history_tokens=200)
+
+    exchanges = [
+        (&quot;How do I set up the database?&quot;, &quot;Run docker-compose up to start PostgreSQL. Then run the migrations with npm run migrate.&quot;),
+        (&quot;What about the environment variables?&quot;, &quot;Copy .env.example to .env and fill in DATABASE_URL and JWT_SECRET.&quot;),
+        (&quot;The migrations are failing with a connection error.&quot;, &quot;Check that PostgreSQL is running on port 5432 and the DATABASE_URL matches.&quot;),
+        (&quot;Fixed it. Now how do I seed test data?&quot;, &quot;Run npm run seed which loads fixtures from the test/fixtures directory.&quot;),
+        (&quot;Can I run the tests now?&quot;, &quot;Yes, run npm test. Make sure the test database is separate from development.&quot;),
+    ]
+
+    for i, (user_msg, assistant_msg) in enumerate(exchanges):
+        conv.add_turn(&quot;user&quot;, user_msg)
+        conv.add_turn(&quot;assistant&quot;, assistant_msg)
+        stats = conv.stats()
+        print(f&quot;\n  After turn {i + 1}:&quot;)
+        print(f&quot;    Live turns: {stats[&#39;live_turns&#39;]}, Summaries: {stats[&#39;summaries&#39;]}, Tokens: {stats[&#39;tokens&#39;]}&quot;)
+
+    print(f&quot;\n  Final context:&quot;)
+    for line in conv.get_context().split(&quot;\n&quot;):
+        print(f&quot;    {line}&quot;)
+
+
+def run_tool_selection_demo():
+    print(f&quot;\n{&#39;=&#39; * 60}&quot;)
+    print(&quot;  STEP 4: Dynamic Tool Selection&quot;)
+    print(&quot;=&quot; * 60)
+
+    test_queries = [
+        &quot;Fix the bug in auth.py where JWT tokens expire too early&quot;,
+        &quot;Schedule a meeting with the design team for next Tuesday at 2pm&quot;,
+        &quot;Show me the database query performance stats and generate a chart&quot;,
+        &quot;Search for best practices on error handling in Python&quot;,
+        &quot;Send an email to the team about the deployment schedule&quot;,
+        &quot;Read the config file and check for database connection settings&quot;,
+    ]
+
+    print(f&quot;\n  All tools: {list(TOOL_REGISTRY.keys())} ({sum(t[&#39;tokens&#39;] for t in TOOL_REGISTRY.values())} total tokens)&quot;)
+
+    for q in test_queries:
+        tools, tokens = select_tools(q)
+        intents = classify_intent(q)
+        all_tokens = sum(t[&quot;tokens&quot;] for t in TOOL_REGISTRY.values())
+        savings = all_tokens - tokens
+        print(f&quot;\n  Query: {q[:60]}...&quot;)
+        print(f&quot;    Intents: {intents}&quot;)
+        print(f&quot;    Selected: {list(tools.keys())}&quot;)
+        print(f&quot;    Tokens: {tokens} (saved {savings} by pruning)&quot;)
+
+
+def run_full_pipeline_demo():
+    print(f&quot;\n{&#39;=&#39; * 60}&quot;)
+    print(&quot;  STEP 5: Full Context Assembly Pipeline&quot;)
+    print(&quot;=&quot; * 60)
+
+    engine = ContextEngine(max_tokens=128000, generation_reserve=4000)
+
+    queries = [
+        &quot;Fix the bug in the authentication module where JWT tokens expire too early&quot;,
+        &quot;What is the best approach for implementing vector search with PostgreSQL?&quot;,
+        &quot;Schedule a team standup meeting for tomorrow morning&quot;,
+    ]
+
+    for q in queries:
+        print(f&quot;\n  Query: {q}&quot;)
+        budget = engine.chat(q)
+        print(budget.report())
+
+    print(f&quot;\n  --- After building up conversation history ---&quot;)
+    for i in range(6):
+        engine.conversation.add_turn(&quot;user&quot;, f&quot;Follow-up question {i+1} about the database migration and authentication setup&quot;)
+        engine.conversation.add_turn(&quot;assistant&quot;, f&quot;Detailed response {i+1} covering the technical architecture and implementation steps&quot;)
+
+    budget = engine.chat(&quot;Now implement all the changes we discussed in the previous turns&quot;)
+    print(budget.report())
+    conv_stats = engine.conversation.stats()
+    print(f&quot;\n  Conversation state: {conv_stats[&#39;live_turns&#39;]} live turns, {conv_stats[&#39;summaries&#39;]} summaries, {conv_stats[&#39;tokens&#39;]} tokens&quot;)
+
+
+def run_relevance_demo():
+    print(f&quot;\n{&#39;=&#39; * 60}&quot;)
+    print(&quot;  STEP 6: Relevance Scoring + Filtering&quot;)
+    print(&quot;=&quot; * 60)
+
+    knowledge = [
+        &quot;Python 3.12 introduced type parameter syntax for generic classes.&quot;,
+        &quot;The project uses PostgreSQL 16 with pgvector for embedding storage.&quot;,
+        &quot;Authentication is handled by Supabase Auth with JWT tokens.&quot;,
+        &quot;The frontend is built with Next.js 15 using the App Router.&quot;,
+        &quot;API rate limits are set to 100 requests per minute per user.&quot;,
+        &quot;The deployment pipeline uses GitHub Actions with Docker builds.&quot;,
+        &quot;Test coverage must be above 80% for all new modules.&quot;,
+        &quot;Error logging uses structured JSON format with correlation IDs.&quot;,
+    ]
+
+    query = &quot;How do I fix the JWT authentication token expiry bug?&quot;
+    scores = score_relevance(query, knowledge)
+
+    print(f&quot;\n  Query: {query}&quot;)
+    print(f&quot;\n  Relevance scores:&quot;)
+    for doc, score in sorted(zip(knowledge, scores), key=lambda x: -x[1]):
+        marker = &quot;*&quot; if score &gt;= 0.05 else &quot; &quot;
+        print(f&quot;    {marker} {score:.3f}  {doc[:70]}...&quot;)
+
+    threshold = 0.05
+    included = sum(1 for s in scores if s &gt;= threshold)
+    excluded = len(scores) - included
+    print(f&quot;\n  Threshold {threshold}: {included} included, {excluded} excluded&quot;)
+    print(f&quot;  Token savings: ~{excluded * 20} tokens from excluded docs&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    run_budget_demo()
+    run_reorder_demo()
+    run_conversation_demo()
+    run_tool_selection_demo()
+    run_full_pipeline_demo()
+    run_relevance_demo()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/11-llm-engineering/05-context-engineering/code/main.ts">phases/11-llm-engineering/05-context-engineering/code/main.ts</a><details><summary>查看原始文本</summary><pre><code>// Phase 11 · Lesson 05 — Context engineering (TypeScript port).
+// Token budget, sliding-window history compressor, lost-in-the-middle reorder.
+// Token counts use the 1 word ≈ 1.3 tokens heuristic — close enough for budgeting
+// without dragging in tiktoken. Real assemblers swap in a tokenizer at the seam.
+// Refs: https://arxiv.org/abs/2307.03172  (Lost in the Middle — Liu et al.)
+//       https://www.anthropic.com/news/contextual-retrieval
+//       https://platform.openai.com/docs/guides/conversation-state
+
+import process from &quot;node:process&quot;;
+
+const WORD_TO_TOKEN = 1.3;
+
+function countTokens(text: string): number {
+  if (!text) return 0;
+  return Math.floor(text.trim().split(/\s+/).length * WORD_TO_TOKEN);
+}
+
+type AllocationResult = { content: string; tokens: number };
+
+class ContextBudget {
+  readonly maxTokens: number;
+  readonly generationReserve: number;
+  readonly available: number;
+  private readonly allocations = new Map&lt;string, number&gt;();
+
+  constructor(maxTokens = 128_000, generationReserve = 4_000) {
+    this.maxTokens = maxTokens;
+    this.generationReserve = generationReserve;
+    this.available = maxTokens - generationReserve;
+  }
+
+  allocate(component: string, content: string, maxComponentTokens?: number): AllocationResult {
+    let tokens = countTokens(content);
+    let trimmed = content;
+
+    if (maxComponentTokens !== undefined &amp;&amp; tokens &gt; maxComponentTokens) {
+      const words = trimmed.split(/\s+/);
+      trimmed = words.slice(0, Math.floor(maxComponentTokens / WORD_TO_TOKEN)).join(&quot; &quot;);
+      tokens = countTokens(trimmed);
+    }
+
+    const used = this.usedTokens();
+    if (used + tokens &gt; this.available) {
+      const allowed = this.available - used;
+      if (allowed &lt;= 0) return { content: &quot;&quot;, tokens: 0 };
+      const words = trimmed.split(/\s+/);
+      trimmed = words.slice(0, Math.floor(allowed / WORD_TO_TOKEN)).join(&quot; &quot;);
+      tokens = countTokens(trimmed);
+    }
+
+    this.allocations.set(component, tokens);
+    return { content: trimmed, tokens };
+  }
+
+  usedTokens(): number {
+    let total = 0;
+    for (const v of this.allocations.values()) total += v;
+    return total;
+  }
+
+  remaining(): number {
+    return this.available - this.usedTokens();
+  }
+
+  report(): string {
+    const lines: string[] = [];
+    lines.push(`\n  Context Budget Report (${this.maxTokens.toLocaleString()} token window)`);
+    lines.push(&quot;  &quot; + &quot;-&quot;.repeat(55));
+    for (const [component, tokens] of this.allocations) {
+      const pct = (tokens / this.maxTokens) * 100;
+      const bar = pct &gt;= 0.5 ? &quot;#&quot;.repeat(Math.floor(pct * 2)) : &quot;&quot;;
+      lines.push(`    ${component.padEnd(25)} ${String(tokens).padStart(6)} tokens (${pct.toFixed(1).padStart(5)}%) ${bar}`);
+    }
+    lines.push(&quot;  &quot; + &quot;-&quot;.repeat(55));
+    lines.push(`    ${&quot;Used&quot;.padEnd(25)} ${String(this.usedTokens()).padStart(6)} tokens`);
+    lines.push(`    ${&quot;Generation reserve&quot;.padEnd(25)} ${String(this.generationReserve).padStart(6)} tokens`);
+    lines.push(`    ${&quot;Remaining&quot;.padEnd(25)} ${String(this.remaining()).padStart(6)} tokens`);
+    return lines.join(&quot;\n&quot;);
+  }
+}
+
+// Liu et al. 2023: attention dips for tokens placed in the middle of long
+// contexts. So we put the highest-relevance docs at the head AND tail and
+// hide the weakest in the middle.
+function reorderLostInMiddle&lt;T&gt;(items: T[], scores: number[]): T[] {
+  const paired = items.map((item, i) =&gt; ({ item, score: scores[i] ?? 0 }));
+  paired.sort((a, b) =&gt; b.score - a.score);
+  const sorted = paired.map((p) =&gt; p.item);
+  if (sorted.length &lt;= 2) return sorted;
+  const head: T[] = [];
+  const tail: T[] = [];
+  for (let i = 0; i &lt; sorted.length; i += 1) {
+    if (i % 2 === 0) head.push(sorted[i]!);
+    else tail.unshift(sorted[i]!);
+  }
+  return [...head, ...tail];
+}
+
+type Turn = { role: &quot;user&quot; | &quot;assistant&quot;; content: string };
+
+class ConversationManager {
+  private turns: Turn[] = [];
+  private summaries: string[] = [];
+  constructor(private readonly maxHistoryTokens = 5_000) {}
+
+  addTurn(role: Turn[&quot;role&quot;], content: string): void {
+    this.turns.push({ role, content });
+    this.compress();
+  }
+
+  // Sliding window with cheap summarisation. Real systems summarise with an
+  // LLM; here we keep just the first 100 chars of each compacted turn.
+  private compress(): void {
+    let total = this.totalTurnTokens();
+    while (total &gt; this.maxHistoryTokens &amp;&amp; this.turns.length &gt; 4) {
+      const oldTurns = this.turns.slice(0, 2);
+      this.summaries.push(this.summarise(oldTurns));
+      this.turns = this.turns.slice(2);
+      total = this.totalTurnTokens();
+    }
+  }
+
+  private totalTurnTokens(): number {
+    let total = 0;
+    for (const t of this.turns) total += countTokens(t.content);
+    return total;
+  }
+
+  private summarise(turns: Turn[]): string {
+    const parts = turns.map((t) =&gt; {
+      const slice = t.content.length &gt; 100 ? `${t.content.slice(0, 100)}...` : t.content;
+      return `${t.role}: ${slice}`;
+    });
+    return `Previous: ${parts.join(&quot; | &quot;)}`;
+  }
+
+  contextText(): string {
+    const parts: string[] = [];
+    if (this.summaries.length) {
+      parts.push(&quot;[Conversation Summary]&quot;);
+      parts.push(...this.summaries);
+    }
+    if (this.turns.length) {
+      parts.push(&quot;[Recent Conversation]&quot;);
+      for (const t of this.turns) parts.push(`${t.role}: ${t.content}`);
+    }
+    return parts.join(&quot;\n&quot;);
+  }
+
+  stats(): { liveTurns: number; summaries: number; tokens: number } {
+    return {
+      liveTurns: this.turns.length,
+      summaries: this.summaries.length,
+      tokens: countTokens(this.contextText()),
+    };
+  }
+}
+
+function scoreRelevance(query: string, docs: string[]): number[] {
+  const queryWords = new Set(query.toLowerCase().split(/\s+/));
+  if (queryWords.size === 0) return docs.map(() =&gt; 0);
+  return docs.map((doc) =&gt; {
+    const docWords = new Set(doc.toLowerCase().split(/\s+/));
+    let overlap = 0;
+    for (const w of queryWords) if (docWords.has(w)) overlap += 1;
+    return Number((overlap / queryWords.size).toFixed(3));
+  });
+}
+
+function runBudgetDemo(): void {
+  process.stdout.write(&quot;=&quot;.repeat(60) + &quot;\n  STEP 1: Context Budget Manager\n&quot; + &quot;=&quot;.repeat(60) + &quot;\n&quot;);
+  const budget = new ContextBudget(128_000, 4_000);
+  budget.allocate(&quot;system_prompt&quot;, &quot;You are a helpful assistant. &quot;.repeat(20), 500);
+  budget.allocate(&quot;tools&quot;, JSON.stringify([&quot;read_file&quot;, &quot;write_file&quot;, &quot;search_code&quot;, &quot;run_command&quot;]), 2_000);
+  budget.allocate(&quot;retrieved_docs&quot;, &quot;The project uses PostgreSQL. &quot;.repeat(50), 3_000);
+  budget.allocate(&quot;history&quot;, &quot;user: How? assistant: Check logs. &quot;.repeat(20), 5_000);
+  budget.allocate(&quot;query&quot;, &quot;Fix the auth bug in JWT validation&quot;, 500);
+  process.stdout.write(budget.report() + &quot;\n&quot;);
+}
+
+function runReorderDemo(): void {
+  process.stdout.write(&quot;\n&quot; + &quot;=&quot;.repeat(60) + &quot;\n  STEP 2: Lost-in-the-middle reordering\n&quot; + &quot;=&quot;.repeat(60) + &quot;\n&quot;);
+  const docs = [
+    &quot;Doc A: PostgreSQL connection pooling&quot;,
+    &quot;Doc B: Redis caching layer&quot;,
+    &quot;Doc C: CSS styling guide&quot;,
+    &quot;Doc D: Database migration scripts&quot;,
+    &quot;Doc E: CI/CD pipeline config&quot;,
+    &quot;Doc F: API authentication flow&quot;,
+    &quot;Doc G: Frontend routing&quot;,
+  ];
+  const scores = [0.95, 0.6, 0.05, 0.8, 0.3, 0.75, 0.1];
+  const reordered = reorderLostInMiddle(docs, scores);
+  process.stdout.write(&quot;\n  reordered (high relevance at start + end, low in middle):\n&quot;);
+  for (let i = 0; i &lt; reordered.length; i += 1) {
+    const position = i &lt; 2 ? &quot;START&quot; : i &gt;= reordered.length - 2 ? &quot;END&quot; : &quot;middle&quot;;
+    process.stdout.write(`    [${position.padStart(6)}] ${reordered[i]}\n`);
+  }
+}
+
+function runConversationDemo(): void {
+  process.stdout.write(&quot;\n&quot; + &quot;=&quot;.repeat(60) + &quot;\n  STEP 3: Conversation compression (sliding window)\n&quot; + &quot;=&quot;.repeat(60) + &quot;\n&quot;);
+  const conv = new ConversationManager(200);
+  const exchanges: [string, string][] = [
+    [&quot;How do I set up the database?&quot;, &quot;Run docker-compose up to start PostgreSQL, then run migrations.&quot;],
+    [&quot;What about environment variables?&quot;, &quot;Copy .env.example to .env and fill in DATABASE_URL and JWT_SECRET.&quot;],
+    [&quot;The migrations are failing.&quot;, &quot;Check PostgreSQL is on port 5432 and DATABASE_URL matches.&quot;],
+    [&quot;How do I seed test data?&quot;, &quot;Run npm run seed which loads fixtures from test/fixtures.&quot;],
+    [&quot;Can I run the tests?&quot;, &quot;Yes, run npm test. Use a separate test database.&quot;],
+  ];
+  exchanges.forEach(([user, assistant], idx) =&gt; {
+    conv.addTurn(&quot;user&quot;, user);
+    conv.addTurn(&quot;assistant&quot;, assistant);
+    const stats = conv.stats();
+    process.stdout.write(
+      `\n  after turn ${idx + 1}: live=${stats.liveTurns} summaries=${stats.summaries} tokens=${stats.tokens}\n`,
+    );
+  });
+  process.stdout.write(&quot;\n  final context:\n&quot;);
+  for (const line of conv.contextText().split(&quot;\n&quot;)) process.stdout.write(`    ${line}\n`);
+}
+
+function runRelevanceDemo(): void {
+  process.stdout.write(&quot;\n&quot; + &quot;=&quot;.repeat(60) + &quot;\n  STEP 4: Relevance scoring\n&quot; + &quot;=&quot;.repeat(60) + &quot;\n&quot;);
+  const docs = [
+    &quot;Python 3.12 introduced type parameter syntax for generic classes.&quot;,
+    &quot;The project uses PostgreSQL 16 with pgvector for embedding storage.&quot;,
+    &quot;Authentication is handled by Supabase Auth with JWT tokens.&quot;,
+    &quot;The frontend is built with Next.js 15 using the App Router.&quot;,
+    &quot;API rate limits are 100 requests per minute per user.&quot;,
+  ];
+  const query = &quot;How do I fix the JWT authentication token expiry bug?&quot;;
+  const scores = scoreRelevance(query, docs);
+  const ranked = docs.map((d, i) =&gt; ({ d, s: scores[i] ?? 0 })).sort((a, b) =&gt; b.s - a.s);
+  process.stdout.write(`\n  query: ${query}\n\n`);
+  for (const { d, s } of ranked) {
+    const marker = s &gt;= 0.05 ? &quot;*&quot; : &quot; &quot;;
+    process.stdout.write(`    ${marker} ${s.toFixed(3)}  ${d}\n`);
+  }
+}
+
+function main(): void {
+  runBudgetDemo();
+  runReorderDemo();
+  runConversationDemo();
+  runRelevanceDemo();
+}
+
+main();
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/11-llm-engineering/05-context-engineering/outputs/prompt-context-optimizer.md">phases/11-llm-engineering/05-context-engineering/outputs/prompt-context-optimizer.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: prompt-context-optimizer
+description: Audit a context assembly strategy and recommend optimizations to reduce token waste and improve response quality
+phase: 11
+lesson: 05
+---
+
+You are a context engineering consultant. I will describe how an LLM application assembles its context window. You will audit the strategy and recommend specific optimizations.
+
+## Audit Protocol
+
+### 1. Token Budget Analysis
+
+Calculate the current token allocation:
+
+- System prompt: how many tokens? Is there redundancy?
+- Tool definitions: how many tools, total tokens? Are all tools relevant to every query?
+- Retrieved context: how many chunks, total tokens? What is the retrieval quality?
+- Conversation history: how many turns kept verbatim? Is summarization used?
+- Few-shot examples: how many, total tokens? Are they static or dynamic?
+- Generation reserve: how many tokens? Is it sufficient for the expected output?
+- Total used vs available: what is the utilization percentage?
+
+### 2. Waste Detection
+
+Flag specific sources of token waste:
+
+**Over-allocation**: components using more than 30% of the budget. A system prompt consuming 10,000 tokens is almost certainly too verbose.
+
+**Static context**: tool definitions or few-shot examples that never change per query. If 80% of tools are irrelevant to most queries, you are wasting tool tokens 80% of the time.
+
+**Stale history**: conversation turns from 20 messages ago that are irrelevant to the current query. Verbatim history is the biggest token waste in long conversations.
+
+**Low-relevance retrieval**: retrieved chunks with low similarity scores that dilute the signal. Better to include 3 highly relevant chunks than 10 mediocre ones.
+
+**Duplicate information**: the same fact appearing in the system prompt, retrieved context, and conversation history.
+
+### 3. Ordering Analysis
+
+Check for lost-in-the-middle problems:
+
+- Is the most important information at the start and end of the context?
+- Are retrieved documents ordered by relevance, or by insertion order?
+- Is the user query near the end of the context (where attention is highest)?
+
+### 4. Recommendations
+
+For each waste source, provide a specific fix:
+
+- **System prompt**: reduce to essential instructions, move examples to dynamic few-shot
+- **Tools**: implement intent-based tool selection, only include relevant tools per query
+- **Retrieval**: add reranking, raise similarity threshold, deduplicate chunks
+- **History**: summarize turns older than N, keep only the last K verbatim
+- **Ordering**: reorder by lost-in-the-middle pattern (important first and last)
+- **Generation**: ensure at least 2K tokens reserved, increase for long-form outputs
+
+### 5. Impact Estimate
+
+For each recommendation, estimate:
+
+- Tokens saved per query
+- Expected quality impact (positive, neutral, or negative)
+- Implementation effort (minutes to hours)
+
+## Input Format
+
+Provide:
+- Context window size (e.g., 128K tokens)
+- Current token breakdown by component
+- Number of tools defined
+- Retrieval strategy (vector search, keyword, hybrid)
+- History management (keep all, truncate, summarize)
+- Any observed quality issues
+
+## Output Format
+
+1. **Budget Summary**: current allocation table with waste flags
+2. **Top 3 Waste Sources**: specific problems with estimated token cost
+3. **Recommendations**: ordered by impact/effort ratio
+4. **Projected Savings**: estimated tokens recovered and quality improvement
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/11-llm-engineering/05-context-engineering/outputs/skill-context-engineering.md">phases/11-llm-engineering/05-context-engineering/outputs/skill-context-engineering.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: skill-context-engineering
+description: Decision framework for designing context assembly pipelines based on task type, window size, and latency budget
+version: 1.0.0
+phase: 11
+lesson: 05
+tags: [context-engineering, context-window, rag, memory, tool-selection, lost-in-the-middle]
+---
+
+# Context Engineering
+
+When building an LLM application, apply this framework to design the context assembly pipeline.
+
+## Core principles
+
+1. **Context is scarce.** A 128K window sounds large but fills fast. Budget every component explicitly.
+2. **Attention is uneven.** Models attend more to the start and end. Put critical information there. The middle is the dead zone.
+3. **Dynamic beats static.** Different queries need different context. Assemble per query, not once at startup.
+4. **Less is more.** A curated 10K context outperforms a dumped 100K context. Signal-to-noise ratio matters more than total information.
+5. **Measure everything.** You cannot optimize what you do not measure. Count tokens per component on every request.
+
+## Context budget guidelines
+
+| Component | Typical Range | Priority | Compression Strategy |
+|-----------|-------------|----------|---------------------|
+| System prompt | 200-1,000 tokens | Fixed, high | Write tight, remove redundancy |
+| Tool definitions | 500-3,000 tokens | Dynamic, medium | Prune by query intent |
+| Retrieved context | 1,000-5,000 tokens | Dynamic, high | Rerank + threshold + deduplicate |
+| Conversation history | 500-5,000 tokens | Dynamic, medium | Summarize old turns |
+| Few-shot examples | 500-2,000 tokens | Dynamic, high | Select by task similarity |
+| User query | 50-500 tokens | Fixed, highest | N/A |
+| Generation reserve | 2,000-8,000 tokens | Fixed | Adjust by expected output length |
+
+## When to use each memory type
+
+**Short-term (conversation history):** The current session. Managed by summarization. Compress turns older than 5-10 exchanges. Keep the last 3-4 turns verbatim.
+
+**Long-term (facts database):** Preferences and project facts that persist across sessions. Retrieve on session start. Examples: &quot;user prefers Python&quot;, &quot;project uses PostgreSQL&quot;, &quot;team follows trunk-based development&quot;. Store in CLAUDE.md, a database, or a structured memory system.
+
+**Episodic (past interactions):** Specific past conversations relevant to the current task. Store as embeddings, retrieve by similarity. &quot;Last week we debugged a similar auth issue&quot; is episodic memory.
+
+## Tool selection strategy
+
+Do not include all tools in every request. This wastes tokens and confuses the model.
+
+1. Classify the query intent (code, email, calendar, research, data)
+2. Map intents to tool categories
+3. Include only matching tools
+4. If intent is ambiguous, include tools from the top 2 categories
+5. Always include a &quot;general&quot; tool (like web search) as fallback
+
+Expected savings: 60-80% of tool definition tokens on queries with clear intent.
+
+## Retrieval best practices
+
+- **Rerank after retrieval.** Vector similarity is a rough filter. A reranker (cross-encoder or LLM-based) improves precision significantly.
+- **Set a relevance threshold.** Do not include chunks below 0.3 cosine similarity. They add noise.
+- **Deduplicate.** If two chunks share 80%+ content, keep only the higher-scored one.
+- **Apply lost-in-the-middle ordering.** Place the most relevant chunks first and last.
+- **Limit total retrieval tokens.** 3-5 highly relevant chunks beat 15 mediocre ones.
+
+## History management
+
+- Keep the last 3-4 turns verbatim (the model needs recent context)
+- Summarize older turns into a digest (&quot;We discussed X, decided Y, and blocked on Z&quot;)
+- Drop system-generated turns that add no information (tool invocations with no user-facing content)
+- Trigger compression when history exceeds 30% of the available budget
+
+## Red flags
+
+- System prompt exceeds 2,000 tokens: probably includes information that should be dynamic
+- All tools included on every request: implement intent-based selection
+- No relevance filtering on retrieval: you are dumping noise into the window
+- History grows unbounded: summarization is not implemented
+- No generation reserve: the model truncates its responses
+- Same information in 3 places (system prompt, retrieved doc, history): deduplicate
+- Context utilization over 60%: you are leaving too little room for the model to &quot;think&quot;
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. What is the difference between prompt engineering and context engineering?</legend><label class="option"><input type="radio" name="q0" value="0"> Context engineering is about database design</label><label class="option"><input type="radio" name="q0" value="1"> A prompt is the user&#39;s query; context is everything in the model&#39;s window: system prompt, tools, retrieved docs, history, and the prompt itself</label><label class="option"><input type="radio" name="q0" value="2"> They are the same thing</label><label class="option"><input type="radio" name="q0" value="3"> Prompt engineering is more advanced</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. Why does context window order matter for LLM performance?</legend><label class="option"><input type="radio" name="q1" value="0"> Order only matters for code</label><label class="option"><input type="radio" name="q1" value="1"> LLMs have recency and primacy biases, paying more attention to the beginning and end of the context window</label><label class="option"><input type="radio" name="q1" value="2"> Alphabetical order helps the model search faster</label><label class="option"><input type="radio" name="q1" value="3"> It doesn&#39;t -- LLMs process all tokens equally</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. A coding assistant uses 22,700 tokens of a 128K context window. Why is budget management still important?</legend><label class="option"><input type="radio" name="q2" value="0"> Only the prompt matters</label><label class="option"><input type="radio" name="q2" value="1"> Token counting is inaccurate</label><label class="option"><input type="radio" name="q2" value="2"> 128K should be enough for any use case</label><label class="option"><input type="radio" name="q2" value="3"> Long conversations, large code files, and retrieved documentation can quickly fill the window; without budget management, critical context gets truncated</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. What is the sliding window strategy for conversation history?</legend><label class="option"><input type="radio" name="q3" value="0"> Keeping only the N most recent turns in context and dropping older turns, optionally summarizing them first</label><label class="option"><input type="radio" name="q3" value="1"> Expanding the context window dynamically</label><label class="option"><input type="radio" name="q3" value="2"> Moving the model to a different server</label><label class="option"><input type="radio" name="q3" value="3"> Processing the conversation in fixed-size chunks</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. How should a context assembler allocate tokens across components?</legend><label class="option"><input type="radio" name="q4" value="0"> Maximize retrieval context always</label><label class="option"><input type="radio" name="q4" value="1"> Equal allocation to each component</label><label class="option"><input type="radio" name="q4" value="2"> Minimize system prompt tokens</label><label class="option"><input type="radio" name="q4" value="3"> Dynamically based on query type: a simple question needs less retrieval context; a complex question needs more, with generation headroom always reserved</label><p data-feedback="4"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/11-llm-engineering/04-embeddings/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/11-llm-engineering/06-rag/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/11-llm-engineering/05-context-engineering/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

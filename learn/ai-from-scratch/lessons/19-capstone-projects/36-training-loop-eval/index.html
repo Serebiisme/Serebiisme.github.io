@@ -1,0 +1,932 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>培训循环和评估 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-19-capstone-projects" data-lesson="19-capstone-projects/36-training-loop-eval" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/19-capstone-projects/">综合项目</a> / LESSON 36</p><h1 class="lesson-title">培训循环和评估</h1><p>Training Loop and Evaluation</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>培训循环和评估</h1>
+<blockquote>
+<p>这一课构建了GPT模型驱动的训练循环:AdamW与体重衰减分,加热加密的学习速度时间表,一个<code>calc_loss_batch</code>助手,一个<code>evaluate_model</code>传递已保留的数据,<code>generate_and_print_sample</code>您可以绘制一个JSONL损失记录,同一个骨架训练你将打造的每一个解码器LLM.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 19 lessons 30 to 35
+<strong>Time:</strong> ~90 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>建立一个训练循环,以计算了对象输入和目标对应的交叉输入损失.</li>
+<li>配置AdamW以重量衰减应用于重量位器而不是LayerNorm或偏差位器.</li>
+<li>实施一个以线性变暖和阴性衰变为基础的学习速度时间表,并随着时间的推移阅读结果的 LR.</li>
+<li>根据 经过的分离进行评估<code>evaluate_model</code>因此,测量损失可以在运行中比较.</li>
+<li>通过每一个K步骤生成一个质量样本<code>generate_and_print_sample</code>损失曲线之前,</li>
+<li>继续按步骤输入JSONL,以便您可以重新加载,绘制和将训练日志作为可交付的.</li>
+</ul>
+<h2>问题</h2>
+<p>训练脚本打印损失,但没有其他方法, 它不能告诉你是否有正确的原因导致损失减少 (模型可能会过度适应训练集,而从来没有学习). 它不能告诉你是否开始出现差距 (损失可能会增加一步,然后恢复,或者一步,然后崩). 它不能告诉模型所学到的东西 (损失是个尺度;生成的样本是个段落). 只有循环量度才能隐藏.</p>
+<p>在本课程中,循环测量三个方法.每一步都会失去训练批次.每一步都会失去一个延长的批次.每一步都会产生一个固定的提示的延续.训练日志将降落在JSONL,所以文物是循环的证词.</p>
+<h2>概念</h2>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-f816ec9beda2e818c7ea.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>两个不明显的部分是损失配线和亚当W衰变分.</p>
+<h3>损失配线</h3>
+<p>如果输入批量是代币,<code>[t0, t1, t2, t3]</code>目标批量必须是<code>[t1, t2, t3, t4]</code>交叉体是平面的.<code>(batch * seq, vocab)</code>针对平面目标<code>(batch * seq,)</code>忘记转变,你训练模型来预测自己,而这种模式将会达到零损失,而学习什么都没有用.</p>
+<h3>亚当W衰变分化</h3>
+<p>体重衰减调节了体重位数,但不是正常化尺度或偏差.在LayerNorm尺度上放下衰变,慢慢将尺度推到零,并打破正常化.在偏差上放下衰变是数学上无害的,但是浪费周期的.标准的分化是:矩阵形状的位数 (线性权重,嵌入表) 得到衰变,任何看起来像尺度或转移的东西都没有.</p>
+<h3>热量加上位时间表</h3>
+<p>升温将学习速度从零升到目标, 通过几百步, 随着可西因衰变,学习速度降到零, 结合是开放权力LLM培训中最常见的时间表,因为它消除了第一千步和最后一千步中的大部分脆弱时刻.</p>
+<h3>进行评估</h3>
+<p><code>evaluate_model</code>运行从验证分区的固定数量的批次,积累损失,由批次数分,并返回.没有梯度.没有落后.数量可重复在运行给出相同的种子和相同的分区.报告训练损失旁边的延续损失是如何发现过度匹配.</p>
+<h3>质量样本作为早期信号</h3>
+<p>训练损失下降的模型,但生成的样本都是一样的标志,被打破了.一个损失曲线看起来平坦的模型,但生成的样本变得变得一致的词汇是学习.质量探测器比阅读完整的曲线更快,并捕捉到度错过的模式.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-426211653e189ef5901f.png" alt="cap-training-loop 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<p><code>code/main.py</code>执行:</p>
+<ul>
+<li><code>make_batches(token_ids, batch_size, context_length)</code>通过将一个长代币子切成输入和目标对.</li>
+<li><code>calc_loss_batch(model, inputs, targets)</code>它们可以向前,平坦化,并返回度交叉位.</li>
+<li><code>evaluate_model(model, val_loader, max_batches)</code>没有级别的验证批次复制数量,返回平均损失.</li>
+<li><code>generate_and_print_sample(model, prompt, max_new_tokens)</code>通过固定提示运行课程35代函数,并打印结果.</li>
+<li><code>build_param_groups(model, weight_decay)</code>产生了两个组的AdamW参数列表.</li>
+<li><code>cosine_with_warmup(step, warmup_steps, total_steps, max_lr, min_lr)</code>返回一个步骤的 LR.</li>
+<li><code>train(...)</code>绕着它,持续着.<code>outputs/losses.jsonl</code>并且每次打印了评估损失和样本<code>eval_every</code>走路.</li>
+<li>演示程序在一个小数量的步骤中训练一个小型模型,写一个JSONL日志,并在探测器点打印了评估损失和样本.演示程序在CPU上运行不到一分钟.</li>
+</ul>
+<p>运行它:</p>
+<pre><code class="language-bash">python3 code/main.py
+</code></pre>
+<p>输出:每一步损失线,每次探测量损失,每次探测量步骤产生一个样本,最后一个<code>outputs/losses.jsonl</code>您可以加载<code>json.loads</code>按一线.</p>
+<h2>堆</h2>
+<ul>
+<li><code>torch</code>对于自动化,优化和模块.</li>
+<li><code>main.py</code>重新实现了第35课<code>GPTModel</code>支持模块在本地.</li>
+</ul>
+<h2>野生生产模式</h2>
+<p>三个模式将课本循环变成一个可以一夜之间运行的东西.</p>
+<p>**Gradient norm clipping is non negotiable.**差的批量 (异常数据, LR ,数值边缘) 产生了巨大的梯度,<code>torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)</code>之后<code>backward</code>在此之前<code>step</code>剪切值是一个自由参数;一个是大多数设置中存活的默认参数.</p>
+<p>**Resumable JSONL logging, not pickled state.**按步骤损失记录<code>{&quot;step&quot;: int, &quot;train_loss&quot;: float, &quot;lr&quot;: float}</code>在JSONL中,任何崩都会留下可读的文物,你可以抓住,你可以用三十个字符串绘制,你可以通过阅读最后一步恢复训练. 色状态将你绑定到生成文件的模块布局,这是在反因器中脆弱的.</p>
+<p>**Eval batches drawn from a fixed slice.**验证代币在脚本开始时被切成批次,而不是在飞行时.可复制性取决于评估批次从运行到运行相同;否则,在两个运行之间比较评估损失量度了批次混动与模型一样.</p>
+<h2>用它</h2>
+<ul>
+<li>通过使用现实数据训练124M模型的同时,我们可以将合成代币数换为<code>datasets</code>路的运行方式是不变的.</li>
+<li>接下来的课程使用一个检查站来比较一个新训练的检查站和一个预训练的检查站.</li>
+<li>质量样本探测器是鱼的全部,</li>
+</ul>
+<h2>运动</h2>
+<ol>
+<li>加入<code>weight_decay_groups()</code>确定尺度和偏差参数在不衰减组中降落,线性和嵌入式权重在衰减组中降落的单位测试.</li>
+<li>换取合成随机代币,用小文本文件的字节,使示范器运行可读的东西. 验证生成的样本使用文件中存在的字符.</li>
+<li>添加一个<code>min_lr</code>的10%<code>max_lr</code>现在,我们要把时间安排调整.</li>
+<li>每次都会有一个检查站.<code>eval_every</code>添加一个 <code>resume_from</code>标志重新加载模型状态和优化状态.</li>
+<li>记录损失旁边的每步吞吐量 (每秒代码) 并确认它保持在稳定的频段中.</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Loss alignment</td>
+<td>&quot;Shift by one&quot;</td>
+<td>Input tokens at positions 0..T-1, target tokens at positions 1..T; cross entropy is computed on flattened shapes</td>
+</tr>
+<tr>
+<td>Decay split</td>
+<td>&quot;Two groups&quot;</td>
+<td>AdamW receives matrix shaped tensors with weight decay and scale or bias tensors with none</td>
+</tr>
+<tr>
+<td>Warmup</td>
+<td>&quot;Ramp&quot;</td>
+<td>The learning rate climbs from zero to its target over a fixed number of steps so the optimizer state can populate</td>
+</tr>
+<tr>
+<td>Eval batches</td>
+<td>&quot;Held out batches&quot;</td>
+<td>A fixed slice of the validation token tensor, sliced once at script start, used identically every probe</td>
+</tr>
+<tr>
+<td>Qualitative probe</td>
+<td>&quot;Sample print&quot;</td>
+<td>A short generation from a fixed prompt printed every K steps to catch failure modes loss alone hides</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li>循环驱动的模型的19阶段课程35</li>
+<li>阶段19课37用于将预训练的重量装入同一模型中.</li>
+<li>阶段10课04 (预训练小GPT) 对实数据程序.</li>
+<li>阶段10课10 (评估) 对于跨入体损失以外的更广泛的评估表面.</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Training Loop and Evaluation</h1>
+<blockquote>
+<p>A loop that does not measure is a loop that lies. This lesson builds the training loop that drives the GPT model: AdamW with weight decay split, a warmup plus cosine learning rate schedule, a <code>calc_loss_batch</code> helper, an <code>evaluate_model</code> pass on held out data, a <code>generate_and_print_sample</code> qualitative probe every K steps, and a JSONL log of losses you can plot after. The same skeleton trains every decoder LLM you will ever build.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 19 lessons 30 to 35
+<strong>Time:</strong> ~90 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Build a training loop that computes cross entropy loss with the correct input and target alignment for next token prediction.</li>
+<li>Configure AdamW with weight decay applied to weight tensors and not to LayerNorm or bias tensors.</li>
+<li>Implement a learning rate schedule with linear warmup and cosine decay, and read the resulting LR over time.</li>
+<li>Evaluate on a held out split with <code>evaluate_model</code> so the eval loss is comparable across runs.</li>
+<li>Generate a qualitative sample every K steps with <code>generate_and_print_sample</code> to catch divergence before the loss curve does.</li>
+<li>Persist per step loss to JSONL so you can reload, plot, and ship the training log as a deliverable.</li>
+</ul>
+<h2>The Problem</h2>
+<p>A training script that prints the loss but does nothing else fails three ways. It cannot tell you if the loss is decreasing for the right reason (the model could overfit the training set and never learn). It cannot tell you if a divergence is starting (the loss can spike for one step and recover, or one step and crash). It cannot tell you what the model has learned (loss is a scalar; a generated sample is a paragraph). All three failures hide unless the loop measures.</p>
+<p>The loop in this lesson measures three ways. Loss on the training batch every step. Loss on a held out batch every K steps. A generated continuation from a fixed prompt every K steps. The training log lands in JSONL so the artifact is the loop's testimony.</p>
+<h2>The Concept</h2>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-f816ec9beda2e818c7ea.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>The two non-obvious pieces are the loss alignment and the AdamW decay split.</p>
+<h3>Loss alignment</h3>
+<p>The model predicts the next token at every position. If the input batch is tokens <code>[t0, t1, t2, t3]</code>, the target batch must be <code>[t1, t2, t3, t4]</code>. Cross entropy is computed on the flat shape <code>(batch * seq, vocab)</code> against the flat target <code>(batch * seq,)</code>. Forget the shift and you train the model to predict itself, which converges to zero loss while learning nothing useful.</p>
+<h3>AdamW decay split</h3>
+<p>Weight decay regularizes weight tensors but not normalization scales or biases. Putting decay on the LayerNorm scale slowly drives the scale to zero and breaks normalization. Putting decay on a bias is mathematically harmless but a waste of cycles. The standard split is: matrix shaped tensors (linear weights, embedding tables) get decay, anything that looks like a scale or shift does not.</p>
+<h3>Warmup plus cosine schedule</h3>
+<p>Warmup ramps the learning rate from zero to the target over a few hundred steps so the optimizer state has time to populate. Cosine decay drops the learning rate back toward zero over the remaining steps so the final phase fine tunes the weights at a small step size. The combination is the most common schedule in open weights LLM training because it removes most of the brittle moments in the first thousand steps and the last thousand steps.</p>
+<h3>Held out evaluation</h3>
+<p><code>evaluate_model</code> runs a fixed number of batches from the validation split, accumulates loss, divides by the batch count, and returns. No gradient. No dropout. The number is reproducible across runs given the same seed and the same split. Reporting the held out loss next to the training loss is how you spot overfitting.</p>
+<h3>Qualitative sampling as an early signal</h3>
+<p>A model whose training loss drops nicely but whose generated samples are all the same token is broken. A model whose loss curve looks flat but whose generated samples sharpen into coherent words is learning. The qualitative probe runs faster than reading the full curve and catches modes the scalar misses.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-426211653e189ef5901f.png" alt="cap-training-loop 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<p><code>code/main.py</code> implements:</p>
+<ul>
+<li><code>make_batches(token_ids, batch_size, context_length)</code> which slices a long token tensor into input and target pairs.</li>
+<li><code>calc_loss_batch(model, inputs, targets)</code> which forwards, flattens, and returns the scalar cross entropy.</li>
+<li><code>evaluate_model(model, val_loader, max_batches)</code> which iterates a fixed number of validation batches with no grad and returns the mean loss.</li>
+<li><code>generate_and_print_sample(model, prompt, max_new_tokens)</code> which runs the lesson 35 generation function on a fixed prompt and prints the result.</li>
+<li><code>build_param_groups(model, weight_decay)</code> which produces the two-group AdamW parameter list.</li>
+<li><code>cosine_with_warmup(step, warmup_steps, total_steps, max_lr, min_lr)</code> which returns the LR at a given step.</li>
+<li><code>train(...)</code> which runs the loop, persists <code>outputs/losses.jsonl</code>, and prints the eval loss and a sample every <code>eval_every</code> steps.</li>
+<li>A demo that trains a tiny model on synthetic data for a small number of steps, writes a JSONL log, and prints the eval loss and a sample at the probe points. The demo runs in well under a minute on CPU.</li>
+</ul>
+<p>Run it:</p>
+<pre><code class="language-bash">python3 code/main.py
+</code></pre>
+<p>Output: per step loss line, eval loss every probe step, a generated sample every probe step, and a final <code>outputs/losses.jsonl</code> you can load with <code>json.loads</code> per line.</p>
+<h2>Stack</h2>
+<ul>
+<li><code>torch</code> for autograd, optimizer, and modules.</li>
+<li><code>main.py</code> reimplements the lesson 35 <code>GPTModel</code> and supporting modules locally.</li>
+</ul>
+<h2>Production patterns in the wild</h2>
+<p>Three patterns turn the textbook loop into something you can leave running overnight.</p>
+<p><strong>Gradient norm clipping is non negotiable.</strong> A bad batch (anomalous data, an LR spike, a numerical edge case) produces a huge gradient that wipes out hours of training. <code>torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)</code> after <code>backward</code> and before <code>step</code> keeps the optimizer in a safe range. The clipping value is a free parameter; one is the default that survives most setups.</p>
+<p><strong>Resumable JSONL logging, not pickled state.</strong> Per step loss records as <code>{&quot;step&quot;: int, &quot;train_loss&quot;: float, &quot;lr&quot;: float}</code> lines in JSONL are durable: any crash leaves a readable artifact, you can grep, you can plot with thirty lines of Python, and you can resume training by reading the last step. Pickled state ties you to the exact module layout that produced the file, which is brittle across refactors.</p>
+<p><strong>Eval batches drawn from a fixed slice.</strong> The validation tokens get sliced into batches at script start, not on the fly. Reproducibility depends on the eval batches being identical from run to run; otherwise comparing eval loss between two runs measures the batch shuffle as much as the model.</p>
+<h2>Use It</h2>
+<ul>
+<li>The loop in this lesson is the same skeleton that trains a 124M model on real data. Swap the synthetic token tensor for a <code>datasets</code>-style loader and the loop runs unchanged.</li>
+<li>The JSONL log is the deliverable that turns a training run into evidence. The next lesson uses one to compare a freshly trained checkpoint with a pretrained one.</li>
+<li>The qualitative sample probe is the catch-all that scalar loss cannot replace.</li>
+</ul>
+<h2>Exercises</h2>
+<ol>
+<li>Add <code>weight_decay_groups()</code> unit tests that confirm scale and bias parameters land in the no decay group and linear and embedding weights land in the decay group.</li>
+<li>Replace synthetic random tokens with bytes from a small text file so the demo trains on something legible. Verify the generated sample uses characters present in the file.</li>
+<li>Add a <code>min_lr</code> floor of 10 percent of <code>max_lr</code> to the cosine schedule and re-plot.</li>
+<li>Save a checkpoint every <code>eval_every</code> steps in addition to the JSONL log. Add a <code>resume_from</code> flag that reloads model state and optimizer state.</li>
+<li>Log per step throughput (tokens per second) next to the loss and confirm it stays in a steady band.</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Loss alignment</td>
+<td>&quot;Shift by one&quot;</td>
+<td>Input tokens at positions 0..T-1, target tokens at positions 1..T; cross entropy is computed on flattened shapes</td>
+</tr>
+<tr>
+<td>Decay split</td>
+<td>&quot;Two groups&quot;</td>
+<td>AdamW receives matrix shaped tensors with weight decay and scale or bias tensors with none</td>
+</tr>
+<tr>
+<td>Warmup</td>
+<td>&quot;Ramp&quot;</td>
+<td>The learning rate climbs from zero to its target over a fixed number of steps so the optimizer state can populate</td>
+</tr>
+<tr>
+<td>Eval batches</td>
+<td>&quot;Held out batches&quot;</td>
+<td>A fixed slice of the validation token tensor, sliced once at script start, used identically every probe</td>
+</tr>
+<tr>
+<td>Qualitative probe</td>
+<td>&quot;Sample print&quot;</td>
+<td>A short generation from a fixed prompt printed every K steps to catch failure modes loss alone hides</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li>Phase 19 lesson 35 for the model the loop drives.</li>
+<li>Phase 19 lesson 37 for loading pretrained weights into the same model.</li>
+<li>Phase 10 lesson 04 (pre training mini GPT) for the procedure on real data.</li>
+<li>Phase 10 lesson 10 (evaluation) for the broader eval surface beyond cross entropy loss.</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-19-capstone-projects--36-training-loop-eval.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-19-capstone-projects--36-training-loop-eval.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/36-training-loop-eval/code/main.py">phases/19-capstone-projects/36-training-loop-eval/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Training loop and evaluation harness for the lesson 35 GPT model.
+
+Implements: batch construction with input/target shift by one, cross entropy
+loss in `calc_loss_batch`, held-out evaluation in `evaluate_model`, a qualitative
+generation probe in `generate_and_print_sample`, AdamW with a decay/no-decay
+split, a linear-warmup-plus-cosine learning rate schedule, gradient norm
+clipping, and a JSONL log of per step loss in `outputs/losses.jsonl`.
+
+The demo trains a tiny model on synthetic byte-level tokens for a small number
+of steps, writes the JSONL log, and prints eval losses and generated samples
+at the probe points. End to end runs in well under a minute on CPU.
+
+Run: python3 code/main.py
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import json
+import math
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterator
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+HERE = Path(__file__).resolve().parent
+OUTPUTS = HERE.parent / &quot;outputs&quot;
+OUTPUTS.mkdir(parents=True, exist_ok=True)
+LOG_PATH = OUTPUTS / &quot;losses.jsonl&quot;
+
+
+@dataclass
+class TrainConfig:
+    &quot;&quot;&quot;Training and evaluation hyperparameters for the demo run.&quot;&quot;&quot;
+
+    batch_size: int = 4
+    context_length: int = 32
+    num_steps: int = 80
+    eval_every: int = 20
+    eval_batches: int = 4
+    max_lr: float = 3e-3
+    min_lr: float = 3e-4
+    warmup_steps: int = 10
+    weight_decay: float = 0.01
+    grad_clip: float = 1.0
+    sample_max_new_tokens: int = 16
+    seed: int = 0
+
+
+@dataclass
+class ModelConfig:
+    vocab_size: int = 256
+    context_length: int = 32
+    d_model: int = 64
+    num_heads: int = 4
+    num_layers: int = 2
+    mlp_expansion: int = 4
+    dropout: float = 0.1
+    use_bias: bool = True
+    weight_tying: bool = True
+
+
+class LayerNorm(nn.Module):
+    def __init__(self, d_model: int, eps: float = 1e-5) -&gt; None:
+        super().__init__()
+        self.eps = eps
+        self.scale = nn.Parameter(torch.ones(d_model))
+        self.shift = nn.Parameter(torch.zeros(d_model))
+
+    def forward(self, x: torch.Tensor) -&gt; torch.Tensor:
+        mean = x.mean(dim=-1, keepdim=True)
+        var = x.var(dim=-1, keepdim=True, unbiased=False)
+        return self.scale * (x - mean) / torch.sqrt(var + self.eps) + self.shift
+
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, cfg: ModelConfig) -&gt; None:
+        super().__init__()
+        if cfg.d_model % cfg.num_heads != 0:
+            raise ValueError(&quot;d_model must be divisible by num_heads&quot;)
+        self.d_model = cfg.d_model
+        self.num_heads = cfg.num_heads
+        self.head_dim = cfg.d_model // cfg.num_heads
+        self.context_length = cfg.context_length
+        self.qkv = nn.Linear(cfg.d_model, 3 * cfg.d_model, bias=cfg.use_bias)
+        self.out_proj = nn.Linear(cfg.d_model, cfg.d_model, bias=cfg.use_bias)
+        self.attn_dropout = nn.Dropout(cfg.dropout)
+        self.resid_dropout = nn.Dropout(cfg.dropout)
+        mask = torch.triu(
+            torch.ones(cfg.context_length, cfg.context_length, dtype=torch.bool),
+            diagonal=1,
+        )
+        self.register_buffer(&quot;causal_mask&quot;, mask, persistent=False)
+
+    def forward(self, x: torch.Tensor) -&gt; torch.Tensor:
+        batch, seq, dim = x.shape
+        qkv = self.qkv(x)
+        q, k, v = qkv.split(self.d_model, dim=-1)
+        q = q.view(batch, seq, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(batch, seq, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(batch, seq, self.num_heads, self.head_dim).transpose(1, 2)
+        scores = q @ k.transpose(-2, -1) / math.sqrt(self.head_dim)
+        scores = scores.masked_fill(self.causal_mask[:seq, :seq], float(&quot;-inf&quot;))
+        attn = F.softmax(scores, dim=-1)
+        attn = self.attn_dropout(attn)
+        out = (attn @ v).transpose(1, 2).contiguous().view(batch, seq, dim)
+        return self.resid_dropout(self.out_proj(out))
+
+
+class FeedForward(nn.Module):
+    def __init__(self, cfg: ModelConfig) -&gt; None:
+        super().__init__()
+        hidden = cfg.mlp_expansion * cfg.d_model
+        self.fc1 = nn.Linear(cfg.d_model, hidden, bias=cfg.use_bias)
+        self.act = nn.GELU(approximate=&quot;tanh&quot;)
+        self.fc2 = nn.Linear(hidden, cfg.d_model, bias=cfg.use_bias)
+        self.dropout = nn.Dropout(cfg.dropout)
+
+    def forward(self, x: torch.Tensor) -&gt; torch.Tensor:
+        return self.dropout(self.fc2(self.act(self.fc1(x))))
+
+
+class TransformerBlock(nn.Module):
+    def __init__(self, cfg: ModelConfig) -&gt; None:
+        super().__init__()
+        self.ln1 = LayerNorm(cfg.d_model)
+        self.attn = MultiHeadAttention(cfg)
+        self.ln2 = LayerNorm(cfg.d_model)
+        self.mlp = FeedForward(cfg)
+
+    def forward(self, x: torch.Tensor) -&gt; torch.Tensor:
+        x = x + self.attn(self.ln1(x))
+        x = x + self.mlp(self.ln2(x))
+        return x
+
+
+class GPTModel(nn.Module):
+    def __init__(self, cfg: ModelConfig) -&gt; None:
+        super().__init__()
+        self.cfg = cfg
+        self.tok_embed = nn.Embedding(cfg.vocab_size, cfg.d_model)
+        self.pos_embed = nn.Embedding(cfg.context_length, cfg.d_model)
+        self.embed_dropout = nn.Dropout(cfg.dropout)
+        self.blocks = nn.ModuleList([TransformerBlock(cfg) for _ in range(cfg.num_layers)])
+        self.final_ln = LayerNorm(cfg.d_model)
+        self.lm_head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
+        if cfg.weight_tying:
+            self.lm_head.weight = self.tok_embed.weight
+        self.register_buffer(
+            &quot;position_ids&quot;,
+            torch.arange(cfg.context_length, dtype=torch.long),
+            persistent=False,
+        )
+        self.apply(self._init_weights)
+        scale = 1.0 / math.sqrt(2 * cfg.num_layers)
+        for block in self.blocks:
+            block.attn.out_proj.weight.data.mul_(scale)
+            block.mlp.fc2.weight.data.mul_(scale)
+
+    @staticmethod
+    def _init_weights(module: nn.Module) -&gt; None:
+        if isinstance(module, nn.Linear):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def forward(self, tokens: torch.Tensor) -&gt; torch.Tensor:
+        batch, seq = tokens.shape
+        tok = self.tok_embed(tokens)
+        pos = self.pos_embed(self.position_ids[:seq])
+        x = self.embed_dropout(tok + pos)
+        for block in self.blocks:
+            x = block(x)
+        return self.lm_head(self.final_ln(x))
+
+
+def make_batches(
+    token_ids: torch.Tensor,
+    batch_size: int,
+    context_length: int,
+    seed: int = 0,
+) -&gt; Iterator[tuple[torch.Tensor, torch.Tensor]]:
+    &quot;&quot;&quot;Yield (input, target) batches where target is input shifted by one position.
+
+    Sampling is uniform random over valid start positions. With a fixed seed the
+    sequence of batches is reproducible across runs.
+    &quot;&quot;&quot;
+    if token_ids.dim() != 1:
+        raise ValueError(&quot;token_ids must be a 1D tensor&quot;)
+    if token_ids.numel() &lt; context_length + 1:
+        raise ValueError(&quot;token_ids too short for the requested context_length&quot;)
+
+    generator = torch.Generator().manual_seed(seed)
+    max_start = token_ids.numel() - context_length - 1
+
+    while True:
+        starts = torch.randint(0, max_start + 1, (batch_size,), generator=generator)
+        inputs = torch.stack([token_ids[s : s + context_length] for s in starts.tolist()])
+        targets = torch.stack(
+            [token_ids[s + 1 : s + 1 + context_length] for s in starts.tolist()]
+        )
+        yield inputs, targets
+
+
+def calc_loss_batch(
+    model: GPTModel,
+    inputs: torch.Tensor,
+    targets: torch.Tensor,
+) -&gt; torch.Tensor:
+    &quot;&quot;&quot;Forward, flatten across batch and time, return scalar cross entropy.&quot;&quot;&quot;
+    logits = model(inputs)
+    return F.cross_entropy(
+        logits.reshape(-1, logits.size(-1)),
+        targets.reshape(-1),
+    )
+
+
+@torch.no_grad()
+def evaluate_model(
+    model: GPTModel,
+    val_loader: Iterator[tuple[torch.Tensor, torch.Tensor]],
+    max_batches: int,
+) -&gt; float:
+    &quot;&quot;&quot;Mean cross entropy over `max_batches` validation batches; no grad, no dropout.&quot;&quot;&quot;
+    was_training = model.training
+    model.eval()
+    total = 0.0
+    count = 0
+    for inputs, targets in val_loader:
+        if count &gt;= max_batches:
+            break
+        loss = calc_loss_batch(model, inputs, targets)
+        total += float(loss.item())
+        count += 1
+    if was_training:
+        model.train()
+    return total / max(count, 1)
+
+
+@torch.no_grad()
+def generate_and_print_sample(
+    model: GPTModel,
+    prompt: torch.Tensor,
+    max_new_tokens: int,
+    temperature: float = 1.0,
+    top_k: int = 40,
+    seed: int = 0,
+) -&gt; list[int]:
+    &quot;&quot;&quot;Print a short generated continuation from a fixed prompt and return the tokens.&quot;&quot;&quot;
+    sample_gen = torch.Generator(device=prompt.device).manual_seed(seed)
+    was_training = model.training
+    model.eval()
+    tokens = prompt.clone()
+    for _ in range(max_new_tokens):
+        window = tokens[:, -model.cfg.context_length :]
+        logits = model(window)
+        next_logits = logits[:, -1, :] / temperature
+        if top_k &gt; 0:
+            top_k_eff = min(top_k, next_logits.size(-1))
+            values, _ = torch.topk(next_logits, top_k_eff, dim=-1)
+            threshold = values[..., -1:]
+            next_logits = torch.where(
+                next_logits &lt; threshold, torch.full_like(next_logits, float(&quot;-inf&quot;)), next_logits
+            )
+        probs = F.softmax(next_logits, dim=-1)
+        next_token = torch.multinomial(probs, num_samples=1, generator=sample_gen)
+        tokens = torch.cat([tokens, next_token], dim=1)
+    if was_training:
+        model.train()
+    seq = tokens.tolist()[0]
+    print(f&quot;  sample tokens          : {seq}&quot;)
+    return seq
+
+
+def build_param_groups(model: nn.Module, weight_decay: float) -&gt; list[dict]:
+    &quot;&quot;&quot;Split parameters: matrix-shaped tensors get decay; scale/bias/embedding biases do not.&quot;&quot;&quot;
+    decay: list[nn.Parameter] = []
+    no_decay: list[nn.Parameter] = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if param.dim() &lt; 2 or name.endswith(&quot;.bias&quot;) or name.endswith(&quot;.shift&quot;) or name.endswith(&quot;.scale&quot;):
+            no_decay.append(param)
+        else:
+            decay.append(param)
+    return [
+        {&quot;params&quot;: decay, &quot;weight_decay&quot;: weight_decay},
+        {&quot;params&quot;: no_decay, &quot;weight_decay&quot;: 0.0},
+    ]
+
+
+def cosine_with_warmup(
+    step: int,
+    warmup_steps: int,
+    total_steps: int,
+    max_lr: float,
+    min_lr: float,
+) -&gt; float:
+    &quot;&quot;&quot;Linear warmup then cosine decay to min_lr over the remaining steps.&quot;&quot;&quot;
+    if step &lt; warmup_steps:
+        return max_lr * (step + 1) / max(warmup_steps, 1)
+    progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
+    progress = min(max(progress, 0.0), 1.0)
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return min_lr + (max_lr - min_lr) * cosine
+
+
+def train(
+    model: GPTModel,
+    train_tokens: torch.Tensor,
+    val_tokens: torch.Tensor,
+    cfg: TrainConfig,
+    prompt: torch.Tensor,
+    log_path: Path = LOG_PATH,
+) -&gt; list[dict]:
+    &quot;&quot;&quot;Run the training loop, persist losses.jsonl, return the in-memory log.&quot;&quot;&quot;
+    torch.manual_seed(cfg.seed)
+    optimizer = torch.optim.AdamW(
+        build_param_groups(model, cfg.weight_decay),
+        lr=cfg.max_lr,
+        betas=(0.9, 0.95),
+    )
+
+    train_loader = make_batches(train_tokens, cfg.batch_size, cfg.context_length, seed=cfg.seed)
+
+    if log_path.exists():
+        log_path.unlink()
+
+    records: list[dict] = []
+    model.train()
+    for step in range(cfg.num_steps):
+        lr = cosine_with_warmup(step, cfg.warmup_steps, cfg.num_steps, cfg.max_lr, cfg.min_lr)
+        for group in optimizer.param_groups:
+            group[&quot;lr&quot;] = lr
+
+        inputs, targets = next(train_loader)
+        optimizer.zero_grad(set_to_none=True)
+        loss = calc_loss_batch(model, inputs, targets)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=cfg.grad_clip)
+        optimizer.step()
+
+        record = {&quot;step&quot;: step, &quot;train_loss&quot;: float(loss.item()), &quot;lr&quot;: lr}
+
+        if (step + 1) % cfg.eval_every == 0 or step == cfg.num_steps - 1:
+            val_loader = make_batches(
+                val_tokens, cfg.batch_size, cfg.context_length, seed=cfg.seed + 1
+            )
+            val_loss = evaluate_model(model, val_loader, cfg.eval_batches)
+            record[&quot;val_loss&quot;] = val_loss
+            print(
+                f&quot;step {step:4d} | lr {lr:.5f} | train_loss {loss.item():.4f} | val_loss {val_loss:.4f}&quot;
+            )
+            generate_and_print_sample(
+                model, prompt, cfg.sample_max_new_tokens, temperature=0.8, top_k=20, seed=step
+            )
+
+        records.append(record)
+        with log_path.open(&quot;a&quot;, encoding=&quot;utf-8&quot;) as fh:
+            fh.write(json.dumps(record) + &quot;\n&quot;)
+
+    return records
+
+
+def _synthetic_byte_tokens(length: int, vocab_size: int, seed: int) -&gt; torch.Tensor:
+    &quot;&quot;&quot;Deterministic synthetic tokens.
+
+    Bytes drawn from a small repeating pattern so the model has structure to learn
+    in a handful of steps; the eval loss should drop visibly during the demo.
+    &quot;&quot;&quot;
+    rng = torch.Generator().manual_seed(seed)
+    base = torch.randint(0, vocab_size, (32,), generator=rng)
+    repeats = (length + base.numel() - 1) // base.numel()
+    tokens = base.repeat(repeats)[:length]
+    noise = torch.randint(0, vocab_size, (length,), generator=rng)
+    mask = (torch.rand(length, generator=rng) &lt; 0.1)
+    tokens = torch.where(mask, noise, tokens)
+    return tokens.to(dtype=torch.long)
+
+
+def demo() -&gt; None:
+    torch.manual_seed(0)
+    cfg = TrainConfig()
+    mcfg = ModelConfig(
+        vocab_size=256,
+        context_length=cfg.context_length,
+        d_model=64,
+        num_heads=4,
+        num_layers=2,
+        dropout=0.0,
+    )
+
+    train_tokens = _synthetic_byte_tokens(length=4096, vocab_size=mcfg.vocab_size, seed=1)
+    val_tokens = _synthetic_byte_tokens(length=1024, vocab_size=mcfg.vocab_size, seed=2)
+
+    print(f&quot;train tokens   : {train_tokens.numel():,}&quot;)
+    print(f&quot;val tokens     : {val_tokens.numel():,}&quot;)
+    print(f&quot;model params   : {sum(p.numel() for p in GPTModel(mcfg).parameters()):,} (untied count)&quot;)
+
+    model = GPTModel(mcfg)
+    prompt = torch.tensor([[7, 11, 13, 17]], dtype=torch.long)
+
+    print(&quot;\nTraining run:&quot;)
+    records = train(model, train_tokens, val_tokens, cfg, prompt)
+
+    print(&quot;\nFinal log records (last 3):&quot;)
+    for record in records[-3:]:
+        print(&quot; &quot;, record)
+    print(f&quot;\nWrote losses to {LOG_PATH}&quot;)
+
+    first_loss = records[0][&quot;train_loss&quot;]
+    last_loss = records[-1][&quot;train_loss&quot;]
+    print(f&quot;First step train_loss  : {first_loss:.4f}&quot;)
+    print(f&quot;Last step train_loss   : {last_loss:.4f}&quot;)
+    assert last_loss &lt; first_loss, &quot;training loss should decrease across the demo run&quot;
+    print(&quot;Training loop check passed.&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    demo()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/36-training-loop-eval/code/tests/test_training.py">phases/19-capstone-projects/36-training-loop-eval/code/tests/test_training.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Unit tests for the training loop, evaluation, schedule, and decay split.&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+import torch
+
+HERE = Path(__file__).resolve()
+CODE_DIR = HERE.parent.parent
+sys.path.insert(0, str(CODE_DIR))
+
+from main import (
+    GPTModel,
+    ModelConfig,
+    TrainConfig,
+    build_param_groups,
+    calc_loss_batch,
+    cosine_with_warmup,
+    evaluate_model,
+    generate_and_print_sample,
+    make_batches,
+    train,
+    _synthetic_byte_tokens,
+)
+
+
+def _model_cfg(**overrides) -&gt; ModelConfig:
+    base = dict(
+        vocab_size=128,
+        context_length=16,
+        d_model=32,
+        num_heads=4,
+        num_layers=2,
+        dropout=0.0,
+    )
+    base.update(overrides)
+    return ModelConfig(**base)
+
+
+class BatchTests(unittest.TestCase):
+    def test_target_is_input_shifted_by_one(self):
+        tokens = torch.arange(200, dtype=torch.long)
+        loader = make_batches(tokens, batch_size=2, context_length=8, seed=0)
+        inputs, targets = next(loader)
+        self.assertEqual(inputs.shape, (2, 8))
+        self.assertEqual(targets.shape, (2, 8))
+        for row in range(inputs.shape[0]):
+            for col in range(inputs.shape[1] - 1):
+                self.assertEqual(
+                    int(targets[row, col].item()),
+                    int(inputs[row, col + 1].item()),
+                )
+
+    def test_rejects_short_token_stream(self):
+        with self.assertRaises(ValueError):
+            next(make_batches(torch.arange(5), batch_size=1, context_length=8))
+
+    def test_seed_makes_batches_reproducible(self):
+        tokens = torch.arange(200, dtype=torch.long)
+        a = next(make_batches(tokens, 4, 8, seed=42))
+        b = next(make_batches(tokens, 4, 8, seed=42))
+        self.assertTrue(torch.equal(a[0], b[0]))
+        self.assertTrue(torch.equal(a[1], b[1]))
+
+
+class LossTests(unittest.TestCase):
+    def test_loss_returns_scalar(self):
+        cfg = _model_cfg()
+        model = GPTModel(cfg)
+        inputs = torch.randint(0, cfg.vocab_size, (2, 8))
+        targets = torch.randint(0, cfg.vocab_size, (2, 8))
+        loss = calc_loss_batch(model, inputs, targets)
+        self.assertEqual(loss.shape, torch.Size([]))
+        self.assertGreater(float(loss.item()), 0.0)
+
+
+class EvalTests(unittest.TestCase):
+    def test_evaluate_returns_positive_loss_and_restores_training_mode(self):
+        cfg = _model_cfg(dropout=0.5)
+        model = GPTModel(cfg)
+        tokens = torch.arange(500, dtype=torch.long) % cfg.vocab_size
+        model.train()
+        loader = make_batches(tokens, 2, 8, seed=0)
+        loss = evaluate_model(model, loader, max_batches=3)
+        self.assertGreater(loss, 0.0)
+        self.assertTrue(model.training)
+
+    def test_evaluate_keeps_model_in_eval_when_called_during_eval(self):
+        cfg = _model_cfg(dropout=0.5)
+        model = GPTModel(cfg)
+        tokens = torch.arange(500, dtype=torch.long) % cfg.vocab_size
+        model.eval()
+        loader = make_batches(tokens, 2, 8, seed=0)
+        _ = evaluate_model(model, loader, max_batches=2)
+        self.assertFalse(model.training)
+
+
+class ParamGroupTests(unittest.TestCase):
+    def test_layer_norm_scale_and_shift_in_no_decay_group(self):
+        cfg = _model_cfg()
+        model = GPTModel(cfg)
+        groups = build_param_groups(model, weight_decay=0.1)
+        decay_ids = {id(p) for p in groups[0][&quot;params&quot;]}
+        no_decay_ids = {id(p) for p in groups[1][&quot;params&quot;]}
+
+        ln_scale = model.blocks[0].ln1.scale
+        ln_shift = model.blocks[0].ln1.shift
+        self.assertIn(id(ln_scale), no_decay_ids)
+        self.assertIn(id(ln_shift), no_decay_ids)
+        self.assertNotIn(id(ln_scale), decay_ids)
+
+    def test_linear_weights_in_decay_group(self):
+        cfg = _model_cfg()
+        model = GPTModel(cfg)
+        groups = build_param_groups(model, weight_decay=0.1)
+        decay_ids = {id(p) for p in groups[0][&quot;params&quot;]}
+        mlp_w = model.blocks[0].mlp.fc1.weight
+        self.assertIn(id(mlp_w), decay_ids)
+
+    def test_biases_in_no_decay_group(self):
+        cfg = _model_cfg(use_bias=True)
+        model = GPTModel(cfg)
+        groups = build_param_groups(model, weight_decay=0.1)
+        no_decay_ids = {id(p) for p in groups[1][&quot;params&quot;]}
+        bias = model.blocks[0].mlp.fc1.bias
+        self.assertIn(id(bias), no_decay_ids)
+
+
+class ScheduleTests(unittest.TestCase):
+    def test_warmup_starts_below_max(self):
+        lr0 = cosine_with_warmup(0, warmup_steps=10, total_steps=100, max_lr=1.0, min_lr=0.1)
+        self.assertLess(lr0, 1.0)
+        self.assertGreater(lr0, 0.0)
+
+    def test_peak_at_warmup_end(self):
+        lr_peak = cosine_with_warmup(9, warmup_steps=10, total_steps=100, max_lr=1.0, min_lr=0.1)
+        self.assertAlmostEqual(lr_peak, 1.0, places=5)
+
+    def test_decay_reaches_min_lr_at_end(self):
+        lr_end = cosine_with_warmup(100, warmup_steps=10, total_steps=100, max_lr=1.0, min_lr=0.1)
+        self.assertAlmostEqual(lr_end, 0.1, places=5)
+
+
+class TrainingLoopTests(unittest.TestCase):
+    def test_short_run_writes_jsonl_and_reduces_loss(self):
+        torch.manual_seed(0)
+        train_cfg = TrainConfig(
+            batch_size=4,
+            context_length=16,
+            num_steps=30,
+            eval_every=15,
+            eval_batches=2,
+            max_lr=3e-3,
+            min_lr=3e-4,
+            warmup_steps=5,
+            sample_max_new_tokens=4,
+        )
+        mcfg = _model_cfg(context_length=train_cfg.context_length)
+        model = GPTModel(mcfg)
+        train_tokens = _synthetic_byte_tokens(2048, mcfg.vocab_size, seed=1)
+        val_tokens = _synthetic_byte_tokens(512, mcfg.vocab_size, seed=2)
+        prompt = torch.tensor([[1, 2, 3, 4]], dtype=torch.long)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / &quot;losses.jsonl&quot;
+            records = train(model, train_tokens, val_tokens, train_cfg, prompt, log_path=log_path)
+            self.assertTrue(log_path.exists())
+
+            with log_path.open() as fh:
+                lines = [json.loads(line) for line in fh if line.strip()]
+            self.assertEqual(len(lines), train_cfg.num_steps)
+            self.assertEqual(lines[0][&quot;step&quot;], 0)
+            self.assertIn(&quot;val_loss&quot;, lines[-1])
+
+        first_loss = records[0][&quot;train_loss&quot;]
+        last_loss = records[-1][&quot;train_loss&quot;]
+        self.assertLess(last_loss, first_loss)
+
+
+class GenerationProbeTests(unittest.TestCase):
+    def test_sample_returns_prompt_plus_new_tokens(self):
+        cfg = _model_cfg()
+        model = GPTModel(cfg)
+        prompt = torch.tensor([[1, 2, 3]], dtype=torch.long)
+        tokens = generate_and_print_sample(model, prompt, max_new_tokens=4, seed=0)
+        self.assertEqual(len(tokens), 7)
+
+
+if __name__ == &quot;__main__&quot;:
+    unittest.main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/36-training-loop-eval/outputs/losses.jsonl">phases/19-capstone-projects/36-training-loop-eval/outputs/losses.jsonl</a><details><summary>查看原始文本</summary><pre><code>{&quot;step&quot;: 0, &quot;train_loss&quot;: 5.5609517097473145, &quot;lr&quot;: 0.00030000000000000003}
+{&quot;step&quot;: 1, &quot;train_loss&quot;: 5.5083441734313965, &quot;lr&quot;: 0.0006000000000000001}
+{&quot;step&quot;: 2, &quot;train_loss&quot;: 5.339808464050293, &quot;lr&quot;: 0.0009000000000000001}
+{&quot;step&quot;: 3, &quot;train_loss&quot;: 5.220459461212158, &quot;lr&quot;: 0.0012000000000000001}
+{&quot;step&quot;: 4, &quot;train_loss&quot;: 5.091414928436279, &quot;lr&quot;: 0.0015}
+{&quot;step&quot;: 5, &quot;train_loss&quot;: 4.864233016967773, &quot;lr&quot;: 0.0018000000000000002}
+{&quot;step&quot;: 6, &quot;train_loss&quot;: 4.789365768432617, &quot;lr&quot;: 0.0021000000000000003}
+{&quot;step&quot;: 7, &quot;train_loss&quot;: 4.591393947601318, &quot;lr&quot;: 0.0024000000000000002}
+{&quot;step&quot;: 8, &quot;train_loss&quot;: 4.446695804595947, &quot;lr&quot;: 0.0027}
+{&quot;step&quot;: 9, &quot;train_loss&quot;: 4.405417442321777, &quot;lr&quot;: 0.003}
+{&quot;step&quot;: 10, &quot;train_loss&quot;: 4.159717559814453, &quot;lr&quot;: 0.003}
+{&quot;step&quot;: 11, &quot;train_loss&quot;: 4.034996509552002, &quot;lr&quot;: 0.002998640639830775}
+{&quot;step&quot;: 12, &quot;train_loss&quot;: 3.919910192489624, &quot;lr&quot;: 0.002994565296893573}
+{&quot;step&quot;: 13, &quot;train_loss&quot;: 3.6933352947235107, &quot;lr&quot;: 0.002987782178386712}
+{&quot;step&quot;: 14, &quot;train_loss&quot;: 3.48164963722229, &quot;lr&quot;: 0.00297830494460815}
+{&quot;step&quot;: 15, &quot;train_loss&quot;: 3.371638774871826, &quot;lr&quot;: 0.002966152681445462}
+{&quot;step&quot;: 16, &quot;train_loss&quot;: 3.2548677921295166, &quot;lr&quot;: 0.002951349861939402}
+{&quot;step&quot;: 17, &quot;train_loss&quot;: 3.1430790424346924, &quot;lr&quot;: 0.0029339262969984574}
+{&quot;step&quot;: 18, &quot;train_loss&quot;: 2.8930702209472656, &quot;lr&quot;: 0.0029139170753636453}
+{&quot;step&quot;: 19, &quot;train_loss&quot;: 2.9560399055480957, &quot;lr&quot;: 0.0028913624929444584, &quot;val_loss&quot;: 6.578274488449097}
+{&quot;step&quot;: 20, &quot;train_loss&quot;: 2.631803035736084, &quot;lr&quot;: 0.0028663079716682656}
+{&quot;step&quot;: 21, &quot;train_loss&quot;: 2.4066503047943115, &quot;lr&quot;: 0.0028388039680065963}
+{&quot;step&quot;: 22, &quot;train_loss&quot;: 2.5108301639556885, &quot;lr&quot;: 0.0028089058713625195}
+{&quot;step&quot;: 23, &quot;train_loss&quot;: 2.5543267726898193, &quot;lr&quot;: 0.002776673892523759}
+{&quot;step&quot;: 24, &quot;train_loss&quot;: 2.04250168800354, &quot;lr&quot;: 0.0027421729424061793}
+{&quot;step&quot;: 25, &quot;train_loss&quot;: 2.462780475616455, &quot;lr&quot;: 0.0027054725013318406}
+{&quot;step&quot;: 26, &quot;train_loss&quot;: 2.2032034397125244, &quot;lr&quot;: 0.002666646479104875}
+{&quot;step&quot;: 27, &quot;train_loss&quot;: 1.9432605504989624, &quot;lr&quot;: 0.0026257730661669787}
+{&quot;step&quot;: 28, &quot;train_loss&quot;: 1.8033198118209839, &quot;lr&quot;: 0.0025829345761322676}
+{&quot;step&quot;: 29, &quot;train_loss&quot;: 1.8097037076950073, &quot;lr&quot;: 0.002538217280018612}
+{&quot;step&quot;: 30, &quot;train_loss&quot;: 1.7287076711654663, &quot;lr&quot;: 0.0024917112325092902}
+{&quot;step&quot;: 31, &quot;train_loss&quot;: 1.5080151557922363, &quot;lr&quot;: 0.002443510090594839}
+{&quot;step&quot;: 32, &quot;train_loss&quot;: 1.573897123336792, &quot;lr&quot;: 0.0023937109249603386}
+{&quot;step&quot;: 33, &quot;train_loss&quot;: 2.0746054649353027, &quot;lr&quot;: 0.0023424140244979737}
+{&quot;step&quot;: 34, &quot;train_loss&quot;: 1.6173994541168213, &quot;lr&quot;: 0.002289722694338548}
+{&quot;step&quot;: 35, &quot;train_loss&quot;: 1.5444879531860352, &quot;lr&quot;: 0.0022357430478087037}
+{&quot;step&quot;: 36, &quot;train_loss&quot;: 1.8085474967956543, &quot;lr&quot;: 0.002180583792732797}
+{&quot;step&quot;: 37, &quot;train_loss&quot;: 1.737733006477356, &quot;lr&quot;: 0.002124356012509813}
+{&quot;step&quot;: 38, &quot;train_loss&quot;: 1.22307550907135, &quot;lr&quot;: 0.002067172942406179}
+{&quot;step&quot;: 39, &quot;train_loss&quot;: 1.1025065183639526, &quot;lr&quot;: 0.0020091497415150113, &quot;val_loss&quot;: 7.534635543823242}
+{&quot;step&quot;: 40, &quot;train_loss&quot;: 1.42277991771698, &quot;lr&quot;: 0.0019504032608410244}
+{&quot;step&quot;: 41, &quot;train_loss&quot;: 1.502669334411621, &quot;lr&quot;: 0.0018910518079781596}
+{&quot;step&quot;: 42, &quot;train_loss&quot;: 1.5766810178756714, &quot;lr&quot;: 0.001831214908853835}
+{&quot;step&quot;: 43, &quot;train_loss&quot;: 0.863057017326355, &quot;lr&quot;: 0.0017710130670196352}
+{&quot;step&quot;: 44, &quot;train_loss&quot;: 1.6312795877456665, &quot;lr&quot;: 0.0017105675209731952}
+{&quot;step&quot;: 45, &quot;train_loss&quot;: 1.473196268081665, &quot;lr&quot;: 0.00165}
+{&quot;step&quot;: 46, &quot;train_loss&quot;: 1.6282159090042114, &quot;lr&quot;: 0.0015894324790268052}
+{&quot;step&quot;: 47, &quot;train_loss&quot;: 0.9235190749168396, &quot;lr&quot;: 0.0015289869329803648}
+{&quot;step&quot;: 48, &quot;train_loss&quot;: 0.8889820575714111, &quot;lr&quot;: 0.0014687850911461655}
+{&quot;step&quot;: 49, &quot;train_loss&quot;: 1.2164663076400757, &quot;lr&quot;: 0.0014089481920218406}
+{&quot;step&quot;: 50, &quot;train_loss&quot;: 1.522023320198059, &quot;lr&quot;: 0.0013495967391589756}
+{&quot;step&quot;: 51, &quot;train_loss&quot;: 1.270756483078003, &quot;lr&quot;: 0.0012908502584849887}
+{&quot;step&quot;: 52, &quot;train_loss&quot;: 0.803480863571167, &quot;lr&quot;: 0.0012328270575938211}
+{&quot;step&quot;: 53, &quot;train_loss&quot;: 0.9560679197311401, &quot;lr&quot;: 0.0011756439874901871}
+{&quot;step&quot;: 54, &quot;train_loss&quot;: 1.5317867994308472, &quot;lr&quot;: 0.0011194162072672032}
+{&quot;step&quot;: 55, &quot;train_loss&quot;: 0.8600215315818787, &quot;lr&quot;: 0.0010642569521912967}
+{&quot;step&quot;: 56, &quot;train_loss&quot;: 1.1801406145095825, &quot;lr&quot;: 0.0010102773056614518}
+{&quot;step&quot;: 57, &quot;train_loss&quot;: 1.4103419780731201, &quot;lr&quot;: 0.0009575859755020268}
+{&quot;step&quot;: 58, &quot;train_loss&quot;: 1.229042887687683, &quot;lr&quot;: 0.0009062890750396618}
+{&quot;step&quot;: 59, &quot;train_loss&quot;: 1.1246596574783325, &quot;lr&quot;: 0.0008564899094051614, &quot;val_loss&quot;: 7.315136075019836}
+{&quot;step&quot;: 60, &quot;train_loss&quot;: 1.2651046514511108, &quot;lr&quot;: 0.0008082887674907098}
+{&quot;step&quot;: 61, &quot;train_loss&quot;: 1.3972716331481934, &quot;lr&quot;: 0.000761782719981388}
+{&quot;step&quot;: 62, &quot;train_loss&quot;: 1.609734296798706, &quot;lr&quot;: 0.0007170654238677327}
+{&quot;step&quot;: 63, &quot;train_loss&quot;: 1.3914546966552734, &quot;lr&quot;: 0.0006742269338330215}
+{&quot;step&quot;: 64, &quot;train_loss&quot;: 1.073408603668213, &quot;lr&quot;: 0.0006333535208951253}
+{&quot;step&quot;: 65, &quot;train_loss&quot;: 1.1000263690948486, &quot;lr&quot;: 0.0005945274986681599}
+{&quot;step&quot;: 66, &quot;train_loss&quot;: 1.0305655002593994, &quot;lr&quot;: 0.0005578270575938211}
+{&quot;step&quot;: 67, &quot;train_loss&quot;: 1.0380833148956299, &quot;lr&quot;: 0.0005233261074762414}
+{&quot;step&quot;: 68, &quot;train_loss&quot;: 1.2421759366989136, &quot;lr&quot;: 0.0004910941286374807}
+{&quot;step&quot;: 69, &quot;train_loss&quot;: 0.7231584787368774, &quot;lr&quot;: 0.0004611960319934037}
+{&quot;step&quot;: 70, &quot;train_loss&quot;: 1.352099061012268, &quot;lr&quot;: 0.00043369202833173426}
+{&quot;step&quot;: 71, &quot;train_loss&quot;: 1.186295986175537, &quot;lr&quot;: 0.0004086375070555417}
+{&quot;step&quot;: 72, &quot;train_loss&quot;: 1.5352849960327148, &quot;lr&quot;: 0.0003860829246363547}
+{&quot;step&quot;: 73, &quot;train_loss&quot;: 1.201457142829895, &quot;lr&quot;: 0.0003660737030015427}
+{&quot;step&quot;: 74, &quot;train_loss&quot;: 1.0128822326660156, &quot;lr&quot;: 0.0003486501380605981}
+{&quot;step&quot;: 75, &quot;train_loss&quot;: 1.3138853311538696, &quot;lr&quot;: 0.00033384731855453807}
+{&quot;step&quot;: 76, &quot;train_loss&quot;: 1.6582653522491455, &quot;lr&quot;: 0.00032169505539184995}
+{&quot;step&quot;: 77, &quot;train_loss&quot;: 0.8987808227539062, &quot;lr&quot;: 0.00031221782161328814}
+{&quot;step&quot;: 78, &quot;train_loss&quot;: 1.0979820489883423, &quot;lr&quot;: 0.00030543470310642724}
+{&quot;step&quot;: 79, &quot;train_loss&quot;: 1.07351553440094, &quot;lr&quot;: 0.0003013593601692253, &quot;val_loss&quot;: 7.490936279296875}
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. Why must the target tensor be the input tensor shifted by one position?</legend><label class="option"><input type="radio" name="q0" value="0"> Cross entropy needs identical tensors</label><label class="option"><input type="radio" name="q0" value="1"> It speeds up the optimizer</label><label class="option"><input type="radio" name="q0" value="2"> It is required by AdamW</label><label class="option"><input type="radio" name="q0" value="3"> Next token prediction is the training objective: at every position the model predicts the token that comes next; forgetting the shift trains the model to predict itself, which learns nothing useful</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. What does evaluate_model do that the training step does not?</legend><label class="option"><input type="radio" name="q1" value="0"> It runs a fixed number of validation batches under no_grad and with dropout disabled, returning a reproducible mean loss</label><label class="option"><input type="radio" name="q1" value="1"> It changes the model weights</label><label class="option"><input type="radio" name="q1" value="2"> It computes gradients twice</label><label class="option"><input type="radio" name="q1" value="3"> It runs the optimizer</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. Which AdamW parameters get weight decay?</legend><label class="option"><input type="radio" name="q2" value="0"> Matrix-shaped tensors (linear weights, embedding tables) receive weight decay; scale, shift, and bias tensors receive zero decay</label><label class="option"><input type="radio" name="q2" value="1"> Only the LayerNorm scales</label><label class="option"><input type="radio" name="q2" value="2"> Every parameter equally</label><label class="option"><input type="radio" name="q2" value="3"> Only the LM head</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. What shape does the warmup-plus-cosine schedule trace from step 0 to the final step?</legend><label class="option"><input type="radio" name="q3" value="0"> Step function</label><label class="option"><input type="radio" name="q3" value="1"> Constant</label><label class="option"><input type="radio" name="q3" value="2"> Linear ramp from zero to max over warmup_steps, then cosine decay from max to min_lr over the remaining steps</label><label class="option"><input type="radio" name="q3" value="3"> Exponential growth</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. Why clip gradient norm before optimizer.step()?</legend><label class="option"><input type="radio" name="q4" value="0"> It removes the warmup requirement</label><label class="option"><input type="radio" name="q4" value="1"> A bad batch can produce a huge gradient that wipes out hours of training; clipping to max_norm=1.0 keeps the optimizer in a safe range without distorting normal updates</label><label class="option"><input type="radio" name="q4" value="2"> It accelerates the matmul</label><label class="option"><input type="radio" name="q4" value="3"> It reduces memory usage</label><p data-feedback="4"></p></fieldset><fieldset><legend>6. Why log per step records as JSONL instead of pickled state?</legend><label class="option"><input type="radio" name="q5" value="0"> JSONL is required by the optimizer</label><label class="option"><input type="radio" name="q5" value="1"> JSONL trains faster</label><label class="option"><input type="radio" name="q5" value="2"> JSONL records are durable across refactors, greppable, plottable in thirty lines, and survive crashes; pickled state ties you to the module layout that produced it</label><label class="option"><input type="radio" name="q5" value="3"> JSONL uses less GPU memory</label><p data-feedback="5"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/19-capstone-projects/35-gpt-model-assembly/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/19-capstone-projects/37-loading-pretrained-weights/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/19-capstone-projects/36-training-loop-eval/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

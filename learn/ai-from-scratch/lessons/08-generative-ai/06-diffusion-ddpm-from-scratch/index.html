@@ -1,0 +1,624 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>从零开始的DDPM · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-08-generative-ai" data-lesson="08-generative-ai/06-diffusion-ddpm-from-scratch" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/08-generative-ai/">生成式 AI</a> / LESSON 06</p><h1 class="lesson-title">从零开始的DDPM</h1><p>Diffusion Models — DDPM from Scratch</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>从零开始的DDPM</h1>
+<blockquote>
+<p>霍,贾因,阿贝尔 (2020) 给了该领域一个无法停止的食谱. 用千个小步骤的噪音摧毁数据.训练一个神经网络来预测噪音.在推断时逆转过程.今天每个主流图像,视频,3D和音乐模型都运行在这个循环上,可能是上层上有流量匹配或一致性技巧.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 3 · 02 (Backprop), Phase 8 · 02 (VAE)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>问题</h2>
+<p>你想要一个样本器<code>p_data(x)</code>们玩的是一个常常分的最小量游戏.VAE从高斯解码器中产生模糊的样本.你真正想要的是一个训练目标, (a) 只有一个稳定的损失 (没有杆点,没有最小量), (b) 只有一个低边界.<code>log p(x)</code>(所以你有可能性),和 (c) 与SOTA质量相匹配的样本.</p>
+<p>定义一个马科夫链.<code>q(x_t | x_{t-1})</code>逐渐增加了高斯噪音,并引发了反向链.<code>p_θ(x_{t-1} | x_t)</code>霍,贾因,阿贝尔 (2020) 表明损失可以简化为一行 预测噪音 并清理数学.在2020年,这是一个好奇心.在2021年,它生产了最先进的样本.在2022年,它成为稳定分散.在2026年,它是基板.</p>
+<h2>概念</h2>
+<p><img src="/learn/ai-from-scratch/files/phases/08-generative-ai/06-diffusion-ddpm-from-scratch/assets/ddpm.svg" alt="DDPM: forward noise, reverse denoise" loading="lazy"></p>
+<p>**Forward process <code>q</code>.**加入高斯噪音<code>T</code>关闭形式是数学易于处理的原因是累积步骤也是高斯式的:</p>
+<pre><code>q(x_t | x_0) = N( sqrt(α̅_t) · x_0,  (1 - α̅_t) · I )
+</code></pre>
+<p>在哪里<code>α̅_t = ∏_{s=1..t} (1 - β_s)</code>时间表<code>β_t</code>选择<code>β_t</code>通过T=1000步骤从1e-4到0.02直线,<code>x_T</code>平均值<code>N(0, I)</code>现在,我们要去.</p>
+<p>**Reverse process <code>p_θ</code>.**学习一个神经网络<code>ε_θ(x_t, t)</code>由于声增加,<code>x_t</code>标签:</p>
+<pre><code>x_{t-1} = (1 / sqrt(α_t)) · ( x_t - (β_t / sqrt(1 - α̅_t)) · ε_θ(x_t, t) )  +  σ_t · z
+</code></pre>
+<p>在哪里<code>σ_t</code>是否是<code>sqrt(β_t)</code>虽然这个表达式很丑,但它只是代数,<code>x_{t-1}</code>由于后部<code>q(x_{t-1} | x_t, x_0)</code>替代<code>x_0</code>预测噪音预测的情况.</p>
+<p><strong>Training loss.</strong></p>
+<pre><code>L_simple = E_{x_0, t, ε} [ || ε - ε_θ( sqrt(α̅_t) · x_0 + sqrt(1 - α̅_t) · ε,  t ) ||² ]
+</code></pre>
+<p>样本<code>x_0</code>从数据中,选择一个随机的<code>t</code>样本<code>ε ~ N(0, I)</code>计算噪音<code>x_t</code>通过闭式形式,然后退出噪音. 一次输,没有最小值,没有KL,没有重设.</p>
+<p>**Sampling.**开始<code>x_T ~ N(0, I)</code>复制反向步骤<code>t = T</code>为了<code>1</code>完成了.</p>
+<h2>为什么它能有效</h2>
+<p>只有三个直觉:</p>
+<ol>
+<li>
+<p>**Denoising is easy; generating is hard.**在<code>t=T</code>网络必须解决一个微不足道的问题.<code>t=0</code>网络只需要清理几个像素.<code>t</code>网络的度是相同的,从每个噪音水平流动的.</p>
+</li>
+<li>
+<p>**Score matching in disguise.**讯 (2011) 证明,预测噪音与估计等等.<code>∇_x log q(x_t | x_0)</code>逆SDE使用这个分数来走上密度梯度,向高概率区域进行指导的随机走路.</p>
+</li>
+<li>
+<p>**The ELBO reduces to simple MSE.**随着DDPM的参数化,这些KL术语简化为MSE在噪音预测上,具有特定的系数;Ho降低了系数 (称之为&quot;简单&quot;损失) 和质量 <em>改善</em>.</p>
+</li>
+</ol>
+<figure><img src="/learn/ai-from-scratch/figures/figure-bcbd52b8b9b67abf7a14.png" alt="diffusion-denoise 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<p><code>code/main.py</code>网络是一个小的 MLP,它需要一个<code>(x_t, t)</code>训练是单线损失. 样本测试反转链.</p>
+<h3>步骤1:前进时间表 (封闭表格)</h3>
+<pre><code class="language-python">betas = [1e-4 + (0.02 - 1e-4) * t / (T - 1) for t in range(T)]
+alphas = [1 - b for b in betas]
+alpha_bars = []
+cum = 1.0
+for a in alphas:
+    cum *= a
+    alpha_bars.append(cum)
+</code></pre>
+<h3>步骤2: 样本<code>x_t</code>在一个射击中</h3>
+<pre><code class="language-python">def forward_sample(x0, t, alpha_bars, rng):
+    a_bar = alpha_bars[t]
+    eps = rng.gauss(0, 1)
+    x_t = math.sqrt(a_bar) * x0 + math.sqrt(1 - a_bar) * eps
+    return x_t, eps
+</code></pre>
+<h3>步骤3:一个训练步骤</h3>
+<pre><code class="language-python">def train_step(x0, model, alpha_bars, rng):
+    t = rng.randrange(T)
+    x_t, eps = forward_sample(x0, t, alpha_bars, rng)
+    eps_hat = model_forward(model, x_t, t)
+    loss = (eps - eps_hat) ** 2
+    return loss, gradient_step(model, ...)
+</code></pre>
+<h3>步骤4:反向采样</h3>
+<pre><code class="language-python">def sample(model, alpha_bars, T, rng):
+    x = rng.gauss(0, 1)
+    for t in range(T - 1, -1, -1):
+        eps_hat = model_forward(model, x, t)
+        beta_t = 1 - alphas[t]
+        x = (x - beta_t / math.sqrt(1 - alpha_bars[t]) * eps_hat) / math.sqrt(alphas[t])
+        if t &gt; 0:
+            x += math.sqrt(beta_t) * rng.gauss(0, 1)
+    return x
+</code></pre>
+<p>对于一个40个时间步骤和24个单位的MLP的1D问题,这在200个时代中学习了两种模式的混合物.</p>
+<h2>时间定制</h2>
+<p>网络需要知道它正在指定的时间步骤.</p>
+<ul>
+<li>**Sinusoidal embedding.**像变压器定位编码.<code>embed(t) = [sin(t/ω_0), cos(t/ω_0), sin(t/ω_1), ...]</code>通过一个MLP,播出到网络.</li>
+<li>**Film / group-norm conditioning.**项目嵌入每个区块的每道尺度/偏差 (FiLM).</li>
+</ul>
+<p>我们的玩具代码使用了突状 → 缩写.</p>
+<h2>陷</h2>
+<ul>
+<li>**Schedule matters a lot.**线性<code>β</code>根据DDPM默认的规则,但Cosine时间表 (尼乔尔和达里瓦尔,2021) 为相同的计算提供了更好的FID.</li>
+<li>**Timestep embedding is fragile.**通过原始<code>t</code>像浮动机一样,它适用于玩具1-D,但对于图像来说是失败的;总是使用适当的嵌入.</li>
+<li>**V-prediction vs ε-prediction.**对于狭窄的制度 (非常小或非常大),<code>ε</code>信号噪音差.V预测 (<code>v = α·ε - σ·x</code>) 较稳定;SDXL,SD3和Flux使用它.</li>
+<li>**Classifier-free guidance.**在推断时,计算条件和无条件的两个<code>ε</code>现在<code>ε_cfg = (1 + w) · ε_cond - w · ε_uncond</code>随着<code>w ≈ 3-7</code>课第8课中包括.</li>
+<li>**1000 steps is a lot.**生产使用DDIM (20-50步骤),DPM-Solver (10-20步骤),或蒸 (1-4步骤).</li>
+</ul>
+<h2>用它</h2>
+<table>
+<thead>
+<tr>
+<th>Role</th>
+<th>Typical stack in 2026</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Image pixel-space diffusion (small, toy)</td>
+<td>DDPM + U-Net</td>
+</tr>
+<tr>
+<td>Image latent diffusion</td>
+<td>VAE encoder + U-Net or DiT (Lesson 07)</td>
+</tr>
+<tr>
+<td>Video latent diffusion</td>
+<td>Spatiotemporal DiT (Sora, Veo, WAN)</td>
+</tr>
+<tr>
+<td>Audio latent diffusion</td>
+<td>Encodec + diffusion transformer</td>
+</tr>
+<tr>
+<td>Science (molecules, proteins, physics)</td>
+<td>Equivariant diffusion (EDM, RFdiffusion, AlphaFold3)</td>
+</tr>
+</tbody>
+</table>
+<p>流量匹配 (课3) 是2024-2026年通常以推理速度赢得相同质量的竞争者.</p>
+<h2>运送它</h2>
+<p>保存<code>outputs/skill-diffusion-trainer.md</code>技能采用数据集+计算预算和输出:时间表 (线性/可西因/西格莫ид),预测目标 (ε/v/x),步骤数量,指导尺度,样本组和评估协议.</p>
+<h2>运动</h2>
+<ol>
+<li>**Easy.**改变T从40到10<code>code/main.py</code>样品质量 (输出视觉历史图) 如何降低?</li>
+<li>**Medium.**转换从 ε 预测到 v 预测.再推出反向步骤.</li>
+<li>**Hard.**添加无类别指导. 类标签上的条件 <code>c ∈ {0, 1}</code>培训期间,并在采样时间使用时,将其降低10%的时间<code>ε = (1+w)·ε_cond - w·ε_uncond</code>测量条件模式的击中率<code>w = 0, 1, 3, 7</code>现在,我们要去.</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Forward process</td>
+<td>&quot;Adding noise&quot;</td>
+<td>Fixed Markov chain <code>q(x_t | x_{t-1})</code> that destroys the data.</td>
+</tr>
+<tr>
+<td>Reverse process</td>
+<td>&quot;Denoising&quot;</td>
+<td>Learned chain <code>p_θ(x_{t-1} | x_t)</code> that reconstructs the data.</td>
+</tr>
+<tr>
+<td>β schedule</td>
+<td>&quot;The noise ladder&quot;</td>
+<td>Per-step variance; linear, cosine, or sigmoid.</td>
+</tr>
+<tr>
+<td>α̅</td>
+<td>&quot;Alpha bar&quot;</td>
+<td>Cumulative product <code>∏(1 - β)</code>; gives closed-form <code>x_t</code> from <code>x_0</code>.</td>
+</tr>
+<tr>
+<td>Simple loss</td>
+<td>&quot;MSE on noise&quot;</td>
+<td><code>||ε - ε_θ(x_t, t)||²</code>; all variational derivations collapse to this.</td>
+</tr>
+<tr>
+<td>ε-prediction</td>
+<td>&quot;Predict noise&quot;</td>
+<td>Output is the noise added; standard DDPM.</td>
+</tr>
+<tr>
+<td>V-prediction</td>
+<td>&quot;Predict velocity&quot;</td>
+<td>Output is <code>α·ε - σ·x</code>; better conditioning across t.</td>
+</tr>
+<tr>
+<td>DDPM</td>
+<td>&quot;The paper&quot;</td>
+<td>Ho et al. 2020; linear β, 1000 steps, U-Net.</td>
+</tr>
+<tr>
+<td>DDIM</td>
+<td>&quot;Deterministic sampler&quot;</td>
+<td>Non-Markov sampler, 20-50 steps, same training objective.</td>
+</tr>
+<tr>
+<td>Classifier-free guidance</td>
+<td>&quot;CFG&quot;</td>
+<td>Mix conditional and unconditional noise predictions to amplify conditioning.</td>
+</tr>
+</tbody>
+</table>
+<h2>产品注:扩散推断是一个步数问题</h2>
+<p>根据DDPM的文件,T=1000反向步骤.在生产中没有人运行.每一个真正的推断堆都选择了三个策略中的一个,每个都清洁地绘制了生产框架的&quot;延迟来自哪里&quot;:</p>
+<ol>
+<li>**Faster sampler, same model.**通过换反循环,训练有素的 <code>ε_θ</code>减速延迟20-50倍.</li>
+<li>**Distillation.**训练学生以更少的步骤与教师匹配:渐进式蒸 (2 → 1),一致性模型 (任意 → 1-4),LCM,SDXL-Turbo,SD3-Turbo. 降低延迟另一个 5-10 ×,需要重新训练.</li>
+<li><strong>Caching and compilation.</strong> <code>torch.compile(unet, mode=&quot;reduce-overhead&quot;)</code>光RT-LLM的扩散后端,<code>xformers</code>减速速度为2x,堆积1和2</li>
+</ol>
+<p>对于生产传播服务器,预算对话与生产文献描述的LLC相同:延迟是<code>num_steps × step_cost + VAE_decode</code>通过率是<code>batch_size × (num_steps × step_cost)^-1</code>图像生成是从用户的角度来看&quot;一次性&quot;的,因此,TTFT是小的 (一步);TPOT相当于全响应时间.</p>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/1503.03585" rel="noreferrer" data-network="true">Sohl-Dickstein et al. (2015). Deep Unsupervised Learning using Nonequilibrium Thermodynamics <small>↗ 需要联网</small></a></li>
+<li><a href="https://arxiv.org/abs/2006.11239" rel="noreferrer" data-network="true">Ho, Jain, Abbeel (2020). Denoising Diffusion Probabilistic Models <small>↗ 需要联网</small></a></li>
+<li><a href="https://arxiv.org/abs/2010.02502" rel="noreferrer" data-network="true">Song, Meng, Ermon (2021). Denoising Diffusion Implicit Models <small>↗ 需要联网</small></a> DDIM,少了步骤.</li>
+<li><a href="https://arxiv.org/abs/2102.09672" rel="noreferrer" data-network="true">Nichol &amp; Dhariwal (2021). Improved DDPM <small>↗ 需要联网</small></a>代数时间表,学习变异.</li>
+<li><a href="https://arxiv.org/abs/2105.05233" rel="noreferrer" data-network="true">Dhariwal &amp; Nichol (2021). Diffusion Models Beat GANs on Image Synthesis <small>↗ 需要联网</small></a>分类指导</li>
+<li><a href="https://arxiv.org/abs/2207.12598" rel="noreferrer" data-network="true">Ho &amp; Salimans (2022). Classifier-Free Diffusion Guidance <small>↗ 需要联网</small></a></li>
+<li><a href="https://arxiv.org/abs/2206.00364" rel="noreferrer" data-network="true">Karras et al. (2022). Elucidating the Design Space of Diffusion-Based Generative Models (EDM) <small>↗ 需要联网</small></a>统一的标记,最清洁的食谱.</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Diffusion Models — DDPM from Scratch</h1>
+<blockquote>
+<p>Ho, Jain, Abbeel (2020) gave the field a recipe it could not quit. Destroy the data with noise over a thousand small steps. Train one neural net to predict the noise. Reverse the process at inference. Today every mainstream image, video, 3D, and music model runs on this loop, possibly with flow matching or consistency tricks on top.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 3 · 02 (Backprop), Phase 8 · 02 (VAE)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>The Problem</h2>
+<p>You want a sampler for <code>p_data(x)</code>. GANs play a minimax game that often diverges. VAEs produce blurry samples from a Gaussian decoder. What you really want is a training objective that is (a) a single stable loss (no saddle point, no minimax), (b) a lower bound on <code>log p(x)</code> (so you have likelihoods), and (c) samples that match SOTA quality.</p>
+<p>Sohl-Dickstein et al. (2015) had a theoretical answer: define a Markov chain <code>q(x_t | x_{t-1})</code> that gradually adds Gaussian noise, and train a reverse chain <code>p_θ(x_{t-1} | x_t)</code> to denoise. Ho, Jain, Abbeel (2020) showed the loss could be simplified to one line — predict the noise — and cleaned up the math. In 2020 this was a curiosity. In 2021 it produced state-of-the-art samples. In 2022 it became Stable Diffusion. In 2026 it is the substrate.</p>
+<h2>The Concept</h2>
+<p><img src="/learn/ai-from-scratch/files/phases/08-generative-ai/06-diffusion-ddpm-from-scratch/assets/ddpm.svg" alt="DDPM: forward noise, reverse denoise" loading="lazy"></p>
+<p><strong>Forward process <code>q</code>.</strong> Add Gaussian noise in <code>T</code> small steps. The closed form — the reason the math is tractable — is that the cumulative step is also Gaussian:</p>
+<pre><code>q(x_t | x_0) = N( sqrt(α̅_t) · x_0,  (1 - α̅_t) · I )
+</code></pre>
+<p>where <code>α̅_t = ∏_{s=1..t} (1 - β_s)</code> for a schedule of <code>β_t</code>. Pick <code>β_t</code> from 1e-4 to 0.02 linearly over T=1000 steps and <code>x_T</code> is approximately <code>N(0, I)</code>.</p>
+<p><strong>Reverse process <code>p_θ</code>.</strong> Learn a neural net <code>ε_θ(x_t, t)</code> that predicts the noise that was added. Given <code>x_t</code>, denoise by:</p>
+<pre><code>x_{t-1} = (1 / sqrt(α_t)) · ( x_t - (β_t / sqrt(1 - α̅_t)) · ε_θ(x_t, t) )  +  σ_t · z
+</code></pre>
+<p>where <code>σ_t</code> is either <code>sqrt(β_t)</code> or a learned variance. The expression is ugly but it is just algebra — solving for <code>x_{t-1}</code> given the posterior <code>q(x_{t-1} | x_t, x_0)</code> and substituting <code>x_0</code> with its noise-predicted estimate.</p>
+<p><strong>Training loss.</strong></p>
+<pre><code>L_simple = E_{x_0, t, ε} [ || ε - ε_θ( sqrt(α̅_t) · x_0 + sqrt(1 - α̅_t) · ε,  t ) ||² ]
+</code></pre>
+<p>Sample <code>x_0</code> from data, pick a random <code>t</code>, sample <code>ε ~ N(0, I)</code>, compute the noisy <code>x_t</code> in one shot via the closed form, and regress on the noise. One loss, no minimax, no KL, no reparameterization tricks.</p>
+<p><strong>Sampling.</strong> Start <code>x_T ~ N(0, I)</code>. Iterate the reverse step from <code>t = T</code> to <code>1</code>. Done.</p>
+<h2>Why it works</h2>
+<p>Three intuitions:</p>
+<ol>
+<li>
+<p><strong>Denoising is easy; generating is hard.</strong> At <code>t=T</code>, the data is pure noise — the net has to solve a trivial problem. At <code>t=0</code>, the net only has to clean up a few pixels. At intermediate <code>t</code>, the problem is hard but the net has many gradients flowing through the same weights from every noise level.</p>
+</li>
+<li>
+<p><strong>Score matching in disguise.</strong> Vincent (2011) proved that predicting the noise is equivalent to estimating <code>∇_x log q(x_t | x_0)</code>, the <em>score</em>. The reverse SDE uses this score to walk up the density gradient — a guided random walk toward high-probability regions.</p>
+</li>
+<li>
+<p><strong>The ELBO reduces to simple MSE.</strong> The full variational lower bound has a KL term per timestep. With DDPM's parameterization those KL terms simplify to MSE on noise prediction with specific coefficients; Ho dropped the coefficients (calling it &quot;simple&quot; loss) and quality <em>improved</em>.</p>
+</li>
+</ol>
+<figure><img src="/learn/ai-from-scratch/figures/figure-bcbd52b8b9b67abf7a14.png" alt="diffusion-denoise 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<p><code>code/main.py</code> implements a 1-D DDPM. Data is a two-mode mixture. The &quot;net&quot; is a tiny MLP that takes <code>(x_t, t)</code> and outputs predicted noise. Training is the one-line loss. Sampling iterates the reverse chain.</p>
+<h3>Step 1: the forward schedule (closed form)</h3>
+<pre><code class="language-python">betas = [1e-4 + (0.02 - 1e-4) * t / (T - 1) for t in range(T)]
+alphas = [1 - b for b in betas]
+alpha_bars = []
+cum = 1.0
+for a in alphas:
+    cum *= a
+    alpha_bars.append(cum)
+</code></pre>
+<h3>Step 2: sample <code>x_t</code> in one shot</h3>
+<pre><code class="language-python">def forward_sample(x0, t, alpha_bars, rng):
+    a_bar = alpha_bars[t]
+    eps = rng.gauss(0, 1)
+    x_t = math.sqrt(a_bar) * x0 + math.sqrt(1 - a_bar) * eps
+    return x_t, eps
+</code></pre>
+<h3>Step 3: one training step</h3>
+<pre><code class="language-python">def train_step(x0, model, alpha_bars, rng):
+    t = rng.randrange(T)
+    x_t, eps = forward_sample(x0, t, alpha_bars, rng)
+    eps_hat = model_forward(model, x_t, t)
+    loss = (eps - eps_hat) ** 2
+    return loss, gradient_step(model, ...)
+</code></pre>
+<h3>Step 4: reverse sampling</h3>
+<pre><code class="language-python">def sample(model, alpha_bars, T, rng):
+    x = rng.gauss(0, 1)
+    for t in range(T - 1, -1, -1):
+        eps_hat = model_forward(model, x, t)
+        beta_t = 1 - alphas[t]
+        x = (x - beta_t / math.sqrt(1 - alpha_bars[t]) * eps_hat) / math.sqrt(alphas[t])
+        if t &gt; 0:
+            x += math.sqrt(beta_t) * rng.gauss(0, 1)
+    return x
+</code></pre>
+<p>For a 1-D problem with 40 timesteps and a 24-unit MLP, this learns the two-mode mixture in ~200 epochs.</p>
+<h2>Time conditioning</h2>
+<p>The net needs to know which timestep it is denoising. Two standard options:</p>
+<ul>
+<li><strong>Sinusoidal embedding.</strong> Like Transformer positional encoding. <code>embed(t) = [sin(t/ω_0), cos(t/ω_0), sin(t/ω_1), ...]</code>. Pass through an MLP, broadcast into the net.</li>
+<li><strong>Film / group-norm conditioning.</strong> Project embedding to per-channel scale/bias (FiLM) at each block.</li>
+</ul>
+<p>Our toy code uses sinusoidal → concat. Production U-Nets use FiLM.</p>
+<h2>Pitfalls</h2>
+<ul>
+<li><strong>Schedule matters a lot.</strong> Linear <code>β</code> is the DDPM default but cosine schedule (Nichol &amp; Dhariwal, 2021) gives better FID for the same compute. Switch schedules if quality plateaus.</li>
+<li><strong>Timestep embedding is fragile.</strong> Passing raw <code>t</code> as a float works for toy 1-D but fails for images; always use a proper embedding.</li>
+<li><strong>V-prediction vs ε-prediction.</strong> For narrow regimes (very small or very large t), <code>ε</code> has poor signal-to-noise. V-prediction (<code>v = α·ε - σ·x</code>) is more stable; SDXL, SD3, and Flux use it.</li>
+<li><strong>Classifier-free guidance.</strong> At inference, compute both conditional and unconditional <code>ε</code>, then <code>ε_cfg = (1 + w) · ε_cond - w · ε_uncond</code> with <code>w ≈ 3-7</code>. Covered in Lesson 08.</li>
+<li><strong>1000 steps is a lot.</strong> Production uses DDIM (20-50 steps), DPM-Solver (10-20 steps), or distillation (1-4 steps). See Lesson 12.</li>
+</ul>
+<h2>Use It</h2>
+<table>
+<thead>
+<tr>
+<th>Role</th>
+<th>Typical stack in 2026</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Image pixel-space diffusion (small, toy)</td>
+<td>DDPM + U-Net</td>
+</tr>
+<tr>
+<td>Image latent diffusion</td>
+<td>VAE encoder + U-Net or DiT (Lesson 07)</td>
+</tr>
+<tr>
+<td>Video latent diffusion</td>
+<td>Spatiotemporal DiT (Sora, Veo, WAN)</td>
+</tr>
+<tr>
+<td>Audio latent diffusion</td>
+<td>Encodec + diffusion transformer</td>
+</tr>
+<tr>
+<td>Science (molecules, proteins, physics)</td>
+<td>Equivariant diffusion (EDM, RFdiffusion, AlphaFold3)</td>
+</tr>
+</tbody>
+</table>
+<p>Diffusion is the universal generative backbone. Flow matching (Lesson 13) is the 2024-2026 competitor that usually wins on inference speed for the same quality.</p>
+<h2>Ship It</h2>
+<p>Save <code>outputs/skill-diffusion-trainer.md</code>. Skill takes a dataset + compute budget and outputs: schedule (linear/cosine/sigmoid), prediction target (ε/v/x), number of steps, guidance scale, sampler family, and an eval protocol.</p>
+<h2>Exercises</h2>
+<ol>
+<li><strong>Easy.</strong> Change T from 40 to 10 in <code>code/main.py</code>. How does sample quality (visual histogram of outputs) degrade? At what T does the two-mode structure collapse?</li>
+<li><strong>Medium.</strong> Switch from ε-prediction to v-prediction. Re-derive the reverse step. Compare final sample quality.</li>
+<li><strong>Hard.</strong> Add classifier-free guidance. Condition on a class label <code>c ∈ {0, 1}</code>, drop it 10% of the time during training, and at sampling time use <code>ε = (1+w)·ε_cond - w·ε_uncond</code>. Measure the conditional-mode-hit rate at <code>w = 0, 1, 3, 7</code>.</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Forward process</td>
+<td>&quot;Adding noise&quot;</td>
+<td>Fixed Markov chain <code>q(x_t | x_{t-1})</code> that destroys the data.</td>
+</tr>
+<tr>
+<td>Reverse process</td>
+<td>&quot;Denoising&quot;</td>
+<td>Learned chain <code>p_θ(x_{t-1} | x_t)</code> that reconstructs the data.</td>
+</tr>
+<tr>
+<td>β schedule</td>
+<td>&quot;The noise ladder&quot;</td>
+<td>Per-step variance; linear, cosine, or sigmoid.</td>
+</tr>
+<tr>
+<td>α̅</td>
+<td>&quot;Alpha bar&quot;</td>
+<td>Cumulative product <code>∏(1 - β)</code>; gives closed-form <code>x_t</code> from <code>x_0</code>.</td>
+</tr>
+<tr>
+<td>Simple loss</td>
+<td>&quot;MSE on noise&quot;</td>
+<td><code>||ε - ε_θ(x_t, t)||²</code>; all variational derivations collapse to this.</td>
+</tr>
+<tr>
+<td>ε-prediction</td>
+<td>&quot;Predict noise&quot;</td>
+<td>Output is the noise added; standard DDPM.</td>
+</tr>
+<tr>
+<td>V-prediction</td>
+<td>&quot;Predict velocity&quot;</td>
+<td>Output is <code>α·ε - σ·x</code>; better conditioning across t.</td>
+</tr>
+<tr>
+<td>DDPM</td>
+<td>&quot;The paper&quot;</td>
+<td>Ho et al. 2020; linear β, 1000 steps, U-Net.</td>
+</tr>
+<tr>
+<td>DDIM</td>
+<td>&quot;Deterministic sampler&quot;</td>
+<td>Non-Markov sampler, 20-50 steps, same training objective.</td>
+</tr>
+<tr>
+<td>Classifier-free guidance</td>
+<td>&quot;CFG&quot;</td>
+<td>Mix conditional and unconditional noise predictions to amplify conditioning.</td>
+</tr>
+</tbody>
+</table>
+<h2>Production note: diffusion inference is a step-count problem</h2>
+<p>The DDPM paper runs T=1000 reverse steps. Nobody ships that in production. Every real inference stack picks one of three strategies — and each maps cleanly to production framing of &quot;where is the latency coming from&quot;:</p>
+<ol>
+<li><strong>Faster sampler, same model.</strong> DDIM (20-50 steps), DPM-Solver++ (10-20), UniPC (8-16). Drop-in replacement of the reverse loop; the trained <code>ε_θ</code> weights are untouched. Cuts latency 20-50×.</li>
+<li><strong>Distillation.</strong> Train a student to match the teacher in fewer steps: Progressive Distillation (2 → 1), Consistency Models (arbitrary → 1-4), LCM, SDXL-Turbo, SD3-Turbo. Cuts latency another 5-10×, requires retraining.</li>
+<li><strong>Caching and compilation.</strong> <code>torch.compile(unet, mode=&quot;reduce-overhead&quot;)</code>, TensorRT-LLM's diffusion backends, <code>xformers</code>/SDPA attention, bf16 weights. Cuts per-step latency ~2×. Stacks with (1) and (2).</li>
+</ol>
+<p>For a production diffusion server the budget conversation is the same as production literature describes for LLMs: latency is <code>num_steps × step_cost + VAE_decode</code>, throughput is <code>batch_size × (num_steps × step_cost)^-1</code>. TTFT is small (one step); TPOT-equivalent is the full response time because image generation is &quot;all-at-once&quot; from the user's perspective.</p>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/1503.03585" rel="noreferrer" data-network="true">Sohl-Dickstein et al. (2015). Deep Unsupervised Learning using Nonequilibrium Thermodynamics <small>↗ 需要联网</small></a> — the diffusion paper, ahead of its time.</li>
+<li><a href="https://arxiv.org/abs/2006.11239" rel="noreferrer" data-network="true">Ho, Jain, Abbeel (2020). Denoising Diffusion Probabilistic Models <small>↗ 需要联网</small></a> — DDPM.</li>
+<li><a href="https://arxiv.org/abs/2010.02502" rel="noreferrer" data-network="true">Song, Meng, Ermon (2021). Denoising Diffusion Implicit Models <small>↗ 需要联网</small></a> — DDIM, fewer steps.</li>
+<li><a href="https://arxiv.org/abs/2102.09672" rel="noreferrer" data-network="true">Nichol &amp; Dhariwal (2021). Improved DDPM <small>↗ 需要联网</small></a> — cosine schedule, learned variance.</li>
+<li><a href="https://arxiv.org/abs/2105.05233" rel="noreferrer" data-network="true">Dhariwal &amp; Nichol (2021). Diffusion Models Beat GANs on Image Synthesis <small>↗ 需要联网</small></a> — classifier guidance.</li>
+<li><a href="https://arxiv.org/abs/2207.12598" rel="noreferrer" data-network="true">Ho &amp; Salimans (2022). Classifier-Free Diffusion Guidance <small>↗ 需要联网</small></a> — CFG.</li>
+<li><a href="https://arxiv.org/abs/2206.00364" rel="noreferrer" data-network="true">Karras et al. (2022). Elucidating the Design Space of Diffusion-Based Generative Models (EDM) <small>↗ 需要联网</small></a> — unified notation, cleanest recipe.</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-08-generative-ai--06-diffusion-ddpm-from-scratch.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-08-generative-ai--06-diffusion-ddpm-from-scratch.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/08-generative-ai/06-diffusion-ddpm-from-scratch/code/main.py">phases/08-generative-ai/06-diffusion-ddpm-from-scratch/code/main.py</a><details><summary>查看原始文本</summary><pre><code>import math
+import random
+
+
+def sin_embed(t, T, dim=8):
+    &quot;&quot;&quot;Sinusoidal timestep embedding.&quot;&quot;&quot;
+    out = []
+    half = dim // 2
+    for i in range(half):
+        freq = 1.0 / (10000 ** (i / max(half - 1, 1)))
+        out.append(math.sin(t * freq))
+        out.append(math.cos(t * freq))
+    return out[:dim]
+
+
+def tanh(v):
+    return [math.tanh(x) for x in v]
+
+
+def tanh_grad(h):
+    return [1 - x * x for x in h]
+
+
+def matmul(W, x):
+    return [sum(w * xi for w, xi in zip(row, x)) for row in W]
+
+
+def add(a, b):
+    return [x + y for x, y in zip(a, b)]
+
+
+def randn_matrix(rows, cols, rng, scale=0.3):
+    return [[rng.gauss(0, scale) for _ in range(cols)] for _ in range(rows)]
+
+
+def init_net(x_dim, t_dim, hidden, rng):
+    return {
+        &quot;W1&quot;: randn_matrix(hidden, x_dim + t_dim, rng),
+        &quot;b1&quot;: [0.0] * hidden,
+        &quot;W2&quot;: randn_matrix(hidden, hidden, rng),
+        &quot;b2&quot;: [0.0] * hidden,
+        &quot;W3&quot;: randn_matrix(x_dim, hidden, rng),
+        &quot;b3&quot;: [0.0] * x_dim,
+    }
+
+
+def forward(x_t, t_embed, net):
+    inp = x_t + t_embed
+    pre1 = add(matmul(net[&quot;W1&quot;], inp), net[&quot;b1&quot;])
+    h1 = tanh(pre1)
+    pre2 = add(matmul(net[&quot;W2&quot;], h1), net[&quot;b2&quot;])
+    h2 = tanh(pre2)
+    eps_hat = add(matmul(net[&quot;W3&quot;], h2), net[&quot;b3&quot;])
+    return eps_hat, {&quot;inp&quot;: inp, &quot;h1&quot;: h1, &quot;h2&quot;: h2, &quot;pre1&quot;: pre1, &quot;pre2&quot;: pre2}
+
+
+def backward(target_eps, eps_hat, cache, net):
+    grads = {k: None for k in net}
+    for part in net:
+        if isinstance(net[part][0], list):
+            grads[part] = [[0.0] * len(net[part][0]) for _ in net[part]]
+        else:
+            grads[part] = [0.0] * len(net[part])
+
+    d_out = [2 * (a - b) for a, b in zip(eps_hat, target_eps)]
+    for i in range(len(d_out)):
+        grads[&quot;b3&quot;][i] += d_out[i]
+        for j in range(len(cache[&quot;h2&quot;])):
+            grads[&quot;W3&quot;][i][j] += d_out[i] * cache[&quot;h2&quot;][j]
+    d_h2 = [sum(net[&quot;W3&quot;][i][j] * d_out[i] for i in range(len(d_out)))
+            for j in range(len(cache[&quot;h2&quot;]))]
+    d_pre2 = [d_h2[j] * tanh_grad(cache[&quot;h2&quot;])[j] for j in range(len(cache[&quot;h2&quot;]))]
+    for j in range(len(cache[&quot;h2&quot;])):
+        grads[&quot;b2&quot;][j] += d_pre2[j]
+        for k in range(len(cache[&quot;h1&quot;])):
+            grads[&quot;W2&quot;][j][k] += d_pre2[j] * cache[&quot;h1&quot;][k]
+    d_h1 = [sum(net[&quot;W2&quot;][j][k] * d_pre2[j] for j in range(len(cache[&quot;h2&quot;])))
+            for k in range(len(cache[&quot;h1&quot;]))]
+    d_pre1 = [d_h1[j] * tanh_grad(cache[&quot;h1&quot;])[j] for j in range(len(cache[&quot;h1&quot;]))]
+    for j in range(len(cache[&quot;h1&quot;])):
+        grads[&quot;b1&quot;][j] += d_pre1[j]
+        for k in range(len(cache[&quot;inp&quot;])):
+            grads[&quot;W1&quot;][j][k] += d_pre1[j] * cache[&quot;inp&quot;][k]
+    return grads
+
+
+def apply_update(net, grads, lr):
+    for k, v in net.items():
+        if isinstance(v[0], list):
+            for i in range(len(v)):
+                for j in range(len(v[i])):
+                    v[i][j] -= lr * grads[k][i][j]
+        else:
+            for i in range(len(v)):
+                v[i] -= lr * grads[k][i]
+
+
+def make_schedule(T):
+    betas = [1e-4 + (0.02 - 1e-4) * t / (T - 1) for t in range(T)]
+    alphas = [1 - b for b in betas]
+    alpha_bars, cum = [], 1.0
+    for a in alphas:
+        cum *= a
+        alpha_bars.append(cum)
+    return betas, alphas, alpha_bars
+
+
+def sample_data(rng):
+    return rng.gauss(-2.0, 0.4) if rng.random() &lt; 0.5 else rng.gauss(2.0, 0.4)
+
+
+def train(net, alpha_bars, T, steps, lr, t_dim, rng):
+    for step in range(steps):
+        x0 = sample_data(rng)
+        t = rng.randrange(T)
+        a_bar = alpha_bars[t]
+        eps = rng.gauss(0, 1)
+        x_t = math.sqrt(a_bar) * x0 + math.sqrt(1 - a_bar) * eps
+        t_emb = sin_embed(t, T, t_dim)
+        eps_hat, cache = forward([x_t], t_emb, net)
+        grads = backward([eps], eps_hat, cache, net)
+        apply_update(net, grads, lr)
+        if (step + 1) % 500 == 0:
+            loss = (eps_hat[0] - eps) ** 2
+            print(f&quot;step {step+1:5d}: loss {loss:.4f}&quot;)
+
+
+def sample(net, alphas, alpha_bars, T, t_dim, rng):
+    x = rng.gauss(0, 1)
+    for t in range(T - 1, -1, -1):
+        t_emb = sin_embed(t, T, t_dim)
+        eps_hat, _ = forward([x], t_emb, net)
+        beta_t = 1 - alphas[t]
+        mean = (x - beta_t / math.sqrt(1 - alpha_bars[t]) * eps_hat[0]) / math.sqrt(alphas[t])
+        if t &gt; 0:
+            x = mean + math.sqrt(beta_t) * rng.gauss(0, 1)
+        else:
+            x = mean
+    return x
+
+
+def histogram(samples, lo=-5.0, hi=5.0, bins=30):
+    width = (hi - lo) / bins
+    counts = [0] * bins
+    for s in samples:
+        if lo &lt;= s &lt; hi:
+            counts[int((s - lo) / width)] += 1
+    peak = max(counts) or 1
+    height = 8
+    rows = []
+    for r in range(height, 0, -1):
+        thr = peak * r / height
+        rows.append(&quot;&quot;.join(&quot;#&quot; if c &gt;= thr else &quot; &quot; for c in counts))
+    rows.append(&quot;-&quot; * bins)
+    return &quot;\n&quot;.join(rows)
+
+
+def main():
+    rng = random.Random(13)
+    T, t_dim, hidden = 40, 8, 24
+    _, alphas, alpha_bars = make_schedule(T)
+    net = init_net(1, t_dim, hidden, rng)
+
+    print(&quot;=== training DDPM on two-mode 1-D mixture ===&quot;)
+    train(net, alpha_bars, T, steps=4000, lr=0.01, t_dim=t_dim, rng=rng)
+
+    print()
+    print(&quot;=== sampling ===&quot;)
+    samples = [sample(net, alphas, alpha_bars, T, t_dim, rng) for _ in range(500)]
+    print(histogram(samples))
+    m = sum(samples) / len(samples)
+    pos = sum(1 for s in samples if s &gt; 0)
+    print(f&quot;mean {m:+.3f}, modeA(&lt;0)={500-pos}, modeB(&gt;0)={pos}&quot;)
+
+    print()
+    print(&quot;takeaway: trained noise predictor + reverse chain reproduces both modes.&quot;)
+    print(&quot;          same loss function that scales to images, video, 3D.&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/08-generative-ai/06-diffusion-ddpm-from-scratch/outputs/skill-diffusion-trainer.md">phases/08-generative-ai/06-diffusion-ddpm-from-scratch/outputs/skill-diffusion-trainer.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: diffusion-trainer
+description: Configure a diffusion training run: schedule, prediction target, sampler, and eval plan.
+version: 1.0.0
+phase: 8
+lesson: 06
+tags: [diffusion, ddpm, training]
+---
+
+Given a dataset profile (modality, resolution, dataset size), compute budget (GPU hours, VRAM floor), and quality bar (FID target or downstream use), output:
+
+1. Schedule. Linear, cosine (Nichol), or sigmoid. Number of steps T (1000 for DDPM baseline; 256 for faster variants).
+2. Prediction target. epsilon, v-prediction, or x_0. Reason tied to resolution and signal-to-noise across the schedule.
+3. Architecture. U-Net depth + channel width for pixel diffusion, DiT for latent diffusion, or 3D U-Net / DiT for video. Include time embedding scheme (sinusoidal + MLP, FiLM, or AdaLN).
+4. Sampler. DDIM (20-50 steps), DPM-Solver++ (10-20), Euler-A (creative), or distilled 1-4-step. Include guidance scale (CFG w) recommendation.
+5. Eval plan. FID / KID / CLIP-score / human-preference, with sample counts (&gt;=10k for FID), sweep protocol for CFG w.
+
+Refuse to recommend training pixel-space diffusion at &amp;gt;=256x256 when latent diffusion achieves the same quality at 1/16th the FLOPs. Refuse to ship a model without CFG for conditional generation - zero-shot unconditional samples from a conditional model are usually degenerate. Flag any schedule with beta_T &amp;gt; 0.1 as likely to produce saturated or unstable training.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原课程未提供测验。</p></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/08-generative-ai/05-stylegan/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/08-generative-ai/07-latent-diffusion-stable-diffusion/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/08-generative-ai/06-diffusion-ddpm-from-scratch/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

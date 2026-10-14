@@ -1,0 +1,1221 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>从零开始构建一个标记器 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-10-llms-from-scratch" data-lesson="10-llms-from-scratch/02-building-a-tokenizer" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/10-llms-from-scratch/">从零构建大语言模型</a> / LESSON 02</p><h1 class="lesson-title">从零开始构建一个标记器</h1><p>Building a Tokenizer from Scratch</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>从零开始构建一个标记器</h1>
+<blockquote>
+<p>第1课给你玩具,这课给你武器.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 10, Lesson 01 (Tokenizers: BPE, WordPiece, SentencePiece)
+<strong>Time:</strong> ~90 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>建立一个处理 Unicode,白色空间规范化和特殊代币的生产级 BPE 代币器</li>
+<li>实现字节级下降,以便代币器可以在未知的代币的情况下编码任何输入 (包括emoji,CJK和代码)</li>
+<li>在应用BPE合并之前添加预代币化regex模式,将文字分为词界限</li>
+<li>训练一个定制代码符号在一个体积上,并评估其压缩比与多语言文本上的代码符号</li>
+</ul>
+<h2>问题</h2>
+<p>你从01课的BPE标记器使用英语文,现在把日本文写在上面,或者是爱默契,或者是Python代码,</p>
+<p>它会破裂.</p>
+<p>不是因为BPE是错误的,因为实现是不完整的.一个生产代币器处理任何编码中的原始字节,在分化之前将Unicode正常化,管理永远不会合并的特殊代币,</p>
+<p>现在,我们可以看到一个新的代码. 拉马3号有128,256. GPT-4有大约10万个. 这些不是玩具号码. 这些词汇背后的结合表是用数百个千兆字节的文字训练的, 周围的机器 - - 正常化,预代币化,特殊代币注射,聊天模板格式化 - - 是区分一个处理&quot;你好世界&quot;的代币器与一个处理整个互联网的代币器的东西.</p>
+<p>你将建造那种机器.</p>
+<h2>概念</h2>
+<h3>整个管道</h3>
+<p>生产代币不是一个算法,而是五个阶段的管道,每个阶段都解决了不同的问题.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-98a90f3b64f75ebea665.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>每个阶段都有一个特定的工作:</p>
+<table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>What It Does</th>
+<th>Why It Matters</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Normalize</td>
+<td>NFKC Unicode, lowercase optional, strip accents optional</td>
+<td>&quot;fi&quot; ligature (U+FB01) becomes &quot;fi&quot; (two chars). Without this, same word gets different tokens.</td>
+</tr>
+<tr>
+<td>Pre-Tokenize</td>
+<td>Split text into chunks before BPE</td>
+<td>Prevents BPE from merging across word boundaries. &quot;the cat&quot; should never produce a token &quot;e c&quot;.</td>
+</tr>
+<tr>
+<td>BPE Merge</td>
+<td>Apply learned merge rules to byte sequences</td>
+<td>The core compression. Turns raw bytes into subword tokens.</td>
+</tr>
+<tr>
+<td>Special Tokens</td>
+<td>Inject [BOS], [EOS], [PAD], chat template markers</td>
+<td>These tokens have fixed IDs. They never participate in BPE merges. The model needs them for structure.</td>
+</tr>
+<tr>
+<td>ID Mapping</td>
+<td>Convert token strings to integer IDs</td>
+<td>The model sees integers, not strings.</td>
+</tr>
+</tbody>
+</table>
+<h3>字节级BPE</h3>
+<p>课01的代币器运行在UTF-8字节.这是一个正确的呼叫.但我们错过了一些重要的事情:当这些字节不有效的UTF-8时会发生什么?</p>
+<p>字节级BPE通过将每一个可能的字节值 (0-255) 作为一个有效的代币来解决这个问题.你的基础词汇库是正确的 256 个条目.任何文件 - 文字,二进制,损坏 - 可以在没有产生未知的代币的情况下代币化.</p>
+<p>GPT-2 增加了一个技巧:将每个字节映射到可打印的 Unicode 字符,使词汇保持于人能读取的.字节0x20 (空间) 成为它们的映射中的字符&quot;G&quot;.这纯粹是化品.算法不关心.</p>
+<p>实际实力:字节级BPE处理地球上的每一种语言.中国字符每字母是3 UTF-8字节.日本字母可以是3-8字节.阿拉伯语,德瓦纳加里,爱莫吉语 - - 所有这些都是字节序列.BPE算法在这些字节序列中找到模式,就像它在英语ASCII字节中找到模式一样.</p>
+<h3>预托克化</h3>
+<p>在BPE触及你的文本之前,你需要将它分成块. 这阻止了合并算法创建跨越词界限的代币.</p>
+<p>通过使用regex模式来分开文本:</p>
+<pre><code>'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+
+</code></pre>
+<p>这种模式分为缩写 (&quot;don't&quot;变成&quot;don&quot; + &quot;'t&quot;),有可选的领先空间,数字,分点和白色空间的单词.领先空间被附加到单词 - - 因此&quot;猫&quot;变成 [&quot;the&quot;, &quot;cat&quot;],而不是 [&quot;the&quot;, &quot;&quot;, &quot;cat&quot;].</p>
+<p>拉马使用SentencePiece,它完全跳过regex.它将原始字节流作为一个长序列,并让BPE算法弄清楚边界.这更简单,但给BPE更多的自由创建交叉字符.</p>
+<p>选择是重要的.GPT-2的regex阻止令牌商学习一个词的结尾和下一个词的开始应该合并.SentencePiece允许,这有时会产生更有效的压缩,但更不易解释的令牌.</p>
+<h3>特殊的代币</h3>
+<p>每个生产代币商都保留了结构标记的代币ID:</p>
+<table>
+<thead>
+<tr>
+<th>Token</th>
+<th>Purpose</th>
+<th>Used By</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>[BOS]</code> / <code>&lt;s&gt;</code></td>
+<td>Beginning of sequence</td>
+<td>Llama 3, GPT</td>
+</tr>
+<tr>
+<td><code>[EOS]</code> / <code>&lt;/s&gt;</code></td>
+<td>End of sequence</td>
+<td>All models</td>
+</tr>
+<tr>
+<td><code>[PAD]</code></td>
+<td>Padding for batch alignment</td>
+<td>BERT, T5</td>
+</tr>
+<tr>
+<td><code>[UNK]</code></td>
+<td>Unknown token (byte-level BPE eliminates this)</td>
+<td>BERT, WordPiece</td>
+</tr>
+<tr>
+<td><code>&lt;|im_start|&gt;</code></td>
+<td>Chat message boundary start</td>
+<td>ChatGPT, Qwen</td>
+</tr>
+<tr>
+<td><code>&lt;|im_end|&gt;</code></td>
+<td>Chat message boundary end</td>
+<td>ChatGPT, Qwen</td>
+</tr>
+<tr>
+<td><code>&lt;|user|&gt;</code></td>
+<td>User turn marker</td>
+<td>Llama 3</td>
+</tr>
+<tr>
+<td><code>&lt;|assistant|&gt;</code></td>
+<td>Assistant turn marker</td>
+<td>Llama 3</td>
+</tr>
+</tbody>
+</table>
+<p>特殊代币从来没有被BPE分开.它们在合并算法运行之前就匹配,用固定ID取代,周围的文本通常被代币化.</p>
+<h3>聊天模板</h3>
+<p>这就是大多数人感到困惑的地方,</p>
+<p>当你发送消息给聊天模型时,API接受一个消息列表:</p>
+<pre><code>[
+  {&quot;role&quot;: &quot;system&quot;, &quot;content&quot;: &quot;You are helpful.&quot;},
+  {&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;Hello&quot;},
+  {&quot;role&quot;: &quot;assistant&quot;, &quot;content&quot;: &quot;Hi there!&quot;}
+]
+</code></pre>
+<p>模型不看到JSON. 它看到一个平坦的代币序列.聊天模板将消息转换成那个平坦的序列使用特殊的代币.每个模型都会以不同的方式进行:</p>
+<pre><code>Llama 3:
+&lt;|begin_of_text|&gt;&lt;|start_header_id|&gt;system&lt;|end_header_id|&gt;
+
+You are helpful.&lt;|eot_id|&gt;&lt;|start_header_id|&gt;user&lt;|end_header_id|&gt;
+
+Hello&lt;|eot_id|&gt;&lt;|start_header_id|&gt;assistant&lt;|end_header_id|&gt;
+
+Hi there!&lt;|eot_id|&gt;
+
+ChatGPT:
+&lt;|im_start|&gt;system
+You are helpful.&lt;|im_end|&gt;
+&lt;|im_start|&gt;user
+Hello&lt;|im_end|&gt;
+&lt;|im_start|&gt;assistant
+Hi there!&lt;|im_end|&gt;
+</code></pre>
+<p>错误的模板,模型产生垃圾.它是训练在一个准确的格式.任何偏差 - - 缺失的新线,交换的代币,额外的空间 - - 将输入置于训练分布之外.</p>
+<h3>速度</h3>
+<p>对于生产代码化来说,Python太慢了.</p>
+<p>接脸标记器也叫做Rust.SentencePiece是C++.这些标记器可以实现10-100倍的速度.</p>
+<p>为了展望:在每秒100万代币 (Rust) 时,需要174天,在每秒15万代币 (Rust) 时,需要1.7天.</p>
+<p>在制作中,你会使用编译的实现,只触摸Python包装.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-c11d9d235f9c14462b95.png" alt="weight-tying 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<h3>步骤1:字节级编码</h3>
+<p>转换任何字符串为字节序列,将每个字节映射到可打印的字符中,然后逆转过程.</p>
+<pre><code class="language-python">def bytes_to_tokens(text):
+    return list(text.encode(&quot;utf-8&quot;))
+
+def tokens_to_text(token_bytes):
+    return bytes(token_bytes).decode(&quot;utf-8&quot;, errors=&quot;replace&quot;)
+</code></pre>
+<p>测试多语言文本,以查看字节数量:</p>
+<pre><code class="language-python">texts = [
+    (&quot;English&quot;, &quot;hello&quot;),
+    (&quot;Chinese&quot;, &quot;你好&quot;),
+    (&quot;Emoji&quot;, &quot;🔥&quot;),
+    (&quot;Mixed&quot;, &quot;hello你好🔥&quot;),
+]
+
+for label, text in texts:
+    b = bytes_to_tokens(text)
+    print(f&quot;{label}: {len(text)} chars -&gt; {len(b)} bytes -&gt; {b}&quot;)
+</code></pre>
+<p>&quot;hello&quot;是5字节. &quot;你好&quot;是6字节 (3个字符).火焰的爱默契是4字节.字节级代币符号不关心它是什么语言.字节是字节.</p>
+<h3>步骤2:使用 Regex 的预托克尼化器</h3>
+<p>通过GPT-2regex模式将文本分成块,每个部分由BPE独立地代码化.</p>
+<pre><code class="language-python">import re
+
+try:
+    import regex
+    GPT2_PATTERN = regex.compile(
+        r&quot;&quot;&quot;'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+&quot;&quot;&quot;
+    )
+except ImportError:
+    GPT2_PATTERN = re.compile(
+        r&quot;&quot;&quot;'(?:[sdmt]|ll|ve|re)| ?[a-zA-Z]+| ?[0-9]+| ?[^\s\w]+|\s+(?!\S)|\s+&quot;&quot;&quot;
+    )
+
+def pre_tokenize(text):
+    return [match.group() for match in GPT2_PATTERN.finditer(text)]
+</code></pre>
+<p>其他<code>regex</code>模块支持 Unicode 属性逃逸 (<code>\p{L}</code>对于信件,<code>\p{N}</code>标准图书馆<code>re</code>对于生产多语言代币器,安装 <code>regex</code>现在,我们要去.</p>
+<p>试试吧.</p>
+<pre><code class="language-python">print(pre_tokenize(&quot;Hello, world! Don't stop.&quot;))
+# [' Hello', ',', ' world', '!', &quot; Don&quot;, &quot;'t&quot;, ' stop', '.']
+</code></pre>
+<p>位将保持与词的连接.缩写在位分开.点击成为自己的部分.BPE永远不会将代币融合在这些边界.</p>
+<h3>步骤3: 字节序列上的 BPE</h3>
+<p>核心算法从课01中,但现在在预先代币的块上独立运行.</p>
+<pre><code class="language-python">from collections import Counter
+
+def get_byte_pairs(chunks):
+    pairs = Counter()
+    for chunk in chunks:
+        byte_seq = list(chunk.encode(&quot;utf-8&quot;))
+        for i in range(len(byte_seq) - 1):
+            pairs[(byte_seq[i], byte_seq[i + 1])] += 1
+    return pairs
+
+def apply_merge(byte_seq, pair, new_id):
+    merged = []
+    i = 0
+    while i &lt; len(byte_seq):
+        if i &lt; len(byte_seq) - 1 and byte_seq[i] == pair[0] and byte_seq[i + 1] == pair[1]:
+            merged.append(new_id)
+            i += 2
+        else:
+            merged.append(byte_seq[i])
+            i += 1
+    return merged
+</code></pre>
+<h3>步骤4:特殊的标志处理</h3>
+<p>特殊的代币需要精确的匹配和固定的身份证.</p>
+<pre><code class="language-python">class SpecialTokenHandler:
+    def __init__(self):
+        self.special_tokens = {}
+        self.pattern = None
+
+    def add_token(self, token_str, token_id):
+        self.special_tokens[token_str] = token_id
+        escaped = [re.escape(t) for t in sorted(self.special_tokens.keys(), key=len, reverse=True)]
+        self.pattern = re.compile(&quot;|&quot;.join(escaped))
+
+    def split_with_specials(self, text):
+        if not self.pattern:
+            return [(text, False)]
+        parts = []
+        last_end = 0
+        for match in self.pattern.finditer(text):
+            if match.start() &gt; last_end:
+                parts.append((text[last_end:match.start()], False))
+            parts.append((match.group(), True))
+            last_end = match.end()
+        if last_end &lt; len(text):
+            parts.append((text[last_end:], False))
+        return parts
+</code></pre>
+<h3>步骤5: 完整的标记器类</h3>
+<p>链接所有东西:正常化,分成特殊代币,预代币化,BPE合并,地图到身份证.</p>
+<pre><code class="language-python">import unicodedata
+
+class ProductionTokenizer:
+    def __init__(self):
+        self.merges = {}
+        self.vocab = {i: bytes([i]) for i in range(256)}
+        self.special_handler = SpecialTokenHandler()
+        self.next_id = 256
+
+    def normalize(self, text):
+        return unicodedata.normalize(&quot;NFKC&quot;, text)
+
+    def train(self, text, num_merges):
+        text = self.normalize(text)
+        chunks = pre_tokenize(text)
+        chunk_bytes = [list(chunk.encode(&quot;utf-8&quot;)) for chunk in chunks]
+
+        for i in range(num_merges):
+            pairs = Counter()
+            for seq in chunk_bytes:
+                for j in range(len(seq) - 1):
+                    pairs[(seq[j], seq[j + 1])] += 1
+            if not pairs:
+                break
+            best = max(pairs, key=pairs.get)
+            new_id = self.next_id
+            self.next_id += 1
+            self.merges[best] = new_id
+            self.vocab[new_id] = self.vocab[best[0]] + self.vocab[best[1]]
+            chunk_bytes = [apply_merge(seq, best, new_id) for seq in chunk_bytes]
+
+    def add_special_token(self, token_str):
+        token_id = self.next_id
+        self.next_id += 1
+        self.special_handler.add_token(token_str, token_id)
+        self.vocab[token_id] = token_str.encode(&quot;utf-8&quot;)
+        return token_id
+
+    def encode(self, text):
+        text = self.normalize(text)
+        parts = self.special_handler.split_with_specials(text)
+        all_ids = []
+        for part_text, is_special in parts:
+            if is_special:
+                all_ids.append(self.special_handler.special_tokens[part_text])
+            else:
+                for chunk in pre_tokenize(part_text):
+                    byte_seq = list(chunk.encode(&quot;utf-8&quot;))
+                    for pair, new_id in self.merges.items():
+                        byte_seq = apply_merge(byte_seq, pair, new_id)
+                    all_ids.extend(byte_seq)
+        return all_ids
+
+    def decode(self, ids):
+        byte_parts = []
+        for token_id in ids:
+            if token_id in self.vocab:
+                byte_parts.append(self.vocab[token_id])
+        return b&quot;&quot;.join(byte_parts).decode(&quot;utf-8&quot;, errors=&quot;replace&quot;)
+
+    def vocab_size(self):
+        return len(self.vocab)
+</code></pre>
+<h3>六步:多语言测试</h3>
+<p>试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试试</p>
+<pre><code class="language-python">corpus = (
+    &quot;The quick brown fox jumps over the lazy dog. &quot;
+    &quot;The quick brown fox runs through the forest. &quot;
+    &quot;Machine learning models process natural language. &quot;
+    &quot;Deep learning transforms how we build software. &quot;
+    &quot;def train(model, data): return model.fit(data) &quot;
+    &quot;def predict(model, x): return model(x) &quot;
+)
+
+tok = ProductionTokenizer()
+tok.train(corpus, num_merges=50)
+
+bos = tok.add_special_token(&quot;&lt;|begin|&gt;&quot;)
+eos = tok.add_special_token(&quot;&lt;|end|&gt;&quot;)
+
+test_texts = [
+    &quot;The quick brown fox.&quot;,
+    &quot;你好世界&quot;,
+    &quot;Hello 🌍 World&quot;,
+    &quot;def foo(x): return x + 1&quot;,
+    f&quot;&lt;|begin|&gt;Hello&lt;|end|&gt;&quot;,
+]
+
+for text in test_texts:
+    ids = tok.encode(text)
+    decoded = tok.decode(ids)
+    print(f&quot;Input:   {text}&quot;)
+    print(f&quot;Tokens:  {len(ids)} ids&quot;)
+    print(f&quot;Decoded: {decoded}&quot;)
+    print()
+</code></pre>
+<p>汉字每字产生3字节. 情感符号产生4字节. 没有一个字符打破代币器. 没有一个字符产生未知的代币. 这就是字节级BPE的功率.</p>
+<h2>用它</h2>
+<h3>实际的代币交易者</h3>
+<p>查看各个语言段落的处理方式.</p>
+<pre><code class="language-python">import tiktoken
+
+gpt4_enc = tiktoken.get_encoding(&quot;cl100k_base&quot;)
+
+test_paragraph = &quot;Machine learning is powerful. 机器学习很强大。 L'apprentissage automatique est puissant. 🤖💪&quot;
+
+tokens = gpt4_enc.encode(test_paragraph)
+pieces = [gpt4_enc.decode([t]) for t in tokens]
+print(f&quot;GPT-4 ({len(tokens)} tokens): {pieces}&quot;)
+</code></pre>
+<pre><code class="language-python">from transformers import AutoTokenizer
+
+llama_tok = AutoTokenizer.from_pretrained(&quot;meta-llama/Meta-Llama-3-8B&quot;)
+mistral_tok = AutoTokenizer.from_pretrained(&quot;mistralai/Mistral-7B-v0.1&quot;)
+
+for name, tok in [(&quot;Llama 3&quot;, llama_tok), (&quot;Mistral&quot;, mistral_tok)]:
+    tokens = tok.encode(test_paragraph)
+    pieces = tok.convert_ids_to_tokens(tokens)
+    print(f&quot;{name} ({len(tokens)} tokens): {pieces[:20]}...&quot;)
+</code></pre>
+<p>您将看到相同文本的代币数量不同. 128K 词汇的 Llama 3 在合并常见模式方面更具侵略性. 100K 的 GPT-4 在中间. 32K 的 Mistral 生产更多代币,但具有较小的嵌入层.</p>
+<p>交易总是相同的:更大的词汇意味着更短的序列,但更多的参数.</p>
+<h2>运送它</h2>
+<p>这一课产生的提示是建立和调试生产代币.<code>outputs/prompt-tokenizer-builder.md</code>现在,我们要去.</p>
+<h2>运动</h2>
+<ol>
+<li>**Easy:**添加一个<code>get_token_bytes(id)</code>使用它检查您最常见的合并代币实际上代表什么.</li>
+<li>**Medium:**实现Llama式预代币器,它分为白色空间和数字,但保持领先空间. 比较其词汇与GPT-2regex方法在同一体.</li>
+<li>**Hard:**添加一个聊天模板方法,包含列表<code>{&quot;role&quot;: ..., &quot;content&quot;: ...}</code>通过&quot;HuggingFace&quot;实现,测试它.</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Byte-level BPE</td>
+<td>&quot;Tokenizer that works on bytes&quot;</td>
+<td>BPE with a base vocabulary of 256 byte values -- handles any input without unknown tokens</td>
+</tr>
+<tr>
+<td>Pre-tokenization</td>
+<td>&quot;Splitting before BPE&quot;</td>
+<td>Regex or rule-based splitting that prevents BPE from merging across word boundaries</td>
+</tr>
+<tr>
+<td>NFKC normalization</td>
+<td>&quot;Unicode cleanup&quot;</td>
+<td>Canonical decomposition followed by compatibility composition -- &quot;fi&quot; ligature becomes &quot;fi&quot;, fullwidth &quot;A&quot; becomes &quot;A&quot;</td>
+</tr>
+<tr>
+<td>Chat template</td>
+<td>&quot;How messages become tokens&quot;</td>
+<td>The exact format for converting a list of role/content messages into a flat token sequence -- model-specific and must match training format</td>
+</tr>
+<tr>
+<td>Special tokens</td>
+<td>&quot;Control tokens&quot;</td>
+<td>Reserved token IDs that bypass BPE -- [BOS], [EOS], [PAD], chat markers -- matched exactly before merge</td>
+</tr>
+<tr>
+<td>Fertility</td>
+<td>&quot;Tokens per word&quot;</td>
+<td>Ratio of output tokens to input words -- 1.3 for English in GPT-4, 2-3 for Korean, higher means wasted context</td>
+</tr>
+<tr>
+<td>tiktoken</td>
+<td>&quot;OpenAI tokenizer&quot;</td>
+<td>Rust BPE implementation with Python bindings -- 10-100x faster than pure Python</td>
+</tr>
+<tr>
+<td>Merge table</td>
+<td>&quot;The vocabulary&quot;</td>
+<td>Ordered list of byte-pair merges learned during training -- this IS the tokenizer's learned knowledge</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://github.com/openai/tiktoken" rel="noreferrer" data-network="true">OpenAI tiktoken source <small>↗ 需要联网</small></a>-- GPT-3.5/4 所使用的性BPE实现</li>
+<li><a href="https://github.com/huggingface/tokenizers" rel="noreferrer" data-network="true">HuggingFace tokenizers <small>↗ 需要联网</small></a>-- 支持BPE,WordPiece,Unigram的结代币库</li>
+<li><a href="https://arxiv.org/abs/2407.21783" rel="noreferrer" data-network="true">Llama 3 paper (Meta, 2024) <small>↗ 需要联网</small></a>-- 128K词汇和代币化培训的详细信息</li>
+<li><a href="https://arxiv.org/abs/1808.06226" rel="noreferrer" data-network="true">SentencePiece (Kudo &amp; Richardson, 2018) <small>↗ 需要联网</small></a>--语言认知标记</li>
+<li><a href="https://github.com/openai/gpt-2/blob/master/src/encoder.py" rel="noreferrer" data-network="true">GPT-2 tokenizer source <small>↗ 需要联网</small></a>-- 原始的字节到Unicode映射</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Building a Tokenizer from Scratch</h1>
+<blockquote>
+<p>Lesson 01 gave you a toy. This lesson gives you a weapon.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 10, Lesson 01 (Tokenizers: BPE, WordPiece, SentencePiece)
+<strong>Time:</strong> ~90 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Build a production-grade BPE tokenizer that handles Unicode, whitespace normalization, and special tokens</li>
+<li>Implement byte-level fallback so the tokenizer can encode any input (including emoji, CJK, and code) without unknown tokens</li>
+<li>Add pre-tokenization regex patterns that split text at word boundaries before applying BPE merges</li>
+<li>Train a custom tokenizer on a corpus and evaluate its compression ratio against tiktoken on multilingual text</li>
+</ul>
+<h2>The Problem</h2>
+<p>Your BPE tokenizer from Lesson 01 works on English text. Now throw Japanese at it. Or emoji. Or Python code with mixed tabs and spaces.</p>
+<p>It breaks.</p>
+<p>Not because BPE is wrong -- because the implementation is incomplete. A production tokenizer handles raw bytes in any encoding, normalizes Unicode before splitting, manages special tokens that never get merged, chains pre-tokenization with subword splitting, and does all of this fast enough to not bottleneck a training pipeline processing 15 trillion tokens.</p>
+<p>GPT-2's tokenizer has 50,257 tokens. Llama 3 has 128,256. GPT-4 has roughly 100,000. These are not toy numbers. The merge tables behind those vocabularies were trained on hundreds of gigabytes of text, and the surrounding machinery -- normalization, pre-tokenization, special token injection, chat template formatting -- is what separates a tokenizer that handles &quot;hello world&quot; from one that handles the entire internet.</p>
+<p>You are going to build that machinery.</p>
+<h2>The Concept</h2>
+<h3>The Full Pipeline</h3>
+<p>A production tokenizer is not one algorithm. It is a pipeline of five stages, each solving a different problem.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-98a90f3b64f75ebea665.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>Each stage has a specific job:</p>
+<table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>What It Does</th>
+<th>Why It Matters</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Normalize</td>
+<td>NFKC Unicode, lowercase optional, strip accents optional</td>
+<td>&quot;fi&quot; ligature (U+FB01) becomes &quot;fi&quot; (two chars). Without this, same word gets different tokens.</td>
+</tr>
+<tr>
+<td>Pre-Tokenize</td>
+<td>Split text into chunks before BPE</td>
+<td>Prevents BPE from merging across word boundaries. &quot;the cat&quot; should never produce a token &quot;e c&quot;.</td>
+</tr>
+<tr>
+<td>BPE Merge</td>
+<td>Apply learned merge rules to byte sequences</td>
+<td>The core compression. Turns raw bytes into subword tokens.</td>
+</tr>
+<tr>
+<td>Special Tokens</td>
+<td>Inject [BOS], [EOS], [PAD], chat template markers</td>
+<td>These tokens have fixed IDs. They never participate in BPE merges. The model needs them for structure.</td>
+</tr>
+<tr>
+<td>ID Mapping</td>
+<td>Convert token strings to integer IDs</td>
+<td>The model sees integers, not strings.</td>
+</tr>
+</tbody>
+</table>
+<h3>Byte-Level BPE</h3>
+<p>Lesson 01's tokenizer operated on UTF-8 bytes. That was the right call. But we skipped something important: what happens when those bytes are not valid UTF-8?</p>
+<p>Byte-level BPE solves this by treating every possible byte value (0-255) as a valid token. Your base vocabulary is exactly 256 entries. Any file -- text, binary, corrupted -- can be tokenized without producing an unknown token.</p>
+<p>GPT-2 added a trick: map each byte to a printable Unicode character so the vocabulary stays human-readable. Byte 0x20 (space) becomes the character &quot;G&quot; in their mapping. This is purely cosmetic. The algorithm does not care.</p>
+<p>The real power: byte-level BPE handles every language on earth. Chinese characters are 3 UTF-8 bytes each. Japanese can be 3-4 bytes. Arabic, Devanagari, emoji -- all just byte sequences. The BPE algorithm finds patterns in these byte sequences exactly the same way it finds patterns in English ASCII bytes.</p>
+<h3>Pre-Tokenization</h3>
+<p>Before BPE touches your text, you need to split it into chunks. This prevents the merge algorithm from creating tokens that span word boundaries.</p>
+<p>GPT-2 uses a regex pattern to split text:</p>
+<pre><code>'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+
+</code></pre>
+<p>This pattern splits on contractions (&quot;don't&quot; becomes &quot;don&quot; + &quot;'t&quot;), words with optional leading spaces, numbers, punctuation, and whitespace. The leading space is kept attached to the word -- so &quot;the cat&quot; becomes [&quot; the&quot;, &quot; cat&quot;], not [&quot;the&quot;, &quot; &quot;, &quot;cat&quot;].</p>
+<p>Llama uses SentencePiece, which skips regex entirely. It treats the raw byte stream as one long sequence and lets the BPE algorithm figure out the boundaries. This is simpler but gives BPE more freedom to create cross-word tokens.</p>
+<p>The choice matters. GPT-2's regex prevents the tokenizer from learning that &quot;the&quot; at the end of one word and &quot;the&quot; at the start of the next should merge. SentencePiece allows it, which sometimes produces more efficient compression but less interpretable tokens.</p>
+<h3>Special Tokens</h3>
+<p>Every production tokenizer reserves token IDs for structural markers:</p>
+<table>
+<thead>
+<tr>
+<th>Token</th>
+<th>Purpose</th>
+<th>Used By</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>[BOS]</code> / <code>&lt;s&gt;</code></td>
+<td>Beginning of sequence</td>
+<td>Llama 3, GPT</td>
+</tr>
+<tr>
+<td><code>[EOS]</code> / <code>&lt;/s&gt;</code></td>
+<td>End of sequence</td>
+<td>All models</td>
+</tr>
+<tr>
+<td><code>[PAD]</code></td>
+<td>Padding for batch alignment</td>
+<td>BERT, T5</td>
+</tr>
+<tr>
+<td><code>[UNK]</code></td>
+<td>Unknown token (byte-level BPE eliminates this)</td>
+<td>BERT, WordPiece</td>
+</tr>
+<tr>
+<td><code>&lt;|im_start|&gt;</code></td>
+<td>Chat message boundary start</td>
+<td>ChatGPT, Qwen</td>
+</tr>
+<tr>
+<td><code>&lt;|im_end|&gt;</code></td>
+<td>Chat message boundary end</td>
+<td>ChatGPT, Qwen</td>
+</tr>
+<tr>
+<td><code>&lt;|user|&gt;</code></td>
+<td>User turn marker</td>
+<td>Llama 3</td>
+</tr>
+<tr>
+<td><code>&lt;|assistant|&gt;</code></td>
+<td>Assistant turn marker</td>
+<td>Llama 3</td>
+</tr>
+</tbody>
+</table>
+<p>Special tokens are never split by BPE. They are matched exactly before the merge algorithm runs, replaced with their fixed ID, and the surrounding text is tokenized normally.</p>
+<h3>Chat Templates</h3>
+<p>This is where most people get confused and most implementations break.</p>
+<p>When you send messages to a chat model, the API accepts a list of messages:</p>
+<pre><code>[
+  {&quot;role&quot;: &quot;system&quot;, &quot;content&quot;: &quot;You are helpful.&quot;},
+  {&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;Hello&quot;},
+  {&quot;role&quot;: &quot;assistant&quot;, &quot;content&quot;: &quot;Hi there!&quot;}
+]
+</code></pre>
+<p>The model does not see JSON. It sees a flat token sequence. The chat template converts messages into that flat sequence using special tokens. Every model does this differently:</p>
+<pre><code>Llama 3:
+&lt;|begin_of_text|&gt;&lt;|start_header_id|&gt;system&lt;|end_header_id|&gt;
+
+You are helpful.&lt;|eot_id|&gt;&lt;|start_header_id|&gt;user&lt;|end_header_id|&gt;
+
+Hello&lt;|eot_id|&gt;&lt;|start_header_id|&gt;assistant&lt;|end_header_id|&gt;
+
+Hi there!&lt;|eot_id|&gt;
+
+ChatGPT:
+&lt;|im_start|&gt;system
+You are helpful.&lt;|im_end|&gt;
+&lt;|im_start|&gt;user
+Hello&lt;|im_end|&gt;
+&lt;|im_start|&gt;assistant
+Hi there!&lt;|im_end|&gt;
+</code></pre>
+<p>Get the template wrong and the model produces garbage. It was trained on one exact format. Any deviation -- a missing newline, a swapped token, an extra space -- puts the input outside the training distribution.</p>
+<h3>Speed</h3>
+<p>Python is too slow for production tokenization.</p>
+<p>tiktoken (OpenAI) is written in Rust with Python bindings. HuggingFace tokenizers is also Rust. SentencePiece is C++. These achieve 10-100x speedups over pure Python.</p>
+<p>For perspective: tokenizing 15 trillion tokens for Llama 3 pre-training at 1 million tokens per second (fast Python) would take 174 days. At 100 million tokens per second (Rust), it takes 1.7 days.</p>
+<p>You are building in Python to understand the algorithm. In production, you would use a compiled implementation and only touch the Python wrapper.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-c11d9d235f9c14462b95.png" alt="weight-tying 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<h3>Step 1: Byte-Level Encoding</h3>
+<p>The foundation. Convert any string into a sequence of bytes, map each byte to a printable character for display, and reverse the process.</p>
+<pre><code class="language-python">def bytes_to_tokens(text):
+    return list(text.encode(&quot;utf-8&quot;))
+
+def tokens_to_text(token_bytes):
+    return bytes(token_bytes).decode(&quot;utf-8&quot;, errors=&quot;replace&quot;)
+</code></pre>
+<p>Test on multilingual text to see the byte counts:</p>
+<pre><code class="language-python">texts = [
+    (&quot;English&quot;, &quot;hello&quot;),
+    (&quot;Chinese&quot;, &quot;你好&quot;),
+    (&quot;Emoji&quot;, &quot;🔥&quot;),
+    (&quot;Mixed&quot;, &quot;hello你好🔥&quot;),
+]
+
+for label, text in texts:
+    b = bytes_to_tokens(text)
+    print(f&quot;{label}: {len(text)} chars -&gt; {len(b)} bytes -&gt; {b}&quot;)
+</code></pre>
+<p>&quot;hello&quot; is 5 bytes. &quot;你好&quot; is 6 bytes (3 per character). The fire emoji is 4 bytes. The byte-level tokenizer does not care what language it is. Bytes are bytes.</p>
+<h3>Step 2: Pre-Tokenizer with Regex</h3>
+<p>Split text into chunks using the GPT-2 regex pattern. Each chunk gets tokenized independently by BPE.</p>
+<pre><code class="language-python">import re
+
+try:
+    import regex
+    GPT2_PATTERN = regex.compile(
+        r&quot;&quot;&quot;'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+&quot;&quot;&quot;
+    )
+except ImportError:
+    GPT2_PATTERN = re.compile(
+        r&quot;&quot;&quot;'(?:[sdmt]|ll|ve|re)| ?[a-zA-Z]+| ?[0-9]+| ?[^\s\w]+|\s+(?!\S)|\s+&quot;&quot;&quot;
+    )
+
+def pre_tokenize(text):
+    return [match.group() for match in GPT2_PATTERN.finditer(text)]
+</code></pre>
+<p>The <code>regex</code> module supports Unicode property escapes (<code>\p{L}</code> for letters, <code>\p{N}</code> for numbers). The standard library <code>re</code> module does not, so we fall back to ASCII character classes. For production multilingual tokenizers, install <code>regex</code>.</p>
+<p>Try it:</p>
+<pre><code class="language-python">print(pre_tokenize(&quot;Hello, world! Don't stop.&quot;))
+# [' Hello', ',', ' world', '!', &quot; Don&quot;, &quot;'t&quot;, ' stop', '.']
+</code></pre>
+<p>The leading space stays attached to the word. Contractions split at the apostrophe. Punctuation becomes its own chunk. BPE will never merge tokens across these boundaries.</p>
+<h3>Step 3: BPE on Byte Sequences</h3>
+<p>The core algorithm from Lesson 01, but now operating on pre-tokenized chunks independently.</p>
+<pre><code class="language-python">from collections import Counter
+
+def get_byte_pairs(chunks):
+    pairs = Counter()
+    for chunk in chunks:
+        byte_seq = list(chunk.encode(&quot;utf-8&quot;))
+        for i in range(len(byte_seq) - 1):
+            pairs[(byte_seq[i], byte_seq[i + 1])] += 1
+    return pairs
+
+def apply_merge(byte_seq, pair, new_id):
+    merged = []
+    i = 0
+    while i &lt; len(byte_seq):
+        if i &lt; len(byte_seq) - 1 and byte_seq[i] == pair[0] and byte_seq[i + 1] == pair[1]:
+            merged.append(new_id)
+            i += 2
+        else:
+            merged.append(byte_seq[i])
+            i += 1
+    return merged
+</code></pre>
+<h3>Step 4: Special Token Handling</h3>
+<p>Special tokens need exact matching and fixed IDs. They bypass BPE entirely.</p>
+<pre><code class="language-python">class SpecialTokenHandler:
+    def __init__(self):
+        self.special_tokens = {}
+        self.pattern = None
+
+    def add_token(self, token_str, token_id):
+        self.special_tokens[token_str] = token_id
+        escaped = [re.escape(t) for t in sorted(self.special_tokens.keys(), key=len, reverse=True)]
+        self.pattern = re.compile(&quot;|&quot;.join(escaped))
+
+    def split_with_specials(self, text):
+        if not self.pattern:
+            return [(text, False)]
+        parts = []
+        last_end = 0
+        for match in self.pattern.finditer(text):
+            if match.start() &gt; last_end:
+                parts.append((text[last_end:match.start()], False))
+            parts.append((match.group(), True))
+            last_end = match.end()
+        if last_end &lt; len(text):
+            parts.append((text[last_end:], False))
+        return parts
+</code></pre>
+<h3>Step 5: Full Tokenizer Class</h3>
+<p>Chain everything together: normalize, split on special tokens, pre-tokenize, BPE merge, map to IDs.</p>
+<pre><code class="language-python">import unicodedata
+
+class ProductionTokenizer:
+    def __init__(self):
+        self.merges = {}
+        self.vocab = {i: bytes([i]) for i in range(256)}
+        self.special_handler = SpecialTokenHandler()
+        self.next_id = 256
+
+    def normalize(self, text):
+        return unicodedata.normalize(&quot;NFKC&quot;, text)
+
+    def train(self, text, num_merges):
+        text = self.normalize(text)
+        chunks = pre_tokenize(text)
+        chunk_bytes = [list(chunk.encode(&quot;utf-8&quot;)) for chunk in chunks]
+
+        for i in range(num_merges):
+            pairs = Counter()
+            for seq in chunk_bytes:
+                for j in range(len(seq) - 1):
+                    pairs[(seq[j], seq[j + 1])] += 1
+            if not pairs:
+                break
+            best = max(pairs, key=pairs.get)
+            new_id = self.next_id
+            self.next_id += 1
+            self.merges[best] = new_id
+            self.vocab[new_id] = self.vocab[best[0]] + self.vocab[best[1]]
+            chunk_bytes = [apply_merge(seq, best, new_id) for seq in chunk_bytes]
+
+    def add_special_token(self, token_str):
+        token_id = self.next_id
+        self.next_id += 1
+        self.special_handler.add_token(token_str, token_id)
+        self.vocab[token_id] = token_str.encode(&quot;utf-8&quot;)
+        return token_id
+
+    def encode(self, text):
+        text = self.normalize(text)
+        parts = self.special_handler.split_with_specials(text)
+        all_ids = []
+        for part_text, is_special in parts:
+            if is_special:
+                all_ids.append(self.special_handler.special_tokens[part_text])
+            else:
+                for chunk in pre_tokenize(part_text):
+                    byte_seq = list(chunk.encode(&quot;utf-8&quot;))
+                    for pair, new_id in self.merges.items():
+                        byte_seq = apply_merge(byte_seq, pair, new_id)
+                    all_ids.extend(byte_seq)
+        return all_ids
+
+    def decode(self, ids):
+        byte_parts = []
+        for token_id in ids:
+            if token_id in self.vocab:
+                byte_parts.append(self.vocab[token_id])
+        return b&quot;&quot;.join(byte_parts).decode(&quot;utf-8&quot;, errors=&quot;replace&quot;)
+
+    def vocab_size(self):
+        return len(self.vocab)
+</code></pre>
+<h3>Step 6: Multilingual Test</h3>
+<p>The real test. Throw English, Chinese, emoji, and code at it.</p>
+<pre><code class="language-python">corpus = (
+    &quot;The quick brown fox jumps over the lazy dog. &quot;
+    &quot;The quick brown fox runs through the forest. &quot;
+    &quot;Machine learning models process natural language. &quot;
+    &quot;Deep learning transforms how we build software. &quot;
+    &quot;def train(model, data): return model.fit(data) &quot;
+    &quot;def predict(model, x): return model(x) &quot;
+)
+
+tok = ProductionTokenizer()
+tok.train(corpus, num_merges=50)
+
+bos = tok.add_special_token(&quot;&lt;|begin|&gt;&quot;)
+eos = tok.add_special_token(&quot;&lt;|end|&gt;&quot;)
+
+test_texts = [
+    &quot;The quick brown fox.&quot;,
+    &quot;你好世界&quot;,
+    &quot;Hello 🌍 World&quot;,
+    &quot;def foo(x): return x + 1&quot;,
+    f&quot;&lt;|begin|&gt;Hello&lt;|end|&gt;&quot;,
+]
+
+for text in test_texts:
+    ids = tok.encode(text)
+    decoded = tok.decode(ids)
+    print(f&quot;Input:   {text}&quot;)
+    print(f&quot;Tokens:  {len(ids)} ids&quot;)
+    print(f&quot;Decoded: {decoded}&quot;)
+    print()
+</code></pre>
+<p>Chinese characters produce 3 bytes each. The emoji produces 4 bytes. None of these crash the tokenizer. None produce unknown tokens. That is the power of byte-level BPE.</p>
+<h2>Use It</h2>
+<h3>Comparing Real Tokenizers</h3>
+<p>Load the actual tokenizers from Llama 3, GPT-4, and Mistral. See how each handles the same multilingual paragraph.</p>
+<pre><code class="language-python">import tiktoken
+
+gpt4_enc = tiktoken.get_encoding(&quot;cl100k_base&quot;)
+
+test_paragraph = &quot;Machine learning is powerful. 机器学习很强大。 L'apprentissage automatique est puissant. 🤖💪&quot;
+
+tokens = gpt4_enc.encode(test_paragraph)
+pieces = [gpt4_enc.decode([t]) for t in tokens]
+print(f&quot;GPT-4 ({len(tokens)} tokens): {pieces}&quot;)
+</code></pre>
+<pre><code class="language-python">from transformers import AutoTokenizer
+
+llama_tok = AutoTokenizer.from_pretrained(&quot;meta-llama/Meta-Llama-3-8B&quot;)
+mistral_tok = AutoTokenizer.from_pretrained(&quot;mistralai/Mistral-7B-v0.1&quot;)
+
+for name, tok in [(&quot;Llama 3&quot;, llama_tok), (&quot;Mistral&quot;, mistral_tok)]:
+    tokens = tok.encode(test_paragraph)
+    pieces = tok.convert_ids_to_tokens(tokens)
+    print(f&quot;{name} ({len(tokens)} tokens): {pieces[:20]}...&quot;)
+</code></pre>
+<p>You will see different token counts for the same text. Llama 3 with 128K vocabulary is more aggressive at merging common patterns. GPT-4 with 100K sits in the middle. Mistral with 32K produces more tokens but has a smaller embedding layer.</p>
+<p>The tradeoff is always the same: larger vocabulary means shorter sequences but more parameters.</p>
+<h2>Ship It</h2>
+<p>This lesson produces a prompt for building and debugging production tokenizers. See <code>outputs/prompt-tokenizer-builder.md</code>.</p>
+<h2>Exercises</h2>
+<ol>
+<li><strong>Easy:</strong> Add a <code>get_token_bytes(id)</code> method that shows the raw bytes for any token ID. Use it to inspect what your most common merged tokens actually represent.</li>
+<li><strong>Medium:</strong> Implement the Llama-style pre-tokenizer that splits on whitespace and digits but keeps leading spaces. Compare its vocabulary with the GPT-2 regex approach on the same corpus.</li>
+<li><strong>Hard:</strong> Add a chat template method that takes a list of <code>{&quot;role&quot;: ..., &quot;content&quot;: ...}</code> messages and produces the correct token sequence for the Llama 3 chat format. Test it against the HuggingFace implementation.</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Byte-level BPE</td>
+<td>&quot;Tokenizer that works on bytes&quot;</td>
+<td>BPE with a base vocabulary of 256 byte values -- handles any input without unknown tokens</td>
+</tr>
+<tr>
+<td>Pre-tokenization</td>
+<td>&quot;Splitting before BPE&quot;</td>
+<td>Regex or rule-based splitting that prevents BPE from merging across word boundaries</td>
+</tr>
+<tr>
+<td>NFKC normalization</td>
+<td>&quot;Unicode cleanup&quot;</td>
+<td>Canonical decomposition followed by compatibility composition -- &quot;fi&quot; ligature becomes &quot;fi&quot;, fullwidth &quot;A&quot; becomes &quot;A&quot;</td>
+</tr>
+<tr>
+<td>Chat template</td>
+<td>&quot;How messages become tokens&quot;</td>
+<td>The exact format for converting a list of role/content messages into a flat token sequence -- model-specific and must match training format</td>
+</tr>
+<tr>
+<td>Special tokens</td>
+<td>&quot;Control tokens&quot;</td>
+<td>Reserved token IDs that bypass BPE -- [BOS], [EOS], [PAD], chat markers -- matched exactly before merge</td>
+</tr>
+<tr>
+<td>Fertility</td>
+<td>&quot;Tokens per word&quot;</td>
+<td>Ratio of output tokens to input words -- 1.3 for English in GPT-4, 2-3 for Korean, higher means wasted context</td>
+</tr>
+<tr>
+<td>tiktoken</td>
+<td>&quot;OpenAI tokenizer&quot;</td>
+<td>Rust BPE implementation with Python bindings -- 10-100x faster than pure Python</td>
+</tr>
+<tr>
+<td>Merge table</td>
+<td>&quot;The vocabulary&quot;</td>
+<td>Ordered list of byte-pair merges learned during training -- this IS the tokenizer's learned knowledge</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://github.com/openai/tiktoken" rel="noreferrer" data-network="true">OpenAI tiktoken source <small>↗ 需要联网</small></a> -- Rust BPE implementation used by GPT-3.5/4</li>
+<li><a href="https://github.com/huggingface/tokenizers" rel="noreferrer" data-network="true">HuggingFace tokenizers <small>↗ 需要联网</small></a> -- Rust tokenizer library supporting BPE, WordPiece, Unigram</li>
+<li><a href="https://arxiv.org/abs/2407.21783" rel="noreferrer" data-network="true">Llama 3 paper (Meta, 2024) <small>↗ 需要联网</small></a> -- details on 128K vocabulary and tokenizer training</li>
+<li><a href="https://arxiv.org/abs/1808.06226" rel="noreferrer" data-network="true">SentencePiece (Kudo &amp; Richardson, 2018) <small>↗ 需要联网</small></a> -- language-agnostic tokenization</li>
+<li><a href="https://github.com/openai/gpt-2/blob/master/src/encoder.py" rel="noreferrer" data-network="true">GPT-2 tokenizer source <small>↗ 需要联网</small></a> -- the original byte-to-Unicode mapping</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-10-llms-from-scratch--02-building-a-tokenizer.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-10-llms-from-scratch--02-building-a-tokenizer.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/10-llms-from-scratch/02-building-a-tokenizer/code/main.py">phases/10-llms-from-scratch/02-building-a-tokenizer/code/main.py</a><details><summary>查看原始文本</summary><pre><code>import re
+import unicodedata
+from collections import Counter
+
+
+try:
+    import regex
+    GPT2_PATTERN = regex.compile(
+        r&quot;&quot;&quot;&#39;(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+&quot;&quot;&quot;
+    )
+except ImportError:
+    GPT2_PATTERN = re.compile(
+        r&quot;&quot;&quot;&#39;(?:[sdmt]|ll|ve|re)| ?[a-zA-Z]+| ?[0-9]+| ?[^\s\w]+|\s+(?!\S)|\s+&quot;&quot;&quot;
+    )
+
+
+def pre_tokenize(text):
+    return [match.group() for match in GPT2_PATTERN.finditer(text)]
+
+
+def apply_merge(byte_seq, pair, new_id):
+    merged = []
+    i = 0
+    while i &lt; len(byte_seq):
+        if i &lt; len(byte_seq) - 1 and byte_seq[i] == pair[0] and byte_seq[i + 1] == pair[1]:
+            merged.append(new_id)
+            i += 2
+        else:
+            merged.append(byte_seq[i])
+            i += 1
+    return merged
+
+
+class SpecialTokenHandler:
+    def __init__(self):
+        self.special_tokens = {}
+        self.pattern = None
+
+    def add_token(self, token_str, token_id):
+        self.special_tokens[token_str] = token_id
+        escaped = [re.escape(t) for t in sorted(self.special_tokens.keys(), key=len, reverse=True)]
+        self.pattern = re.compile(&quot;|&quot;.join(escaped))
+
+    def split_with_specials(self, text):
+        if not self.pattern:
+            return [(text, False)]
+        parts = []
+        last_end = 0
+        for match in self.pattern.finditer(text):
+            if match.start() &gt; last_end:
+                parts.append((text[last_end:match.start()], False))
+            parts.append((match.group(), True))
+            last_end = match.end()
+        if last_end &lt; len(text):
+            parts.append((text[last_end:], False))
+        return parts
+
+
+class ProductionTokenizer:
+    def __init__(self):
+        self.merges = {}
+        self.vocab = {i: bytes([i]) for i in range(256)}
+        self.special_handler = SpecialTokenHandler()
+        self.next_id = 256
+
+    def normalize(self, text):
+        return unicodedata.normalize(&quot;NFKC&quot;, text)
+
+    def train(self, text, num_merges):
+        text = self.normalize(text)
+        chunks = pre_tokenize(text)
+        chunk_bytes = [list(chunk.encode(&quot;utf-8&quot;)) for chunk in chunks]
+
+        for i in range(num_merges):
+            pairs = Counter()
+            for seq in chunk_bytes:
+                for j in range(len(seq) - 1):
+                    pairs[(seq[j], seq[j + 1])] += 1
+            if not pairs:
+                break
+            best = max(pairs, key=pairs.get)
+            new_id = self.next_id
+            self.next_id += 1
+            self.merges[best] = new_id
+            self.vocab[new_id] = self.vocab[best[0]] + self.vocab[best[1]]
+            chunk_bytes = [apply_merge(seq, best, new_id) for seq in chunk_bytes]
+            merged_display = self.vocab[new_id]
+            print(f&quot;Merge {i + 1}: ({best[0]}, {best[1]}) -&gt; {new_id} = {merged_display}&quot;)
+
+    def add_special_token(self, token_str):
+        token_id = self.next_id
+        self.next_id += 1
+        self.special_handler.add_token(token_str, token_id)
+        self.vocab[token_id] = token_str.encode(&quot;utf-8&quot;)
+        return token_id
+
+    def encode(self, text):
+        text = self.normalize(text)
+        parts = self.special_handler.split_with_specials(text)
+        all_ids = []
+        for part_text, is_special in parts:
+            if is_special:
+                all_ids.append(self.special_handler.special_tokens[part_text])
+            else:
+                for chunk in pre_tokenize(part_text):
+                    byte_seq = list(chunk.encode(&quot;utf-8&quot;))
+                    for pair, new_id in self.merges.items():
+                        byte_seq = apply_merge(byte_seq, pair, new_id)
+                    all_ids.extend(byte_seq)
+        return all_ids
+
+    def decode(self, ids):
+        byte_parts = []
+        for token_id in ids:
+            if token_id in self.vocab:
+                byte_parts.append(self.vocab[token_id])
+        return b&quot;&quot;.join(byte_parts).decode(&quot;utf-8&quot;, errors=&quot;replace&quot;)
+
+    def vocab_size(self):
+        return len(self.vocab)
+
+    def get_token_bytes(self, token_id):
+        return self.vocab.get(token_id, b&quot;&lt;?&gt;&quot;)
+
+
+def demo_byte_encoding():
+    print(&quot;=&quot; * 60)
+    print(&quot;Byte-Level Encoding&quot;)
+    print(&quot;=&quot; * 60)
+
+    texts = [
+        (&quot;English&quot;, &quot;hello&quot;),
+        (&quot;Chinese&quot;, &quot;你好&quot;),
+        (&quot;Japanese&quot;, &quot;こんにちは&quot;),
+        (&quot;Emoji&quot;, &quot;🔥🌍&quot;),
+        (&quot;Mixed&quot;, &quot;hello你好🔥&quot;),
+        (&quot;Code&quot;, &quot;def f(x):&quot;),
+    ]
+
+    for label, text in texts:
+        b = list(text.encode(&quot;utf-8&quot;))
+        print(f&quot;{label:10s}: {len(text):2d} chars -&gt; {len(b):2d} bytes -&gt; {b[:16]}{&#39;...&#39; if len(b) &gt; 16 else &#39;&#39;}&quot;)
+
+
+def demo_pre_tokenization():
+    print(&quot;\n&quot; + &quot;=&quot; * 60)
+    print(&quot;Pre-Tokenization (GPT-2 Regex)&quot;)
+    print(&quot;=&quot; * 60)
+
+    texts = [
+        &quot;Hello, world! Don&#39;t stop.&quot;,
+        &quot;def train(model, data):&quot;,
+        &quot;The price is $3.14 per unit.&quot;,
+        &quot;  multiple   spaces   here  &quot;,
+    ]
+
+    for text in texts:
+        chunks = pre_tokenize(text)
+        print(f&quot;\n&#39;{text}&#39;&quot;)
+        print(f&quot;  -&gt; {chunks}&quot;)
+
+
+def demo_full_tokenizer():
+    print(&quot;\n&quot; + &quot;=&quot; * 60)
+    print(&quot;Training Production Tokenizer&quot;)
+    print(&quot;=&quot; * 60)
+
+    corpus = (
+        &quot;The quick brown fox jumps over the lazy dog. &quot;
+        &quot;The quick brown fox runs through the forest. &quot;
+        &quot;Machine learning models process natural language. &quot;
+        &quot;Machine learning transforms how we build software. &quot;
+        &quot;Deep learning models need large datasets to train. &quot;
+        &quot;def train(model, data): return model.fit(data) &quot;
+        &quot;def predict(model, x): return model(x) &quot;
+        &quot;for i in range(100): print(i) &quot;
+    )
+
+    tok = ProductionTokenizer()
+    tok.train(corpus, num_merges=50)
+
+    bos_id = tok.add_special_token(&quot;&lt;|begin|&gt;&quot;)
+    eos_id = tok.add_special_token(&quot;&lt;|end|&gt;&quot;)
+    user_id = tok.add_special_token(&quot;&lt;|user|&gt;&quot;)
+    asst_id = tok.add_special_token(&quot;&lt;|assistant|&gt;&quot;)
+
+    print(f&quot;\nVocab size: {tok.vocab_size()}&quot;)
+    print(f&quot;Special tokens: &lt;|begin|&gt;={bos_id}, &lt;|end|&gt;={eos_id}, &lt;|user|&gt;={user_id}, &lt;|assistant|&gt;={asst_id}&quot;)
+
+    print(&quot;\n&quot; + &quot;=&quot; * 60)
+    print(&quot;Encoding Tests&quot;)
+    print(&quot;=&quot; * 60)
+
+    test_texts = [
+        &quot;The quick brown fox.&quot;,
+        &quot;你好世界 Hello World&quot;,
+        &quot;🔥🌍🚀&quot;,
+        &quot;def foo(x): return x + 1&quot;,
+        &quot;&lt;|begin|&gt;&lt;|user|&gt;Hello&lt;|end|&gt;&quot;,
+        &quot;Machine learning is powerful.&quot;,
+    ]
+
+    for text in test_texts:
+        ids = tok.encode(text)
+        decoded = tok.decode(ids)
+        raw_bytes = len(text.encode(&quot;utf-8&quot;))
+        print(f&quot;\nInput:   {text}&quot;)
+        print(f&quot;IDs:     {ids[:20]}{&#39;...&#39; if len(ids) &gt; 20 else &#39;&#39;}&quot;)
+        print(f&quot;Tokens:  {len(ids)} (from {raw_bytes} bytes, ratio: {len(ids)/raw_bytes:.2f})&quot;)
+        print(f&quot;Decoded: {decoded}&quot;)
+        roundtrip = &quot;PASS&quot; if decoded == text else &quot;FAIL&quot;
+        print(f&quot;Round-trip: {roundtrip}&quot;)
+
+
+def demo_tiktoken_comparison():
+    try:
+        import tiktoken
+    except ImportError:
+        print(&quot;\ntiktoken not installed. Run: pip install tiktoken&quot;)
+        return
+
+    print(&quot;\n&quot; + &quot;=&quot; * 60)
+    print(&quot;Comparison with tiktoken (GPT-4)&quot;)
+    print(&quot;=&quot; * 60)
+
+    enc = tiktoken.get_encoding(&quot;cl100k_base&quot;)
+
+    test_paragraph = &quot;Machine learning is powerful. 机器学习很强大。 L&#39;apprentissage automatique est puissant. 🤖💪&quot;
+
+    tokens = enc.encode(test_paragraph)
+    pieces = [enc.decode([t]) for t in tokens]
+
+    print(f&quot;\nInput: {test_paragraph}&quot;)
+    print(f&quot;GPT-4 tokens ({len(tokens)}): {pieces}&quot;)
+
+    languages = [
+        (&quot;English&quot;, &quot;The quick brown fox jumps over the lazy dog.&quot;),
+        (&quot;Chinese&quot;, &quot;快速的棕色狐狸跳过了懒狗。&quot;),
+        (&quot;Japanese&quot;, &quot;素早い茶色のキツネが怠け者の犬を飛び越えた。&quot;),
+        (&quot;Korean&quot;, &quot;빠른 갈색 여우가 게으른 개를 뛰어넘었다.&quot;),
+        (&quot;Code&quot;, &quot;def quicksort(arr): return sorted(arr)&quot;),
+        (&quot;Emoji&quot;, &quot;🎉🎊🎈🎁🎂🎄🎃🎆🎇✨&quot;),
+    ]
+
+    print(f&quot;\n{&#39;Language&#39;:&lt;10} {&#39;Chars&#39;:&lt;6} {&#39;Tokens&#39;:&lt;7} {&#39;Fertility&#39;:&lt;10}&quot;)
+    print(&quot;-&quot; * 35)
+    for label, text in languages:
+        toks = enc.encode(text)
+        words = len(text.split())
+        fertility = len(toks) / max(words, 1)
+        print(f&quot;{label:&lt;10} {len(text):&lt;6} {len(toks):&lt;7} {fertility:&lt;10.2f}&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    demo_byte_encoding()
+    demo_pre_tokenization()
+    demo_full_tokenizer()
+    demo_tiktoken_comparison()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/10-llms-from-scratch/02-building-a-tokenizer/outputs/prompt-tokenizer-builder.md">phases/10-llms-from-scratch/02-building-a-tokenizer/outputs/prompt-tokenizer-builder.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: prompt-tokenizer-builder
+description: Build and debug production-quality tokenizers for LLM projects
+version: 1.0.0
+phase: 10
+lesson: 2
+tags: [tokenizer, bpe, byte-level, special-tokens, chat-template, multilingual]
+---
+
+# Production Tokenizer Builder
+
+When building or debugging a tokenizer for an LLM project, follow this framework.
+
+## Pipeline Checklist
+
+Every production tokenizer needs these five stages. If one is missing, you will hit edge cases in production.
+
+1. **Normalize** -- Apply NFKC Unicode normalization. This collapses ligatures (&quot;fi&quot; -&gt; &quot;fi&quot;), normalizes fullwidth characters, and standardizes whitespace. Skip this and the same word gets different token IDs depending on how it was typed.
+
+2. **Pre-Tokenize** -- Split text into chunks before BPE. Use GPT-2&#39;s regex pattern for English-centric models. Use SentencePiece&#39;s raw-byte approach for multilingual models. The choice determines whether BPE can merge across word boundaries.
+
+3. **BPE Merge** -- Apply the learned merge table to byte sequences within each chunk. The merge table IS the tokenizer&#39;s learned knowledge. Everything else is plumbing.
+
+4. **Special Token Injection** -- Match special tokens exactly before BPE runs. [BOS], [EOS], [PAD], chat template markers get fixed IDs. They never participate in merges.
+
+5. **ID Mapping** -- Convert token strings to integers. The model sees integers only.
+
+## Debugging Tokenizer Issues
+
+**Symptom: model produces garbage on chat input**
+- Check the chat template. Every model has a different format. Llama 3 uses `&lt;|start_header_id|&gt;` markers. ChatGPT uses `&lt;|im_start|&gt;` markers. A wrong template puts input outside the training distribution.
+
+**Symptom: non-English text uses too many tokens**
+- Check fertility (tokens per word). Above 2.0 means the tokenizer wastes context window on that language. Solutions: retrain with more multilingual data, increase vocabulary size, or use SentencePiece with Unigram.
+
+**Symptom: numbers and arithmetic fail**
+- Check how digits are tokenized. &quot;1234&quot; as one token means the model cannot do digit-level operations. Split digits individually during pre-tokenization.
+
+**Symptom: code tokens are inefficient**
+- Check how indentation is handled. GPT-2&#39;s tokenizer wastes tokens on spaces. Codex and StarCoder use special indentation tokens (4 spaces = 1 token).
+
+## Vocabulary Size Decision
+
+- 32K tokens: single-language, small model, limited compute. Embedding layer is 32K * d_model parameters.
+- 50K-64K: multilingual or code-heavy. Good balance for most projects.
+- 100K+ (GPT-4, Llama 3): only with massive training data. Shorter sequences but 100K * d_model embedding parameters.
+
+For a 4096-dimensional model: 32K vocab = 131M embedding params. 128K vocab = 524M embedding params. That is 400M parameters just in the embedding layer.
+
+## Speed Requirements
+
+- Training data tokenization: use Rust-backed libraries (tiktoken, HuggingFace tokenizers). Pure Python is 10-100x slower.
+- Inference tokenization: latency matters less (single sequence), but still use compiled implementations.
+- Benchmark: tokenize 1GB of text and measure wall clock time. If it takes more than 60 seconds, switch to a Rust backend.
+
+## Chat Template Validation
+
+Before deploying any chat model, verify the template:
+
+1. Encode a known conversation with the tokenizer
+2. Decode it back to text
+3. Compare character-by-character with the expected format from the model&#39;s documentation
+4. Pay attention to: newlines after header tokens, spaces before content, end-of-turn markers
+5. Test edge cases: empty system message, very long user message, multiple assistant turns
+
+Getting the chat template wrong is the most common source of degraded chat model performance.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. Why does a basic BPE tokenizer break on multilingual or code input?</legend><label class="option"><input type="radio" name="q0" value="0"> BPE only works on ASCII</label><label class="option"><input type="radio" name="q0" value="1"> BPE is inherently monolingual</label><label class="option"><input type="radio" name="q0" value="2"> Multilingual text can&#39;t be tokenized</label><label class="option"><input type="radio" name="q0" value="3"> Without proper Unicode handling, byte fallback, and pre-tokenization regex, it produces incorrect or inefficient token sequences</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. What is the role of pre-tokenization regex in a production tokenizer?</legend><label class="option"><input type="radio" name="q1" value="0"> It splits text at word boundaries before BPE merges, preventing merges across spaces and word boundaries</label><label class="option"><input type="radio" name="q1" value="1"> It compresses whitespace</label><label class="option"><input type="radio" name="q1" value="2"> It converts text to lowercase</label><label class="option"><input type="radio" name="q1" value="3"> It removes punctuation</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. What is a special token and why are tokenizers designed to handle them?</legend><label class="option"><input type="radio" name="q2" value="0"> Reserved tokens like &lt;|endoftext|&gt; or [PAD] that control model behavior and must be encoded as single, specific IDs</label><label class="option"><input type="radio" name="q2" value="1"> Tokens with the highest embedding values</label><label class="option"><input type="radio" name="q2" value="2"> Tokens used only during evaluation</label><label class="option"><input type="radio" name="q2" value="3"> Tokens that appear frequently</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. How do you evaluate whether a custom tokenizer is good?</legend><label class="option"><input type="radio" name="q3" value="0"> By measuring compression ratio (tokens per character) across diverse text and comparing to established tokenizers like tiktoken</label><label class="option"><input type="radio" name="q3" value="1"> By checking if it can tokenize your name</label><label class="option"><input type="radio" name="q3" value="2"> By measuring encoding speed only</label><label class="option"><input type="radio" name="q3" value="3"> By counting the vocabulary size</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. Why is byte-level BPE preferred over word-level tokenization for modern LLMs?</legend><label class="option"><input type="radio" name="q4" value="0"> Word-level tokenization is more accurate</label><label class="option"><input type="radio" name="q4" value="1"> It can represent any input without unknown tokens while still learning efficient subword merges for common patterns</label><label class="option"><input type="radio" name="q4" value="2"> It produces smaller vocabularies</label><label class="option"><input type="radio" name="q4" value="3"> It&#39;s faster</label><p data-feedback="4"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/10-llms-from-scratch/01-tokenizers/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/10-llms-from-scratch/03-data-pipelines/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/10-llms-from-scratch/02-building-a-tokenizer/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

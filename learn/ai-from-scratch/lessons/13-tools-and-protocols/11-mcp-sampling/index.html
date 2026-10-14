@@ -1,0 +1,1134 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>采样移民和无国籍MRTR · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-13-tools-and-protocols" data-lesson="13-tools-and-protocols/11-mcp-sampling" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/13-tools-and-protocols/">工具与协议</a> / LESSON 11</p><h1 class="lesson-title">采样移民和无国籍MRTR</h1><p>MCP Model Input: Sampling Migration and Stateless MRTR</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>采样移民和无国籍MRTR</h1>
+<blockquote>
+<p>通过MCP 2026-07-28将新设计的样本取消,并删除服务器到客户端请求道.如果现有工作流仍然需要客户端的模型,服务器将返回一个 <code>input_required</code>结果是,客户端将原始请求重新尝试,使用模型输出.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 13 · 07 (MCP server), Phase 13 · 10 (resources and prompts)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>解释为什么MCP 2026-07-28中采样已过时,并选择新服务器的直接模型集成默认.</li>
+<li>实现兼容性工作流程<code>sampling/createMessage</code>通过多次回路请求 (MRTR).</li>
+<li>将协议修改和客户端功能放入每个请求中<code>_meta</code>它们是什么?</li>
+<li>返回<code>resultType: &quot;input_required&quot;</code>通过新的JSON-RPCID重新尝试原始方法.</li>
+<li>保护完整性<code>requestState</code>并且将其绑定到本,方法,论点和过期.</li>
+<li>附带模型辅助循环,具有能力检查,批准,响应验证和圆的限制.</li>
+</ul>
+<h2>议定书前的决定</h2>
+<p>工具如<code>summarize_repo</code>需要两种工作:</p>
+<ol>
+<li>确定性工作:列表文件,阅读允许文件,验证路径和组装内容.</li>
+<li>模型工作:选择代表文件并合成总结.</li>
+</ol>
+<p>现在你有两个有效的架构.</p>
+<h3>新服务器:直接与模型提供商集成</h3>
+<p>服务器拥有模型选择,凭证,预算,重试和可观测性.它返回一个普通 <code>tools/call</code>结果对MCP客户.</p>
+<p>当服务器已经是一个托管服务或预测模型行为比使用托管模型更重要时,选择此.</p>
+<h3>现有样本工作流程:将其迁移到MRTR</h3>
+<p>针对2026-07-28的服务器不能发送直播<code>sampling/createMessage</code>要求返回客户.<code>InputRequiredResult</code>现在,我们要去.</p>
+<p>选择这种兼容性路径只有在使用客户端模型时,并且凭证是真正的产品要求.记录一个删除计划,因为新的实现不应该采用过时的样本.</p>
+<h2>无国籍合同</h2>
+<p>2026年7月份的协议没有<code>initialize</code>交换,没有<code>notifications/initialized</code>没有.<code>Mcp-Session-Id</code>每个请求都包含了以前在握手中生活的信息:</p>
+<pre><code class="language-json">{
+  &quot;jsonrpc&quot;: &quot;2.0&quot;,
+  &quot;id&quot;: 1,
+  &quot;method&quot;: &quot;tools/call&quot;,
+  &quot;params&quot;: {
+    &quot;name&quot;: &quot;summarize_repo&quot;,
+    &quot;arguments&quot;: {&quot;audience&quot;: &quot;developer&quot;},
+    &quot;_meta&quot;: {
+      &quot;io.modelcontextprotocol/protocolVersion&quot;: &quot;2026-07-28&quot;,
+      &quot;io.modelcontextprotocol/clientCapabilities&quot;: {&quot;sampling&quot;: {}},
+      &quot;io.modelcontextprotocol/clientInfo&quot;: {
+        &quot;name&quot;: &quot;lesson-client&quot;,
+        &quot;version&quot;: &quot;1.0.0&quot;
+      }
+    }
+  }
+}
+</code></pre>
+<p>服务器验证每一个请求的修改. 缺失或无字符串版本是无效的参数,<code>-32602</code>没有支持的字符串返回<code>-32022</code>具有准确的数据<code>{&quot;supported&quot;:[&quot;2026-07-28&quot;],&quot;requested&quot;:&quot;&lt;client version&gt;&quot;}</code>缺失的样本能力返回<code>-32021</code>随着<code>data.requiredCapabilities</code>设置为<code>{&quot;sampling&quot;:{}}</code>现在,我们要去.</p>
+<p>没有JSON-RPC的封面<code>id</code>接收器可能会处理它,但它不会发出成功响应或错误响应.<code>202 Accepted</code>没有接受通知的机构.</p>
+<p>服务器还实现了<code>server/discover</code>准确的<code>supportedVersions</code>关键,能力,<code>ttlMs</code>其他<code>cacheScope</code>为了让客户端能够在调用工具之前学习和缓存服务器合同.<code>tools</code>服务器也执行强制性<code>tools/list</code>它是决定性的.<code>summarize_repo</code>描述符包含一个有效的对象<code>inputSchema</code>现在<code>resultType: &quot;complete&quot;</code>服务器身份元数据,以及公共缓存提示.</p>
+<p>每一个成功的现代结果都有一个差异:</p>
+<ul>
+<li><code>resultType: &quot;complete&quot;</code>代表行动结束.</li>
+<li><code>resultType: &quot;input_required&quot;</code>客户必须满足嵌入式请求,并再次尝试.</li>
+<li>扩展可能定义其他结果类型. 任务扩展添加 <code>&quot;task&quot;</code>在第13课.</li>
+</ul>
+<h2>一轮MRT</h2>
+<p>服务器无法在处理请求时调用客户端.</p>
+<pre><code class="language-json">{
+  &quot;jsonrpc&quot;: &quot;2.0&quot;,
+  &quot;id&quot;: 1,
+  &quot;result&quot;: {
+    &quot;resultType&quot;: &quot;input_required&quot;,
+    &quot;inputRequests&quot;: {
+      &quot;pick_files&quot;: {
+        &quot;method&quot;: &quot;sampling/createMessage&quot;,
+        &quot;params&quot;: {
+          &quot;messages&quot;: [
+            {
+              &quot;role&quot;: &quot;user&quot;,
+              &quot;content&quot;: {
+                &quot;type&quot;: &quot;text&quot;,
+                &quot;text&quot;: &quot;Choose three representative files and return a JSON array.&quot;
+              }
+            }
+          ],
+          &quot;systemPrompt&quot;: &quot;Return only the requested value.&quot;,
+          &quot;modelPreferences&quot;: {
+            &quot;costPriority&quot;: 0.8,
+            &quot;intelligencePriority&quot;: 0.2
+          },
+          &quot;maxTokens&quot;: 400
+        }
+      }
+    },
+    &quot;requestState&quot;: &quot;opaque-integrity-protected-value&quot;
+  }
+}
+</code></pre>
+<p>客户端验证它支持采样,应用其批准和模型政策,并获得模型响应.然后它发送一个新的请求,使用不同的JSON-RPC id:</p>
+<pre><code class="language-json">{
+  &quot;jsonrpc&quot;: &quot;2.0&quot;,
+  &quot;id&quot;: 2,
+  &quot;method&quot;: &quot;tools/call&quot;,
+  &quot;params&quot;: {
+    &quot;name&quot;: &quot;summarize_repo&quot;,
+    &quot;arguments&quot;: {&quot;audience&quot;: &quot;developer&quot;},
+    &quot;inputResponses&quot;: {
+      &quot;pick_files&quot;: {
+        &quot;role&quot;: &quot;assistant&quot;,
+        &quot;content&quot;: {
+          &quot;type&quot;: &quot;text&quot;,
+          &quot;text&quot;: &quot;[\&quot;README.md\&quot;, \&quot;server.py\&quot;, \&quot;docs/intro.md\&quot;]&quot;
+        },
+        &quot;model&quot;: &quot;host-model&quot;,
+        &quot;stopReason&quot;: &quot;endTurn&quot;
+      }
+    },
+    &quot;requestState&quot;: &quot;opaque-integrity-protected-value&quot;,
+    &quot;_meta&quot;: {
+      &quot;io.modelcontextprotocol/protocolVersion&quot;: &quot;2026-07-28&quot;,
+      &quot;io.modelcontextprotocol/clientCapabilities&quot;: {&quot;sampling&quot;: {}}
+    }
+  }
+}
+</code></pre>
+<p>复试不是协议会议的延续,而是重复原始方法和参数的新请求,只添加当前轮的参数.<code>inputResponses</code>声的声音<code>requestState</code>字节对字节.</p>
+<p>只有在 <code>tools/call</code>现在<code>prompts/get</code>其他<code>resources/read</code>服务器不得返回<code>input_required</code>没有相关的方法.</p>
+<h2>多圆形状态</h2>
+<p>这一课需要两个模式:</p>
+<ol>
+<li><code>pick_files</code>返回一个JSON阵列.</li>
+<li><code>summary</code>返回最后的散文.</li>
+</ol>
+<p>每次重试只包含了该轮回复.因此服务器将阶段和验证的中间数据放入下一个轮.<code>requestState</code>现在,我们要去.</p>
+<p>通过使用一个原始的相位名称,将状态绑定到:</p>
+<ul>
+<li>证实的资本,非自报 <code>clientInfo</code>其他</li>
+<li>产品来源方法;</li>
+<li>关于本案的论点的摘要;</li>
+<li>短期的期限;</li>
+<li>现阶段和验证的中间值.</li>
+</ul>
+<p>使用HMAC,如果不需要保密.使用验证加密,如果客户端不能读取状态.拒绝错误的签名,过期值,改变主题或改变参数.<code>-32602</code>现在,我们要去.</p>
+<p>客户不得分析或修改<code>requestState</code>唯一的任务是重试时回声.</p>
+<h2>模型偏好是提示</h2>
+<p><code>costPriority</code>现在<code>speedPriority</code>其他<code>intelligencePriority</code>客户可能会忽略它们,因为客户拥有模型政策.</p>
+<p>保持<code>includeContext</code>在<code>&quot;none&quot;</code>如果您保留已旧的样本流量.其他语境模式增加泄漏风险,本身已过时.请通过请求中最小明确的语境.</p>
+<h2>安全变化</h2>
+<p>客户是嵌入式样本请求的信任界限.</p>
+<ul>
+<li>显示用户在政策需要批准时服务器要求模型做什么.</li>
+<li>通过MRT,一个恶意服务器可以创建一个模型支出循环.</li>
+<li>在使用它作为文件名,URL或工具输入之前验证每个样本反应.</li>
+<li>每轮的字节和代币限制.</li>
+<li>拒绝未在当前客户端功能中声明的输入请求.</li>
+<li>保持模型输出在授权决策中.</li>
+<li>记录原始方法和输入请求键,而不记录敏感的提示内容.</li>
+</ul>
+<p><code>clientInfo</code>其他<code>serverInfo</code>任何一个数据都不能被认证身份.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-4c9bd7c2ad1d2bc836ba.png" alt="t3-sampling-flip 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<p><code>code/main.py</code>实现了完全的双轮流,没有第三方包:</p>
+<ul>
+<li><code>server/discover</code>收益<code>supportedVersions</code>通过Cache,广告工具支持,并返回缓存提示.</li>
+<li><code>tools/list</code>返回一个确定性,可缓存的<code>summarize_repo</code>具有对象输入方案的描述符.</li>
+<li><code>tools/call</code>根据请求验证了元数据.</li>
+<li>首先,结果是<code>sampling/createMessage</code>文件选择.</li>
+<li>第一次重试验证实模型结果,并嵌入第二次请求.</li>
+<li>受到HMAC保护<code>requestState</code>独立请求之间的阶段.</li>
+<li>最终结果使用<code>resultType: &quot;complete&quot;</code>现在,我们要去.</li>
+</ul>
+<p>假的主机模型使得例子是确定性的.<code>fake_host_model</code>服务器边状态机应该保持确定性和可测试性.</p>
+<h2>用它</h2>
+<p>根据数据库根:</p>
+<pre><code class="language-bash">cd phases/13-tools-and-protocols/11-mcp-sampling/code
+python3 main.py
+python3 -m unittest discover tests -v
+</code></pre>
+<p>预期的检查站:</p>
+<ul>
+<li>发现返回一个完整的结果<code>ttlMs</code>其他<code>cacheScope</code>现在,我们要去.</li>
+<li>工具发现返回相同的分类描述符<code>resultType</code>服务器身份,缓存提示.</li>
+<li>缺失功能和不支持版本使用精确的<code>-32021</code>其他<code>-32022</code>错误数据.</li>
+<li>没有 id 的通知不会产生 JSON-RPC 响应.</li>
+<li>要求身份证是<code>[1, 2, 3]</code>证明每次MRTR轮都是独立的.</li>
+<li>首先的两个结果是<code>input_required</code>现在,我们要去.</li>
+<li>最终结果是<code>complete</code>包含选定的文件以及总结.</li>
+<li>试验中改变原始参数将失败于请求状态检查.</li>
+</ul>
+<h2>运送它</h2>
+<p><code>outputs/skill-sampling-loop-designer.md</code>现在是迁移规划师.它首先决定是否应该取消样本以支持直接模型集成.如果需要兼容性,它会产生MRTR轮,状态绑定,能力门,预算,验证和取消计划.</p>
+<h2>运动</h2>
+<ol>
+<li>改变文件选择响应为无效的JSON. 确认服务器返回<code>-32602</code>而不是相信模型的输出.</li>
+<li>改变<code>audience</code>解释为什么封闭状态阻止了交叉请求的重复使用.</li>
+<li>加入第三轮,要求主机批评总结. 携带之前的总结进入签署状态,并将整个流量限制在三个轮.</li>
+<li>通过用服务器所有模型适配器取代假的主机回调,删除样本.列出哪些批准,发票和可观察责任转移到服务器.</li>
+<li>添加使用超过一秒的状态值的过期测试.</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>Meaning in 2026-07-28</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Sampling</td>
+<td>Deprecated feature that asks the client's model for a completion</td>
+</tr>
+<tr>
+<td>MRTR</td>
+<td>Stateless retry pattern for client input required during a request</td>
+</tr>
+<tr>
+<td><code>InputRequiredResult</code></td>
+<td>Result with <code>resultType: &quot;input_required&quot;</code></td>
+</tr>
+<tr>
+<td><code>inputRequests</code></td>
+<td>Server-assigned map of embedded elicitation, sampling, or roots requests</td>
+</tr>
+<tr>
+<td><code>inputResponses</code></td>
+<td>Current round's client results keyed like <code>inputRequests</code></td>
+</tr>
+<tr>
+<td><code>requestState</code></td>
+<td>Opaque server state echoed exactly by the client and verified by the server</td>
+</tr>
+<tr>
+<td><code>resultType</code></td>
+<td>Required discriminator for modern MCP results</td>
+</tr>
+<tr>
+<td>Direct model integration</td>
+<td>Recommended replacement for new servers that need model inference</td>
+</tr>
+<tr>
+<td>Capability gate</td>
+<td>Rule that prevents sending an embedded request the client did not advertise</td>
+</tr>
+<tr>
+<td>Loop budget</td>
+<td>Maximum rounds, tokens, bytes, time, and spend allowed for the operation</td>
+</tr>
+</tbody>
+</table>
+<h2>遗产兼容性</h2>
+<p>预定到2025-11-25的客户端可能仍然使用旧的服务器启动<code>sampling/createMessage</code>通过直播连接来传输. 仅在版本特定的适配器中保持这种行为. 不要让会议的路径成为2026-07-28服务器的架构.</p>
+<p>官方SDK可以翻译现代化<code>input_required</code>对于老年同龄人来说,这种闪是兼容性界限,而不是允许添加新的依赖于会议的逻辑.</p>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/mrtr" rel="noreferrer" data-network="true">MCP 2026-07-28 Multi Round-Trip Requests <small>↗ 需要联网</small></a></li>
+<li><a href="https://modelcontextprotocol.io/specification/2026-07-28/changelog" rel="noreferrer" data-network="true">MCP 2026-07-28 changelog <small>↗ 需要联网</small></a></li>
+<li><a href="https://modelcontextprotocol.io/seps/2577-deprecate-roots-sampling-and-logging" rel="noreferrer" data-network="true">MCP Sampling deprecation <small>↗ 需要联网</small></a></li>
+<li><a href="https://modelcontextprotocol.io/specification/2026-07-28/server/discover" rel="noreferrer" data-network="true">MCP 2026-07-28 server discovery <small>↗ 需要联网</small></a></li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>MCP Model Input: Sampling Migration and Stateless MRTR</h1>
+<blockquote>
+<p>MCP 2026-07-28 deprecates Sampling for new designs and removes the server-to-client request channel. If an existing workflow still needs the client's model, the server returns an <code>input_required</code> result and the client retries the original request with the model output. The reasoning loop becomes explicit, bounded, and stateless at the protocol layer.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 13 · 07 (MCP server), Phase 13 · 10 (resources and prompts)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Explain why Sampling is deprecated in MCP 2026-07-28 and choose the direct model integration default for new servers.</li>
+<li>Implement a compatibility workflow that carries <code>sampling/createMessage</code> through Multi Round-Trip Requests (MRTR).</li>
+<li>Put the protocol revision and client capabilities in every request <code>_meta</code> object.</li>
+<li>Return <code>resultType: &quot;input_required&quot;</code> and retry the original method with a fresh JSON-RPC id.</li>
+<li>Integrity-protect <code>requestState</code> and bind it to the principal, method, arguments, and expiry.</li>
+<li>Bound model-assisted loops with capability checks, approval, response validation, and a round limit.</li>
+</ul>
+<h2>The Decision Before the Protocol</h2>
+<p>A tool such as <code>summarize_repo</code> needs two kinds of work:</p>
+<ol>
+<li>Deterministic work: list files, read allowed files, validate paths, and assemble content.</li>
+<li>Model work: choose representative files and synthesize the summary.</li>
+</ol>
+<p>You now have two valid architectures.</p>
+<h3>New server: integrate with a model provider directly</h3>
+<p>This is the current default. The server owns model selection, credentials, budgets, retries, and observability. It returns one ordinary <code>tools/call</code> result to the MCP client.</p>
+<p>Choose this when the server is already a hosted service or when predictable model behavior matters more than using the host's model.</p>
+<h3>Existing Sampling workflow: migrate it to MRTR</h3>
+<p>Sampling still exists during its deprecation window. A server targeting 2026-07-28 cannot send a live <code>sampling/createMessage</code> request back to the client. It instead embeds that request in an <code>InputRequiredResult</code>.</p>
+<p>Choose this compatibility path only when using the client's model and credentials is a real product requirement. Record a removal plan because new implementations should not adopt deprecated Sampling.</p>
+<h2>The Stateless Contract</h2>
+<p>The July 2026 protocol has no <code>initialize</code> exchange, no <code>notifications/initialized</code>, and no <code>Mcp-Session-Id</code>. Every request carries the information that used to live in the handshake:</p>
+<pre><code class="language-json">{
+  &quot;jsonrpc&quot;: &quot;2.0&quot;,
+  &quot;id&quot;: 1,
+  &quot;method&quot;: &quot;tools/call&quot;,
+  &quot;params&quot;: {
+    &quot;name&quot;: &quot;summarize_repo&quot;,
+    &quot;arguments&quot;: {&quot;audience&quot;: &quot;developer&quot;},
+    &quot;_meta&quot;: {
+      &quot;io.modelcontextprotocol/protocolVersion&quot;: &quot;2026-07-28&quot;,
+      &quot;io.modelcontextprotocol/clientCapabilities&quot;: {&quot;sampling&quot;: {}},
+      &quot;io.modelcontextprotocol/clientInfo&quot;: {
+        &quot;name&quot;: &quot;lesson-client&quot;,
+        &quot;version&quot;: &quot;1.0.0&quot;
+      }
+    }
+  }
+}
+</code></pre>
+<p>The server validates the revision on every request. A missing or non-string version is invalid params, <code>-32602</code>. An unsupported string returns <code>-32022</code> with exact data <code>{&quot;supported&quot;:[&quot;2026-07-28&quot;],&quot;requested&quot;:&quot;&lt;client version&gt;&quot;}</code>. A missing Sampling capability returns <code>-32021</code> with <code>data.requiredCapabilities</code> set to <code>{&quot;sampling&quot;:{}}</code>.</p>
+<p>An envelope without a JSON-RPC <code>id</code> is a notification. The receiver may process it, but it emits neither a success response nor an error response. A Streamable HTTP adapter returns <code>202 Accepted</code> with no body for an accepted notification.</p>
+<p>The server also implements <code>server/discover</code> with the exact <code>supportedVersions</code> key, capabilities, <code>ttlMs</code>, and <code>cacheScope</code> so a client can learn and cache the server contract before calling a tool. Because discovery advertises <code>tools</code>, the server also implements mandatory <code>tools/list</code>. Its deterministic <code>summarize_repo</code> descriptor includes a valid object <code>inputSchema</code>, <code>resultType: &quot;complete&quot;</code>, server identity metadata, and public cache hints.</p>
+<p>Every successful modern result has a discriminator:</p>
+<ul>
+<li><code>resultType: &quot;complete&quot;</code> means the operation finished.</li>
+<li><code>resultType: &quot;input_required&quot;</code> means the client must fulfill embedded requests and retry.</li>
+<li>Extensions may define additional result types. The Tasks extension adds <code>&quot;task&quot;</code> in Lesson 13.</li>
+</ul>
+<h2>One MRTR Round</h2>
+<p>The server cannot call the client while handling the request. It returns this result instead:</p>
+<pre><code class="language-json">{
+  &quot;jsonrpc&quot;: &quot;2.0&quot;,
+  &quot;id&quot;: 1,
+  &quot;result&quot;: {
+    &quot;resultType&quot;: &quot;input_required&quot;,
+    &quot;inputRequests&quot;: {
+      &quot;pick_files&quot;: {
+        &quot;method&quot;: &quot;sampling/createMessage&quot;,
+        &quot;params&quot;: {
+          &quot;messages&quot;: [
+            {
+              &quot;role&quot;: &quot;user&quot;,
+              &quot;content&quot;: {
+                &quot;type&quot;: &quot;text&quot;,
+                &quot;text&quot;: &quot;Choose three representative files and return a JSON array.&quot;
+              }
+            }
+          ],
+          &quot;systemPrompt&quot;: &quot;Return only the requested value.&quot;,
+          &quot;modelPreferences&quot;: {
+            &quot;costPriority&quot;: 0.8,
+            &quot;intelligencePriority&quot;: 0.2
+          },
+          &quot;maxTokens&quot;: 400
+        }
+      }
+    },
+    &quot;requestState&quot;: &quot;opaque-integrity-protected-value&quot;
+  }
+}
+</code></pre>
+<p>The client verifies that it supports Sampling, applies its approval and model policies, and obtains a model response. Then it sends a new request with a different JSON-RPC id:</p>
+<pre><code class="language-json">{
+  &quot;jsonrpc&quot;: &quot;2.0&quot;,
+  &quot;id&quot;: 2,
+  &quot;method&quot;: &quot;tools/call&quot;,
+  &quot;params&quot;: {
+    &quot;name&quot;: &quot;summarize_repo&quot;,
+    &quot;arguments&quot;: {&quot;audience&quot;: &quot;developer&quot;},
+    &quot;inputResponses&quot;: {
+      &quot;pick_files&quot;: {
+        &quot;role&quot;: &quot;assistant&quot;,
+        &quot;content&quot;: {
+          &quot;type&quot;: &quot;text&quot;,
+          &quot;text&quot;: &quot;[\&quot;README.md\&quot;, \&quot;server.py\&quot;, \&quot;docs/intro.md\&quot;]&quot;
+        },
+        &quot;model&quot;: &quot;host-model&quot;,
+        &quot;stopReason&quot;: &quot;endTurn&quot;
+      }
+    },
+    &quot;requestState&quot;: &quot;opaque-integrity-protected-value&quot;,
+    &quot;_meta&quot;: {
+      &quot;io.modelcontextprotocol/protocolVersion&quot;: &quot;2026-07-28&quot;,
+      &quot;io.modelcontextprotocol/clientCapabilities&quot;: {&quot;sampling&quot;: {}}
+    }
+  }
+}
+</code></pre>
+<p>The retry is not a continuation of a protocol session. It is a new request that repeats the original method and arguments, adds only the current round's <code>inputResponses</code>, and echoes <code>requestState</code> byte for byte.</p>
+<p>MRTR is allowed only on <code>tools/call</code>, <code>prompts/get</code>, and <code>resources/read</code>. A server must not return <code>input_required</code> from unrelated methods.</p>
+<h2>Multi-Round State</h2>
+<p>This lesson needs two model calls:</p>
+<ol>
+<li><code>pick_files</code> returns a JSON array.</li>
+<li><code>summary</code> returns the final prose.</li>
+</ol>
+<p>Each retry carries only the responses for that round. The server therefore puts the phase and validated intermediate data into the next <code>requestState</code>.</p>
+<p>Treat that value as attacker-controlled. Signing a raw phase name is not enough. Bind the state to:</p>
+<ul>
+<li>the authenticated principal, not self-reported <code>clientInfo</code>;</li>
+<li>the originating method;</li>
+<li>a digest of the original arguments;</li>
+<li>a short expiry;</li>
+<li>the current phase and validated intermediate values.</li>
+</ul>
+<p>Use HMAC when confidentiality is not required. Use authenticated encryption when the client must not read the state. Reject a bad signature, expired value, changed principal, or changed arguments with <code>-32602</code>.</p>
+<p>The client must not parse or modify <code>requestState</code>. Its only job is to echo the exact string on the retry.</p>
+<h2>Model Preferences Are Hints</h2>
+<p><code>costPriority</code>, <code>speedPriority</code>, and <code>intelligencePriority</code> are independent preferences. They are not a probability distribution and do not need to sum to one. The client may ignore them because the client owns model policy.</p>
+<p>Keep <code>includeContext</code> at <code>&quot;none&quot;</code> if you maintain a legacy Sampling flow. Other context modes increase leakage risk and are themselves deprecated. Pass the minimum explicit context in the request.</p>
+<h2>Safety Invariants</h2>
+<p>The client is the trust boundary for embedded Sampling requests.</p>
+<ul>
+<li>Show the user what the server is asking the model to do when policy requires approval.</li>
+<li>Cap MRTR rounds. A malicious server can otherwise create a model-spend loop.</li>
+<li>Validate every sampling response before using it as a filename, URL, or tool input.</li>
+<li>Limit bytes and tokens per round.</li>
+<li>Refuse an input request that was not declared in current client capabilities.</li>
+<li>Keep model output out of authorization decisions.</li>
+<li>Log the originating method and input-request key without logging sensitive prompt content.</li>
+</ul>
+<p><code>clientInfo</code> and <code>serverInfo</code> are display and diagnostics metadata. Never use either as an authenticated identity.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-4c9bd7c2ad1d2bc836ba.png" alt="t3-sampling-flip 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<p><code>code/main.py</code> implements the full two-round flow with no third-party package:</p>
+<ul>
+<li><code>server/discover</code> returns <code>supportedVersions</code>, advertises tool support, and returns cache hints.</li>
+<li><code>tools/list</code> returns a deterministic, cacheable <code>summarize_repo</code> descriptor with an object input schema.</li>
+<li><code>tools/call</code> validates per-request metadata.</li>
+<li>The first result embeds <code>sampling/createMessage</code> for file selection.</li>
+<li>The first retry validates the model result and embeds a second request.</li>
+<li>HMAC-protected <code>requestState</code> carries the phase between independent requests.</li>
+<li>The final result uses <code>resultType: &quot;complete&quot;</code>.</li>
+</ul>
+<p>The fake host model makes the example deterministic. Replace only <code>fake_host_model</code> when connecting a real host. The server-side state machine should stay deterministic and testable.</p>
+<h2>Use It</h2>
+<p>From the repository root:</p>
+<pre><code class="language-bash">cd phases/13-tools-and-protocols/11-mcp-sampling/code
+python3 main.py
+python3 -m unittest discover tests -v
+</code></pre>
+<p>Expected checkpoints:</p>
+<ul>
+<li>Discovery returns a complete result with <code>ttlMs</code> and <code>cacheScope</code>.</li>
+<li>Tool discovery returns the same sorted descriptor with <code>resultType</code>, server identity, and cache hints.</li>
+<li>Missing capabilities and unsupported versions use exact <code>-32021</code> and <code>-32022</code> error data.</li>
+<li>An id-less notification produces no JSON-RPC response.</li>
+<li>Request ids are <code>[1, 2, 3]</code>, proving each MRTR round is independent.</li>
+<li>The first two results are <code>input_required</code>.</li>
+<li>The final result is <code>complete</code> and contains the selected files plus summary.</li>
+<li>Changing the original arguments on a retry fails the request-state check.</li>
+</ul>
+<h2>Ship It</h2>
+<p><code>outputs/skill-sampling-loop-designer.md</code> is now a migration planner. It first decides whether Sampling should be removed in favor of direct model integration. If compatibility is required, it produces the MRTR rounds, state binding, capability gate, budget, validation, and removal plan.</p>
+<h2>Exercises</h2>
+<ol>
+<li>Change the file-selection response to invalid JSON. Confirm the server returns <code>-32602</code> instead of trusting model output.</li>
+<li>Change <code>audience</code> between the first call and retry. Explain why the sealed state blocks cross-request reuse.</li>
+<li>Add a third round that asks the host to critique the summary. Carry the earlier summary inside signed state and cap the entire flow at three rounds.</li>
+<li>Remove Sampling by replacing the fake host callback with a server-owned model adapter. List which approval, billing, and observability responsibilities move to the server.</li>
+<li>Add an expiry test using a state value that is one second past its deadline.</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>Meaning in 2026-07-28</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Sampling</td>
+<td>Deprecated feature that asks the client's model for a completion</td>
+</tr>
+<tr>
+<td>MRTR</td>
+<td>Stateless retry pattern for client input required during a request</td>
+</tr>
+<tr>
+<td><code>InputRequiredResult</code></td>
+<td>Result with <code>resultType: &quot;input_required&quot;</code></td>
+</tr>
+<tr>
+<td><code>inputRequests</code></td>
+<td>Server-assigned map of embedded elicitation, sampling, or roots requests</td>
+</tr>
+<tr>
+<td><code>inputResponses</code></td>
+<td>Current round's client results keyed like <code>inputRequests</code></td>
+</tr>
+<tr>
+<td><code>requestState</code></td>
+<td>Opaque server state echoed exactly by the client and verified by the server</td>
+</tr>
+<tr>
+<td><code>resultType</code></td>
+<td>Required discriminator for modern MCP results</td>
+</tr>
+<tr>
+<td>Direct model integration</td>
+<td>Recommended replacement for new servers that need model inference</td>
+</tr>
+<tr>
+<td>Capability gate</td>
+<td>Rule that prevents sending an embedded request the client did not advertise</td>
+</tr>
+<tr>
+<td>Loop budget</td>
+<td>Maximum rounds, tokens, bytes, time, and spend allowed for the operation</td>
+</tr>
+</tbody>
+</table>
+<h2>Legacy Compatibility</h2>
+<p>A client pinned to 2025-11-25 may still use the older server-initiated <code>sampling/createMessage</code> flow over a live connection. Keep that behavior in a version-specific adapter only. Do not make the sessionful path the architecture for a 2026-07-28 server.</p>
+<p>Official SDKs can translate modern <code>input_required</code> handlers for older peers. That shim is a compatibility boundary, not permission to add new session-dependent logic.</p>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/mrtr" rel="noreferrer" data-network="true">MCP 2026-07-28 Multi Round-Trip Requests <small>↗ 需要联网</small></a></li>
+<li><a href="https://modelcontextprotocol.io/specification/2026-07-28/changelog" rel="noreferrer" data-network="true">MCP 2026-07-28 changelog <small>↗ 需要联网</small></a></li>
+<li><a href="https://modelcontextprotocol.io/seps/2577-deprecate-roots-sampling-and-logging" rel="noreferrer" data-network="true">MCP Sampling deprecation <small>↗ 需要联网</small></a></li>
+<li><a href="https://modelcontextprotocol.io/specification/2026-07-28/server/discover" rel="noreferrer" data-network="true">MCP 2026-07-28 server discovery <small>↗ 需要联网</small></a></li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-13-tools-and-protocols--11-mcp-sampling.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-13-tools-and-protocols--11-mcp-sampling.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/13-tools-and-protocols/11-mcp-sampling/code/main.py">phases/13-tools-and-protocols/11-mcp-sampling/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Phase 13 Lesson 11: model input through stateless MCP MRTR.
+
+Lesson: ../docs/en.md
+Specification: https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/mrtr
+This example uses only Python&#39;s standard library.
+Run: python3 main.py
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import hmac
+import json
+import time
+from copy import deepcopy
+from dataclasses import dataclass
+from typing import Any
+
+
+PROTOCOL_VERSION = &quot;2026-07-28&quot;
+PROTOCOL_META = &quot;io.modelcontextprotocol/protocolVersion&quot;
+CAPABILITIES_META = &quot;io.modelcontextprotocol/clientCapabilities&quot;
+CLIENT_INFO_META = &quot;io.modelcontextprotocol/clientInfo&quot;
+SERVER_INFO_META = &quot;io.modelcontextprotocol/serverInfo&quot;
+SERVER_SECRET = b&quot;lesson-11-demo-secret-change-in-production&quot;
+
+FAKE_REPO = {
+    &quot;README.md&quot;: &quot;A small notes server used to teach stateless MCP.&quot;,
+    &quot;server.py&quot;: &quot;def dispatch(request): return handle(request)&quot;,
+    &quot;client.py&quot;: &quot;def retry(request, inputs, state): ...&quot;,
+    &quot;LICENSE&quot;: &quot;MIT&quot;,
+    &quot;tests/test_server.py&quot;: &quot;def test_stateless_retry(): ...&quot;,
+    &quot;docs/intro.md&quot;: &quot;The server has no protocol session state.&quot;,
+}
+TOOLS = [
+    {
+        &quot;name&quot;: &quot;summarize_repo&quot;,
+        &quot;description&quot;: &quot;Select representative repository files and summarize them.&quot;,
+        &quot;inputSchema&quot;: {
+            &quot;type&quot;: &quot;object&quot;,
+            &quot;properties&quot;: {
+                &quot;audience&quot;: {
+                    &quot;type&quot;: &quot;string&quot;,
+                    &quot;description&quot;: &quot;Audience for the final repository summary.&quot;,
+                }
+            },
+            &quot;required&quot;: [],
+        },
+    }
+]
+
+
+@dataclass
+class McpError(Exception):
+    code: int
+    message: str
+    data: dict[str, Any] | None = None
+
+
+def request_meta(*, sampling: bool = True) -&gt; dict[str, Any]:
+    capabilities: dict[str, Any] = {&quot;sampling&quot;: {}} if sampling else {}
+    return {
+        PROTOCOL_META: PROTOCOL_VERSION,
+        CAPABILITIES_META: capabilities,
+        CLIENT_INFO_META: {&quot;name&quot;: &quot;lesson-client&quot;, &quot;version&quot;: &quot;1.0.0&quot;},
+    }
+
+
+def _server_meta() -&gt; dict[str, Any]:
+    return {SERVER_INFO_META: {&quot;name&quot;: &quot;mrtr-demo&quot;, &quot;version&quot;: &quot;1.0.0&quot;}}
+
+
+def complete(**fields: Any) -&gt; dict[str, Any]:
+    return {&quot;resultType&quot;: &quot;complete&quot;, **fields, &quot;_meta&quot;: _server_meta()}
+
+
+def validate_request_meta(params: dict[str, Any]) -&gt; dict[str, Any]:
+    meta = params.get(&quot;_meta&quot;)
+    if not isinstance(meta, dict):
+        raise McpError(-32602, &quot;missing request _meta&quot;)
+    requested_version = meta.get(PROTOCOL_META)
+    if not isinstance(requested_version, str):
+        raise McpError(-32602, &quot;missing protocol version&quot;)
+    if requested_version != PROTOCOL_VERSION:
+        raise McpError(
+            -32022,
+            &quot;unsupported protocol version&quot;,
+            {&quot;supported&quot;: [PROTOCOL_VERSION], &quot;requested&quot;: requested_version},
+        )
+    capabilities = meta.get(CAPABILITIES_META)
+    if not isinstance(capabilities, dict):
+        raise McpError(-32602, &quot;missing client capabilities&quot;)
+    return meta
+
+
+def server_discover(params: dict[str, Any]) -&gt; dict[str, Any]:
+    validate_request_meta(params)
+    return complete(
+        supportedVersions=[PROTOCOL_VERSION],
+        capabilities={&quot;tools&quot;: {}},
+        ttlMs=300_000,
+        cacheScope=&quot;public&quot;,
+    )
+
+
+def tools_list(params: dict[str, Any]) -&gt; dict[str, Any]:
+    validate_request_meta(params)
+    return complete(
+        tools=sorted(deepcopy(TOOLS), key=lambda tool: tool[&quot;name&quot;]),
+        ttlMs=60_000,
+        cacheScope=&quot;public&quot;,
+    )
+
+
+def _b64(data: bytes) -&gt; str:
+    return base64.urlsafe_b64encode(data).decode(&quot;ascii&quot;).rstrip(&quot;=&quot;)
+
+
+def _unb64(value: str) -&gt; bytes:
+    return base64.urlsafe_b64decode(value + &quot;=&quot; * (-len(value) % 4))
+
+
+def _arguments_digest(arguments: dict[str, Any]) -&gt; str:
+    encoded = json.dumps(arguments, sort_keys=True, separators=(&quot;,&quot;, &quot;:&quot;)).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def seal_request_state(payload: dict[str, Any]) -&gt; str:
+    body = json.dumps(payload, sort_keys=True, separators=(&quot;,&quot;, &quot;:&quot;)).encode()
+    signature = hmac.new(SERVER_SECRET, body, hashlib.sha256).digest()
+    return f&quot;{_b64(body)}.{_b64(signature)}&quot;
+
+
+def verify_request_state(
+    token: str,
+    *,
+    principal: str,
+    arguments: dict[str, Any],
+    now: int | None = None,
+) -&gt; dict[str, Any]:
+    try:
+        body_part, signature_part = token.split(&quot;.&quot;, 1)
+        body = _unb64(body_part)
+        supplied = _unb64(signature_part)
+    except (ValueError, TypeError) as exc:
+        raise McpError(-32602, &quot;invalid requestState encoding&quot;) from exc
+    expected = hmac.new(SERVER_SECRET, body, hashlib.sha256).digest()
+    if not hmac.compare_digest(supplied, expected):
+        raise McpError(-32602, &quot;requestState integrity check failed&quot;)
+    try:
+        state = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise McpError(-32602, &quot;invalid requestState payload&quot;) from exc
+    if state.get(&quot;principal&quot;) != principal:
+        raise McpError(-32602, &quot;requestState principal mismatch&quot;)
+    if state.get(&quot;method&quot;) != &quot;tools/call&quot;:
+        raise McpError(-32602, &quot;requestState method mismatch&quot;)
+    if state.get(&quot;argumentsDigest&quot;) != _arguments_digest(arguments):
+        raise McpError(-32602, &quot;requestState arguments mismatch&quot;)
+    if int(state.get(&quot;expiresAt&quot;, 0)) &lt; (int(time.time()) if now is None else now):
+        raise McpError(-32602, &quot;requestState expired&quot;)
+    return state
+
+
+def _sampling_request(prompt: str, *, intelligence: float) -&gt; dict[str, Any]:
+    return {
+        &quot;method&quot;: &quot;sampling/createMessage&quot;,
+        &quot;params&quot;: {
+            &quot;messages&quot;: [
+                {&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: {&quot;type&quot;: &quot;text&quot;, &quot;text&quot;: prompt}}
+            ],
+            &quot;systemPrompt&quot;: &quot;Return only the requested value.&quot;,
+            &quot;modelPreferences&quot;: {
+                &quot;costPriority&quot;: round(1.0 - intelligence, 2),
+                &quot;intelligencePriority&quot;: intelligence,
+            },
+            &quot;maxTokens&quot;: 400,
+        },
+    }
+
+
+def _input_required(
+    key: str,
+    prompt: str,
+    state: dict[str, Any],
+    *,
+    intelligence: float,
+) -&gt; dict[str, Any]:
+    return {
+        &quot;resultType&quot;: &quot;input_required&quot;,
+        &quot;inputRequests&quot;: {key: _sampling_request(prompt, intelligence=intelligence)},
+        &quot;requestState&quot;: seal_request_state(state),
+        &quot;_meta&quot;: _server_meta(),
+    }
+
+
+def _sampling_text(input_responses: Any, key: str) -&gt; str:
+    if not isinstance(input_responses, dict):
+        raise McpError(-32602, &quot;inputResponses must be an object&quot;)
+    response = input_responses.get(key)
+    if not isinstance(response, dict):
+        raise McpError(-32602, f&quot;missing input response: {key}&quot;)
+    content = response.get(&quot;content&quot;)
+    if not isinstance(content, dict) or content.get(&quot;type&quot;) != &quot;text&quot;:
+        raise McpError(-32602, f&quot;invalid sampling response: {key}&quot;)
+    text = content.get(&quot;text&quot;)
+    if not isinstance(text, str) or not text.strip():
+        raise McpError(-32602, f&quot;empty sampling response: {key}&quot;)
+    return text
+
+
+def tools_call(params: dict[str, Any], *, principal: str) -&gt; dict[str, Any]:
+    meta = validate_request_meta(params)
+    if params.get(&quot;name&quot;) != &quot;summarize_repo&quot;:
+        raise McpError(-32602, &quot;unknown tool&quot;)
+    arguments = params.get(&quot;arguments&quot;, {})
+    if not isinstance(arguments, dict):
+        raise McpError(-32602, &quot;arguments must be an object&quot;)
+    capabilities = meta[CAPABILITIES_META]
+    if &quot;sampling&quot; not in capabilities:
+        raise McpError(
+            -32021,
+            &quot;missing required client capability&quot;,
+            {&quot;requiredCapabilities&quot;: {&quot;sampling&quot;: {}}},
+        )
+
+    state_token = params.get(&quot;requestState&quot;)
+    if state_token is None:
+        state = {
+            &quot;phase&quot;: &quot;pick&quot;,
+            &quot;principal&quot;: principal,
+            &quot;method&quot;: &quot;tools/call&quot;,
+            &quot;argumentsDigest&quot;: _arguments_digest(arguments),
+            &quot;expiresAt&quot;: int(time.time()) + 300,
+        }
+        prompt = (
+            &quot;Choose three representative files and return a JSON array. Files: &quot;
+            + json.dumps(sorted(FAKE_REPO))
+        )
+        return _input_required(&quot;pick_files&quot;, prompt, state, intelligence=0.2)
+
+    if not isinstance(state_token, str):
+        raise McpError(-32602, &quot;requestState must be a string&quot;)
+    state = verify_request_state(
+        state_token,
+        principal=principal,
+        arguments=arguments,
+    )
+    responses = params.get(&quot;inputResponses&quot;)
+
+    if state[&quot;phase&quot;] == &quot;pick&quot;:
+        raw_picks = _sampling_text(responses, &quot;pick_files&quot;)
+        try:
+            picks = json.loads(raw_picks)
+        except json.JSONDecodeError as exc:
+            raise McpError(-32602, &quot;pick_files must return JSON&quot;) from exc
+        if not isinstance(picks, list) or not all(isinstance(item, str) for item in picks):
+            raise McpError(-32602, &quot;pick_files must return a string array&quot;)
+        picked = [name for name in picks if name in FAKE_REPO][:3]
+        if not picked:
+            raise McpError(-32602, &quot;pick_files returned no known files&quot;)
+        combined = &quot;\n\n&quot;.join(f&quot;{name}: {FAKE_REPO[name]}&quot; for name in picked)
+        next_state = {
+            **state,
+            &quot;phase&quot;: &quot;summarize&quot;,
+            &quot;picked&quot;: picked,
+            &quot;expiresAt&quot;: int(time.time()) + 300,
+        }
+        prompt = &quot;Summarize these files in two sentences:\n\n&quot; + combined
+        return _input_required(&quot;summary&quot;, prompt, next_state, intelligence=0.8)
+
+    if state[&quot;phase&quot;] == &quot;summarize&quot;:
+        summary = _sampling_text(responses, &quot;summary&quot;)
+        return complete(
+            content=[{&quot;type&quot;: &quot;text&quot;, &quot;text&quot;: summary}],
+            structuredContent={&quot;picked&quot;: state[&quot;picked&quot;], &quot;summary&quot;: summary},
+            isError=False,
+        )
+
+    raise McpError(-32602, &quot;unknown requestState phase&quot;)
+
+
+def dispatch(
+    request: dict[str, Any],
+    *,
+    principal: str = &quot;user-42&quot;,
+) -&gt; dict[str, Any] | None:
+    is_notification = &quot;id&quot; not in request
+    request_id = request.get(&quot;id&quot;)
+    try:
+        method = request.get(&quot;method&quot;)
+        params = request.get(&quot;params&quot;, {})
+        if not isinstance(params, dict):
+            raise McpError(-32602, &quot;params must be an object&quot;)
+        if method == &quot;server/discover&quot;:
+            result = server_discover(params)
+        elif method == &quot;tools/list&quot;:
+            result = tools_list(params)
+        elif method == &quot;tools/call&quot;:
+            result = tools_call(params, principal=principal)
+        else:
+            raise McpError(-32601, &quot;method not found&quot;)
+        if is_notification:
+            return None
+        return {&quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;id&quot;: request_id, &quot;result&quot;: result}
+    except McpError as exc:
+        if is_notification:
+            return None
+        error: dict[str, Any] = {&quot;code&quot;: exc.code, &quot;message&quot;: exc.message}
+        if exc.data is not None:
+            error[&quot;data&quot;] = exc.data
+        return {&quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;id&quot;: request_id, &quot;error&quot;: error}
+
+
+def fake_host_model(input_request: dict[str, Any]) -&gt; dict[str, Any]:
+    prompt = input_request[&quot;params&quot;][&quot;messages&quot;][-1][&quot;content&quot;][&quot;text&quot;]
+    if &quot;Choose three&quot; in prompt:
+        text = json.dumps([&quot;README.md&quot;, &quot;server.py&quot;, &quot;docs/intro.md&quot;])
+    else:
+        text = (
+            &quot;This repository demonstrates a stateless MCP server and client retry loop. &quot;
+            &quot;Each MRTR round carries all required state without a protocol session.&quot;
+        )
+    return {
+        &quot;role&quot;: &quot;assistant&quot;,
+        &quot;content&quot;: {&quot;type&quot;: &quot;text&quot;, &quot;text&quot;: text},
+        &quot;model&quot;: &quot;host-model&quot;,
+        &quot;stopReason&quot;: &quot;endTurn&quot;,
+    }
+
+
+def run_mrtr() -&gt; tuple[dict[str, Any], list[int]]:
+    base_params = {
+        &quot;name&quot;: &quot;summarize_repo&quot;,
+        &quot;arguments&quot;: {&quot;audience&quot;: &quot;developer&quot;},
+        &quot;_meta&quot;: request_meta(),
+    }
+    request_id = 1
+    response = dispatch(
+        {&quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;id&quot;: request_id, &quot;method&quot;: &quot;tools/call&quot;, &quot;params&quot;: base_params}
+    )
+    seen_ids = [request_id]
+
+    while response.get(&quot;result&quot;, {}).get(&quot;resultType&quot;) == &quot;input_required&quot;:
+        pending = response[&quot;result&quot;]
+        fulfilled = {
+            key: fake_host_model(input_request)
+            for key, input_request in pending[&quot;inputRequests&quot;].items()
+        }
+        request_id += 1
+        seen_ids.append(request_id)
+        retry_params = {
+            **base_params,
+            &quot;inputResponses&quot;: fulfilled,
+            &quot;requestState&quot;: pending[&quot;requestState&quot;],
+        }
+        response = dispatch(
+            {
+                &quot;jsonrpc&quot;: &quot;2.0&quot;,
+                &quot;id&quot;: request_id,
+                &quot;method&quot;: &quot;tools/call&quot;,
+                &quot;params&quot;: retry_params,
+            }
+        )
+    return response, seen_ids
+
+
+def main() -&gt; None:
+    discovery = dispatch(
+        {
+            &quot;jsonrpc&quot;: &quot;2.0&quot;,
+            &quot;id&quot;: 0,
+            &quot;method&quot;: &quot;server/discover&quot;,
+            &quot;params&quot;: {&quot;_meta&quot;: request_meta()},
+        }
+    )
+    print(&quot;discover:&quot;, json.dumps(discovery[&quot;result&quot;], indent=2))
+    response, request_ids = run_mrtr()
+    print(&quot;independent request ids:&quot;, request_ids)
+    print(&quot;final:&quot;, json.dumps(response[&quot;result&quot;], indent=2))
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/13-tools-and-protocols/11-mcp-sampling/code/tests/test_main.py">phases/13-tools-and-protocols/11-mcp-sampling/code/tests/test_main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Tests for the stateless MCP MRTR sampling migration lesson.&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import sys
+import unittest
+from pathlib import Path
+
+
+MODULE_PATH = Path(__file__).resolve().parents[1] / &quot;main.py&quot;
+SPEC = importlib.util.spec_from_file_location(&quot;lesson11_main&quot;, MODULE_PATH)
+assert SPEC and SPEC.loader
+main = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = main
+SPEC.loader.exec_module(main)
+
+
+def tool_request(request_id: int = 1, *, sampling: bool = True) -&gt; dict:
+    return {
+        &quot;jsonrpc&quot;: &quot;2.0&quot;,
+        &quot;id&quot;: request_id,
+        &quot;method&quot;: &quot;tools/call&quot;,
+        &quot;params&quot;: {
+            &quot;name&quot;: &quot;summarize_repo&quot;,
+            &quot;arguments&quot;: {&quot;audience&quot;: &quot;developer&quot;},
+            &quot;_meta&quot;: main.request_meta(sampling=sampling),
+        },
+    }
+
+
+class SamplingMrtrTests(unittest.TestCase):
+    def test_discovery_is_complete_and_cacheable(self) -&gt; None:
+        response = main.dispatch(
+            {
+                &quot;jsonrpc&quot;: &quot;2.0&quot;,
+                &quot;id&quot;: 0,
+                &quot;method&quot;: &quot;server/discover&quot;,
+                &quot;params&quot;: {&quot;_meta&quot;: main.request_meta()},
+            }
+        )
+        self.assertEqual(response[&quot;result&quot;][&quot;resultType&quot;], &quot;complete&quot;)
+        self.assertEqual(response[&quot;result&quot;][&quot;supportedVersions&quot;], [&quot;2026-07-28&quot;])
+        self.assertEqual(response[&quot;result&quot;][&quot;ttlMs&quot;], 300_000)
+        self.assertIn(main.SERVER_INFO_META, response[&quot;result&quot;][&quot;_meta&quot;])
+
+    def test_tools_list_is_deterministic_cacheable_and_described(self) -&gt; None:
+        response = main.dispatch(
+            {
+                &quot;jsonrpc&quot;: &quot;2.0&quot;,
+                &quot;id&quot;: 1,
+                &quot;method&quot;: &quot;tools/list&quot;,
+                &quot;params&quot;: {&quot;_meta&quot;: main.request_meta()},
+            }
+        )
+        result = response[&quot;result&quot;]
+        self.assertEqual(result[&quot;resultType&quot;], &quot;complete&quot;)
+        self.assertEqual(result[&quot;ttlMs&quot;], 60_000)
+        self.assertEqual(result[&quot;cacheScope&quot;], &quot;public&quot;)
+        self.assertIn(main.SERVER_INFO_META, result[&quot;_meta&quot;])
+        self.assertEqual(
+            [tool[&quot;name&quot;] for tool in result[&quot;tools&quot;]],
+            sorted(tool[&quot;name&quot;] for tool in result[&quot;tools&quot;]),
+        )
+        descriptor = result[&quot;tools&quot;][0]
+        self.assertEqual(descriptor[&quot;name&quot;], &quot;summarize_repo&quot;)
+        self.assertEqual(descriptor[&quot;inputSchema&quot;][&quot;type&quot;], &quot;object&quot;)
+
+    def test_tools_list_returns_independent_descriptors(self) -&gt; None:
+        request = {
+            &quot;jsonrpc&quot;: &quot;2.0&quot;,
+            &quot;id&quot;: 2,
+            &quot;method&quot;: &quot;tools/list&quot;,
+            &quot;params&quot;: {&quot;_meta&quot;: main.request_meta()},
+        }
+        first = main.dispatch(request)[&quot;result&quot;][&quot;tools&quot;]
+        first[0][&quot;inputSchema&quot;][&quot;properties&quot;][&quot;audience&quot;][&quot;type&quot;] = &quot;integer&quot;
+        second = main.dispatch({**request, &quot;id&quot;: 3})[&quot;result&quot;][&quot;tools&quot;]
+        self.assertEqual(
+            second[0][&quot;inputSchema&quot;][&quot;properties&quot;][&quot;audience&quot;][&quot;type&quot;],
+            &quot;string&quot;,
+        )
+
+    def test_initial_call_returns_embedded_sampling_request(self) -&gt; None:
+        response = main.dispatch(tool_request())
+        result = response[&quot;result&quot;]
+        self.assertEqual(result[&quot;resultType&quot;], &quot;input_required&quot;)
+        self.assertEqual(
+            result[&quot;inputRequests&quot;][&quot;pick_files&quot;][&quot;method&quot;],
+            &quot;sampling/createMessage&quot;,
+        )
+        self.assertIsInstance(result[&quot;requestState&quot;], str)
+
+    def test_client_driver_uses_fresh_ids_and_finishes(self) -&gt; None:
+        response, request_ids = main.run_mrtr()
+        self.assertEqual(request_ids, [1, 2, 3])
+        self.assertEqual(response[&quot;result&quot;][&quot;resultType&quot;], &quot;complete&quot;)
+        self.assertFalse(response[&quot;result&quot;][&quot;isError&quot;])
+        self.assertEqual(len(response[&quot;result&quot;][&quot;structuredContent&quot;][&quot;picked&quot;]), 3)
+
+    def test_unsupported_protocol_version_is_rejected(self) -&gt; None:
+        request = tool_request()
+        request[&quot;params&quot;][&quot;_meta&quot;][main.PROTOCOL_META] = &quot;2025-11-25&quot;
+        response = main.dispatch(request)
+        self.assertEqual(response[&quot;error&quot;][&quot;code&quot;], -32022)
+        self.assertEqual(
+            response[&quot;error&quot;][&quot;data&quot;],
+            {&quot;supported&quot;: [main.PROTOCOL_VERSION], &quot;requested&quot;: &quot;2025-11-25&quot;},
+        )
+
+    def test_missing_request_metadata_is_rejected(self) -&gt; None:
+        request = tool_request()
+        del request[&quot;params&quot;][&quot;_meta&quot;]
+        response = main.dispatch(request)
+        self.assertEqual(response[&quot;error&quot;][&quot;code&quot;], -32602)
+
+    def test_non_string_protocol_version_is_invalid_params(self) -&gt; None:
+        request = tool_request()
+        request[&quot;params&quot;][&quot;_meta&quot;][main.PROTOCOL_META] = None
+        response = main.dispatch(request)
+        self.assertEqual(response[&quot;error&quot;][&quot;code&quot;], -32602)
+
+    def test_sampling_capability_is_required(self) -&gt; None:
+        response = main.dispatch(tool_request(sampling=False))
+        self.assertEqual(response[&quot;error&quot;][&quot;code&quot;], -32021)
+        self.assertEqual(
+            response[&quot;error&quot;][&quot;data&quot;],
+            {&quot;requiredCapabilities&quot;: {&quot;sampling&quot;: {}}},
+        )
+
+    def test_notification_never_receives_a_json_rpc_response(self) -&gt; None:
+        request = tool_request()
+        del request[&quot;id&quot;]
+        self.assertIsNone(main.dispatch(request))
+
+    def test_request_state_tampering_is_rejected(self) -&gt; None:
+        response = main.dispatch(tool_request())
+        token = response[&quot;result&quot;][&quot;requestState&quot;]
+        tampered = (&quot;A&quot; if token[0] != &quot;A&quot; else &quot;B&quot;) + token[1:]
+        retry = tool_request(2)
+        retry[&quot;params&quot;].update(
+            {
+                &quot;requestState&quot;: tampered,
+                &quot;inputResponses&quot;: {
+                    &quot;pick_files&quot;: main.fake_host_model(
+                        response[&quot;result&quot;][&quot;inputRequests&quot;][&quot;pick_files&quot;]
+                    )
+                },
+            }
+        )
+        rejected = main.dispatch(retry)
+        self.assertEqual(rejected[&quot;error&quot;][&quot;code&quot;], -32602)
+
+    def test_request_state_is_bound_to_original_arguments(self) -&gt; None:
+        response = main.dispatch(tool_request())
+        retry = tool_request(2)
+        retry[&quot;params&quot;][&quot;arguments&quot;] = {&quot;audience&quot;: &quot;executive&quot;}
+        retry[&quot;params&quot;].update(
+            {
+                &quot;requestState&quot;: response[&quot;result&quot;][&quot;requestState&quot;],
+                &quot;inputResponses&quot;: {
+                    &quot;pick_files&quot;: {
+                        &quot;role&quot;: &quot;assistant&quot;,
+                        &quot;content&quot;: {
+                            &quot;type&quot;: &quot;text&quot;,
+                            &quot;text&quot;: json.dumps([&quot;README.md&quot;]),
+                        },
+                        &quot;model&quot;: &quot;host-model&quot;,
+                        &quot;stopReason&quot;: &quot;endTurn&quot;,
+                    }
+                },
+            }
+        )
+        rejected = main.dispatch(retry)
+        self.assertEqual(rejected[&quot;error&quot;][&quot;code&quot;], -32602)
+
+    def test_expired_request_state_is_rejected(self) -&gt; None:
+        arguments = {&quot;audience&quot;: &quot;developer&quot;}
+        token = main.seal_request_state(
+            {
+                &quot;phase&quot;: &quot;pick&quot;,
+                &quot;principal&quot;: &quot;user-42&quot;,
+                &quot;method&quot;: &quot;tools/call&quot;,
+                &quot;argumentsDigest&quot;: main._arguments_digest(arguments),
+                &quot;expiresAt&quot;: 10,
+            }
+        )
+        with self.assertRaises(main.McpError) as context:
+            main.verify_request_state(
+                token,
+                principal=&quot;user-42&quot;,
+                arguments=arguments,
+                now=11,
+            )
+        self.assertEqual(context.exception.code, -32602)
+
+
+if __name__ == &quot;__main__&quot;:
+    unittest.main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/13-tools-and-protocols/11-mcp-sampling/outputs/skill-sampling-loop-designer.md">phases/13-tools-and-protocols/11-mcp-sampling/outputs/skill-sampling-loop-designer.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: sampling-loop-designer
+description: Migrate model-assisted MCP tools to direct inference or stateless 2026-07-28 MRTR with bounded compatibility sampling.
+version: 2.0.0
+phase: 13
+lesson: 11
+tags: [mcp, mrtr, sampling, stateless, migration]
+---
+
+Design model-assisted behavior for an MCP server targeting protocol revision `2026-07-28`.
+
+Start with one decision: can the server integrate directly with a model provider? Sampling is deprecated for new designs. Prefer direct integration unless using the client&#39;s model and credentials is an explicit product requirement.
+
+Produce:
+
+1. Architecture decision. Choose direct inference or compatibility Sampling and state why.
+2. Discovery contract. Show `server/discover` with exact `supportedVersions`, advertised capabilities, `ttlMs`, and `cacheScope`. If tools are advertised, include mandatory deterministic `tools/list` descriptors with valid object `inputSchema`, `resultType: &quot;complete&quot;`, server identity metadata, and cache hints.
+3. Request envelope. Include protocol version and client capabilities in `_meta` on every request. Use `-32602` for a missing or non-string version, `-32022` with exact `supported` and `requested` data for an unsupported version, and `-32021` with a `requiredCapabilities` object when Sampling is absent. Treat client identity metadata as informational only. Never emit a JSON-RPC response for an id-less notification; an accepted HTTP notification receives `202` with no body.
+4. Round table. For each MRTR round, name the `inputRequests` key, embedded request method, expected response schema, validation, and budget.
+5. Retry contract. Require the original method and arguments, a fresh JSON-RPC id, current-round `inputResponses`, and byte-exact `requestState`.
+6. State protection. Bind HMAC or authenticated encryption to the authenticated principal, method, argument digest, phase, and short expiry.
+7. Safety policy. Define approval, maximum rounds, token and byte limits, response validation, logging, and refusal behavior.
+8. Removal plan. If Sampling remains, name the condition and date for replacing it with direct integration.
+
+Hard rejects:
+
+- A new design that adopts deprecated Sampling without a documented requirement.
+- A 2026-07-28 server that sends `sampling/createMessage` as a live server-to-client request.
+- Any use of `initialize`, `notifications/initialized`, `Mcp-Session-Id`, or hidden protocol-session state.
+- Unsigned `requestState` that affects authorization, resource access, or business logic.
+- A retry that reuses the original JSON-RPC id or changes the original arguments.
+- A client model loop without capability checks, approval policy, validation, and a hard round limit.
+- `includeContext: &quot;allServers&quot;` or implicit cross-server context.
+
+Refusal rules:
+
+- Refuse covert model calls or any design that hides the server&#39;s intent from the user.
+- Refuse model output as proof of identity, authorization, or user consent.
+- Refuse a multi-round design when one deterministic tool call is sufficient.
+- Refuse to call client and server metadata an authenticated identity.
+
+Output a one-page architecture with the decision, wire flow, round table, signed state contents, safety budget, failure cases, and migration plan. End with a verdict: `direct inference`, `temporary MRTR compatibility`, or `no model required`.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. A new MCP server needs model inference. What is the default architecture under 2026-07-28?</legend><label class="option"><input type="radio" name="q0" value="0"> Integrate directly with a model provider</label><label class="option"><input type="radio" name="q0" value="1"> Send sampling/createMessage before every tool call</label><label class="option"><input type="radio" name="q0" value="2"> Store the client&#39;s model key in a protocol session</label><label class="option"><input type="radio" name="q0" value="3"> Open a permanent SSE stream for Sampling</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. How does a 2026-07-28 server request compatibility Sampling during tools/call?</legend><label class="option"><input type="radio" name="q1" value="0"> It writes the prompt into server/discover</label><label class="option"><input type="radio" name="q1" value="1"> It places the prompt in an Mcp-Session-Id header</label><label class="option"><input type="radio" name="q1" value="2"> It returns resultType input_required with sampling/createMessage in inputRequests</label><label class="option"><input type="radio" name="q1" value="3"> It sends a reverse JSON-RPC request on the same connection</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. Which property proves an MRTR retry is an independent JSON-RPC request?</legend><label class="option"><input type="radio" name="q2" value="0"> It omits per-request metadata</label><label class="option"><input type="radio" name="q2" value="1"> It uses the same id as the original request</label><label class="option"><input type="radio" name="q2" value="2"> It uses a fresh id while repeating the original method and arguments</label><label class="option"><input type="radio" name="q2" value="3"> It removes the original tool arguments</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. What must protect requestState when it affects resource access?</legend><label class="option"><input type="radio" name="q3" value="0"> HMAC or authenticated encryption bound to principal, request, and expiry</label><label class="option"><input type="radio" name="q3" value="1"> Base64 encoding alone</label><label class="option"><input type="radio" name="q3" value="2"> A clientInfo name</label><label class="option"><input type="radio" name="q3" value="3"> A long-lived transport session</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. The client did not advertise Sampling in its per-request capabilities. What exact protocol response should the server use?</legend><label class="option"><input type="radio" name="q4" value="0"> Send the embedded sampling request anyway</label><label class="option"><input type="radio" name="q4" value="1"> Return -32021 with data.requiredCapabilities, or choose a non-Sampling path</label><label class="option"><input type="radio" name="q4" value="2"> Add the capability to the client&#39;s metadata</label><label class="option"><input type="radio" name="q4" value="3"> Assume capability from a previous request</label><p data-feedback="4"></p></fieldset><fieldset><legend>6. Which migration keeps a two-round compatibility loop stateless at the protocol layer?</legend><label class="option"><input type="radio" name="q5" value="0"> Carry only current-round inputResponses and signed phase state on each fresh retry</label><label class="option"><input type="radio" name="q5" value="1"> Store phase state under Mcp-Session-Id</label><label class="option"><input type="radio" name="q5" value="2"> Reuse the original request id until completion</label><label class="option"><input type="radio" name="q5" value="3"> Accumulate all model responses in a hidden session</label><p data-feedback="5"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/13-tools-and-protocols/10-mcp-resources-and-prompts/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/13-tools-and-protocols/12-mcp-roots-and-elicitation/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/13-tools-and-protocols/11-mcp-sampling/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

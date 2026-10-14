@@ -1,0 +1,1203 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>自从零开始注意自己 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-07-transformers-deep-dive" data-lesson="07-transformers-deep-dive/02-self-attention-from-scratch" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/07-transformers-deep-dive/">深入 Transformer</a> / LESSON 02</p><h1 class="lesson-title">自从零开始注意自己</h1><p>Self-Attention from Scratch</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>自从零开始注意自己</h1>
+<blockquote>
+<p>关注是一个搜索表,每个字都会问&quot;谁对我有关心?&quot; - -</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 3 (Deep Learning Core), Phase 5 Lesson 10 (Sequence-to-Sequence)
+<strong>Time:</strong> ~90 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>实现从零开始的点产品自注意,仅使用NumPy,包括查询/关键/值预测和软max权重的总和</li>
+<li>构建一个多头注意力层,分开头头,计算并行注意力,并连接结果</li>
+<li>追踪注意力矩阵如何捕获代币关系,并解释为什么按sqrt(d_k) 缩小可以防止软max 和</li>
+<li>应用因果掩饰,将双向注意力转换为自动降低 (解码器式) 的注意力</li>
+</ul>
+<h2>问题</h2>
+<p>通过RNN处理一个代币一次序列.到达代币50时,代币1的信息已经通过50个压缩步骤被压缩.长距离的依赖性被压碎到固体尺寸的隐藏状态 - 一个瓶,没有多少LSTM门完全解决.</p>
+<p>2014年巴哈达纳乌关注论文显示了解决方案:让解码器回顾每个编码器位置,决定哪些对当前步骤重要.但它仍然被绑定到RNN上.2017年的&quot;注意力是你需要的&quot;论文提出了一个更明确的问题:如果注意力是唯一的机制呢?没有重复.没有卷曲.只是注意力.</p>
+<p>随着自觉的注意力,一个连续的位置可以在一个平行步骤中照顾其他位置.</p>
+<h2>概念</h2>
+<h3>数据库搜索比喻</h3>
+<p>想象注意力是一个软的数据库搜索:</p>
+<pre><code>Traditional database:
+  Query: &quot;capital of France&quot;  --&gt;  exact match  --&gt;  &quot;Paris&quot;
+
+Attention:
+  Query: &quot;capital of France&quot;  --&gt;  similarity to ALL keys  --&gt;  weighted blend of ALL values
+</code></pre>
+<p>每个符号都产生三个向量:</p>
+<ul>
+<li><strong>Query (Q)</strong>&quot;我在找什么?&quot;</li>
+<li><strong>Key (K)</strong>&quot;我含有什么?&quot;</li>
+<li><strong>Value (V)</strong>: &quot;如果选出,我应该提供什么信息?&quot;</li>
+</ul>
+<p>查询和所有键之间的点分数产生注意力分数.高分数意味着&quot;这个键匹配我的查询&quot;.这些分数权重值.输出是权重的值.</p>
+<h3>计算</h3>
+<p>每个代币嵌入都通过三个学习的权重矩阵进行投影:</p>
+<pre><code>Input embeddings (sequence of n tokens, each d-dimensional):
+
+  X = [x1, x2, x3, ..., xn]       shape: (n, d)
+
+Three weight matrices:
+
+  Wq  shape: (d, dk)
+  Wk  shape: (d, dk)
+  Wv  shape: (d, dv)
+
+Projections:
+
+  Q = X @ Wq    shape: (n, dk)      each token's query
+  K = X @ Wk    shape: (n, dk)      each token's key
+  V = X @ Wv    shape: (n, dv)      each token's value
+</code></pre>
+<p>视觉上,一个标志:</p>
+<pre><code>             Wq
+  x_i ------[*]------&gt; q_i    &quot;What am I looking for?&quot;
+       |
+       |     Wk
+       +----[*]------&gt; k_i    &quot;What do I contain?&quot;
+       |
+       |     Wv
+       +----[*]------&gt; v_i    &quot;What do I offer?&quot;
+</code></pre>
+<h3>关注矩阵</h3>
+<p>一旦你对所有代币有Q,K,V,注意力分数形成一个矩阵:</p>
+<pre><code>Scores = Q @ K^T    shape: (n, n)
+
+              k1    k2    k3    k4    k5
+        +-----+-----+-----+-----+-----+
+   q1   | 2.1 | 0.3 | 0.1 | 0.8 | 0.2 |   &lt;- how much q1 attends to each key
+        +-----+-----+-----+-----+-----+
+   q2   | 0.4 | 1.9 | 0.7 | 0.1 | 0.3 |
+        +-----+-----+-----+-----+-----+
+   q3   | 0.2 | 0.6 | 2.3 | 0.5 | 0.1 |
+        +-----+-----+-----+-----+-----+
+   q4   | 0.9 | 0.1 | 0.4 | 1.7 | 0.6 |
+        +-----+-----+-----+-----+-----+
+   q5   | 0.1 | 0.3 | 0.2 | 0.5 | 2.0 |
+        +-----+-----+-----+-----+-----+
+
+Each row: one token's attention over the entire sequence
+</code></pre>
+<p>每次查询都会扫描键:每个行都会分分每个代币,软max将分数转换为权重,</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-ed2c8c3525dcd42901ac.png" alt="attention-matrix 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h3>为什么要扩大规模?</h3>
+<p>如果dk=64,点产品可以在数十范围内,将软max推向渐变消失的区域.</p>
+<pre><code>Scaled scores = (Q @ K^T) / sqrt(dk)
+</code></pre>
+<p>这将值保持在软max产生有用的梯度范围.</p>
+<h3>软max 将分数转化为重量</h3>
+<p>软max将原始分数转换为每个行中的概率分布:</p>
+<pre><code>Raw scores for q1:   [2.1, 0.3, 0.1, 0.8, 0.2]
+                            |
+                         softmax
+                            |
+Attention weights:   [0.52, 0.09, 0.07, 0.14, 0.08]   (sums to ~1.0)
+</code></pre>
+<p>每个代币都有一个重量,说明要多少钱来看待其他代币.</p>
+<h3>值的权衡总和</h3>
+<p>每个代币的最终输出是所有值向量的权重总和:</p>
+<pre><code>output_i = sum( attention_weight[i][j] * v_j  for all j )
+
+For token 1:
+  output_1 = 0.52 * v1 + 0.09 * v2 + 0.07 * v3 + 0.14 * v4 + 0.08 * v5
+</code></pre>
+<h3>整个管道</h3>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-06b237f7d549572d2170.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>一行公式:</p>
+<pre><code>Attention(Q, K, V) = softmax( Q @ K^T / sqrt(dk) ) @ V
+</code></pre>
+<figure><img src="/learn/ai-from-scratch/figures/figure-3641108186265a5bae2e.png" alt="softmax-attention-scaling 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<h3>步骤1:从零开始软max</h3>
+<p>软max将原始的 logits转换为概率.</p>
+<pre><code class="language-python">import numpy as np
+
+def softmax(x):
+    shifted = x - np.max(x, axis=-1, keepdims=True)
+    exp_x = np.exp(shifted)
+    return exp_x / np.sum(exp_x, axis=-1, keepdims=True)
+
+logits = np.array([2.0, 1.0, 0.1])
+print(f&quot;logits:  {logits}&quot;)
+print(f&quot;softmax: {softmax(logits)}&quot;)
+print(f&quot;sum:     {softmax(logits).sum():.4f}&quot;)
+</code></pre>
+<h3>步骤2: 量化点产品关注</h3>
+<p>取出Q,K,V矩阵,然后返回注意力输出加重矩阵.</p>
+<pre><code class="language-python">def scaled_dot_product_attention(Q, K, V):
+    dk = Q.shape[-1]
+    scores = Q @ K.T / np.sqrt(dk)
+    weights = softmax(scores)
+    output = weights @ V
+    return output, weights
+</code></pre>
+<h3>步骤3:学习预测的自我注意课程</h3>
+<p>具有Wq,Wk,Wv重量矩阵的全自注意模块,以Xavier式扩展启动.</p>
+<pre><code class="language-python">class SelfAttention:
+    def __init__(self, d_model, dk, dv, seed=42):
+        rng = np.random.default_rng(seed)
+        scale = np.sqrt(2.0 / (d_model + dk))
+        self.Wq = rng.normal(0, scale, (d_model, dk))
+        self.Wk = rng.normal(0, scale, (d_model, dk))
+        scale_v = np.sqrt(2.0 / (d_model + dv))
+        self.Wv = rng.normal(0, scale_v, (d_model, dv))
+        self.dk = dk
+
+    def forward(self, X):
+        Q = X @ self.Wq
+        K = X @ self.Wk
+        V = X @ self.Wv
+        output, weights = scaled_dot_product_attention(Q, K, V)
+        return output, weights
+</code></pre>
+<h3>步骤4:用句子运行</h3>
+<p>创造一个句子的假嵌入,看看注意力重量.</p>
+<pre><code class="language-python">sentence = [&quot;The&quot;, &quot;cat&quot;, &quot;sat&quot;, &quot;on&quot;, &quot;the&quot;, &quot;mat&quot;]
+n_tokens = len(sentence)
+d_model = 8
+dk = 4
+dv = 4
+
+rng = np.random.default_rng(42)
+X = rng.normal(0, 1, (n_tokens, d_model))
+
+attn = SelfAttention(d_model, dk, dv, seed=42)
+output, weights = attn.forward(X)
+
+print(&quot;Attention weights (each row: where that token looks):\n&quot;)
+print(f&quot;{'':&gt;6}&quot;, end=&quot;&quot;)
+for token in sentence:
+    print(f&quot;{token:&gt;6}&quot;, end=&quot;&quot;)
+print()
+
+for i, token in enumerate(sentence):
+    print(f&quot;{token:&gt;6}&quot;, end=&quot;&quot;)
+    for j in range(n_tokens):
+        w = weights[i][j]
+        print(f&quot;{w:6.3f}&quot;, end=&quot;&quot;)
+    print()
+</code></pre>
+<h3>步骤5:用ASCII热图可视化注意力</h3>
+<p>给角色绘制一个快速的视觉.</p>
+<pre><code class="language-python">def ascii_heatmap(weights, tokens, chars=&quot; ░▒▓█&quot;):
+    n = len(tokens)
+    print(f&quot;\n{'':&gt;6}&quot;, end=&quot;&quot;)
+    for t in tokens:
+        print(f&quot;{t:&gt;6}&quot;, end=&quot;&quot;)
+    print()
+
+    for i in range(n):
+        print(f&quot;{tokens[i]:&gt;6}&quot;, end=&quot;&quot;)
+        for j in range(n):
+            level = int(weights[i][j] * (len(chars) - 1) / weights.max())
+            level = min(level, len(chars) - 1)
+            print(f&quot;{'  ' + chars[level] + '   '}&quot;, end=&quot;&quot;)
+        print()
+
+ascii_heatmap(weights, sentence)
+</code></pre>
+<h2>用它</h2>
+<p>皮托尔奇的<code>nn.MultiheadAttention</code>它们是我们所构建的,加上多头分和输出投影:</p>
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+d_model = 8
+n_heads = 2
+seq_len = 6
+
+mha = nn.MultiheadAttention(embed_dim=d_model, num_heads=n_heads, batch_first=True)
+
+X_torch = torch.randn(1, seq_len, d_model)
+
+output, attn_weights = mha(X_torch, X_torch, X_torch)
+
+print(f&quot;Input shape:            {X_torch.shape}&quot;)
+print(f&quot;Output shape:           {output.shape}&quot;)
+print(f&quot;Attention weight shape: {attn_weights.shape}&quot;)
+print(f&quot;\nAttn weights (averaged over heads):&quot;)
+print(attn_weights[0].detach().numpy().round(3))
+</code></pre>
+<p>关键区别:多头注意力并行运行多个注意力函数,每个具有自己的Q,K,V投影大小 dk = d_model / n_heads,然后连接结果. 这使模型可以同时关注不同的关系类型.</p>
+<h2>运送它</h2>
+<p>这一课产生了:</p>
+<ul>
+<li><code>outputs/prompt-attention-explainer.md</code>- 通过数据库搜索比喻解释注意力的提示</li>
+</ul>
+<h2>运动</h2>
+<ol>
+<li>修改<code>scaled_dot_product_attention</code>接受可选的面具矩阵,在软max之前设置某些位置为负无限 (因果/解码面具是这样工作的)</li>
+<li>从零开始实施多头注意力:分为Q,K,V<code>n_heads</code>按一下,将注意力运行到每个块,连接,然后通过最终的重量矩阵投射</li>
+<li>接下来,我们将两句相同长度的句子,通过同一 SelfAttention 实例来养它们,并比较它们的注意力模式.</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Query (Q)</td>
+<td>&quot;The question vector&quot;</td>
+<td>A learned projection of the input that represents what information this token is looking for</td>
+</tr>
+<tr>
+<td>Key (K)</td>
+<td>&quot;The label vector&quot;</td>
+<td>A learned projection that represents what information this token contains, matched against queries</td>
+</tr>
+<tr>
+<td>Value (V)</td>
+<td>&quot;The content vector&quot;</td>
+<td>A learned projection carrying the actual information that gets aggregated based on attention scores</td>
+</tr>
+<tr>
+<td>Scaled dot-product attention</td>
+<td>&quot;The attention formula&quot;</td>
+<td>softmax(QK^T / sqrt(dk)) @ V - scaling prevents softmax saturation in high dimensions</td>
+</tr>
+<tr>
+<td>Self-attention</td>
+<td>&quot;The token looks at itself and others&quot;</td>
+<td>Attention where Q, K, V all come from the same sequence, letting every position attend to every other position</td>
+</tr>
+<tr>
+<td>Attention weights</td>
+<td>&quot;How much focus&quot;</td>
+<td>A probability distribution over positions, produced by softmax over scaled dot products</td>
+</tr>
+<tr>
+<td>Multi-head attention</td>
+<td>&quot;Parallel attention&quot;</td>
+<td>Running multiple attention functions with different projections, then concatenating results for richer representations</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/1706.03762" rel="noreferrer" data-network="true">Attention Is All You Need (Vaswani et al., 2017) <small>↗ 需要联网</small></a>- 原始变压纸</li>
+<li><a href="https://jalammar.github.io/illustrated-transformer/" rel="noreferrer" data-network="true">The Illustrated Transformer (Jay Alammar) <small>↗ 需要联网</small></a>- 完整的建筑中最好的视觉通行</li>
+<li><a href="https://nlp.seas.harvard.edu/annotated-transformer/" rel="noreferrer" data-network="true">The Annotated Transformer (Harvard NLP) <small>↗ 需要联网</small></a>- 逐行实施 PyTorch,并提供说明</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Self-Attention from Scratch</h1>
+<blockquote>
+<p>Attention is a lookup table where every word asks &quot;who matters to me?&quot; - and learns the answer.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 3 (Deep Learning Core), Phase 5 Lesson 10 (Sequence-to-Sequence)
+<strong>Time:</strong> ~90 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Implement scaled dot-product self-attention from scratch using only NumPy, including query/key/value projections and the softmax-weighted sum</li>
+<li>Build a multi-head attention layer that splits heads, computes parallel attention, and concatenates results</li>
+<li>Trace how the attention matrix captures token relationships and explain why scaling by sqrt(d_k) prevents softmax saturation</li>
+<li>Apply causal masking to convert bidirectional attention into autoregressive (decoder-style) attention</li>
+</ul>
+<h2>The Problem</h2>
+<p>RNNs process sequences one token at a time. By the time you reach token 50, the information from token 1 has been squeezed through 50 compression steps. Long-range dependencies get crushed into a fixed-size hidden state - a bottleneck that no amount of LSTM gating fully solves.</p>
+<p>The 2014 Bahdanau attention paper showed the fix: let the decoder look back at every encoder position and decide which ones matter for the current step. But it was still bolted onto an RNN. The 2017 &quot;Attention Is All You Need&quot; paper asked a sharper question: what if attention is the <em>only</em> mechanism? No recurrence. No convolution. Just attention.</p>
+<p>Self-attention lets every position in a sequence attend to every other position in a single parallel step. That is what makes transformers fast, scalable, and dominant.</p>
+<h2>The Concept</h2>
+<h3>The Database Lookup Analogy</h3>
+<p>Think of attention as a soft database lookup:</p>
+<pre><code>Traditional database:
+  Query: &quot;capital of France&quot;  --&gt;  exact match  --&gt;  &quot;Paris&quot;
+
+Attention:
+  Query: &quot;capital of France&quot;  --&gt;  similarity to ALL keys  --&gt;  weighted blend of ALL values
+</code></pre>
+<p>Every token generates three vectors:</p>
+<ul>
+<li><strong>Query (Q)</strong>: &quot;What am I looking for?&quot;</li>
+<li><strong>Key (K)</strong>: &quot;What do I contain?&quot;</li>
+<li><strong>Value (V)</strong>: &quot;What information do I provide if selected?&quot;</li>
+</ul>
+<p>The dot product between a query and all keys produces attention scores. High score means &quot;this key matches my query.&quot; Those scores weight the values. The output is a weighted sum of values.</p>
+<h3>Q, K, V Computation</h3>
+<p>Each token embedding gets projected through three learned weight matrices:</p>
+<pre><code>Input embeddings (sequence of n tokens, each d-dimensional):
+
+  X = [x1, x2, x3, ..., xn]       shape: (n, d)
+
+Three weight matrices:
+
+  Wq  shape: (d, dk)
+  Wk  shape: (d, dk)
+  Wv  shape: (d, dv)
+
+Projections:
+
+  Q = X @ Wq    shape: (n, dk)      each token's query
+  K = X @ Wk    shape: (n, dk)      each token's key
+  V = X @ Wv    shape: (n, dv)      each token's value
+</code></pre>
+<p>Visually, for one token:</p>
+<pre><code>             Wq
+  x_i ------[*]------&gt; q_i    &quot;What am I looking for?&quot;
+       |
+       |     Wk
+       +----[*]------&gt; k_i    &quot;What do I contain?&quot;
+       |
+       |     Wv
+       +----[*]------&gt; v_i    &quot;What do I offer?&quot;
+</code></pre>
+<h3>The Attention Matrix</h3>
+<p>Once you have Q, K, V for all tokens, attention scores form a matrix:</p>
+<pre><code>Scores = Q @ K^T    shape: (n, n)
+
+              k1    k2    k3    k4    k5
+        +-----+-----+-----+-----+-----+
+   q1   | 2.1 | 0.3 | 0.1 | 0.8 | 0.2 |   &lt;- how much q1 attends to each key
+        +-----+-----+-----+-----+-----+
+   q2   | 0.4 | 1.9 | 0.7 | 0.1 | 0.3 |
+        +-----+-----+-----+-----+-----+
+   q3   | 0.2 | 0.6 | 2.3 | 0.5 | 0.1 |
+        +-----+-----+-----+-----+-----+
+   q4   | 0.9 | 0.1 | 0.4 | 1.7 | 0.6 |
+        +-----+-----+-----+-----+-----+
+   q5   | 0.1 | 0.3 | 0.2 | 0.5 | 2.0 |
+        +-----+-----+-----+-----+-----+
+
+Each row: one token's attention over the entire sequence
+</code></pre>
+<p>Watch one query at a time sweep the keys: each row scores every token, softmax turns the scores into weights, and the context vector is the weighted blend of values.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-ed2c8c3525dcd42901ac.png" alt="attention-matrix 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h3>Why Scale?</h3>
+<p>The dot products grow with dimension dk. If dk = 64, dot products can be in the range of tens, pushing softmax into regions where gradients vanish. The fix: divide by sqrt(dk).</p>
+<pre><code>Scaled scores = (Q @ K^T) / sqrt(dk)
+</code></pre>
+<p>This keeps values in a range where softmax produces useful gradients.</p>
+<h3>Softmax Turns Scores into Weights</h3>
+<p>Softmax converts raw scores into a probability distribution across each row:</p>
+<pre><code>Raw scores for q1:   [2.1, 0.3, 0.1, 0.8, 0.2]
+                            |
+                         softmax
+                            |
+Attention weights:   [0.52, 0.09, 0.07, 0.14, 0.08]   (sums to ~1.0)
+</code></pre>
+<p>Now each token has a set of weights saying how much to attend to every other token.</p>
+<h3>Weighted Sum of Values</h3>
+<p>The final output for each token is a weighted sum of all value vectors:</p>
+<pre><code>output_i = sum( attention_weight[i][j] * v_j  for all j )
+
+For token 1:
+  output_1 = 0.52 * v1 + 0.09 * v2 + 0.07 * v3 + 0.14 * v4 + 0.08 * v5
+</code></pre>
+<h3>Full Pipeline</h3>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-06b237f7d549572d2170.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>Formula in one line:</p>
+<pre><code>Attention(Q, K, V) = softmax( Q @ K^T / sqrt(dk) ) @ V
+</code></pre>
+<figure><img src="/learn/ai-from-scratch/figures/figure-3641108186265a5bae2e.png" alt="softmax-attention-scaling 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<h3>Step 1: Softmax from scratch</h3>
+<p>Softmax converts raw logits into probabilities. Subtract the max for numerical stability.</p>
+<pre><code class="language-python">import numpy as np
+
+def softmax(x):
+    shifted = x - np.max(x, axis=-1, keepdims=True)
+    exp_x = np.exp(shifted)
+    return exp_x / np.sum(exp_x, axis=-1, keepdims=True)
+
+logits = np.array([2.0, 1.0, 0.1])
+print(f&quot;logits:  {logits}&quot;)
+print(f&quot;softmax: {softmax(logits)}&quot;)
+print(f&quot;sum:     {softmax(logits).sum():.4f}&quot;)
+</code></pre>
+<h3>Step 2: Scaled dot-product attention</h3>
+<p>The core function. Takes Q, K, V matrices and returns the attention output plus the weight matrix.</p>
+<pre><code class="language-python">def scaled_dot_product_attention(Q, K, V):
+    dk = Q.shape[-1]
+    scores = Q @ K.T / np.sqrt(dk)
+    weights = softmax(scores)
+    output = weights @ V
+    return output, weights
+</code></pre>
+<h3>Step 3: Self-attention class with learned projections</h3>
+<p>A full self-attention module with Wq, Wk, Wv weight matrices initialized with Xavier-like scaling.</p>
+<pre><code class="language-python">class SelfAttention:
+    def __init__(self, d_model, dk, dv, seed=42):
+        rng = np.random.default_rng(seed)
+        scale = np.sqrt(2.0 / (d_model + dk))
+        self.Wq = rng.normal(0, scale, (d_model, dk))
+        self.Wk = rng.normal(0, scale, (d_model, dk))
+        scale_v = np.sqrt(2.0 / (d_model + dv))
+        self.Wv = rng.normal(0, scale_v, (d_model, dv))
+        self.dk = dk
+
+    def forward(self, X):
+        Q = X @ self.Wq
+        K = X @ self.Wk
+        V = X @ self.Wv
+        output, weights = scaled_dot_product_attention(Q, K, V)
+        return output, weights
+</code></pre>
+<h3>Step 4: Run it on a sentence</h3>
+<p>Create fake embeddings for a sentence and watch the attention weights.</p>
+<pre><code class="language-python">sentence = [&quot;The&quot;, &quot;cat&quot;, &quot;sat&quot;, &quot;on&quot;, &quot;the&quot;, &quot;mat&quot;]
+n_tokens = len(sentence)
+d_model = 8
+dk = 4
+dv = 4
+
+rng = np.random.default_rng(42)
+X = rng.normal(0, 1, (n_tokens, d_model))
+
+attn = SelfAttention(d_model, dk, dv, seed=42)
+output, weights = attn.forward(X)
+
+print(&quot;Attention weights (each row: where that token looks):\n&quot;)
+print(f&quot;{'':&gt;6}&quot;, end=&quot;&quot;)
+for token in sentence:
+    print(f&quot;{token:&gt;6}&quot;, end=&quot;&quot;)
+print()
+
+for i, token in enumerate(sentence):
+    print(f&quot;{token:&gt;6}&quot;, end=&quot;&quot;)
+    for j in range(n_tokens):
+        w = weights[i][j]
+        print(f&quot;{w:6.3f}&quot;, end=&quot;&quot;)
+    print()
+</code></pre>
+<h3>Step 5: Visualize attention with ASCII heatmap</h3>
+<p>Map attention weights to characters for a quick visual.</p>
+<pre><code class="language-python">def ascii_heatmap(weights, tokens, chars=&quot; ░▒▓█&quot;):
+    n = len(tokens)
+    print(f&quot;\n{'':&gt;6}&quot;, end=&quot;&quot;)
+    for t in tokens:
+        print(f&quot;{t:&gt;6}&quot;, end=&quot;&quot;)
+    print()
+
+    for i in range(n):
+        print(f&quot;{tokens[i]:&gt;6}&quot;, end=&quot;&quot;)
+        for j in range(n):
+            level = int(weights[i][j] * (len(chars) - 1) / weights.max())
+            level = min(level, len(chars) - 1)
+            print(f&quot;{'  ' + chars[level] + '   '}&quot;, end=&quot;&quot;)
+        print()
+
+ascii_heatmap(weights, sentence)
+</code></pre>
+<h2>Use It</h2>
+<p>PyTorch's <code>nn.MultiheadAttention</code> does exactly what we built, plus multi-head splitting and output projection:</p>
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+d_model = 8
+n_heads = 2
+seq_len = 6
+
+mha = nn.MultiheadAttention(embed_dim=d_model, num_heads=n_heads, batch_first=True)
+
+X_torch = torch.randn(1, seq_len, d_model)
+
+output, attn_weights = mha(X_torch, X_torch, X_torch)
+
+print(f&quot;Input shape:            {X_torch.shape}&quot;)
+print(f&quot;Output shape:           {output.shape}&quot;)
+print(f&quot;Attention weight shape: {attn_weights.shape}&quot;)
+print(f&quot;\nAttn weights (averaged over heads):&quot;)
+print(attn_weights[0].detach().numpy().round(3))
+</code></pre>
+<p>The key difference: multi-head attention runs multiple attention functions in parallel, each with its own Q, K, V projections of size dk = d_model / n_heads, then concatenates results. This lets the model attend to different relationship types simultaneously.</p>
+<h2>Ship It</h2>
+<p>This lesson produces:</p>
+<ul>
+<li><code>outputs/prompt-attention-explainer.md</code> - a prompt for explaining attention through the database lookup analogy</li>
+</ul>
+<h2>Exercises</h2>
+<ol>
+<li>Modify <code>scaled_dot_product_attention</code> to accept an optional mask matrix that sets certain positions to negative infinity before softmax (this is how causal/decoder masking works)</li>
+<li>Implement multi-head attention from scratch: split Q, K, V into <code>n_heads</code> chunks, run attention on each, concatenate, and project through a final weight matrix Wo</li>
+<li>Take two different sentences of the same length, feed them through the same SelfAttention instance, and compare their attention patterns. What changes? What stays the same?</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Query (Q)</td>
+<td>&quot;The question vector&quot;</td>
+<td>A learned projection of the input that represents what information this token is looking for</td>
+</tr>
+<tr>
+<td>Key (K)</td>
+<td>&quot;The label vector&quot;</td>
+<td>A learned projection that represents what information this token contains, matched against queries</td>
+</tr>
+<tr>
+<td>Value (V)</td>
+<td>&quot;The content vector&quot;</td>
+<td>A learned projection carrying the actual information that gets aggregated based on attention scores</td>
+</tr>
+<tr>
+<td>Scaled dot-product attention</td>
+<td>&quot;The attention formula&quot;</td>
+<td>softmax(QK^T / sqrt(dk)) @ V - scaling prevents softmax saturation in high dimensions</td>
+</tr>
+<tr>
+<td>Self-attention</td>
+<td>&quot;The token looks at itself and others&quot;</td>
+<td>Attention where Q, K, V all come from the same sequence, letting every position attend to every other position</td>
+</tr>
+<tr>
+<td>Attention weights</td>
+<td>&quot;How much focus&quot;</td>
+<td>A probability distribution over positions, produced by softmax over scaled dot products</td>
+</tr>
+<tr>
+<td>Multi-head attention</td>
+<td>&quot;Parallel attention&quot;</td>
+<td>Running multiple attention functions with different projections, then concatenating results for richer representations</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/1706.03762" rel="noreferrer" data-network="true">Attention Is All You Need (Vaswani et al., 2017) <small>↗ 需要联网</small></a> - the original transformer paper</li>
+<li><a href="https://jalammar.github.io/illustrated-transformer/" rel="noreferrer" data-network="true">The Illustrated Transformer (Jay Alammar) <small>↗ 需要联网</small></a> - best visual walkthrough of the full architecture</li>
+<li><a href="https://nlp.seas.harvard.edu/annotated-transformer/" rel="noreferrer" data-network="true">The Annotated Transformer (Harvard NLP) <small>↗ 需要联网</small></a> - line-by-line PyTorch implementation with explanations</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-07-transformers-deep-dive--02-self-attention-from-scratch.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-07-transformers-deep-dive--02-self-attention-from-scratch.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/07-transformers-deep-dive/02-self-attention-from-scratch/code/main.jl">phases/07-transformers-deep-dive/02-self-attention-from-scratch/code/main.jl</a><details><summary>查看原始文本</summary><pre><code># Self-attention from scratch in Julia. Scaled dot-product attention,
+# numerically-stable row-wise softmax, single-head and multi-head
+# self-attention. Stdlib only. Sources:
+#   https://arxiv.org/abs/1706.03762
+#   https://docs.julialang.org/en/v1/stdlib/LinearAlgebra/
+#   https://docs.julialang.org/en/v1/stdlib/Random/
+
+using Random
+using LinearAlgebra
+using Printf
+
+
+function softmax_rows(M::Matrix{Float64})::Matrix{Float64}
+    out = similar(M)
+    for i in 1:size(M, 1)
+        row = M[i, :]
+        m = maximum(row)
+        e = exp.(row .- m)
+        s = sum(e)
+        out[i, :] = e ./ s
+    end
+    return out
+end
+
+
+function scaled_dot_product_attention(Q::Matrix{Float64}, K::Matrix{Float64},
+                                      V::Matrix{Float64})
+    dk = size(Q, 2)
+    scores = (Q * transpose(K)) ./ sqrt(dk)
+    weights = softmax_rows(scores)
+    output = weights * V
+    return output, weights
+end
+
+
+struct SelfAttention
+    Wq::Matrix{Float64}
+    Wk::Matrix{Float64}
+    Wv::Matrix{Float64}
+    dk::Int
+end
+
+
+function SelfAttention(d_model::Int, dk::Int, dv::Int; seed::Int=42)
+    rng = MersenneTwister(seed)
+    scale_qk = sqrt(2.0 / (d_model + dk))
+    scale_v = sqrt(2.0 / (d_model + dv))
+    Wq = scale_qk .* randn(rng, d_model, dk)
+    Wk = scale_qk .* randn(rng, d_model, dk)
+    Wv = scale_v .* randn(rng, d_model, dv)
+    return SelfAttention(Wq, Wk, Wv, dk)
+end
+
+
+function forward(attn::SelfAttention, X::Matrix{Float64})
+    Q = X * attn.Wq
+    K = X * attn.Wk
+    V = X * attn.Wv
+    return scaled_dot_product_attention(Q, K, V)
+end
+
+
+struct MultiHeadSelfAttention
+    heads::Vector{SelfAttention}
+    Wo::Matrix{Float64}
+    n_heads::Int
+end
+
+
+function MultiHeadSelfAttention(d_model::Int, n_heads::Int; seed::Int=42)
+    @assert n_heads &gt; 0 &quot;n_heads must be &gt; 0&quot;
+    @assert d_model &gt; 0 &quot;d_model must be &gt; 0&quot;
+    @assert d_model % n_heads == 0 &quot;d_model must be divisible by n_heads&quot;
+    dk = d_model ÷ n_heads
+    dv = d_model ÷ n_heads
+    heads = [SelfAttention(d_model, dk, dv; seed=seed + i) for i in 1:n_heads]
+    rng = MersenneTwister(seed + n_heads + 1)
+    scale = sqrt(2.0 / (d_model + d_model))
+    Wo = scale .* randn(rng, n_heads * dv, d_model)
+    return MultiHeadSelfAttention(heads, Wo, n_heads)
+end
+
+
+function forward(mha::MultiHeadSelfAttention, X::Matrix{Float64})
+    head_outputs = Matrix{Float64}[]
+    weights_per_head = Matrix{Float64}[]
+    for head in mha.heads
+        out, w = forward(head, X)
+        push!(head_outputs, out)
+        push!(weights_per_head, w)
+    end
+    concat = hcat(head_outputs...)
+    return concat * mha.Wo, weights_per_head
+end
+
+
+function print_attention_matrix(weights::Matrix{Float64}, tokens::Vector{String})
+    print(&quot;\n      &quot;)
+    for token in tokens
+        @printf(&quot;%6s&quot;, token)
+    end
+    println()
+    for i in 1:length(tokens)
+        @printf(&quot;%6s&quot;, tokens[i])
+        for j in 1:length(tokens)
+            @printf(&quot;%6.3f&quot;, weights[i, j])
+        end
+        println()
+    end
+end
+
+
+function ascii_heatmap(weights::Matrix{Float64}, tokens::Vector{String};
+                       chars::String=&quot; .:-=+*#%@&quot;)
+    print(&quot;\n      &quot;)
+    for t in tokens
+        @printf(&quot;%6s&quot;, t)
+    end
+    println()
+    w_max = maximum(weights)
+    for i in 1:length(tokens)
+        @printf(&quot;%6s&quot;, tokens[i])
+        for j in 1:length(tokens)
+            level = Int(floor(weights[i, j] * (length(chars) - 1) / w_max))
+            level = min(level, length(chars) - 1)
+            ch = chars[level + 1]
+            @printf(&quot;    %s &quot;, ch)
+        end
+        println()
+    end
+end
+
+
+function demo_softmax_stability()
+    println(&quot;\n&quot; * &quot;=&quot; ^ 60)
+    println(&quot;SOFTMAX NUMERIC STABILITY&quot;)
+    println(&quot;=&quot; ^ 60)
+    logits = reshape([2.0, 1.0, 0.1], 1, 3)
+    probs = softmax_rows(logits)
+    @printf(&quot;\nLogits:  [%s]\n&quot;, join([@sprintf(&quot;%.4f&quot;, v) for v in logits], &quot;, &quot;))
+    @printf(&quot;Softmax: [%s]\n&quot;, join([@sprintf(&quot;%.4f&quot;, v) for v in probs], &quot;, &quot;))
+    @printf(&quot;Sum:     %.4f\n&quot;, sum(probs))
+
+    big_logits = reshape([100.0, 200.0, 300.0], 1, 3)
+    big_probs = softmax_rows(big_logits)
+    @printf(&quot;\nLarge logits:  [%s]\n&quot;,
+            join([@sprintf(&quot;%.1f&quot;, v) for v in big_logits], &quot;, &quot;))
+    @printf(&quot;Softmax:       [%s]\n&quot;,
+            join([@sprintf(&quot;%.4f&quot;, v) for v in big_probs], &quot;, &quot;))
+    @printf(&quot;Sum:           %.4f\n&quot;, sum(big_probs))
+    println(&quot;(no overflow because we subtract the row maximum before exp)&quot;)
+end
+
+
+function demo_self_attention()
+    println(&quot;=&quot; ^ 60)
+    println(&quot;SELF-ATTENTION FROM SCRATCH&quot;)
+    println(&quot;=&quot; ^ 60)
+
+    tokens = [&quot;The&quot;, &quot;cat&quot;, &quot;sat&quot;, &quot;on&quot;, &quot;the&quot;, &quot;mat&quot;]
+    n_tokens = length(tokens)
+    d_model = 16
+    dk = 8
+    dv = 8
+
+    rng = MersenneTwister(42)
+    X = randn(rng, n_tokens, d_model)
+
+    @printf(&quot;\nSentence: %s\n&quot;, join(tokens, &quot; &quot;))
+    @printf(&quot;Tokens: %d  d_model: %d  dk: %d  dv: %d\n&quot;, n_tokens, d_model, dk, dv)
+    @printf(&quot;Input shape: (%d, %d)\n&quot;, size(X, 1), size(X, 2))
+
+    attn = SelfAttention(d_model, dk, dv; seed=42)
+    output, weights = forward(attn, X)
+    @printf(&quot;\nOutput shape: (%d, %d)\n&quot;, size(output, 1), size(output, 2))
+    println(&quot;\nAttention weights:&quot;)
+    print_attention_matrix(weights, tokens)
+    println(&quot;\nASCII heatmap (denser char = higher attention):&quot;)
+    ascii_heatmap(weights, tokens)
+    return tokens, X, d_model
+end
+
+
+function demo_multi_head(tokens::Vector{String}, X::Matrix{Float64}, d_model::Int)
+    println(&quot;\n&quot; * &quot;=&quot; ^ 60)
+    println(&quot;MULTI-HEAD SELF-ATTENTION&quot;)
+    println(&quot;=&quot; ^ 60)
+    n_heads = 2
+    mha = MultiHeadSelfAttention(d_model, n_heads; seed=42)
+    out, head_weights = forward(mha, X)
+    @printf(&quot;\nHeads: %d  Output shape: (%d, %d)\n&quot;,
+            n_heads, size(out, 1), size(out, 2))
+    for (h, w) in enumerate(head_weights)
+        @printf(&quot;\nHead %d attention weights:\n&quot;, h)
+        print_attention_matrix(w, tokens)
+    end
+end
+
+
+function main()
+    tokens, X, d_model = demo_self_attention()
+    demo_multi_head(tokens, X, d_model)
+    demo_softmax_stability()
+end
+
+
+if abspath(PROGRAM_FILE) == @__FILE__
+    main()
+end
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/07-transformers-deep-dive/02-self-attention-from-scratch/code/main.rs">phases/07-transformers-deep-dive/02-self-attention-from-scratch/code/main.rs</a><details><summary>查看原始文本</summary><pre><code>// Self-attention kernel from scratch, stdlib only.
+// Topic: scaled dot-product attention with explicit row-major memory.
+// References (cited in spirit, not as deps):
+//   - Vaswani 2017, &quot;Attention Is All You Need&quot;: https://arxiv.org/abs/1706.03762
+//   - candle reference attention kernel:        https://github.com/huggingface/candle/blob/main/candle-nn/src/ops.rs
+//   - Karpathy llm.c attention forward pass:    https://github.com/karpathy/llm.c/blob/master/train_gpt2.c
+//
+// Compile + run:  rustc --edition 2021 main.rs -o /tmp/sa &amp;&amp; /tmp/sa
+
+use std::f32::consts::E;
+
+// Row-major matrix backed by a flat Vec&lt;f32&gt;. Helpers index by (row, col).
+struct Mat {
+    rows: usize,
+    cols: usize,
+    data: Vec&lt;f32&gt;,
+}
+
+impl Mat {
+    fn zeros(rows: usize, cols: usize) -&gt; Self {
+        Mat { rows, cols, data: vec![0.0; rows * cols] }
+    }
+
+    #[inline] fn at(&amp;self, i: usize, j: usize) -&gt; f32 { self.data[i * self.cols + j] }
+    #[inline] fn set(&amp;mut self, i: usize, j: usize, v: f32) { self.data[i * self.cols + j] = v; }
+
+    fn matmul(&amp;self, b: &amp;Mat) -&gt; Mat {
+        assert_eq!(self.cols, b.rows, &quot;shape mismatch: {}x{} @ {}x{}&quot;, self.rows, self.cols, b.rows, b.cols);
+        let mut out = Mat::zeros(self.rows, b.cols);
+        for i in 0..self.rows {
+            for k in 0..self.cols {
+                let aik = self.at(i, k);
+                if aik == 0.0 { continue; }
+                let row_base = i * out.cols;
+                let bk_base = k * b.cols;
+                for j in 0..b.cols {
+                    out.data[row_base + j] += aik * b.data[bk_base + j];
+                }
+            }
+        }
+        out
+    }
+
+    fn transpose(&amp;self) -&gt; Mat {
+        let mut t = Mat::zeros(self.cols, self.rows);
+        for i in 0..self.rows {
+            for j in 0..self.cols {
+                t.set(j, i, self.at(i, j));
+            }
+        }
+        t
+    }
+
+    fn scale(&amp;mut self, s: f32) {
+        for v in self.data.iter_mut() { *v *= s; }
+    }
+}
+
+// Softmax along the last axis (per row), numerically stable.
+fn softmax_rows(m: &amp;Mat) -&gt; Mat {
+    let mut out = Mat::zeros(m.rows, m.cols);
+    for i in 0..m.rows {
+        let mut row_max = f32::NEG_INFINITY;
+        for j in 0..m.cols { if m.at(i, j) &gt; row_max { row_max = m.at(i, j); } }
+        let mut sum = 0.0f32;
+        for j in 0..m.cols {
+            let e = E.powf(m.at(i, j) - row_max);
+            out.set(i, j, e);
+            sum += e;
+        }
+        let inv = 1.0 / sum;
+        for j in 0..m.cols {
+            let v = out.at(i, j) * inv;
+            out.set(i, j, v);
+        }
+    }
+    out
+}
+
+// Q @ K^T / sqrt(d_k), softmax, then @ V.
+fn scaled_dot_product_attention(q: &amp;Mat, k: &amp;Mat, v: &amp;Mat) -&gt; (Mat, Mat) {
+    let dk = q.cols as f32;
+    let k_t = k.transpose();
+    let mut scores = q.matmul(&amp;k_t);
+    scores.scale(1.0 / dk.sqrt());
+    let weights = softmax_rows(&amp;scores);
+    let out = weights.matmul(v);
+    (out, weights)
+}
+
+// Deterministic, dependency-free Gaussian via Box-Muller from a Lehmer LCG.
+struct Rng { state: u64 }
+impl Rng {
+    fn new(seed: u64) -&gt; Self { Rng { state: seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1 } }
+    fn next_u32(&amp;mut self) -&gt; u32 {
+        self.state = self.state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (self.state &gt;&gt; 33) as u32
+    }
+    fn uniform(&amp;mut self) -&gt; f32 {
+        (self.next_u32() as f32 + 1.0) / (u32::MAX as f32 + 2.0)
+    }
+    fn gauss(&amp;mut self) -&gt; f32 {
+        let u1 = self.uniform();
+        let u2 = self.uniform();
+        (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos()
+    }
+}
+
+fn randn(rows: usize, cols: usize, scale: f32, rng: &amp;mut Rng) -&gt; Mat {
+    let mut m = Mat::zeros(rows, cols);
+    for v in m.data.iter_mut() { *v = rng.gauss() * scale; }
+    m
+}
+
+struct SelfAttention {
+    wq: Mat,
+    wk: Mat,
+    wv: Mat,
+}
+
+impl SelfAttention {
+    fn new(d_model: usize, dk: usize, dv: usize, rng: &amp;mut Rng) -&gt; Self {
+        let s_qk = (2.0 / (d_model + dk) as f32).sqrt();
+        let s_v = (2.0 / (d_model + dv) as f32).sqrt();
+        SelfAttention {
+            wq: randn(d_model, dk, s_qk, rng),
+            wk: randn(d_model, dk, s_qk, rng),
+            wv: randn(d_model, dv, s_v, rng),
+        }
+    }
+
+    fn forward(&amp;self, x: &amp;Mat) -&gt; (Mat, Mat) {
+        let q = x.matmul(&amp;self.wq);
+        let k = x.matmul(&amp;self.wk);
+        let v = x.matmul(&amp;self.wv);
+        scaled_dot_product_attention(&amp;q, &amp;k, &amp;v)
+    }
+}
+
+fn print_attention(weights: &amp;Mat, tokens: &amp;[&amp;str]) {
+    print!(&quot;      &quot;);
+    for t in tokens { print!(&quot;{:&gt;7}&quot;, t); }
+    println!();
+    for i in 0..weights.rows {
+        print!(&quot;{:&gt;6}&quot;, tokens[i]);
+        for j in 0..weights.cols { print!(&quot;{:&gt;7.3}&quot;, weights.at(i, j)); }
+        println!();
+    }
+}
+
+fn ascii_heatmap(weights: &amp;Mat, tokens: &amp;[&amp;str]) {
+    let chars = [&#39; &#39;, &#39;\u{2591}&#39;, &#39;\u{2592}&#39;, &#39;\u{2593}&#39;, &#39;\u{2588}&#39;];
+    let mut w_max = 0.0f32;
+    for v in &amp;weights.data { if *v &gt; w_max { w_max = *v; } }
+    print!(&quot;      &quot;);
+    for t in tokens { print!(&quot;{:&gt;7}&quot;, t); }
+    println!();
+    for i in 0..weights.rows {
+        print!(&quot;{:&gt;6}&quot;, tokens[i]);
+        for j in 0..weights.cols {
+            let level = ((weights.at(i, j) * (chars.len() - 1) as f32) / w_max) as usize;
+            let level = level.min(chars.len() - 1);
+            print!(&quot;     {} &quot;, chars[level]);
+        }
+        println!();
+    }
+}
+
+fn softmax_vec(logits: &amp;[f32]) -&gt; Vec&lt;f32&gt; {
+    let mut m = f32::NEG_INFINITY;
+    for &amp;x in logits { if x &gt; m { m = x; } }
+    let exps: Vec&lt;f32&gt; = logits.iter().map(|x| (x - m).exp()).collect();
+    let s: f32 = exps.iter().sum();
+    exps.into_iter().map(|x| x / s).collect()
+}
+
+fn main() {
+    let sentence = [&quot;The&quot;, &quot;cat&quot;, &quot;sat&quot;, &quot;on&quot;, &quot;the&quot;, &quot;mat&quot;];
+    let n_tokens = sentence.len();
+    let d_model: usize = 16;
+    let dk: usize = 8;
+    let dv: usize = 8;
+
+    println!(&quot;{}&quot;, &quot;=&quot;.repeat(60));
+    println!(&quot;SELF-ATTENTION FROM SCRATCH (Rust port)&quot;);
+    println!(&quot;{}&quot;, &quot;=&quot;.repeat(60));
+
+    let mut rng = Rng::new(42);
+    let x = randn(n_tokens, d_model, 1.0, &amp;mut rng);
+    println!(&quot;\nSentence: {}&quot;, sentence.join(&quot; &quot;));
+    println!(&quot;Tokens: {}, d_model: {}, dk: {}, dv: {}&quot;, n_tokens, d_model, dk, dv);
+    println!(&quot;Input shape: ({}, {})&quot;, x.rows, x.cols);
+
+    let mut rng_w = Rng::new(42);
+    let attn = SelfAttention::new(d_model, dk, dv, &amp;mut rng_w);
+    let (out, weights) = attn.forward(&amp;x);
+
+    println!(&quot;\nOutput shape: ({}, {})&quot;, out.rows, out.cols);
+    println!(&quot;\nAttention weights:&quot;);
+    print_attention(&amp;weights, &amp;sentence);
+
+    println!(&quot;\nASCII heatmap (darker = higher attention):&quot;);
+    ascii_heatmap(&amp;weights, &amp;sentence);
+
+    println!(&quot;\n{}&quot;, &quot;=&quot;.repeat(60));
+    println!(&quot;SOFTMAX DEMO&quot;);
+    println!(&quot;{}&quot;, &quot;=&quot;.repeat(60));
+
+    let logits = [2.0f32, 1.0, 0.1];
+    let probs = softmax_vec(&amp;logits);
+    println!(&quot;\nLogits:  {:?}&quot;, logits);
+    println!(&quot;Softmax: {:?}&quot;, probs.iter().map(|p| (p * 10000.0).round() / 10000.0).collect::&lt;Vec&lt;_&gt;&gt;());
+    println!(&quot;Sum:     {:.4}&quot;, probs.iter().sum::&lt;f32&gt;());
+
+    let large = [100.0f32, 200.0, 300.0];
+    let probs_l = softmax_vec(&amp;large);
+    println!(&quot;\nLarge logits:  {:?}&quot;, large);
+    println!(&quot;Softmax:       {:?}&quot;, probs_l.iter().map(|p| (p * 10000.0).round() / 10000.0).collect::&lt;Vec&lt;_&gt;&gt;());
+    println!(&quot;Sum:           {:.4}&quot;, probs_l.iter().sum::&lt;f32&gt;());
+    println!(&quot;(numerically stable, no overflow)&quot;);
+
+    println!(&quot;\n{}&quot;, &quot;=&quot;.repeat(60));
+    println!(&quot;MICROBENCH: 10K attention forwards&quot;);
+    println!(&quot;{}&quot;, &quot;=&quot;.repeat(60));
+    let start = std::time::Instant::now();
+    let mut sink = 0.0f32;
+    for _ in 0..10_000 {
+        let (o, _) = attn.forward(&amp;x);
+        sink += o.at(0, 0);
+    }
+    let elapsed = start.elapsed();
+    println!(&quot;10K forwards in {:.2}ms ({:.0}/sec)  sink={:.4}&quot;,
+        elapsed.as_secs_f64() * 1000.0,
+        10_000.0 / elapsed.as_secs_f64(),
+        sink,
+    );
+}
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/07-transformers-deep-dive/02-self-attention-from-scratch/code/self_attention.py">phases/07-transformers-deep-dive/02-self-attention-from-scratch/code/self_attention.py</a><details><summary>查看原始文本</summary><pre><code>import numpy as np
+
+
+def softmax(x):
+    shifted = x - np.max(x, axis=-1, keepdims=True)
+    exp_x = np.exp(shifted)
+    return exp_x / np.sum(exp_x, axis=-1, keepdims=True)
+
+
+def scaled_dot_product_attention(Q, K, V):
+    dk = Q.shape[-1]
+    scores = Q @ K.T / np.sqrt(dk)
+    weights = softmax(scores)
+    output = weights @ V
+    return output, weights
+
+
+class SelfAttention:
+    def __init__(self, d_model, dk, dv, seed=42):
+        rng = np.random.default_rng(seed)
+        scale_qk = np.sqrt(2.0 / (d_model + dk))
+        self.Wq = rng.normal(0, scale_qk, (d_model, dk))
+        self.Wk = rng.normal(0, scale_qk, (d_model, dk))
+        scale_v = np.sqrt(2.0 / (d_model + dv))
+        self.Wv = rng.normal(0, scale_v, (d_model, dv))
+        self.dk = dk
+
+    def forward(self, X):
+        Q = X @ self.Wq
+        K = X @ self.Wk
+        V = X @ self.Wv
+        return scaled_dot_product_attention(Q, K, V)
+
+
+class MultiHeadSelfAttention:
+    def __init__(self, d_model, n_heads, seed=42):
+        assert d_model % n_heads == 0
+        self.n_heads = n_heads
+        self.dk = d_model // n_heads
+        self.dv = d_model // n_heads
+        self.heads = [
+            SelfAttention(d_model, self.dk, self.dv, seed=seed + i)
+            for i in range(n_heads)
+        ]
+        rng = np.random.default_rng(seed + n_heads)
+        scale = np.sqrt(2.0 / (d_model + d_model))
+        self.Wo = rng.normal(0, scale, (n_heads * self.dv, d_model))
+
+    def forward(self, X):
+        head_outputs = []
+        all_weights = []
+        for head in self.heads:
+            out, w = head.forward(X)
+            head_outputs.append(out)
+            all_weights.append(w)
+        concatenated = np.concatenate(head_outputs, axis=-1)
+        output = concatenated @ self.Wo
+        return output, all_weights
+
+
+def print_attention_matrix(weights, tokens):
+    print(f&quot;\n{&#39;&#39;:&gt;6}&quot;, end=&quot;&quot;)
+    for token in tokens:
+        print(f&quot;{token:&gt;6}&quot;, end=&quot;&quot;)
+    print()
+    for i, token in enumerate(tokens):
+        print(f&quot;{token:&gt;6}&quot;, end=&quot;&quot;)
+        for j in range(len(tokens)):
+            print(f&quot;{weights[i][j]:6.3f}&quot;, end=&quot;&quot;)
+        print()
+
+
+def ascii_heatmap(weights, tokens, chars=&quot; ░▒▓█&quot;):
+    print(f&quot;\n{&#39;&#39;:&gt;6}&quot;, end=&quot;&quot;)
+    for t in tokens:
+        print(f&quot;{t:&gt;6}&quot;, end=&quot;&quot;)
+    print()
+    w_max = weights.max()
+    for i in range(len(tokens)):
+        print(f&quot;{tokens[i]:&gt;6}&quot;, end=&quot;&quot;)
+        for j in range(len(tokens)):
+            level = int(weights[i][j] * (len(chars) - 1) / w_max)
+            level = min(level, len(chars) - 1)
+            print(f&quot;{&#39;  &#39; + chars[level] + &#39;   &#39;}&quot;, end=&quot;&quot;)
+        print()
+
+
+if __name__ == &quot;__main__&quot;:
+    sentence = [&quot;The&quot;, &quot;cat&quot;, &quot;sat&quot;, &quot;on&quot;, &quot;the&quot;, &quot;mat&quot;]
+    n_tokens = len(sentence)
+    d_model = 16
+    dk = 8
+    dv = 8
+
+    rng = np.random.default_rng(42)
+    X = rng.normal(0, 1, (n_tokens, d_model))
+
+    print(&quot;=&quot; * 60)
+    print(&quot;SELF-ATTENTION FROM SCRATCH&quot;)
+    print(&quot;=&quot; * 60)
+
+    print(f&quot;\nSentence: {&#39; &#39;.join(sentence)}&quot;)
+    print(f&quot;Tokens: {n_tokens}, d_model: {d_model}, dk: {dk}, dv: {dv}&quot;)
+    print(f&quot;Input shape: {X.shape}&quot;)
+
+    attn = SelfAttention(d_model, dk, dv, seed=42)
+    output, weights = attn.forward(X)
+
+    print(f&quot;\nOutput shape: {output.shape}&quot;)
+    print(&quot;\nAttention weights:&quot;)
+    print_attention_matrix(weights, sentence)
+
+    print(&quot;\nASCII heatmap (darker = higher attention):&quot;)
+    ascii_heatmap(weights, sentence)
+
+    print(&quot;\n&quot; + &quot;=&quot; * 60)
+    print(&quot;MULTI-HEAD SELF-ATTENTION&quot;)
+    print(&quot;=&quot; * 60)
+
+    n_heads = 2
+    mha = MultiHeadSelfAttention(d_model, n_heads, seed=42)
+    mha_output, head_weights = mha.forward(X)
+
+    print(f&quot;\nHeads: {n_heads}&quot;)
+    print(f&quot;Output shape: {mha_output.shape}&quot;)
+
+    for h, hw in enumerate(head_weights):
+        print(f&quot;\nHead {h + 1} attention weights:&quot;)
+        print_attention_matrix(hw, sentence)
+
+    print(&quot;\n&quot; + &quot;=&quot; * 60)
+    print(&quot;SOFTMAX DEMO&quot;)
+    print(&quot;=&quot; * 60)
+
+    logits = np.array([2.0, 1.0, 0.1])
+    probs = softmax(logits)
+    print(f&quot;\nLogits:  {logits}&quot;)
+    print(f&quot;Softmax: {probs.round(4)}&quot;)
+    print(f&quot;Sum:     {probs.sum():.4f}&quot;)
+
+    large_logits = np.array([100.0, 200.0, 300.0])
+    probs_large = softmax(large_logits)
+    print(f&quot;\nLarge logits:  {large_logits}&quot;)
+    print(f&quot;Softmax:       {probs_large.round(4)}&quot;)
+    print(f&quot;Sum:           {probs_large.sum():.4f}&quot;)
+    print(&quot;(Numerically stable - no overflow)&quot;)
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/07-transformers-deep-dive/02-self-attention-from-scratch/outputs/prompt-attention-explainer.md">phases/07-transformers-deep-dive/02-self-attention-from-scratch/outputs/prompt-attention-explainer.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: prompt-attention-explainer
+description: Explain the attention mechanism through the database lookup analogy
+phase: 7
+lesson: 2
+---
+
+You are an expert at explaining the transformer attention mechanism. Your core teaching tool is the &quot;database lookup&quot; analogy.
+
+Framework for explaining attention:
+
+1. Start with traditional databases: a query matches a key exactly and returns one value.
+
+2. Reframe attention as a soft database lookup:
+   - Query (Q): what the current token is searching for
+   - Key (K): what each token advertises about itself
+   - Value (V): the actual content each token carries
+   - Instead of exact match, compute similarity (dot product) between the query and ALL keys
+   - Instead of returning one result, return a weighted blend of ALL values
+
+3. Walk through the math step by step:
+   - Q, K, V are learned linear projections of the input: Q = X @ Wq, K = X @ Wk, V = X @ Wv
+   - Raw scores: Q @ K^T (dot product between every query-key pair)
+   - Scaling: divide by sqrt(dk) to prevent softmax saturation
+   - Softmax: convert raw scores to a probability distribution per row
+   - Output: weighted sum of values using those probabilities
+
+4. Use concrete examples. Given a sentence like &quot;The cat sat on the mat&quot;:
+   - Show which tokens attend to which
+   - Explain why &quot;sat&quot; might attend strongly to &quot;cat&quot; (subject-verb relationship)
+   - Show the attention weight matrix as a grid
+
+5. Connect to the bigger picture:
+   - Self-attention: Q, K, V all come from the same sequence
+   - Cross-attention: Q comes from one sequence, K and V from another (used in translation)
+   - Multi-head: multiple attention functions in parallel, each learning different relationship types
+   - Causal masking: preventing tokens from attending to future positions (used in GPT-style models)
+
+Rules:
+- Always show the formula: Attention(Q, K, V) = softmax(Q @ K^T / sqrt(dk)) @ V
+- Use ASCII diagrams for the attention matrix when possible
+- Ground every abstraction in a concrete token-level example
+- Explain scaling intuitively: high-dimensional dot products produce large numbers that make softmax too peaked
+- When asked about multi-head attention, explain it as &quot;different heads learn different types of relationships: one head for syntax, another for coreference, another for positional patterns&quot;
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. Why does vanilla self-attention scale the dot product by 1/sqrt(d_k)?</legend><label class="option"><input type="radio" name="q0" value="0"> To make the output values between 0 and 1</label><label class="option"><input type="radio" name="q0" value="1"> To normalize the query and key vectors to unit length</label><label class="option"><input type="radio" name="q0" value="2"> To prevent dot products from growing large in high dimensions, which would push softmax into regions with tiny gradients</label><label class="option"><input type="radio" name="q0" value="3"> To reduce the computational cost of the matrix multiplication</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. What are the three projections in self-attention?</legend><label class="option"><input type="radio" name="q1" value="0"> Encoder, decoder, and cross-attention</label><label class="option"><input type="radio" name="q1" value="1"> Query, key, and value -- each a learned linear projection of the same input</label><label class="option"><input type="radio" name="q1" value="2"> Embedding, position, and segment</label><label class="option"><input type="radio" name="q1" value="3"> Input, hidden, and output</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. In multi-head attention with 8 heads and d_model=512, what is the dimension of each head?</legend><label class="option"><input type="radio" name="q2" value="0"> 512 -- each head sees the full dimension</label><label class="option"><input type="radio" name="q2" value="1"> 64 -- d_model is split evenly across heads (512/8=64)</label><label class="option"><input type="radio" name="q2" value="2"> 4096 -- each head expands the representation</label><label class="option"><input type="radio" name="q2" value="3"> 8 -- one dimension per head</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. What does the causal mask in autoregressive attention prevent?</legend><label class="option"><input type="radio" name="q3" value="0"> It prevents each position from attending to future positions, ensuring the model can only use past context when predicting the next token</label><label class="option"><input type="radio" name="q3" value="1"> It prevents the model from attending to its own position</label><label class="option"><input type="radio" name="q3" value="2"> It prevents the model from attending to padding tokens</label><label class="option"><input type="radio" name="q3" value="3"> It prevents attention weights from becoming too large</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. Why does self-attention have O(n^2) complexity in sequence length n?</legend><label class="option"><input type="radio" name="q4" value="0"> Because the model has n layers stacked on top of each other</label><label class="option"><input type="radio" name="q4" value="1"> Because backpropagation through attention requires n^2 gradient computations</label><label class="option"><input type="radio" name="q4" value="2"> Because the feedforward layers after attention are quadratic</label><label class="option"><input type="radio" name="q4" value="3"> Because every token computes attention scores with every other token, producing an n x n attention matrix</label><p data-feedback="4"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/07-transformers-deep-dive/01-why-transformers/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/07-transformers-deep-dive/03-multi-head-attention/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/07-transformers-deep-dive/02-self-attention-from-scratch/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

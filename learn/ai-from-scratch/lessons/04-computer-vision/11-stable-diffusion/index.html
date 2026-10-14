@@ -1,0 +1,768 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>稳定扩散 建筑和精细调节 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-04-computer-vision" data-lesson="04-computer-vision/11-stable-diffusion" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/04-computer-vision/">计算机视觉</a> / LESSON 11</p><h1 class="lesson-title">稳定扩散 建筑和精细调节</h1><p>Stable Diffusion — Architecture &amp; Fine-Tuning</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>稳定扩散 建筑和精细调节</h1>
+<blockquote>
+<p>稳定扩散是DDPM,在预训练的VAE的隐藏空间中运行,通过横向注意力来调节文字,用快速确定性ODE解决器进行样本测试,并通过无分类器指导来引导.</p>
+</blockquote>
+<p><strong>Type:</strong> Learn + Use
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 4 Lesson 10 (Diffusion), Phase 7 Lesson 02 (Self-Attention)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>追踪稳定扩散管道的五个部分:VAE,文本编码器,U-Net,时间表,安全检查器以及它们实际上每一个都做什么</li>
+<li>解释隐藏扩散以及为什么训练在4x64x64隐藏空间 (而不是3x512x512图像) 减少计算量48倍,而不损失质量</li>
+<li>使用<code>diffusers</code>通过控制网进行图像生成,图像到图像运行,涂料和引导生成</li>
+<li>调整细节,在小型定制数据集上使用LoRA稳定扩散,并在推断时加载LoRA适配器</li>
+</ul>
+<h2>问题</h2>
+<p>直接在512x512RGB图像上训练DDPM是昂贵的.每一步训练都通过U-Net来回升,看到3x512x512 =786,432输入值,采样需要50+次通过同一U-Net.在稳定扩散1.5的质量水平 (2022年发布) 上,像素空间扩散需要大约256个GPU月的训练和每张图像在消费GPU上需要10-30秒.</p>
+<p>让开放式文字到图像的操作是<strong>latent diffusion</strong>训练一个VAE,将3x512x512图像映射到4x64x64隐形子,然后在隐形空间中进行扩散.计算下降到<code>(3*512*512)/(4*64*64) = 48x</code>在同一GPU上取样从几十秒钟下降到两个秒钟以下.</p>
+<p>几乎所有现代图像生成模型都是隐藏的扩散模型,其变化包括自动编码器,指标器 (U-Net或 DiT) 和文本调节.学习稳定扩散,你已经学习了模板.</p>
+<h2>概念</h2>
+<h3>管道</h3>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-c78c59017a1fbdbf534d.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><ul>
+<li><strong>VAE</strong>冷的自动编码器.编码器将图像转化为隐形 (用于img2img和训练).解码器将隐形转化为图像.</li>
+<li><strong>Text encoder</strong> CLIP文本编码器 (SD 1.x/2.x), CLIP-L + CLIP-G (SDXL),或 T5-XXL (SD3/FLUX).生成一个代币嵌入的序列.</li>
+<li><strong>U-Net</strong>标示器. 具有跨重视层,从隐藏到每个分辨率级别内嵌的文本.</li>
+<li><strong>Scheduler</strong>采样算法 (DDIM,Euler,DPM-Solver++). 选择了 sigmas,将预测的噪音混合到隐藏中.</li>
+<li><strong>Safety checker</strong>输出图像上可选的NSFW/非法内容过器.</li>
+</ul>
+<h3>无分类指导 (CFG)</h3>
+<p>简体文本调节学习<code>epsilon_theta(x_t, t, c)</code>每次提醒<code>c</code> CFG 运营同一个网络<code>c</code>结果是: 由于声的发生在声中,声的发生在声中,声的发生在声中.</p>
+<pre><code>eps = eps_uncond + w * (eps_cond - eps_uncond)
+</code></pre>
+<p><code>w</code>率是指导的.<code>w=0</code>没有条件<code>w=1</code>完全有条件的.<code>w&gt;1</code>通过 SD 默认方式, SD 输出将会变得更&quot;即时&quot;<code>w=7.5</code>现在,我们要去.</p>
+<p>由于CFG是文字到图像的原因,因此产品质量很好.如果没有CFG,输出偏差很弱;如果没有CFG,输出偏差很弱.</p>
+<h3>隐形空间几何学</h3>
+<p>射器的4通道隐藏不仅仅是压缩图像. 它是一个多元化,数学的大致与语义编辑相匹配 (即时工程 + 插曲都在这里生活), 无机4x64x64隐藏的解码不会产生随机看起来的图像,它产生垃圾,因为只有特定的隐藏的子组才能解码有效的图像.</p>
+<p>两种后果:</p>
+<ol>
+<li><strong>Img2img</strong>图像结构存活,因为编码几乎可以逆转;内容根据提示变化.</li>
+<li><strong>Inpainting</strong>= 与 img2img相同,但指标只更新隐藏区域;未隐藏区域则保持在编码的隐藏状态.</li>
+</ol>
+<h3>网络架构</h3>
+<p>SD U-Net是从10课开始的TinyUNet的大版本,</p>
+<ul>
+<li><strong>Transformer blocks</strong>在每一个空间分辨率上,包含自我注意力+对文本嵌入的横向注意力.</li>
+<li><strong>Time embedding</strong>通过MLP在鼻状编码上.</li>
+<li><strong>Skip connections</strong>在相匹配分辨率的编码器和解码器之间.</li>
+</ul>
+<p>总参数在SD 1.5: ~860M.SDXL: ~2.6B.FLUX: ~12B.参数跳跃主要是在注意层.</p>
+<h3>洛拉细调</h3>
+<p>稳定散的完整细节调整需要20 GB以上的VRAM,并更新了860M参数.LoRA (低级调整) 保持了基模型的冷,并将小级分解矩阵注入注意层中.SD的LoRA适配器通常为10-50MB,在单个消费者GPU上在10-60分钟内运行,并在推断时间中作为降入修改进行加载.</p>
+<pre><code>Original: W_q : (d_in, d_out)   frozen
+LoRA:     W_q + alpha * (A @ B)   where A : (d_in, r), B : (r, d_out)
+
+r is typically 4-32.
+</code></pre>
+<p>洛拉是几乎每个社区的细节调节分布的方式.</p>
+<h3>你会看到的时间表</h3>
+<ul>
+<li><strong>DDIM</strong>确定性,50步,简单.</li>
+<li><strong>Euler ancestral</strong> ,30-50步,稍微有创意的样本.</li>
+<li><strong>DPM-Solver++ 2M Karras</strong>定性,20-30步,生产默认.</li>
+<li><strong>LCM / TCD / Turbo</strong>一致性模型和蒸变体; 1-4步,以某些质量为代价.</li>
+</ul>
+<p>交换时间表是单行变化<code>diffusers</code>并且有时在没有任何重新培训的情况下解决样本问题.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-0cb2b806d8a81e69bb54.png" alt="cv3-latent-compression 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<p>这一课使用<code>diffusers</code>它们是自主课程的主题,而不是从零开始重建稳定扩散.你需要重建的部分 (VAE,文本编码器,U-Net,规划器).</p>
+<h3>步骤1:文字到图像</h3>
+<pre><code class="language-python">import torch
+from diffusers import StableDiffusionPipeline
+
+pipe = StableDiffusionPipeline.from_pretrained(
+    &quot;runwayml/stable-diffusion-v1-5&quot;,
+    torch_dtype=torch.float16,
+).to(&quot;cuda&quot;)
+
+image = pipe(
+    prompt=&quot;a dog riding a skateboard in tokyo, studio ghibli style&quot;,
+    guidance_scale=7.5,
+    num_inference_steps=25,
+    generator=torch.Generator(&quot;cuda&quot;).manual_seed(42),
+).images[0]
+image.save(&quot;dog.png&quot;)
+</code></pre>
+<p><code>float16</code>没有明显的质量损失. <code>num_inference_steps=25</code>具有默认的DPM-Solver++匹配<code>num_inference_steps=50</code>通过DDIM.</p>
+<h3>步骤 2: 改变时间表</h3>
+<pre><code class="language-python">from diffusers import DPMSolverMultistepScheduler, EulerAncestralDiscreteScheduler
+
+pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(pipe.scheduler.config)
+</code></pre>
+<p>时间表表的状态与U-Net权重分离.你可以训练DDPM和任何时间表表的样本.</p>
+<h3>步骤3:图像对图像</h3>
+<pre><code class="language-python">from diffusers import StableDiffusionImg2ImgPipeline
+from PIL import Image
+
+img2img = StableDiffusionImg2ImgPipeline.from_pretrained(
+    &quot;runwayml/stable-diffusion-v1-5&quot;,
+    torch_dtype=torch.float16,
+).to(&quot;cuda&quot;)
+
+init_image = Image.open(&quot;dog.png&quot;).convert(&quot;RGB&quot;).resize((512, 512))
+out = img2img(
+    prompt=&quot;a dog riding a skateboard, oil painting&quot;,
+    image=init_image,
+    strength=0.6,
+    guidance_scale=7.5,
+).images[0]
+</code></pre>
+<p><code>strength</code>音量是指在除之前增加多少噪音 (0.0 = 没有变化, 1.0 = 完全再生).</p>
+<h3>步骤4:涂料</h3>
+<pre><code class="language-python">from diffusers import StableDiffusionInpaintPipeline
+
+inpaint = StableDiffusionInpaintPipeline.from_pretrained(
+    &quot;runwayml/stable-diffusion-inpainting&quot;,
+    torch_dtype=torch.float16,
+).to(&quot;cuda&quot;)
+
+image = Image.open(&quot;dog.png&quot;).convert(&quot;RGB&quot;).resize((512, 512))
+mask = Image.open(&quot;dog_mask.png&quot;).convert(&quot;L&quot;).resize((512, 512))
+
+out = inpaint(
+    prompt=&quot;a cat&quot;,
+    image=image,
+    mask_image=mask,
+    guidance_scale=7.5,
+).images[0]
+</code></pre>
+<p>面具中的白色像素是再生区域.</p>
+<h3>步骤5:LoRA加载</h3>
+<pre><code class="language-python">pipe.load_lora_weights(
+    &quot;artificialguybr/studioghibli-redmond-1-5v-studio-ghibli-lora-for-liberteredmond-sd-1-5&quot;,
+    weight_name=&quot;StudioGhibliRedmond-15V-LiberteRedmond-StdGBRedmAF-StudioGhibli.safetensors&quot;,
+)
+pipe.fuse_lora(lora_scale=0.8)
+
+image = pipe(prompt=&quot;a village square, StdGBRedmAF, Studio Ghibli&quot;).images[0]
+</code></pre>
+<p>模型卡的触发语句 (<code>StdGBRedmAF, Studio Ghibli</code>) 启动风格.<code>lora_scale</code>控制强度;0.0 =没有效果,1.0 =完全效果. <code>fuse_lora</code>调用器将适配器放入适配的重量,但防止交换.<code>pipe.unfuse_lora()</code>在加载不同的适配器之前.</p>
+<h3>步骤 6: LoRA培训 (草图)</h3>
+<p>实际的LORA培训生活在<code>peft</code>或<code>diffusers.training</code>概述:</p>
+<pre><code class="language-python"># Pseudocode
+for step, batch in enumerate(dataloader):
+    images, prompts = batch
+    latents = vae.encode(images).latent_dist.sample() * 0.18215
+
+    t = torch.randint(0, num_train_timesteps, (batch_size,))
+    noise = torch.randn_like(latents)
+    noisy_latents = scheduler.add_noise(latents, noise, t)
+
+    text_emb = text_encoder(tokenizer(prompts))
+
+    pred_noise = unet(noisy_latents, t, text_emb)  # LoRA weights injected here
+
+    loss = F.mse_loss(pred_noise, noise)
+    loss.backward()
+    optimizer.step()
+</code></pre>
+<p>只有LoRA矩阵才会接收梯度;基层U-Net,VAE和文本编码器被结. 随着批量大小为1和梯度检查点,这适合8GB的VRAM.</p>
+<h2>用它</h2>
+<p>在生产中,你实际做出的决定:</p>
+<ul>
+<li><strong>Model family</strong>:SD 1.5用于开源社区细节调音,SDXL用于更高的忠诚度,SD3 / FLUX用于最先进的技术和严格的许可要求.</li>
+<li><strong>Scheduler</strong>: DPM-Solver++ 2M Karras 进行20-30步,LCM-LoRA 延迟低于1秒时.</li>
+<li><strong>Precision</strong>其他<code>float16</code>关于4080/4090的情况<code>bfloat16</code>在A100及新型道路上,<code>int8</code>(通过<code>bitsandbytes</code>或<code>compel</code>) 当VRAM紧张时.</li>
+<li><strong>Conditioning</strong>: 简体文本工作;为了更强大的控制,在基管线上添加ControlNet (可,深度,姿势).</li>
+</ul>
+<p>对于批发发,<code>AUTO1111</code>现在,<code>ComfyUI</code>对于生产API, <code>diffusers</code>其他<code>accelerate</code>或<code>optimum-nvidia</code>通过 TensorRT 编译.</p>
+<h2>运送它</h2>
+<p>这一课产生了:</p>
+<ul>
+<li><code>outputs/prompt-sd-pipeline-planner.md</code>一个提示,以选择SD 1.5 / SDXL / SD3 / FLUX加上调度器和精度,考虑到延迟预算,忠诚度目标和许可限制.</li>
+<li><code>outputs/skill-lora-training-setup.md</code>写完整的 LoRA 训练配置,包括标题,排名,批量大小和学习率.</li>
+</ul>
+<h2>运动</h2>
+<ol>
+<li>**(Easy)**生成相同的提示<code>guidance_scale</code>在<code>[1, 3, 5, 7.5, 10, 15]</code>图像的变化如何?</li>
+<li>**(Medium)**拍摄任何真实的照片,查看它.<code>StableDiffusionImg2ImgPipeline</code>在<code>strength</code>在<code>[0.2, 0.4, 0.6, 0.8, 1.0]</code>什么强度保留了组合,同时改变了风格?为什么1.0完全忽略了输入?</li>
+<li>**(Hard)**训练一个LoRA在一个主体 (一个物,一个标志,一个角色) 的10-20个图像上,并生成其中的主体的新奇场景. 报告LoRA排名和训练步骤,没有过度适应输入图像的最佳身份保护.</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Latent diffusion</td>
+<td>&quot;Diffuse in latents&quot;</td>
+<td>Run the entire DDPM in the VAE latent space (4x64x64) instead of pixel space (3x512x512); 48x compute saving</td>
+</tr>
+<tr>
+<td>VAE scale factor</td>
+<td>&quot;0.18215&quot;</td>
+<td>Constant that rescales the VAE's raw latent to roughly unit variance; hardcoded in every SD pipeline</td>
+</tr>
+<tr>
+<td>Classifier-free guidance</td>
+<td>&quot;CFG&quot;</td>
+<td>Mix conditional and unconditional noise predictions; the single most impactful inference knob</td>
+</tr>
+<tr>
+<td>Scheduler</td>
+<td>&quot;Sampler&quot;</td>
+<td>The algorithm that turns noise + model predictions into a denoised latent trajectory</td>
+</tr>
+<tr>
+<td>LoRA</td>
+<td>&quot;Low-rank adapter&quot;</td>
+<td>Small rank-decomposition matrices that fine-tune attention layers without touching base weights</td>
+</tr>
+<tr>
+<td>Cross-attention</td>
+<td>&quot;Text-image attention&quot;</td>
+<td>Attention from latent tokens to text tokens; injects prompt information at every U-Net level</td>
+</tr>
+<tr>
+<td>ControlNet</td>
+<td>&quot;Structure conditioning&quot;</td>
+<td>A separately-trained adapter that steers SD with an extra input (canny, depth, pose, segmentation)</td>
+</tr>
+<tr>
+<td>DPM-Solver++</td>
+<td>&quot;The default scheduler&quot;</td>
+<td>Second-order deterministic ODE solver; best quality at low step counts (20-30) in 2026</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2112.10752" rel="noreferrer" data-network="true">High-Resolution Image Synthesis with Latent Diffusion (Rombach et al., 2022) <small>↗ 需要联网</small></a>稳定散纸;包括任何证明设计合理的除</li>
+<li><a href="https://arxiv.org/abs/2207.12598" rel="noreferrer" data-network="true">Classifier-Free Diffusion Guidance (Ho &amp; Salimans, 2022) <small>↗ 需要联网</small></a>CFG文件</li>
+<li><a href="https://arxiv.org/abs/2106.09685" rel="noreferrer" data-network="true">LoRA: Low-Rank Adaptation of Large Language Models (Hu et al., 2021) <small>↗ 需要联网</small></a> LoRA是NLP的第一位;它几乎没有变化转移到SD</li>
+<li><a href="https://huggingface.co/docs/diffusers" rel="noreferrer" data-network="true">diffusers documentation <small>↗ 需要联网</small></a>每个SD/SDXL/SD3/FLUX管道的参考</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Stable Diffusion — Architecture &amp; Fine-Tuning</h1>
+<blockquote>
+<p>Stable Diffusion is a DDPM that runs in the latent space of a pretrained VAE, conditioned on text via cross-attention, sampled with a fast deterministic ODE solver, and steered by classifier-free guidance.</p>
+</blockquote>
+<p><strong>Type:</strong> Learn + Use
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 4 Lesson 10 (Diffusion), Phase 7 Lesson 02 (Self-Attention)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Trace the five pieces of a Stable Diffusion pipeline: VAE, text encoder, U-Net, scheduler, safety checker — and what each of them actually does</li>
+<li>Explain latent diffusion and why training in a 4x64x64 latent space (instead of a 3x512x512 image) reduces compute by 48x without quality loss</li>
+<li>Use <code>diffusers</code> to generate images, run image-to-image, inpainting, and ControlNet-guided generation</li>
+<li>Fine-tune Stable Diffusion with LoRA on a small custom dataset and load the LoRA adapter at inference</li>
+</ul>
+<h2>The Problem</h2>
+<p>Training a DDPM directly on 512x512 RGB images is expensive. Every training step backprops through a U-Net that sees 3x512x512 = 786,432 input values, and sampling takes 50+ forward passes through that same U-Net. At the quality level of Stable Diffusion 1.5 (released 2022), pixel-space diffusion would need roughly 256 GPU-months of training and 10-30 seconds per image on a consumer GPU.</p>
+<p>The trick that made open-weight text-to-image practical was <strong>latent diffusion</strong> (Rombach et al., CVPR 2022). Train a VAE that maps a 3x512x512 image to a 4x64x64 latent tensor and back, then do the diffusion in that latent space. Compute drops by <code>(3*512*512)/(4*64*64) = 48x</code>. Sampling drops from tens of seconds to under two seconds on the same GPU.</p>
+<p>Almost every modern image-generation model — SDXL, SD3, FLUX, HunyuanDiT, Wan-Video — is a latent diffusion model with variations on the autoencoder, the denoiser (U-Net or DiT), and the text conditioning. Learn Stable Diffusion and you have learnt the template.</p>
+<h2>The Concept</h2>
+<h3>The pipeline</h3>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-c78c59017a1fbdbf534d.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><ul>
+<li><strong>VAE</strong> — frozen autoencoder. Encoder turns image into latents (used for img2img and training). Decoder turns latents back into an image.</li>
+<li><strong>Text encoder</strong> — CLIP text encoder (SD 1.x/2.x), CLIP-L + CLIP-G (SDXL), or T5-XXL (SD3/FLUX). Produces a sequence of token embeddings.</li>
+<li><strong>U-Net</strong> — the denoiser. Has cross-attention layers that attend from latents to the text embedding at every resolution level.</li>
+<li><strong>Scheduler</strong> — the sampling algorithm (DDIM, Euler, DPM-Solver++). Picks sigmas, blends predicted noise back into the latent.</li>
+<li><strong>Safety checker</strong> — optional NSFW / illegal-content filter on the output image.</li>
+</ul>
+<h3>Classifier-free guidance (CFG)</h3>
+<p>Plain text conditioning learns <code>epsilon_theta(x_t, t, c)</code> for every prompt <code>c</code>. CFG trains the same network with <code>c</code> dropped 10% of the time (replaced by an empty embedding), giving a single model that predicts both the conditional and the unconditional noise. At inference:</p>
+<pre><code>eps = eps_uncond + w * (eps_cond - eps_uncond)
+</code></pre>
+<p><code>w</code> is the guidance scale. <code>w=0</code> is unconditional, <code>w=1</code> is plain conditional, <code>w&gt;1</code> pushes the output toward being &quot;more conditioned on the prompt&quot; at the cost of diversity. SD default is <code>w=7.5</code>.</p>
+<p>CFG is the reason text-to-image works at production quality. Without it, prompts bias the output weakly; with it, prompts dominate.</p>
+<h3>Latent space geometry</h3>
+<p>The VAE's 4-channel latent is not just a compressed image. It is a manifold where arithmetic roughly corresponds to semantic edits (prompt engineering + interpolation both live here), and where the diffusion U-Net has been trained to spend its entire modelling budget. Decoding a random 4x64x64 latent does not produce a random-looking image — it produces garbage, because only a specific submanifold of latents decodes to valid images.</p>
+<p>Two consequences:</p>
+<ol>
+<li><strong>Img2img</strong> = encode image to latent, add partial noise, run the denoiser, decode. Image structure survives because encoding is near-invertible; content changes based on the prompt.</li>
+<li><strong>Inpainting</strong> = same as img2img but the denoiser only updates masked regions; unmasked regions are kept at the encoded latent.</li>
+</ol>
+<h3>The U-Net architecture</h3>
+<p>The SD U-Net is a big version of the TinyUNet from Lesson 10 with three additions:</p>
+<ul>
+<li><strong>Transformer blocks</strong> at every spatial resolution, containing self-attention + cross-attention to the text embedding.</li>
+<li><strong>Time embedding</strong> via MLP on sinusoidal encoding.</li>
+<li><strong>Skip connections</strong> between encoder and decoder at matching resolutions.</li>
+</ul>
+<p>Total parameters in SD 1.5: ~860M. SDXL: ~2.6B. FLUX: ~12B. The jump in params is mostly in attention layers.</p>
+<h3>LoRA fine-tuning</h3>
+<p>Full fine-tuning of Stable Diffusion needs 20+ GB of VRAM and updates 860M parameters. LoRA (Low-Rank Adaptation) keeps the base model frozen and injects small rank-decomposition matrices into the attention layers. A LoRA adapter for SD is typically 10-50 MB, trains in 10-60 minutes on a single consumer GPU, and loads at inference time as a drop-in modification.</p>
+<pre><code>Original: W_q : (d_in, d_out)   frozen
+LoRA:     W_q + alpha * (A @ B)   where A : (d_in, r), B : (r, d_out)
+
+r is typically 4-32.
+</code></pre>
+<p>LoRA is how almost every community fine-tune is distributed. CivitAI and Hugging Face host millions of them.</p>
+<h3>Schedulers you will see</h3>
+<ul>
+<li><strong>DDIM</strong> — deterministic, ~50 steps, simple.</li>
+<li><strong>Euler ancestral</strong> — stochastic, 30-50 steps, slightly more creative samples.</li>
+<li><strong>DPM-Solver++ 2M Karras</strong> — deterministic, 20-30 steps, production default.</li>
+<li><strong>LCM / TCD / Turbo</strong> — consistency models and distilled variants; 1-4 steps at the cost of some quality.</li>
+</ul>
+<p>Swapping schedulers is a one-line change in <code>diffusers</code> and sometimes fixes sample issues without any retraining.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-0cb2b806d8a81e69bb54.png" alt="cv3-latent-compression 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<p>This lesson uses <code>diffusers</code> end-to-end rather than rebuilding Stable Diffusion from scratch. The pieces you would need to rebuild (VAE, text encoder, U-Net, scheduler) are topics of their own lessons; here the goal is fluency with the production API.</p>
+<h3>Step 1: Text-to-image</h3>
+<pre><code class="language-python">import torch
+from diffusers import StableDiffusionPipeline
+
+pipe = StableDiffusionPipeline.from_pretrained(
+    &quot;runwayml/stable-diffusion-v1-5&quot;,
+    torch_dtype=torch.float16,
+).to(&quot;cuda&quot;)
+
+image = pipe(
+    prompt=&quot;a dog riding a skateboard in tokyo, studio ghibli style&quot;,
+    guidance_scale=7.5,
+    num_inference_steps=25,
+    generator=torch.Generator(&quot;cuda&quot;).manual_seed(42),
+).images[0]
+image.save(&quot;dog.png&quot;)
+</code></pre>
+<p><code>float16</code> halves VRAM with no visible quality loss. <code>num_inference_steps=25</code> with the default DPM-Solver++ matches <code>num_inference_steps=50</code> with DDIM.</p>
+<h3>Step 2: Swap the scheduler</h3>
+<pre><code class="language-python">from diffusers import DPMSolverMultistepScheduler, EulerAncestralDiscreteScheduler
+
+pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(pipe.scheduler.config)
+</code></pre>
+<p>Scheduler state is decoupled from U-Net weights. You can train on DDPM and sample with any scheduler.</p>
+<h3>Step 3: Image-to-image</h3>
+<pre><code class="language-python">from diffusers import StableDiffusionImg2ImgPipeline
+from PIL import Image
+
+img2img = StableDiffusionImg2ImgPipeline.from_pretrained(
+    &quot;runwayml/stable-diffusion-v1-5&quot;,
+    torch_dtype=torch.float16,
+).to(&quot;cuda&quot;)
+
+init_image = Image.open(&quot;dog.png&quot;).convert(&quot;RGB&quot;).resize((512, 512))
+out = img2img(
+    prompt=&quot;a dog riding a skateboard, oil painting&quot;,
+    image=init_image,
+    strength=0.6,
+    guidance_scale=7.5,
+).images[0]
+</code></pre>
+<p><code>strength</code> is how much noise to add before denoising (0.0 = unchanged, 1.0 = full regeneration). 0.5-0.7 is the standard range for style transfer.</p>
+<h3>Step 4: Inpainting</h3>
+<pre><code class="language-python">from diffusers import StableDiffusionInpaintPipeline
+
+inpaint = StableDiffusionInpaintPipeline.from_pretrained(
+    &quot;runwayml/stable-diffusion-inpainting&quot;,
+    torch_dtype=torch.float16,
+).to(&quot;cuda&quot;)
+
+image = Image.open(&quot;dog.png&quot;).convert(&quot;RGB&quot;).resize((512, 512))
+mask = Image.open(&quot;dog_mask.png&quot;).convert(&quot;L&quot;).resize((512, 512))
+
+out = inpaint(
+    prompt=&quot;a cat&quot;,
+    image=image,
+    mask_image=mask,
+    guidance_scale=7.5,
+).images[0]
+</code></pre>
+<p>White pixels in the mask are the area to regenerate. Black pixels are preserved.</p>
+<h3>Step 5: LoRA loading</h3>
+<pre><code class="language-python">pipe.load_lora_weights(
+    &quot;artificialguybr/studioghibli-redmond-1-5v-studio-ghibli-lora-for-liberteredmond-sd-1-5&quot;,
+    weight_name=&quot;StudioGhibliRedmond-15V-LiberteRedmond-StdGBRedmAF-StudioGhibli.safetensors&quot;,
+)
+pipe.fuse_lora(lora_scale=0.8)
+
+image = pipe(prompt=&quot;a village square, StdGBRedmAF, Studio Ghibli&quot;).images[0]
+</code></pre>
+<p>The trigger phrase from the model card (<code>StdGBRedmAF, Studio Ghibli</code>) switches the style on. <code>lora_scale</code> controls strength; 0.0 = no effect, 1.0 = full effect. <code>fuse_lora</code> bakes the adapter into the weights in place for speed, but prevents swapping. Call <code>pipe.unfuse_lora()</code> before loading a different adapter.</p>
+<h3>Step 6: LoRA training (sketch)</h3>
+<p>Real LoRA training lives in <code>peft</code> or <code>diffusers.training</code>. The outline:</p>
+<pre><code class="language-python"># Pseudocode
+for step, batch in enumerate(dataloader):
+    images, prompts = batch
+    latents = vae.encode(images).latent_dist.sample() * 0.18215
+
+    t = torch.randint(0, num_train_timesteps, (batch_size,))
+    noise = torch.randn_like(latents)
+    noisy_latents = scheduler.add_noise(latents, noise, t)
+
+    text_emb = text_encoder(tokenizer(prompts))
+
+    pred_noise = unet(noisy_latents, t, text_emb)  # LoRA weights injected here
+
+    loss = F.mse_loss(pred_noise, noise)
+    loss.backward()
+    optimizer.step()
+</code></pre>
+<p>Only the LoRA matrices receive gradient; the base U-Net, VAE, and text encoder are frozen. With a batch size of 1 and gradient checkpointing this fits in 8 GB of VRAM.</p>
+<h2>Use It</h2>
+<p>In production, the decisions you actually make:</p>
+<ul>
+<li><strong>Model family</strong>: SD 1.5 for open-source community fine-tunes, SDXL for higher fidelity, SD3 / FLUX for state of the art and strict licensing requirements.</li>
+<li><strong>Scheduler</strong>: DPM-Solver++ 2M Karras for 20-30 steps, LCM-LoRA when latency is under 1s.</li>
+<li><strong>Precision</strong>: <code>float16</code> on 4080/4090, <code>bfloat16</code> on A100 and newer, <code>int8</code> (via <code>bitsandbytes</code> or <code>compel</code>) when VRAM is tight.</li>
+<li><strong>Conditioning</strong>: plain text works; for stronger control, add ControlNet (canny, depth, pose) on top of the base pipeline.</li>
+</ul>
+<p>For batch generation, <code>AUTO1111</code> / <code>ComfyUI</code> are the community tools; for production APIs, <code>diffusers</code> + <code>accelerate</code> or <code>optimum-nvidia</code> with TensorRT compilation.</p>
+<h2>Ship It</h2>
+<p>This lesson produces:</p>
+<ul>
+<li><code>outputs/prompt-sd-pipeline-planner.md</code> — a prompt that picks SD 1.5 / SDXL / SD3 / FLUX plus scheduler and precision given a latency budget, fidelity target, and licensing constraint.</li>
+<li><code>outputs/skill-lora-training-setup.md</code> — a skill that writes a full LoRA training config for a custom dataset including captions, rank, batch size, and learning rate.</li>
+</ul>
+<h2>Exercises</h2>
+<ol>
+<li><strong>(Easy)</strong> Generate the same prompt with <code>guidance_scale</code> in <code>[1, 3, 5, 7.5, 10, 15]</code>. Describe how the image changes. At what guidance value do artefacts appear?</li>
+<li><strong>(Medium)</strong> Take any real photograph, run it through <code>StableDiffusionImg2ImgPipeline</code> at <code>strength</code> in <code>[0.2, 0.4, 0.6, 0.8, 1.0]</code>. Which strength preserves composition while changing style? Why does 1.0 ignore the input entirely?</li>
+<li><strong>(Hard)</strong> Train a LoRA on 10-20 images of a single subject (a pet, a logo, a character) and generate novel scenes with that subject in them. Report the LoRA rank and training steps that produced the best identity preservation without overfitting to the input images.</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Latent diffusion</td>
+<td>&quot;Diffuse in latents&quot;</td>
+<td>Run the entire DDPM in the VAE latent space (4x64x64) instead of pixel space (3x512x512); 48x compute saving</td>
+</tr>
+<tr>
+<td>VAE scale factor</td>
+<td>&quot;0.18215&quot;</td>
+<td>Constant that rescales the VAE's raw latent to roughly unit variance; hardcoded in every SD pipeline</td>
+</tr>
+<tr>
+<td>Classifier-free guidance</td>
+<td>&quot;CFG&quot;</td>
+<td>Mix conditional and unconditional noise predictions; the single most impactful inference knob</td>
+</tr>
+<tr>
+<td>Scheduler</td>
+<td>&quot;Sampler&quot;</td>
+<td>The algorithm that turns noise + model predictions into a denoised latent trajectory</td>
+</tr>
+<tr>
+<td>LoRA</td>
+<td>&quot;Low-rank adapter&quot;</td>
+<td>Small rank-decomposition matrices that fine-tune attention layers without touching base weights</td>
+</tr>
+<tr>
+<td>Cross-attention</td>
+<td>&quot;Text-image attention&quot;</td>
+<td>Attention from latent tokens to text tokens; injects prompt information at every U-Net level</td>
+</tr>
+<tr>
+<td>ControlNet</td>
+<td>&quot;Structure conditioning&quot;</td>
+<td>A separately-trained adapter that steers SD with an extra input (canny, depth, pose, segmentation)</td>
+</tr>
+<tr>
+<td>DPM-Solver++</td>
+<td>&quot;The default scheduler&quot;</td>
+<td>Second-order deterministic ODE solver; best quality at low step counts (20-30) in 2026</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2112.10752" rel="noreferrer" data-network="true">High-Resolution Image Synthesis with Latent Diffusion (Rombach et al., 2022) <small>↗ 需要联网</small></a> — the Stable Diffusion paper; includes every ablation that justifies the design</li>
+<li><a href="https://arxiv.org/abs/2207.12598" rel="noreferrer" data-network="true">Classifier-Free Diffusion Guidance (Ho &amp; Salimans, 2022) <small>↗ 需要联网</small></a> — the CFG paper</li>
+<li><a href="https://arxiv.org/abs/2106.09685" rel="noreferrer" data-network="true">LoRA: Low-Rank Adaptation of Large Language Models (Hu et al., 2021) <small>↗ 需要联网</small></a> — LoRA was NLP-first; it transferred to SD with almost no changes</li>
+<li><a href="https://huggingface.co/docs/diffusers" rel="noreferrer" data-network="true">diffusers documentation <small>↗ 需要联网</small></a> — the reference for every SD / SDXL / SD3 / FLUX pipeline</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-04-computer-vision--11-stable-diffusion.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-04-computer-vision--11-stable-diffusion.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/04-computer-vision/11-stable-diffusion/code/main.py">phases/04-computer-vision/11-stable-diffusion/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;
+Stable Diffusion usage examples. Requires `diffusers`, `transformers`, and a GPU
+for any real inference. Running this on CPU without the model is a no-op summary.
+&quot;&quot;&quot;
+
+import os
+import torch
+
+
+def has_diffusers():
+    try:
+        import diffusers  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def describe_pipeline():
+    print(&quot;[stable diffusion pipeline]&quot;)
+    print(&quot;  text_encoder:   CLIP-L (SD 1.5) / CLIP-L+G (SDXL) / T5-XXL (SD3, FLUX)&quot;)
+    print(&quot;  unet_params:    860M (SD 1.5) / 2.6B (SDXL) / 12B (FLUX)&quot;)
+    print(&quot;  vae_latent:     4 x 64 x 64 for 512x512 input, 4 x 128 x 128 for 1024x1024&quot;)
+    print(&quot;  vae_scale:      0.18215 (SD 1.5/2), 0.13025 (SDXL)&quot;)
+    print(&quot;  default_cfg:    7.5&quot;)
+
+
+def cfg_sweep_demo():
+    values = [1.0, 3.0, 5.0, 7.5, 10.0, 15.0]
+    print(&quot;\n[cfg sweep values to try on a real pipeline]&quot;)
+    for w in values:
+        effect = (
+            &quot;unconditional&quot; if w &lt;= 1.0
+            else &quot;creative but weak prompt adherence&quot; if w &lt; 5.0
+            else &quot;standard&quot; if w &lt;= 8.0
+            else &quot;strong adherence, possible oversaturation&quot; if w &lt;= 12.0
+            else &quot;heavy artefacts&quot;
+        )
+        print(f&quot;  w={w:5.1f}  expected: {effect}&quot;)
+
+
+def text_to_image_stub(prompt, seed=42):
+    print(f&quot;\n[text_to_image] prompt={prompt!r} seed={seed}&quot;)
+    if not has_diffusers():
+        print(&quot;  diffusers not installed. `pip install diffusers transformers accelerate` to run.&quot;)
+        return None
+    if not torch.cuda.is_available():
+        print(&quot;  CUDA not available; running SD on CPU is extremely slow. Skipping real call.&quot;)
+        return None
+    from diffusers import StableDiffusionPipeline, DPMSolverMultistepScheduler
+    pipe = StableDiffusionPipeline.from_pretrained(
+        &quot;runwayml/stable-diffusion-v1-5&quot;,
+        torch_dtype=torch.float16,
+    ).to(&quot;cuda&quot;)
+    pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+    gen = torch.Generator(&quot;cuda&quot;).manual_seed(seed)
+    out = pipe(prompt, guidance_scale=7.5, num_inference_steps=25, generator=gen).images[0]
+    path = os.path.expanduser(&quot;~/sd_demo.png&quot;)
+    out.save(path)
+    print(f&quot;  saved: {path}&quot;)
+
+
+def lora_training_sketch():
+    print(&quot;\n[lora training pseudocode]&quot;)
+    pseudo = &quot;&quot;&quot;
+for step, batch in enumerate(dataloader):
+    images, prompts = batch
+    latents = vae.encode(images).latent_dist.sample() * 0.18215
+    t = torch.randint(0, num_train_timesteps, (batch_size,))
+    noise = torch.randn_like(latents)
+    noisy_latents = scheduler.add_noise(latents, noise, t)
+    text_emb = text_encoder(tokenizer(prompts))
+    pred_noise = unet(noisy_latents, t, text_emb)       # LoRA weights injected
+    loss = F.mse_loss(pred_noise, noise)
+    loss.backward()
+    optimizer.step()
+&quot;&quot;&quot;
+    print(pseudo)
+
+
+def main():
+    describe_pipeline()
+    cfg_sweep_demo()
+    text_to_image_stub(&quot;a dog riding a skateboard in tokyo, studio ghibli style&quot;)
+    lora_training_sketch()
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/04-computer-vision/11-stable-diffusion/outputs/prompt-sd-pipeline-planner.md">phases/04-computer-vision/11-stable-diffusion/outputs/prompt-sd-pipeline-planner.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: prompt-sd-pipeline-planner
+description: Pick SD 1.5 / SDXL / SD3 / FLUX plus scheduler and precision given a latency budget, fidelity target, and licensing constraint
+phase: 4
+lesson: 11
+---
+
+You are a Stable Diffusion pipeline planner. Given the constraints below, return one model, one scheduler, one precision, and one step count.
+
+## Inputs
+
+- `latency_target_s`: seconds per image at the target GPU
+- `fidelity`: prototype | production | premium
+- `licensing`: permissive (any use) | research | commercial_ok
+- `gpu`: rtx3060 | rtx4090 | a100 | h100 | cpu_only
+- `resolution`: 512 | 768 | 1024 | custom
+
+## Model picker
+
+Rules fire in order; the first match wins.
+
+- `fidelity == prototype` -&gt; **SD 1.5** (fastest, smallest, widest community).
+- `fidelity == production` and `resolution &gt;= 1024` -&gt; **SDXL**.
+- `fidelity == production` and `768 &lt; resolution &lt; 1024` -&gt; **SDXL** at a lower target resolution with a refiner pass, or **SD 1.5** upscaled; pick the former when detail matters, the latter when latency matters.
+- `fidelity == production` and `resolution &lt;= 768` -&gt; **SDXL Turbo** (better quality-per-step than SD 1.5 turbo when commercial licensing is acceptable); if the project requires a fully permissive base, fall back to **SD 1.5 turbo**.
+- `fidelity == production` and `resolution == custom` -&gt; treat as the nearest supported bucket: `&lt;= 768` for any side under 768, otherwise SDXL at 1024.
+- `fidelity == premium` and `licensing == commercial_ok` -&gt; **SD3 Medium**.
+- `fidelity == premium` and `licensing == permissive` -&gt; **FLUX.1-schnell** (Apache 2.0).
+- `fidelity == premium` and `licensing == research` -&gt; **FLUX.1-dev**.
+
+## Scheduler picker
+
+Pick the column by latency budget:
+
+- `latency_target_s &lt; 0.5s` -&gt; Fast column (≤10 steps).
+- `0.5s &lt;= latency_target_s &lt; 3s` -&gt; Quality column (20-30 steps).
+- `latency_target_s &gt;= 3s` -&gt; Reference column (50 steps). If the model&#39;s Reference cell is `N/A`, use the Quality column instead.
+
+| Model | Fast (≤10 steps) | Quality (20-30 steps) | Reference (50 steps) |
+|-------|------------------|-----------------------|----------------------|
+| SD 1.5 | LCM-LoRA | DPM-Solver++ 2M Karras | DDIM |
+| SDXL | Lightning | DPM-Solver++ 2M SDE Karras | Euler ancestral |
+| SD3 | Flow-match Euler | Flow-match Euler | Flow-match Euler |
+| FLUX | Flow-match Euler 4 steps | Flow-match Euler 20 steps | N/A |
+
+## Precision picker
+
+- `gpu == rtx3060 | rtx4090` -&gt; `torch.float16`
+- `gpu == a100 | h100` -&gt; `torch.bfloat16`
+- `gpu == cpu_only` -&gt; `torch.float32`, warn user that inference will be slow
+
+## Output
+
+```
+[pipeline]
+  model:         &lt;full HF id&gt;
+  scheduler:     &lt;name&gt;
+  steps:         &lt;int&gt;
+  guidance:      &lt;float&gt;
+  precision:     float16 | bfloat16 | float32
+  resolution:    &lt;HxW&gt;
+
+[reason]
+  one sentence grounded in fidelity + latency_target + licensing
+
+[expected latency]
+  &lt;float&gt; seconds (approx based on gpu + steps + resolution)
+
+[warnings]
+  - &lt;any licensing caveat&gt;
+  - &lt;any resolution-vs-model mismatch&gt;
+```
+
+## Rules
+
+- Never recommend a model whose license contradicts the user&#39;s constraint. `SD 1.5` ships under CreativeML Open RAIL-M, which forbids specific use categories (listed in the license); when `licensing == commercial_ok`, warn but allow if the user confirms the project is not in a restricted category. When `licensing == permissive`, reject SD 1.5 outright and switch to an Apache 2.0 or similarly permissive base.
+- Flag if requested `resolution` is outside a model&#39;s native size (e.g. SD 1.5 at 1024x1024 produces broken samples without custom training).
+- If `latency_target_s &lt; 0.5s` on consumer GPU, recommend LCM-LoRA or a turbo/schnell variant with 1-4 steps.
+- Do not recommend CPU-only for `fidelity == production`; propose reducing resolution or switching to a smaller model.
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/04-computer-vision/11-stable-diffusion/outputs/skill-lora-training-setup.md">phases/04-computer-vision/11-stable-diffusion/outputs/skill-lora-training-setup.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: skill-lora-training-setup
+description: Write a full LoRA training config for a custom dataset, including captions, rank, batch size, and learning rate
+version: 1.0.0
+phase: 4
+lesson: 11
+tags: [computer-vision, stable-diffusion, lora, fine-tuning]
+---
+
+# LoRA Training Setup
+
+Turn a description of the fine-tune intent into a concrete training config that is ready to pass to `diffusers` or `kohya_ss`.
+
+## When to use
+
+- Training a LoRA for a subject (person, object, character), a style (artist, brand), or a concept (pose, lighting).
+- Extending an existing LoRA with more data.
+- Debugging a LoRA run whose output underfits or overfits the training images.
+
+## Inputs
+
+- `purpose`: subject | style | concept
+- `num_images`: how many training images are available
+- `base_model`: SD 1.5 | SDXL | SD3 | FLUX
+- `gpu_vram_gb`: 8 | 12 | 16 | 24 | 48+
+- `caption_source`: manual | BLIP2-generated | dataset-native
+
+## Rank picker
+
+| Purpose | Rank | Alpha |
+|---------|------|-------|
+| Subject | 8-16 | rank |
+| Style | 16-32 | rank * 2 |
+| Concept | 32-64 | rank |
+
+Higher rank = more capacity, more overfitting risk on small datasets. Alpha scales the LoRA&#39;s effect strength; `alpha == rank` is the safe default. Styles are the documented exception: `alpha == rank * 2` gives a stronger style push at the cost of more risk of baking the style too hard — use only when subject fidelity is not the goal.
+
+## Training step target
+
+- `subject` with 5-20 images: 500-1500 steps.
+- `style` with 30-100 images: 1500-4000 steps.
+- `concept` with 100+ images: 4000-10000 steps.
+
+Overshoot at your peril — a LoRA that has memorised its training images cannot generalise.
+
+## Learning rate
+
+- Text encoder LoRA: `1e-4` for SD 1.5, `5e-5` for SDXL.
+- U-Net LoRA: `1e-4` for SD 1.5, `1e-4` for SDXL.
+- FLUX / SD3: `5e-5` for the transformer, text encoders usually frozen.
+- Halve the LR when `num_images &lt; 15` (subject) or when training for more than 3000 steps; tiny datasets and long runs both benefit from a gentler update.
+
+## Scheduler
+
+- `cosine_with_warmup` (default): warmup over the first 5-10% of steps, then cosine decay. Use when `steps &gt;= 1000`; the decay tail gives sharper final samples.
+- `constant`: use only for very short runs (`steps &lt; 500`) or when resuming a previous LoRA where you want to preserve the current learned features without re-annealing.
+
+## Caption format
+
+- Subject: prepend a unique trigger token (&quot;myperson&quot;) to every caption. Keep trigger token rare so it does not overwrite existing concepts. Avoid real words and common names.
+- Style: append a unique style tag at the end of every caption (&quot;...in mystyle style&quot;). Treat the tag itself as a rare trigger token — `mystyle`, not `impressionism`, which already maps to a real concept.
+- Concept: describe the concept in every caption; no trigger token. The concept itself (e.g. &quot;low-angle shot&quot;) is the anchor.
+
+## Output config
+
+```yaml
+model:
+  base: &lt;base_model HF id&gt;
+  precision: fp16 | bf16
+
+lora:
+  rank: &lt;int&gt;
+  alpha: &lt;int&gt;
+  targets: unet.cross_attention  # and/or unet.to_q, to_k, to_v, to_out
+
+training:
+  steps:          &lt;int&gt;
+  batch_size:     &lt;int, tuned to gpu_vram_gb&gt;
+  grad_accum:     &lt;int, usually 1 on &gt;=16 GB, 4 on &lt;=12 GB&gt;
+  learning_rate:  &lt;float&gt;
+  optimizer:      AdamW8bit | AdamW
+  scheduler:      cosine_with_warmup | constant
+  warmup_steps:   &lt;int&gt;
+  save_every:     &lt;int&gt;
+
+data:
+  images_dir:     &lt;path&gt;
+  caption_source: &lt;manual | BLIP2 | native&gt;
+  trigger_token:   &lt;string if purpose==subject&gt;
+  resolution:      &lt;512 for SD 1.5, 1024 for SDXL&gt;
+  aspect_ratio_bucketing: true
+  augmentation:
+    flip:          true
+    color_jitter:  false
+
+validation:
+  prompts:
+    - &quot;&lt;trigger&gt; ...test prompt...&quot;
+    - &quot;&lt;trigger&gt; in a different scene&quot;
+  every_steps: 250
+```
+
+## Report
+
+```
+[lora setup]
+  purpose:   &lt;subject|style|concept&gt;
+  base:      &lt;model&gt;
+  rank:      &lt;int&gt;
+  steps:     &lt;int&gt;
+  batch:     &lt;int&gt;   grad_accum: &lt;int&gt;
+  lr:        &lt;float&gt;
+  vram est.: &lt;float&gt; GB
+```
+
+## Rules
+
+- Never recommend `rank &gt; 64`; above that the LoRA becomes a mini fine-tune and loses its &quot;adapter&quot; nature.
+- For `num_images &lt; 5`, warn strongly — identity LoRAs on 1-3 images overfit every time.
+- For `gpu_vram_gb &lt; 12`, require AdamW8bit and gradient checkpointing.
+- If `base_model == FLUX` and `gpu_vram_gb &lt; 24`, route to the `schnell` variant and note that training is slower.
+- Never skip validation prompts; a LoRA without sample grids is impossible to evaluate.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. Why does Stable Diffusion run its DDPM in a 4x64x64 latent space rather than directly on 3x512x512 pixel images?</legend><label class="option"><input type="radio" name="q0" value="0"> To make inference deterministic</label><label class="option"><input type="radio" name="q0" value="1"> Latents are easier to visualise</label><label class="option"><input type="radio" name="q0" value="2"> Latents are the native output of GPUs</label><label class="option"><input type="radio" name="q0" value="3"> Training and sampling on 16,384 latent values instead of 786,432 pixels is roughly 48x cheaper; a pretrained VAE handles the image &lt;-&gt; latent conversion, and the diffusion model only has to model the structured latent manifold</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. What does classifier-free guidance (CFG) do at inference?</legend><label class="option"><input type="radio" name="q1" value="0"> Runs two separate models and averages them</label><label class="option"><input type="radio" name="q1" value="1"> Adds a classifier head to the model at test time</label><label class="option"><input type="radio" name="q1" value="2"> Uses one model trained to predict both conditional eps_cond and unconditional eps_uncond noise, then combines them as eps = eps_uncond + w*(eps_cond - eps_uncond) to amplify prompt adherence</label><label class="option"><input type="radio" name="q1" value="3"> Uses a larger scheduler</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. You swap SD&#39;s default scheduler for DPM-Solver++ 2M Karras and reduce num_inference_steps from 50 to 20. What is the expected result?</legend><label class="option"><input type="radio" name="q2" value="0"> You must also retrain the model</label><label class="option"><input type="radio" name="q2" value="1"> Comparable quality in roughly half the time; DPM-Solver++ is a second-order ODE integrator that converges in fewer steps than DDIM for the same sample quality</label><label class="option"><input type="radio" name="q2" value="2"> Worse quality and longer runtime</label><label class="option"><input type="radio" name="q2" value="3"> Numerical instability</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. Why is LoRA fine-tuning popular for Stable Diffusion instead of full fine-tuning?</legend><label class="option"><input type="radio" name="q3" value="0"> LoRA produces better images by default</label><label class="option"><input type="radio" name="q3" value="1"> LoRA keeps the 860M base U-Net frozen and inserts tiny rank-decomposition matrices into attention layers, so a fine-tune trains in minutes on consumer hardware, produces 10-50 MB adapters, and can be swapped or mixed at inference</label><label class="option"><input type="radio" name="q3" value="2"> LoRA is required by diffusers</label><label class="option"><input type="radio" name="q3" value="3"> LoRA prevents overfitting entirely</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. You generate the same prompt with guidance_scale=15 and see oversaturated colours and burned-in artefacts. What is going on?</legend><label class="option"><input type="radio" name="q4" value="0"> CFG amplifies the conditional direction; past a threshold around 9-12 the amplification pushes predictions outside the manifold the VAE can decode cleanly, producing visual artefacts. Drop guidance to 7-9 for balanced results</label><label class="option"><input type="radio" name="q4" value="1"> The seed is wrong</label><label class="option"><input type="radio" name="q4" value="2"> The model is broken</label><label class="option"><input type="radio" name="q4" value="3"> The VAE needs retraining</label><p data-feedback="4"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/04-computer-vision/10-image-generation-diffusion/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/04-computer-vision/12-video-understanding/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/04-computer-vision/11-stable-diffusion/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

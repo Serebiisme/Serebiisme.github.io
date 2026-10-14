@@ -1,0 +1,862 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>快速缓存和语义缓存经济 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-17-infrastructure-and-production" data-lesson="17-infrastructure-and-production/14-prompt-semantic-caching" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/17-infrastructure-and-production/">基础设施与生产</a> / LESSON 14</p><h1 class="lesson-title">快速缓存和语义缓存经济</h1><p>Prompt Caching and Semantic Caching Economics</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>快速缓存和语义缓存经济</h1>
+<blockquote>
+<p>**Pricing snapshot dated 2026-04.**下面的数字索赔反映了本课程发布时捕获的供应商利率卡;在下游报价之前,请与链接的文件进行验证.</p>
+</blockquote>
+<blockquote>
+<p>缓存发生在两个层次.L2 (提供商级) 提示/预写缓存重复使用重复预写的注意 KV  人类的提示缓存文件在长时间提示上宣传到90%的成本降低和85%的延迟降低;对于Claude 3.5 Sonnet缓存读取是<span class="katex"><span class="katex-mathml"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>0.30</mn><mi mathvariant="normal">/</mi><mi>M</mi><mi>v</mi><mi>s</mi></mrow><annotation encoding="application/x-tex">0.30/M vs </annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="katex-base"><span class="katex-strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">0.30/</span><span class="mord mathnormal" style="margin-right:0.109em;">M</span><span class="mord mathnormal" style="margin-right:0.0359em;">v</span><span class="mord mathnormal">s</span></span></span></span>清新3.00/M,为5分钟的TTL和1小时的TTL选项的2倍写费 (docs.anthropic.com, 2026-04). 开启AI提示缓存自动适用于提示 ≥1024个代币和价格缓存输入大约90%折扣对新鲜 (platform.openai.com, 2026-04);每个模型的确切缓存率取决于现场率卡. 应用程序级语义缓存将完全跳过LLM在嵌入类似性击中. 供应商&quot;95%准确性&quot;指匹配准确性,而不是击率 报告的生产击率从10% (开放式聊天) 到70% (结构化常见问题);任何供应商都没有发布官方基准,所以把这些视为社区远程测量而不是保证. 生产陷:并行化杀死缓存 (在第一个缓存写之前发出的N并行请求可以膨胀支出多倍),前内部的动态内容完全防止缓存击中. 项目发现报告通过从可缓存的前中移动动动态文本,从7%到74%的击中率 (2025-11)</p>
+</blockquote>
+<p><strong>Type:</strong> Learn
+<strong>Languages:</strong> Python (stdlib, toy two-layer cache simulator)
+<strong>Prerequisites:</strong> Phase 17 · 04 (Serving Engine Internals), Phase 17 · 06 (SGLang RadixAttention)
+<strong>Time:</strong> ~60 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>区分L2提示/预写缓存 (在提供商中重复使用KV) 与L1语义缓存 (在类似提示时绕过LLM).</li>
+<li>解释人类的故事<code>cache_control</code>显而易见的标记和两个TTL选项 (5分钟对比1小时) 及其价格乘法.</li>
+<li>计算预期的月性节省,以击中率,快速/响应混合和代币价格.</li>
+<li>给出一个反对比模式,使账单膨胀5到10倍,以及一个反对动态内容的反模式,</li>
+</ul>
+<h2>问题</h2>
+<p>您将快速缓存添加到您的RAG服务中.账单保持平稳.您测量了击率;它是7%.您的提示看起来是静态,但它们不是.系统提示包括当前的日期格式为分钟,请求 ID,和随机的例子重新排序为多样性.每个请求写出一个新的缓存输入,读取零.</p>
+<p>您的代理人每次用户问话,每次运行10次并行工具调用.前10次预存写完成之前,所有10次都到达提供商.10次写,零次读.您的账单是5-10倍&quot;预存&quot;所需的成本.</p>
+<p>缓存是协议,不是旗.</p>
+<h2>概念</h2>
+<h3>L2 提供商提示/预设缓存</h3>
+<p>提供商将注意力KV存储为可缓存的预写,并在下一次与预写匹配的请求上再使用它.</p>
+<p>**Anthropic (Claude 3.5 / 3.7 / 4 series)**具体情况<code>cache_control</code>标记在请求中.您标记哪些块可以缓存. TTL: 5 分钟 (写费 1.25x 基础) 或 1 小时 (写费 2x 基础).缓存读取: <span class="katex"><span class="katex-mathml"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>0.30</mn><mi mathvariant="normal">/</mi><mi>M</mi><mi>o</mi><mi>n</mi><mi>C</mi><mi>l</mi><mi>a</mi><mi>u</mi><mi>d</mi><mi>e</mi><mn>3.5</mn><mi>S</mi><mi>o</mi><mi>n</mi><mi>n</mi><mi>e</mi><mi>t</mi><mi>v</mi><mi>s</mi></mrow><annotation encoding="application/x-tex">0.30/M on Claude 3.5 Sonnet vs </annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="katex-base"><span class="katex-strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">0.30/</span><span class="mord mathnormal" style="margin-right:0.109em;">M</span><span class="mord mathnormal">o</span><span class="mord mathnormal">n</span><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="mord mathnormal" style="margin-right:0.0197em;">l</span><span class="mord mathnormal">a</span><span class="mord mathnormal">u</span><span class="mord mathnormal">d</span><span class="mord mathnormal">e</span><span class="mord">3.5</span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span><span class="mord mathnormal">o</span><span class="mord mathnormal">nn</span><span class="mord mathnormal">e</span><span class="mord mathnormal">t</span><span class="mord mathnormal" style="margin-right:0.0359em;">v</span><span class="mord mathnormal">s</span></span></span></span>价格因车型而异 (Opus/Haiku 单独发布); 总是通过直播价格页面进行交叉检查.</p>
+<p><strong>OpenAI</strong>现有gpt-4o/gpt-5率卡上,缓存输入比新增的约10倍便宜.文件和发布说明都没有公布官方的关键率基线;社区报告在3060%左右的细致的提示设计下集成.监测<code>usage.cached_tokens</code>为了测量自己的.</p>
+<p>**Google (Gemini)**通过明确的API进行内存存; 1M-代币内存意味着内存存付出更多.</p>
+<p><strong>Self-hosted (vLLM, SGLang)</strong>: 17 · 06 阶段涵盖RadixAttention 您自己的计算模式.</p>
+<h3>L1 应用级语义缓存</h3>
+<p>在打电话给LLM之前,按点击提示,嵌入它,并寻找类似的缓存请求 (值以上的类似性,通常是0.95+).在击中,返回缓存响应.在错误时,打电话给LLM并缓存结果.</p>
+<p>开源:Redis向量类似性,GPTCache,Qdrant.商业:Portkey Cache,Helicone Cache.</p>
+<p>供应商的准确性要求是指返回缓存响应的含义性适当度,而不是你打的频率.</p>
+<ul>
+<li>开放式聊天: 10-15%.</li>
+<li>结构性常见问题/支持:40-70%.</li>
+<li>代码问题:20-30% (小变量杀死击中).</li>
+<li>语音代理重复提示:50-80% (语音正常化固定设置).</li>
+</ul>
+<h3>平式化反模式</h3>
+<p>您的代理人同时进行10次工具调用.所有10次都具有相同的4K代码系统提示.人类缓存写作是按要求进行的;提供者看到提示后,第一个缓存写作完成了大约300ms. 2-10次请求都在同一毫秒窗口中到达,每个缓存都会出现错误.您支付10次写费,0次阅读折扣.</p>
+<p>修复: 随序列-第一  单独请求 1,然后在 1' 缓存填充后,启动 2-10 秒. 添加300 ms到第一个工具调用;节省 5-10 倍的账单.</p>
+<h3>动态内容反模式</h3>
+<p>你的系统提示看起来像:</p>
+<pre><code>You are a helpful assistant. The current time is 14:32:17.
+User ID: abc123. Today is Tuesday...
+</code></pre>
+<p>每个请求都是独一无二的,每一个请求都写着,零打.</p>
+<p>修复:将真正静态的内容移动到可缓存的前置;在缓存边界后添加动态内容:</p>
+<pre><code>[cacheable]
+You are a helpful assistant. [rules, examples, instructions]
+[/cacheable]
+[dynamic, not cached]
+Current time: 14:32:17. User: abc123.
+</code></pre>
+<p>通过此方式,ProjectDiscovery从7%上升到74%的缓存击中率,并发布了解剖学.</p>
+<h3>堆批量+夜间工作负载的缓存</h3>
+<p>批量API (阶段17 · 15) 在24小时转换时提供50%的折扣. 存储输入上方为您提供了10倍的额外. 通过堆叠,一夜间分类,标签和报告生成工作负载可以降至同步未加载成本的10%</p>
+<h3>你应该记住的数字</h3>
+<p>价格点从链接的供应商文件中被捕获2026-04年,每几个月都会被转移到重新检查之前依赖它们.</p>
+<ul>
+<li>克劳德3.5索尼特的缓存读数:0.30美元/万,比新输入的价格约是10倍.</li>
+<li>人类缓存写入溢价: 1.25x (5分钟TL) 或 2x (1小时TL).</li>
+<li>开AI自动缓存:适用于提示 ≥1024个代币;缓存输入价格约为当前价格卡的新输入的10% (platform.openai.com).</li>
+<li>语义缓存击中率 (社区报告): ~10%开放聊天;高达 ~70%结构化的FAQ. 不是供应商记录的基线.</li>
+<li>项目发现: 7% → 74% 的击中率通过从前移动动态 (项目博客, 2025-11).</li>
+<li>平式化反模式:在N平行请求错过第一个缓存写时,典型报告510x账单通胀.</li>
+</ul>
+<figure><img src="/learn/ai-from-scratch/figures/figure-6d77032bbcccd98b8183.png" alt="semantic-cache-hit 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>用它</h2>
+<p><code>code/main.py</code>报告中显示了率,账单,并显示了并行处罚.</p>
+<h2>运送它</h2>
+<p>这一课产生了<code>outputs/skill-cache-auditor.md</code>鉴于快速的模板和流量,审计可存储性,并建议进行重组.</p>
+<h2>运动</h2>
+<ol>
+<li>跑步<code>code/main.py</code>换并行标志. 账单有多少变化?</li>
+<li>系统提示有日期,请移动,显示前后的按率.</li>
+<li>根据您的请求到达率,计算1小时的TTL (2x写) 与5分钟的TTL (1.25x写) 的破解平衡.</li>
+<li>在0.95的门时,语义缓存达到20%.在0.85时,它达到50%但你看到错误的缓存响应.</li>
+<li>按用户问题进行10个并行子查询. 为了缓存友好性,再写,而不需要添加端到端延迟.</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>L2 prompt cache</td>
+<td>&quot;prefix cache&quot;</td>
+<td>Provider stores KV for repeated prefix</td>
+</tr>
+<tr>
+<td><code>cache_control</code></td>
+<td>&quot;Anthropic cache marker&quot;</td>
+<td>Explicit attribute marking cacheable blocks</td>
+</tr>
+<tr>
+<td>Cache write premium</td>
+<td>&quot;write tax&quot;</td>
+<td>Extra cost for first miss-to-cache (1.25x or 2x)</td>
+</tr>
+<tr>
+<td>L1 semantic cache</td>
+<td>&quot;embedding cache&quot;</td>
+<td>App-level hash-and-embed before calling LLM</td>
+</tr>
+<tr>
+<td>GPTCache</td>
+<td>&quot;LLM caching lib&quot;</td>
+<td>Popular OSS L1 cache library</td>
+</tr>
+<tr>
+<td>Cache hit rate</td>
+<td>&quot;hits / total&quot;</td>
+<td>Fraction of requests served from cache</td>
+</tr>
+<tr>
+<td>Parallelization anti-pattern</td>
+<td>&quot;the N-write trap&quot;</td>
+<td>N parallel requests miss cache N times</td>
+</tr>
+<tr>
+<td>Dynamic content trap</td>
+<td>&quot;the time-in-prompt trap&quot;</td>
+<td>Dynamic bytes in prefix kill hit rate</td>
+</tr>
+<tr>
+<td>RadixAttention</td>
+<td>&quot;intra-replica cache&quot;</td>
+<td>SGLang's prefix-cache implementation</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching" rel="noreferrer" data-network="true">Anthropic Prompt Caching <small>↗ 需要联网</small></a>官方<code>cache_control</code>语义和TL.</li>
+<li><a href="https://platform.openai.com/docs/guides/prompt-caching" rel="noreferrer" data-network="true">OpenAI Prompt Caching <small>↗ 需要联网</small></a>自动缓存行为和资格.</li>
+<li><a href="https://tianpan.co/blog/2026-04-10-semantic-caching-llm-production" rel="noreferrer" data-network="true">TianPan — Semantic Caching for LLMs Production <small>↗ 需要联网</small></a></li>
+<li><a href="https://projectdiscovery.io/blog/how-we-cut-llm-cost-with-prompt-caching" rel="noreferrer" data-network="true">ProjectDiscovery — Cut LLM Costs 59% With Prompt Caching <small>↗ 需要联网</small></a></li>
+<li><a href="https://www.digitalocean.com/blog/prompt-caching-with-digital-ocean" rel="noreferrer" data-network="true">DigitalOcean / Anthropic — Prompt Caching <small>↗ 需要联网</small></a></li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Prompt Caching and Semantic Caching Economics</h1>
+<blockquote>
+<p><strong>Pricing snapshot dated 2026-04.</strong> Numeric claims below reflect vendor rate cards captured at this lesson's publication; verify against the linked docs before quoting them downstream.</p>
+</blockquote>
+<blockquote>
+<p>Caching happens at two layers. L2 (provider-level) prompt/prefix caching reuses attention KV for repeated prefixes — Anthropic's prompt-caching docs advertise up to 90% cost reduction and 85% latency reduction on long prompts; for Claude 3.5 Sonnet cache reads are <span class="katex"><span class="katex-mathml"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>0.30</mn><mi mathvariant="normal">/</mi><mi>M</mi><mi>v</mi><mi>s</mi></mrow><annotation encoding="application/x-tex">0.30/M vs </annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="katex-base"><span class="katex-strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">0.30/</span><span class="mord mathnormal" style="margin-right:0.109em;">M</span><span class="mord mathnormal" style="margin-right:0.0359em;">v</span><span class="mord mathnormal">s</span></span></span></span>3.00/M fresh with a 5-minute TTL and a 2x write premium for the 1-hour TTL option (docs.anthropic.com, 2026-04). OpenAI prompt caching applies automatically for prompts ≥1024 tokens and prices cached input at roughly a 90% discount vs fresh (platform.openai.com, 2026-04); the exact per-model cached rate depends on the live rate card. L1 (app-level) semantic caching skips the LLM entirely on embedding similarity hits. Vendor &quot;95% accuracy&quot; refers to match correctness, not hit rate — reported production hit rates range from 10% (open-ended chat) up to 70% (structured FAQ); neither provider publishes an official baseline, so treat these as community telemetry rather than guarantees. The production pitfalls: parallelization kills caching (N parallel requests issued before the first cache write can inflate spend several-fold), and dynamic content inside the prefix prevents cache hits entirely. ProjectDiscovery reported moving from 7% to 74% hit rate (2025-11) by moving dynamic text out of the cacheable prefix.</p>
+</blockquote>
+<p><strong>Type:</strong> Learn
+<strong>Languages:</strong> Python (stdlib, toy two-layer cache simulator)
+<strong>Prerequisites:</strong> Phase 17 · 04 (Serving Engine Internals), Phase 17 · 06 (SGLang RadixAttention)
+<strong>Time:</strong> ~60 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Distinguish L2 prompt/prefix caching (KV reuse at provider) from L1 semantic caching (LLM bypass on similar prompts).</li>
+<li>Explain Anthropic's <code>cache_control</code> explicit marking and the two TTL options (5-min vs 1-hour) with their price multipliers.</li>
+<li>Compute expected monthly savings given hit rate, prompt/response mix, and token prices.</li>
+<li>Name the parallelization anti-pattern that inflates bills by 5-10x and the dynamic-content anti-pattern that collapses hit rate.</li>
+</ul>
+<h2>The Problem</h2>
+<p>You add prompt caching to your RAG service. The bill stays flat. You measure the hit rate; it is 7%. Your prompts look static but they are not — the system prompt includes the current date formatted to the minute, a request ID, and a randomized example reorder for diversity. Every request writes a new cache entry, reads zero.</p>
+<p>Separately, your agent runs ten parallel tool calls per user question. All ten arrive at the provider before the first cache write completes. Ten writes, zero reads. Your bill is 5-10x what &quot;with caching&quot; was supposed to cost.</p>
+<p>Caching is a protocol, not a flag. Two layers, two different failure modes.</p>
+<h2>The Concept</h2>
+<h3>L2 — provider prompt/prefix caching</h3>
+<p>Provider stores the attention KV for a cacheable prefix and reuses it on the next request that matches the prefix. You pay a write cost once, reads nearly free.</p>
+<p><strong>Anthropic (Claude 3.5 / 3.7 / 4 series)</strong>: explicit <code>cache_control</code> marker in the request. You tag which blocks are cacheable. TTL: 5-minute (write costs 1.25x base) or 1-hour (write costs 2x base). Cache reads: <span class="katex"><span class="katex-mathml"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>0.30</mn><mi mathvariant="normal">/</mi><mi>M</mi><mi>o</mi><mi>n</mi><mi>C</mi><mi>l</mi><mi>a</mi><mi>u</mi><mi>d</mi><mi>e</mi><mn>3.5</mn><mi>S</mi><mi>o</mi><mi>n</mi><mi>n</mi><mi>e</mi><mi>t</mi><mi>v</mi><mi>s</mi></mrow><annotation encoding="application/x-tex">0.30/M on Claude 3.5 Sonnet vs </annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="katex-base"><span class="katex-strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">0.30/</span><span class="mord mathnormal" style="margin-right:0.109em;">M</span><span class="mord mathnormal">o</span><span class="mord mathnormal">n</span><span class="mord mathnormal" style="margin-right:0.0715em;">C</span><span class="mord mathnormal" style="margin-right:0.0197em;">l</span><span class="mord mathnormal">a</span><span class="mord mathnormal">u</span><span class="mord mathnormal">d</span><span class="mord mathnormal">e</span><span class="mord">3.5</span><span class="mord mathnormal" style="margin-right:0.0576em;">S</span><span class="mord mathnormal">o</span><span class="mord mathnormal">nn</span><span class="mord mathnormal">e</span><span class="mord mathnormal">t</span><span class="mord mathnormal" style="margin-right:0.0359em;">v</span><span class="mord mathnormal">s</span></span></span></span>3.00/M fresh — 10x cheaper (docs.anthropic.com, as of 2026-04). Rates differ per model (Opus/Haiku published separately); always cross-check the live pricing page.</p>
+<p><strong>OpenAI</strong>: automatic caching for prompts ≥1024 tokens (platform.openai.com, 2026-04). No explicit flag. Cached input is roughly 10x cheaper than fresh on current gpt-4o/gpt-5 rate cards. Neither docs nor release notes publish an official hit-rate baseline; community reports cluster around 30–60% with careful prompt design. Monitor <code>usage.cached_tokens</code> to measure your own.</p>
+<p><strong>Google (Gemini)</strong>: context caching via explicit API; 1M-token context means caching pays even more.</p>
+<p><strong>Self-hosted (vLLM, SGLang)</strong>: Phase 17 · 06 covers RadixAttention — same pattern at your own compute.</p>
+<h3>L1 — app-level semantic caching</h3>
+<p>Before calling the LLM at all, hash the prompt, embed it, and look for a similar cached request (cosine similarity above threshold, typically 0.95+). On hit, return the cached response. On miss, call LLM and cache the result.</p>
+<p>Open-source: Redis Vector Similarity, GPTCache, Qdrant. Commercial: Portkey Cache, Helicone Cache.</p>
+<p>Vendor accuracy claims refer to how often the returned cached response was semantically appropriate — not how often you hit. Production hit rates:</p>
+<ul>
+<li>Open-ended chat: 10-15%.</li>
+<li>Structured FAQ / support: 40-70%.</li>
+<li>Code questions: 20-30% (small variants kill hits).</li>
+<li>Voice agents repeating prompts: 50-80% (voice normalization fixed set).</li>
+</ul>
+<h3>The parallelization anti-pattern</h3>
+<p>Your agent makes 10 tool calls in parallel. All 10 have the same 4K-token system prompt. Anthropic cache writes are per-request; the first cache-write completes around 300 ms after the provider sees the prompt. Requests 2-10 arrive in the same millisecond window and each sees cache miss. You pay 10 write premiums, 0 read discounts.</p>
+<p>Fix: batch with sequential-first — make request 1 alone, then fire 2-10 once 1's cache has populated. Adds 300 ms to the first tool call; saves 5-10x the bill.</p>
+<h3>The dynamic content anti-pattern</h3>
+<p>Your system prompt looks like:</p>
+<pre><code>You are a helpful assistant. The current time is 14:32:17.
+User ID: abc123. Today is Tuesday...
+</code></pre>
+<p>Every request is unique. Every request writes. Zero hits.</p>
+<p>Fix: move everything truly static to the cacheable prefix; append dynamic content after the cache boundary:</p>
+<pre><code>[cacheable]
+You are a helpful assistant. [rules, examples, instructions]
+[/cacheable]
+[dynamic, not cached]
+Current time: 14:32:17. User: abc123.
+</code></pre>
+<p>ProjectDiscovery moved from 7% to 74% cache hit rate this way and published the anatomy.</p>
+<h3>Stack batch + cache for overnight workloads</h3>
+<p>Batch APIs (Phase 17 · 15) give 50% discount at 24-hour turnaround. Cached input on top gets you ~10x on top of that. Overnight classification, labeling, and report generation workloads can drop to ~10% of synchronous-uncached cost by stacking.</p>
+<h3>Numbers you should remember</h3>
+<p>Pricing points are captured 2026-04 from the linked vendor docs and drift every few months — re-check before relying on them.</p>
+<ul>
+<li>Anthropic cached read: $0.30/M on Claude 3.5 Sonnet, roughly 10x cheaper than fresh input (docs.anthropic.com).</li>
+<li>Anthropic cache write premium: 1.25x (5-min TTL) or 2x (1-hour TTL).</li>
+<li>OpenAI auto-cache: applies to prompts ≥1024 tokens; cached input priced at roughly 10% of fresh input on current rate cards (platform.openai.com).</li>
+<li>Semantic cache hit rate (community-reported): ~10% open chat; up to ~70% structured FAQ. Not a vendor-documented baseline.</li>
+<li>ProjectDiscovery: 7% → 74% hit rate by moving dynamic out of prefix (project blog, 2025-11).</li>
+<li>Parallelization anti-pattern: typical reports of 5–10x bill inflation when N parallel requests miss the first cache write.</li>
+</ul>
+<figure><img src="/learn/ai-from-scratch/figures/figure-6d77032bbcccd98b8183.png" alt="semantic-cache-hit 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Use It</h2>
+<p><code>code/main.py</code> simulates L1 + L2 caching on mixed workloads. Reports hit rates, bill, and shows the parallelization penalty.</p>
+<h2>Ship It</h2>
+<p>This lesson produces <code>outputs/skill-cache-auditor.md</code>. Given prompt template and traffic, audits cacheability and recommends restructure.</p>
+<h2>Exercises</h2>
+<ol>
+<li>Run <code>code/main.py</code>. Toggle the parallelization flag. How much does the bill change?</li>
+<li>Your system prompt has a date. Move it out. Show before/after hit rate math.</li>
+<li>Calculate break-even for 1-hour TTL (2x write) vs 5-minute TTL (1.25x write) given your request arrival rate.</li>
+<li>Semantic cache at 0.95 threshold hits 20%. At 0.85 it hits 50% but you see incorrect cached responses. Pick the right threshold and justify.</li>
+<li>You batch 10 parallel sub-queries per user question. Rewrite for cache-friendliness without adding end-to-end latency.</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>L2 prompt cache</td>
+<td>&quot;prefix cache&quot;</td>
+<td>Provider stores KV for repeated prefix</td>
+</tr>
+<tr>
+<td><code>cache_control</code></td>
+<td>&quot;Anthropic cache marker&quot;</td>
+<td>Explicit attribute marking cacheable blocks</td>
+</tr>
+<tr>
+<td>Cache write premium</td>
+<td>&quot;write tax&quot;</td>
+<td>Extra cost for first miss-to-cache (1.25x or 2x)</td>
+</tr>
+<tr>
+<td>L1 semantic cache</td>
+<td>&quot;embedding cache&quot;</td>
+<td>App-level hash-and-embed before calling LLM</td>
+</tr>
+<tr>
+<td>GPTCache</td>
+<td>&quot;LLM caching lib&quot;</td>
+<td>Popular OSS L1 cache library</td>
+</tr>
+<tr>
+<td>Cache hit rate</td>
+<td>&quot;hits / total&quot;</td>
+<td>Fraction of requests served from cache</td>
+</tr>
+<tr>
+<td>Parallelization anti-pattern</td>
+<td>&quot;the N-write trap&quot;</td>
+<td>N parallel requests miss cache N times</td>
+</tr>
+<tr>
+<td>Dynamic content trap</td>
+<td>&quot;the time-in-prompt trap&quot;</td>
+<td>Dynamic bytes in prefix kill hit rate</td>
+</tr>
+<tr>
+<td>RadixAttention</td>
+<td>&quot;intra-replica cache&quot;</td>
+<td>SGLang's prefix-cache implementation</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching" rel="noreferrer" data-network="true">Anthropic Prompt Caching <small>↗ 需要联网</small></a> — official <code>cache_control</code> semantics and TTLs.</li>
+<li><a href="https://platform.openai.com/docs/guides/prompt-caching" rel="noreferrer" data-network="true">OpenAI Prompt Caching <small>↗ 需要联网</small></a> — automatic caching behavior and eligibility.</li>
+<li><a href="https://tianpan.co/blog/2026-04-10-semantic-caching-llm-production" rel="noreferrer" data-network="true">TianPan — Semantic Caching for LLMs Production <small>↗ 需要联网</small></a></li>
+<li><a href="https://projectdiscovery.io/blog/how-we-cut-llm-cost-with-prompt-caching" rel="noreferrer" data-network="true">ProjectDiscovery — Cut LLM Costs 59% With Prompt Caching <small>↗ 需要联网</small></a></li>
+<li><a href="https://www.digitalocean.com/blog/prompt-caching-with-digital-ocean" rel="noreferrer" data-network="true">DigitalOcean / Anthropic — Prompt Caching <small>↗ 需要联网</small></a></li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-17-infrastructure-and-production--14-prompt-semantic-caching.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-17-infrastructure-and-production--14-prompt-semantic-caching.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/17-infrastructure-and-production/14-prompt-semantic-caching/code/main.py">phases/17-infrastructure-and-production/14-prompt-semantic-caching/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Two-layer caching simulator — stdlib Python.
+
+Models L1 (semantic) + L2 (prompt-prefix) caching on a mixed workload.
+Reports bill, hit rates, and the parallelization penalty.
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import random
+
+
+BASE_INPUT = 3.00       # $/M input tokens (Claude Sonnet-class)
+BASE_OUTPUT = 15.00     # $/M output tokens
+CACHED_INPUT = 0.30     # 10x cheaper read
+CACHE_WRITE_5MIN = 1.25 * BASE_INPUT  # write premium 5-min TTL
+CACHE_WRITE_1HR = 2.00 * BASE_INPUT   # write premium 1-hour TTL
+
+
+@dataclass
+class Request:
+    prompt_tokens: int
+    prefix_hash: str
+    is_parallel_wave: bool
+    arrived_at: float
+
+
+@dataclass
+class Config:
+    l1_enabled: bool
+    l2_enabled: bool
+    parallel_penalty: bool  # N parallel arrivals miss cache together
+    l1_threshold: float
+    l1_hit_prob: float
+    ttl: str                # &quot;5min&quot; or &quot;1hr&quot;
+
+
+def make_workload(n: int = 500, seed: int = 7) -&gt; list[Request]:
+    rng = random.Random(seed)
+    reqs = []
+    prefixes = [f&quot;prefix_{i}&quot; for i in range(12)]
+    now = 0.0
+    for i in range(n):
+        # 60% individual arrivals, 40% parallel waves of 5
+        if rng.random() &lt; 0.4:
+            for _ in range(5):
+                reqs.append(Request(rng.choice([2000, 4000, 8000]),
+                                    rng.choice(prefixes), True, now))
+            now += rng.uniform(0.1, 2.0)
+        else:
+            reqs.append(Request(rng.choice([2000, 4000, 8000]),
+                                rng.choice(prefixes), False, now))
+            now += rng.uniform(0.1, 2.0)
+    return reqs
+
+
+def simulate(reqs: list[Request], cfg: Config) -&gt; dict:
+    l2_cache: set[str] = set()
+    l2_writes = 0
+    l2_reads = 0
+    l1_hits = 0
+    cost = 0.0
+    rng = random.Random(11)
+
+    for r in reqs:
+        if cfg.l1_enabled and rng.random() &lt; cfg.l1_hit_prob:
+            l1_hits += 1
+            continue
+
+        if cfg.l2_enabled:
+            if r.prefix_hash in l2_cache:
+                l2_reads += 1
+                cost += (r.prompt_tokens / 1e6) * CACHED_INPUT
+            else:
+                if cfg.parallel_penalty and r.is_parallel_wave:
+                    write_cost = CACHE_WRITE_5MIN if cfg.ttl == &quot;5min&quot; else CACHE_WRITE_1HR
+                    cost += (r.prompt_tokens / 1e6) * write_cost
+                    l2_writes += 1
+                else:
+                    write_cost = CACHE_WRITE_5MIN if cfg.ttl == &quot;5min&quot; else CACHE_WRITE_1HR
+                    cost += (r.prompt_tokens / 1e6) * write_cost
+                    l2_cache.add(r.prefix_hash)
+                    l2_writes += 1
+        else:
+            cost += (r.prompt_tokens / 1e6) * BASE_INPUT
+
+        cost += (200 / 1e6) * BASE_OUTPUT
+
+    return {
+        &quot;cost&quot;: cost,
+        &quot;l1_hits&quot;: l1_hits,
+        &quot;l2_reads&quot;: l2_reads,
+        &quot;l2_writes&quot;: l2_writes,
+    }
+
+
+def report(label: str, cfg: Config, reqs: list[Request]) -&gt; None:
+    res = simulate(reqs, cfg)
+    print(f&quot;{label:45}  cost=${res[&#39;cost&#39;]:7.2f}  &quot;
+          f&quot;L1={res[&#39;l1_hits&#39;]:4}  L2_reads={res[&#39;l2_reads&#39;]:4}  L2_writes={res[&#39;l2_writes&#39;]:4}&quot;)
+
+
+def main() -&gt; None:
+    print(&quot;=&quot; * 95)
+    print(&quot;PROMPT + SEMANTIC CACHING — 500 requests, Claude Sonnet-class pricing&quot;)
+    print(&quot;=&quot; * 95)
+    base = make_workload()
+    reqs = [Request(r.prompt_tokens, r.prefix_hash, r.is_parallel_wave, r.arrived_at) for r in base]
+
+    report(&quot;NO CACHING&quot;,
+           Config(l1_enabled=False, l2_enabled=False, parallel_penalty=True, l1_threshold=0.95, l1_hit_prob=0.0, ttl=&quot;5min&quot;),
+           reqs)
+    report(&quot;L2 5-min, parallel penalty active&quot;,
+           Config(l1_enabled=False, l2_enabled=True, parallel_penalty=True, l1_threshold=0.95, l1_hit_prob=0.0, ttl=&quot;5min&quot;),
+           reqs)
+    report(&quot;L2 5-min, parallel fixed (serialize first)&quot;,
+           Config(l1_enabled=False, l2_enabled=True, parallel_penalty=False, l1_threshold=0.95, l1_hit_prob=0.0, ttl=&quot;5min&quot;),
+           reqs)
+    report(&quot;L2 1-hour + L1 semantic 30%&quot;,
+           Config(l1_enabled=True, l2_enabled=True, parallel_penalty=False, l1_threshold=0.95, l1_hit_prob=0.30, ttl=&quot;1hr&quot;),
+           reqs)
+    report(&quot;L2 1-hour + L1 semantic 70% (structured FAQ)&quot;,
+           Config(l1_enabled=True, l2_enabled=True, parallel_penalty=False, l1_threshold=0.95, l1_hit_prob=0.70, ttl=&quot;1hr&quot;),
+           reqs)
+
+    print(&quot;\nRead: caching is a protocol. Structure your prompts and batching for it to pay off.&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/17-infrastructure-and-production/14-prompt-semantic-caching/code/main.ts">phases/17-infrastructure-and-production/14-prompt-semantic-caching/code/main.ts</a><details><summary>查看原始文本</summary><pre><code>/**
+ * Prompt + semantic caching — TypeScript port.
+ *
+ * Three pieces:
+ *   1. LRU cache with TTL (the L2 prompt-prefix layer&#39;s interface — provider does
+ *      this; we model it).
+ *   2. Semantic cache with cosine-similarity threshold (L1 layer). Uses a
+ *      deterministic word-hash &quot;embedding&quot; so the demo is reproducible and
+ *      requires no model. Swap embed() with a real embedding call in prod.
+ *   3. Two-layer simulator matching main.py, exercising the parallel-write
+ *      anti-pattern with 5-min vs 1-hour TTL premiums.
+ *
+ * Pricing snapshot: 2026-04, captured from docs.anthropic.com / platform.openai.com
+ * via docs/en.md. Verify rate cards before quoting.
+ *
+ * Citations:
+ *   - Anthropic prompt-caching: platform.claude.com/docs/en/build-with-claude/prompt-caching
+ *   - OpenAI prompt-caching: platform.openai.com/docs/guides/prompt-caching
+ *   - ProjectDiscovery 7%→74% by moving dynamic content out of prefix
+ *     https://projectdiscovery.io/blog/how-we-cut-llm-cost-with-prompt-caching
+ *
+ * Runs on Node 20+ stdlib. No npm deps.
+ */
+
+import { createHash } from &quot;node:crypto&quot;;
+
+// -- Pricing constants (2026-04) -------------------------------------------
+
+const BASE_INPUT = 3.0; // $/M input tokens (Claude Sonnet class)
+const BASE_OUTPUT = 15.0; // $/M output tokens
+const CACHED_INPUT = 0.3; // ~10x cheaper read
+const CACHE_WRITE_5MIN = 1.25 * BASE_INPUT;
+const CACHE_WRITE_1HR = 2.0 * BASE_INPUT;
+
+// -- LRU cache with TTL ----------------------------------------------------
+
+// Map preserves insertion order in JS; we exploit that for LRU.
+class LRUCache&lt;K, V&gt; {
+  private readonly map = new Map&lt;K, { value: V; expiresAt: number }&gt;();
+  private readonly capacity: number;
+  private readonly ttlMs: number;
+  private readonly now: () =&gt; number;
+
+  constructor(capacity: number, ttlMs: number, now: () =&gt; number = Date.now) {
+    if (capacity &lt;= 0) throw new Error(&quot;capacity must be positive&quot;);
+    this.capacity = capacity;
+    this.ttlMs = ttlMs;
+    this.now = now;
+  }
+
+  get(key: K): V | undefined {
+    const entry = this.map.get(key);
+    if (!entry) return undefined;
+    if (entry.expiresAt &lt;= this.now()) {
+      this.map.delete(key);
+      return undefined;
+    }
+    // Refresh LRU position.
+    this.map.delete(key);
+    this.map.set(key, entry);
+    return entry.value;
+  }
+
+  set(key: K, value: V): void {
+    if (this.map.has(key)) this.map.delete(key);
+    this.map.set(key, { value, expiresAt: this.now() + this.ttlMs });
+    if (this.map.size &gt; this.capacity) {
+      const oldest = this.map.keys().next();
+      if (!oldest.done) this.map.delete(oldest.value);
+    }
+  }
+
+  has(key: K): boolean {
+    return this.get(key) !== undefined;
+  }
+
+  get size(): number {
+    return this.map.size;
+  }
+}
+
+// -- Semantic cache --------------------------------------------------------
+
+// Toy deterministic embedding: bucket each lowercased word into 64 dims by hash.
+// This is enough to demonstrate cosine threshold behavior; replace with a real
+// embedding provider for production (text-embedding-3-small, voyage-3, etc.).
+const EMBED_DIM = 64;
+
+function embed(text: string): Float32Array {
+  const vec = new Float32Array(EMBED_DIM);
+  const tokens = text
+    .toLowerCase()
+    .replace(/[^a-z0-9 ]/g, &quot; &quot;)
+    .split(/\s+/)
+    .filter((s) =&gt; s.length &gt; 0);
+  for (const tok of tokens) {
+    const h = createHash(&quot;sha256&quot;).update(tok).digest();
+    const idx = h.readUInt16BE(0) % EMBED_DIM;
+    // Sign bit from second pair so we get spread, not pure positive.
+    const sign = h[2] &amp; 1 ? 1 : -1;
+    vec[idx] += sign;
+  }
+  // L2-normalize so cosine = dot product.
+  let norm = 0;
+  for (let i = 0; i &lt; EMBED_DIM; i++) norm += vec[i] * vec[i];
+  norm = Math.sqrt(norm);
+  if (norm &gt; 0) for (let i = 0; i &lt; EMBED_DIM; i++) vec[i] /= norm;
+  return vec;
+}
+
+function cosine(a: Float32Array, b: Float32Array): number {
+  let dot = 0;
+  for (let i = 0; i &lt; EMBED_DIM; i++) dot += a[i] * b[i];
+  return dot;
+}
+
+type SemanticEntry = { vec: Float32Array; response: string };
+
+class SemanticCache {
+  private readonly entries: SemanticEntry[] = [];
+  private readonly threshold: number;
+  private readonly capacity: number;
+
+  constructor(threshold = 0.95, capacity = 1000) {
+    if (threshold &lt; 0 || threshold &gt; 1) {
+      throw new Error(&quot;threshold must be in [0,1]&quot;);
+    }
+    this.threshold = threshold;
+    this.capacity = capacity;
+  }
+
+  // Returns best match above threshold, or undefined.
+  lookup(prompt: string): { response: string; similarity: number } | undefined {
+    const q = embed(prompt);
+    let bestSim = -1;
+    let bestIdx = -1;
+    for (let i = 0; i &lt; this.entries.length; i++) {
+      const sim = cosine(q, this.entries[i].vec);
+      if (sim &gt; bestSim) {
+        bestSim = sim;
+        bestIdx = i;
+      }
+    }
+    if (bestIdx &gt;= 0 &amp;&amp; bestSim &gt;= this.threshold) {
+      return { response: this.entries[bestIdx].response, similarity: bestSim };
+    }
+    return undefined;
+  }
+
+  store(prompt: string, response: string): void {
+    if (this.entries.length &gt;= this.capacity) this.entries.shift();
+    this.entries.push({ vec: embed(prompt), response });
+  }
+
+  get size(): number {
+    return this.entries.length;
+  }
+}
+
+// -- Workload + simulator --------------------------------------------------
+
+// Mulberry32 PRNG.
+function makeRng(seed: number): () =&gt; number {
+  let s = seed &gt;&gt;&gt; 0;
+  return function () {
+    s = (s + 0x6d2b79f5) &gt;&gt;&gt; 0;
+    let t = s;
+    t = Math.imul(t ^ (t &gt;&gt;&gt; 15), t | 1);
+    t ^= t + Math.imul(t ^ (t &gt;&gt;&gt; 7), t | 61);
+    return ((t ^ (t &gt;&gt;&gt; 14)) &gt;&gt;&gt; 0) / 4294967296;
+  };
+}
+
+function pickFrom&lt;T&gt;(rng: () =&gt; number, arr: readonly T[]): T {
+  return arr[Math.floor(rng() * arr.length)];
+}
+
+type Request = {
+  promptTokens: number;
+  prefixHash: string;
+  isParallelWave: boolean;
+  arrivedAt: number;
+  semanticKey: string;
+};
+
+function makeWorkload(n = 500, seed = 7): Request[] {
+  const rng = makeRng(seed);
+  const reqs: Request[] = [];
+  const prefixes = Array.from({ length: 12 }, (_, i) =&gt; `prefix_${i}`);
+  // A small set of FAQ-style canonical queries — drives L1 hit rate.
+  const faqs = [
+    &quot;what is your refund policy&quot;,
+    &quot;how do I reset my password&quot;,
+    &quot;what are your office hours&quot;,
+    &quot;how do I contact support&quot;,
+  ];
+  let now = 0.0;
+  while (reqs.length &lt; n) {
+    if (rng() &lt; 0.4) {
+      for (let k = 0; k &lt; 5; k++) {
+        reqs.push({
+          promptTokens: pickFrom(rng, [2000, 4000, 8000]),
+          prefixHash: pickFrom(rng, prefixes),
+          isParallelWave: true,
+          arrivedAt: now,
+          semanticKey: pickFrom(rng, faqs),
+        });
+      }
+      now += 0.1 + rng() * 1.9;
+    } else {
+      reqs.push({
+        promptTokens: pickFrom(rng, [2000, 4000, 8000]),
+        prefixHash: pickFrom(rng, prefixes),
+        isParallelWave: false,
+        arrivedAt: now,
+        semanticKey: pickFrom(rng, faqs),
+      });
+      now += 0.1 + rng() * 1.9;
+    }
+  }
+  return reqs;
+}
+
+type Config = {
+  l1Enabled: boolean;
+  l2Enabled: boolean;
+  parallelPenalty: boolean;
+  l1Threshold: number;
+  l1HitProb: number;
+  ttl: &quot;5min&quot; | &quot;1hr&quot;;
+};
+
+type SimResult = {
+  cost: number;
+  l1Hits: number;
+  l2Reads: number;
+  l2Writes: number;
+};
+
+function simulate(reqs: readonly Request[], cfg: Config): SimResult {
+  // L2 modeled as a set of prefix hashes seen &quot;long enough ago&quot; to be cached.
+  // L2 LRU here exists to demonstrate the API; the simulator uses a simpler
+  // set + parallel-wave flag (matches main.py&#39;s semantics).
+  const _l2Lru = new LRUCache&lt;string, true&gt;(
+    1024,
+    cfg.ttl === &quot;5min&quot; ? 5 * 60_000 : 60 * 60_000,
+  );
+  void _l2Lru; // referenced so the cache is exercised; behavior tied to set below
+  const l2Cache = new Set&lt;string&gt;();
+  const semantic = new SemanticCache(cfg.l1Threshold);
+
+  // Pre-warm semantic cache with canned answers for FAQ keys so we get hits.
+  semantic.store(&quot;what is your refund policy&quot;, &quot;Refunds within 30 days.&quot;);
+  semantic.store(&quot;how do I reset my password&quot;, &quot;Use the forgot-password link.&quot;);
+  semantic.store(&quot;what are your office hours&quot;, &quot;Mon–Fri 9–5 PT.&quot;);
+  semantic.store(&quot;how do I contact support&quot;, &quot;Email support@example.com.&quot;);
+
+  let l2Writes = 0;
+  let l2Reads = 0;
+  let l1Hits = 0;
+  let cost = 0.0;
+  const rng = makeRng(11);
+
+  for (const r of reqs) {
+    // L1 layer.
+    if (cfg.l1Enabled) {
+      // Inject randomized hit ratio per the simulator contract:
+      // l1HitProb fraction of requests is &quot;semantically close enough&quot; to a
+      // pre-warmed FAQ entry; we look it up to keep the path real.
+      if (rng() &lt; cfg.l1HitProb) {
+        const hit = semantic.lookup(r.semanticKey);
+        if (hit) {
+          l1Hits++;
+          continue;
+        }
+      }
+    }
+
+    // L2 layer.
+    if (cfg.l2Enabled) {
+      if (l2Cache.has(r.prefixHash)) {
+        l2Reads++;
+        cost += (r.promptTokens / 1e6) * CACHED_INPUT;
+      } else {
+        const writeCost =
+          cfg.ttl === &quot;5min&quot; ? CACHE_WRITE_5MIN : CACHE_WRITE_1HR;
+        cost += (r.promptTokens / 1e6) * writeCost;
+        l2Writes++;
+        if (!(cfg.parallelPenalty &amp;&amp; r.isParallelWave)) {
+          l2Cache.add(r.prefixHash);
+        }
+      }
+    } else {
+      cost += (r.promptTokens / 1e6) * BASE_INPUT;
+    }
+
+    // Output cost — held constant at 200 tokens.
+    cost += (200 / 1e6) * BASE_OUTPUT;
+  }
+
+  return { cost, l1Hits, l2Reads, l2Writes };
+}
+
+function report(label: string, cfg: Config, reqs: readonly Request[]): void {
+  const res = simulate(reqs, cfg);
+  const padLabel = label.padEnd(45);
+  const cost = `$${res.cost.toFixed(2)}`.padStart(8);
+  console.log(
+    `${padLabel}  cost=${cost}  L1=${String(res.l1Hits).padStart(4)}  ` +
+      `L2_reads=${String(res.l2Reads).padStart(4)}  ` +
+      `L2_writes=${String(res.l2Writes).padStart(4)}`,
+  );
+}
+
+function main(): void {
+  console.log(&quot;=&quot;.repeat(95));
+  console.log(
+    &quot;PROMPT + SEMANTIC CACHING — 500 requests, Claude Sonnet-class pricing (2026-04)&quot;,
+  );
+  console.log(&quot;=&quot;.repeat(95));
+  const reqs = makeWorkload();
+
+  report(
+    &quot;NO CACHING&quot;,
+    {
+      l1Enabled: false,
+      l2Enabled: false,
+      parallelPenalty: true,
+      l1Threshold: 0.95,
+      l1HitProb: 0.0,
+      ttl: &quot;5min&quot;,
+    },
+    reqs,
+  );
+  report(
+    &quot;L2 5-min, parallel penalty active&quot;,
+    {
+      l1Enabled: false,
+      l2Enabled: true,
+      parallelPenalty: true,
+      l1Threshold: 0.95,
+      l1HitProb: 0.0,
+      ttl: &quot;5min&quot;,
+    },
+    reqs,
+  );
+  report(
+    &quot;L2 5-min, parallel fixed (serialize first)&quot;,
+    {
+      l1Enabled: false,
+      l2Enabled: true,
+      parallelPenalty: false,
+      l1Threshold: 0.95,
+      l1HitProb: 0.0,
+      ttl: &quot;5min&quot;,
+    },
+    reqs,
+  );
+  report(
+    &quot;L2 1-hour + L1 semantic 30%&quot;,
+    {
+      l1Enabled: true,
+      l2Enabled: true,
+      parallelPenalty: false,
+      l1Threshold: 0.95,
+      l1HitProb: 0.3,
+      ttl: &quot;1hr&quot;,
+    },
+    reqs,
+  );
+  report(
+    &quot;L2 1-hour + L1 semantic 70% (structured FAQ)&quot;,
+    {
+      l1Enabled: true,
+      l2Enabled: true,
+      parallelPenalty: false,
+      l1Threshold: 0.95,
+      l1HitProb: 0.7,
+      ttl: &quot;1hr&quot;,
+    },
+    reqs,
+  );
+
+  // Demonstrate the LRU + TTL primitive directly so the API is visible.
+  console.log(&quot;\n--- LRU+TTL primitive demo ---&quot;);
+  const lru = new LRUCache&lt;string, number&gt;(2, 1000);
+  lru.set(&quot;a&quot;, 1);
+  lru.set(&quot;b&quot;, 2);
+  lru.set(&quot;c&quot;, 3); // evicts &quot;a&quot;
+  console.log(`after inserting a,b,c with cap=2: has(a)=${lru.has(&quot;a&quot;)}, has(b)=${lru.has(&quot;b&quot;)}, has(c)=${lru.has(&quot;c&quot;)}`);
+
+  // Demonstrate semantic cache cosine behavior — same-meaning paraphrases.
+  console.log(&quot;\n--- Semantic cache cosine threshold demo ---&quot;);
+  const sc = new SemanticCache(0.5);
+  sc.store(&quot;how do I reset my password&quot;, &quot;Use forgot-password link.&quot;);
+  const near = sc.lookup(&quot;how to reset password please&quot;);
+  const far = sc.lookup(&quot;what is the capital of France&quot;);
+  console.log(
+    `near sim=${(near?.similarity ?? 0).toFixed(3)} response=${near?.response ?? &quot;&lt;miss&gt;&quot;}`,
+  );
+  console.log(
+    `far  sim=${(far?.similarity ?? 0).toFixed(3)} response=${far?.response ?? &quot;&lt;miss&gt;&quot;}`,
+  );
+
+  console.log(
+    &quot;\nRead: caching is a protocol. Structure your prompts and batching for it to pay off.&quot;,
+  );
+}
+
+main();
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/17-infrastructure-and-production/14-prompt-semantic-caching/outputs/skill-cache-auditor.md">phases/17-infrastructure-and-production/14-prompt-semantic-caching/outputs/skill-cache-auditor.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: cache-auditor
+description: Audit an LLM prompt template and traffic pattern for cacheability. Recommend prompt restructure, TTL choice, parallelization fix, and semantic-cache threshold.
+version: 1.0.0
+phase: 17
+lesson: 14
+tags: [caching, prompt-cache, semantic-cache, anthropic, openai, parallelization, ttl]
+---
+
+Given a prompt template, traffic pattern (arrival rate, parallel factor), and provider (Anthropic, OpenAI, Gemini, self-hosted vLLM), produce a cache audit.
+
+Produce:
+
+1. Prefix structure. Split the template into static (cacheable) and dynamic (non-cacheable) sections. Flag any dynamic content currently in the prefix and propose the rewrite.
+2. TTL choice. Anthropic 5-min (1.25x write) vs 1-hour (2x write). Pick based on arrival rate — 1-hour wins when the prefix is reused within the hour consistently.
+3. Parallelization audit. Count parallel requests with shared prefix. If N &gt; 2 and parallel, require serialize-first-then-fanout pattern. Quantify the expected bill reduction.
+4. Semantic cache choice. Decide if L1 is worth it. Open-ended chat: maybe not (low hit). Structured FAQ / support: yes. Set cosine threshold, start 0.95; tune downward only with response-quality evals.
+5. Expected savings. Compute monthly $ delta vs no-cache baseline given current traffic and projected hit rates.
+6. Observable. One dashboard metric that catches regressions: L2 cache hit rate over last rolling hour; alert if drops &gt;20%.
+
+Hard rejects:
+- Claiming &quot;50% savings&quot; without computing expected hit rate and write premium. Refuse — calculate per-layer.
+- Leaving dynamic content in prefix when a simple rewrite moves it out. Refuse to sign off.
+- Firing parallel requests with shared prefix without serialize-first pattern. Refuse — state the 5-10x bill inflation.
+
+Refusal rules:
+- If the prompt is &gt;80% dynamic content by token, refuse to promise cache savings. Recommend semantic caching at best.
+- If semantic cache threshold is dropped below 0.85 without response-quality eval, refuse — hallucination cache risk.
+- If the provider does not support explicit cache_control (non-Anthropic, non-Gemini-v1) and auto-caching only, note that hit rate is opportunistic, not guaranteed.
+
+Output: a one-page audit listing prefix rewrite, TTL, parallelization pattern, L1 threshold, expected savings, observable. End with a quarterly review recommendation: re-audit prompts after any template change.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. What is the difference between L1 semantic caching and L2 prompt/prefix caching?</legend><label class="option"><input type="radio" name="q0" value="0"> L2 stores embeddings; L1 stores attention KV</label><label class="option"><input type="radio" name="q0" value="1"> L1 is provider-side and L2 is client-side</label><label class="option"><input type="radio" name="q0" value="2"> L1 and L2 are the same</label><label class="option"><input type="radio" name="q0" value="3"> L1 skips the LLM entirely on embedding similarity hits; L2 reuses attention KV at the provider for repeated prefixes</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. Which Anthropic mechanism marks blocks as cacheable for L2 prompt caching?</legend><label class="option"><input type="radio" name="q1" value="0"> Explicit cache_control attribute on the request blocks</label><label class="option"><input type="radio" name="q1" value="1"> Filename suffixes in tool definitions</label><label class="option"><input type="radio" name="q1" value="2"> An implicit prompt-length threshold</label><label class="option"><input type="radio" name="q1" value="3"> A separate /caches endpoint</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. How does the parallelization anti-pattern inflate the bill?</legend><label class="option"><input type="radio" name="q2" value="0"> Parallel requests bypass batching</label><label class="option"><input type="radio" name="q2" value="1"> Parallelization triggers a per-request guardrail charge</label><label class="option"><input type="radio" name="q2" value="2"> All parallel requests share one cache entry automatically</label><label class="option"><input type="radio" name="q2" value="3"> N parallel requests with the same prefix arrive before the first cache write completes, so each pays a write premium and gets zero discount</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. What is the dynamic-content anti-pattern in cacheable prefixes?</legend><label class="option"><input type="radio" name="q3" value="0"> Including content that changes every request (current time to the minute, request ID, randomized example order) inside the cacheable prefix, killing hit rate</label><label class="option"><input type="radio" name="q3" value="1"> Using too short a system prompt</label><label class="option"><input type="radio" name="q3" value="2"> Always streaming responses</label><label class="option"><input type="radio" name="q3" value="3"> Putting tool schemas in the prefix</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. How can batch + cached input stack overnight to cut cost?</legend><label class="option"><input type="radio" name="q4" value="0"> Batch is incompatible with caching</label><label class="option"><input type="radio" name="q4" value="1"> Caching disables batch eligibility</label><label class="option"><input type="radio" name="q4" value="2"> Batch only saves output cost</label><label class="option"><input type="radio" name="q4" value="3"> Batch APIs give 50% off; cached input adds another ~10x; combined, overnight pipelines drop to ~10% of synchronous-uncached cost</label><p data-feedback="4"></p></fieldset><fieldset><legend>6. What does the lesson say about semantic cache &quot;95% accuracy&quot; claims?</legend><label class="option"><input type="radio" name="q5" value="0"> 95% means you should expect 95% cache hits</label><label class="option"><input type="radio" name="q5" value="1"> 95% is the OpenAI default cache hit rate</label><label class="option"><input type="radio" name="q5" value="2"> 95% is a vendor-documented hit-rate baseline</label><label class="option"><input type="radio" name="q5" value="3"> 95% refers to match correctness, not hit rate; reported production hit rates range from ~10% (open chat) up to ~70% (structured FAQ)</label><p data-feedback="5"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/17-infrastructure-and-production/13-llm-observability/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/17-infrastructure-and-production/15-batch-apis/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/17-infrastructure-and-production/14-prompt-semantic-caching/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

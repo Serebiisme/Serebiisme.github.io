@@ -1,0 +1,1113 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>图像基础  像素,道,颜色空间 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-04-computer-vision" data-lesson="04-computer-vision/01-image-fundamentals" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/04-computer-vision/">计算机视觉</a> / LESSON 01</p><h1 class="lesson-title">图像基础  像素,道,颜色空间</h1><p>Image Fundamentals — Pixels, Channels, Color Spaces</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>图像基础  像素,道,颜色空间</h1>
+<blockquote>
+<p>图像是光样本的数. 你将使用的每个视觉模型都从这个一个事实开始.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 1 Lesson 12 (Tensor Operations), Phase 3 Lesson 11 (Intro to PyTorch)
+<strong>Time:</strong> ~45 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>解释一个连续场景如何被分化为像素,以及为什么采样/量化决定对每一个下游模型设定了上限</li>
+<li>读取,切片,检查图像作为NumPy阵列,并流动地切换HWC和CHW布局</li>
+<li>将RGB,灰度,HSV和YCbCr之间的转换,并证明每个颜色空间存在的原因</li>
+<li>应用像素级预处理 (规范化,标准化,大小化,频道第一) 正如预训练的 PyTorch 视觉模型所预期的那样</li>
+</ul>
+<h2>问题</h2>
+<p>每篇你读的论文,每篇你下载的预训练重量,每一个你打电话的视觉API都假设输入的特定编码.<code>uint8</code>模型想要的图像<code>float32</code>运行,然后默默产生垃圾. 输送BGR到一个RGB训练的网络,准确性下降了10点. 输入一个模型道,最后输入当它预期道时,第一层的 conv 处理高度作为功能道.这都不会造成错误.它只会毁掉你的测量,你花了一个星期在寻找一个bug,生活在你加载文件的方式.</p>
+<p>一个卷积不复杂,一旦你知道它在滑过什么.难的是&quot;,图像&quot;意味着相机,JPEG解码器,PIL,OpenCV,火视觉和CUDA内核的不同东西.每个堆都有自己的轴序,字节范围和频道会议.一个视觉工程师不能保持这些直线船的破碎管道.</p>
+<p>通过这个课程,你将知道一个像素是什么,为什么每个像素有三个数字,而不是一个, &quot;通过图像网统计正常化&quot;实际上是什么,以及如何在这个阶段的每一个课程所假设的两个或三个布局之间移动.</p>
+<h2>概念</h2>
+<h3>一眼看完整的预加工管道</h3>
+<p>每个生产视觉系统都是相同的逆转变序列. 一步错误,模型会看到不同的输入.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-c0112d663b2dbfefc14d.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>两个红色和蓝色的框中,80%的默默失误存在:缺乏标准化和错误的布局.</p>
+<h3>像素是一个样本,而不是一个方形</h3>
+<p>摄像头传感器计算着落在一个小探测器的电网上的光子.每个探测器集成光子,每秒的部分,并发出与相应的电压.</p>
+<pre><code>Continuous scene                 Sensor grid                     Digital image
+(infinite detail)                (H x W detectors)               (H x W integers)
+
+    ~~~~~                        +--+--+--+--+--+                 210 198 180 155 120
+   现在,我们在这个世界里,
+  没有任何东西,没有任何东西.
+   ~~~~~                         |  |  |  |  |  |                 195 185 170 148 112
+                                 +--+--+--+--+--+                 188 180 165 145 108
+</code></pre>
+<p>在这个阶段,有两个选择,</p>
+<ul>
+<li><strong>Spatial sampling</strong>太少,边缘会变得化.太多,储存和计算会爆炸.</li>
+<li><strong>Intensity quantization</strong>电压的细度决定了电压的细度. 8位为 256 层次,并且是显示标准的. 10, 12, 16位为医疗成像,高清和原始传感器管道提供更平滑的梯度和材料.</li>
+</ul>
+<p>像素不是一个有色的方形,面积.它是一个单一的测量.当你改变尺寸或旋转时,你正在重新样本测量格.</p>
+<h3>为什么有三种道</h3>
+<p>一个探测器在整个可见光谱中计算光子,即灰度.为了获得颜色,传感器将红色,绿色和蓝色过器的摩赛克覆盖电网.在测试后,每个空间位置都有三个整数:红色过器的响应,绿色过器和蓝色过器附近.这些三个整数是像素的RGB三分组.</p>
+<pre><code>One pixel in memory:
+
+    (R, G, B) = (210, 140, 30)   &lt;- reddish-orange
+
+An H x W RGB image:
+
+    shape (H, W, 3)     stored as   H rows of W pixels of 3 values
+                                    each in [0, 255] for uint8
+</code></pre>
+<p>三不是魔法.深度摄像头添加Z频道.卫星添加红外线和紫外线带.医疗扫描通常有一个频道 (X射线,CT) 或许多 (超谱).频道数量是最后一个轴;层学会在它上混合.</p>
+<h3>两项布局公约:HWC和CHW</h3>
+<p>每个图书馆都选择一个.</p>
+<pre><code>HWC (height, width, channels)           CHW (channels, height, width)
+
+   W -&gt;                                    H -&gt;
+  +-----+-----+-----+                     +-----+-----+
+H |R G B|R G B|R G B|                   C |R R R R R R|
+| +-----+-----+-----+                   | +-----+-----+
+v |R G B|R G B|R G B|                   v |G G G G G G|
+  +-----+-----+-----+                     +-----+-----+
+                                          |B B B B B B|
+                                          +-----+-----+
+
+   PIL, OpenCV, matplotlib,              PyTorch, most deep learning
+   almost every image file on disk       frameworks, cuDNN kernels
+</code></pre>
+<p>CHW存在于卷积内核通过H和W滑动的原因.保持频道轴首先意味着每个内核每个频道都会看到连接的2D平面,这可以清洁地向量化.磁盘格式保持HWC,因为这与扫描线如何从传感器中出发相匹配.</p>
+<p>单行转换将会打字千次:</p>
+<pre><code>img_chw = img_hwc.transpose(2, 0, 1)      # NumPy
+img_chw = img_hwc.permute(2, 0, 1)        # PyTorch tensor
+</code></pre>
+<p>存储器配置,可视化:</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-4d39cc260ac7744dfcc2.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>字节范围和d类型</h3>
+<p>现在有三次会议:</p>
+<table>
+<thead>
+<tr>
+<th>Convention</th>
+<th>dtype</th>
+<th>Range</th>
+<th>Where you see it</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Raw</td>
+<td><code>uint8</code></td>
+<td>[0, 255]</td>
+<td>Files on disk, PIL, OpenCV output</td>
+</tr>
+<tr>
+<td>Normalized</td>
+<td><code>float32</code></td>
+<td>[0.0, 1.0]</td>
+<td>After <code>img.astype('float32') / 255</code></td>
+</tr>
+<tr>
+<td>Standardized</td>
+<td><code>float32</code></td>
+<td>roughly [-2, +2]</td>
+<td>After subtracting mean and dividing by std</td>
+</tr>
+</tbody>
+</table>
+<p>缩网络是基于标准化输入训练的.<code>mean=[0.485, 0.456, 0.406]</code>现在<code>std=[0.229, 0.224, 0.225]</code>计算在 [0, 1]正常化像素上,对整个ImageNet训练集中的三个频道的算术平均和标准偏差.<code>uint8</code>应用视觉中最常见的单一默失败是预期标准化的浮动模型.</p>
+<h3>颜色空间以及它们的存在</h3>
+<p>RGB是捕获格式,但它并不总是模型中最有用的表示.</p>
+<pre><code> RGB               HSV                       YCbCr / YUV
+
+ R red             H hue (angle 0-360)       Y luminance (brightness)
+ G green           S saturation (0-1)        Cb chroma blue-yellow
+ B blue            V value/brightness (0-1)  Cr chroma red-green
+
+ Linear to         Separates color from      Separates brightness from
+ sensor output     brightness. Useful for    color. JPEG and most video
+                   color thresholding, UI    codecs compress the chroma
+                   sliders, simple filters   channels harder because the
+                                             human eye is less sensitive
+                                             to chroma detail than to Y.
+</code></pre>
+<p>在大多数现代CNN中,你能播放RGB,你会遇到其他空间,</p>
+<ul>
+<li><strong>HSV</strong>经典简历代码,基于颜色的细分,白色平衡.</li>
+<li><strong>YCbCr</strong>阅读JPEG内部,视频管道,仅使用Y的超级分辨率模型.</li>
+<li><strong>Grayscale</strong> OCR,文件模型,任何颜色是扰动变量而不是信号的情况.</li>
+</ul>
+<p>根据RGB的灰度尺度是重量总数,而不是平均值,因为人类眼睛对绿色更敏感,而不是红色或蓝色:</p>
+<pre><code>Y = 0.299 R + 0.587 G + 0.114 B       (ITU-R BT.601, the classic weights)
+</code></pre>
+<h3>面积比,重大小和插射</h3>
+<p>每个模型都有固定输入尺寸 (224x224对于大多数ImageNet分类器,384x384或512x512对于现代探测器).您的图像很少匹配.</p>
+<ul>
+<li><strong>Resize shorter side, then center crop</strong>标准的图像网配方. 保存面积比例,抛弃边缘像素的条纹.</li>
+<li><strong>Resize and pad</strong>保存视角比率和每个像素,添加黑色条.</li>
+<li><strong>Resize directly to target</strong>拉伸图像. 廉价,扭曲几何,对许多分类任务很好.</li>
+</ul>
+<p>插射方法决定了当新网格不与旧网格一致时,中间像素的计算方式:</p>
+<pre><code>Nearest neighbour     fastest, blocky, only choice for masks/labels
+Bilinear              fast, smooth, default for most image resizing
+Bicubic               slower, sharper on upscaling
+Lanczos               slowest, best quality, used for final display
+</code></pre>
+<p>基本规则:训练的双线,你将查看的资产的双立方或双立方,</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-3d5b886ec6cc2c1a7d8e.png" alt="conv-output-size 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<h3>步骤1: 构建一个图像色器,检查其形状</h3>
+<p>开始使用确定性合成图像,所以第一个实验室只使用NumPy进行离线运行.文件解码是一个独立的边界:一旦JPEG或PNG解码器返回RGB字节,下面的每个数操作都是相同的.</p>
+<pre><code class="language-python">import numpy as np
+
+def synthetic_rgb(h=128, w=192, seed=0):
+    rng = np.random.default_rng(seed)
+    yy, xx = np.meshgrid(np.linspace(0, 1, h), np.linspace(0, 1, w), indexing=&quot;ij&quot;)
+    r = (np.sin(xx * 6) * 0.5 + 0.5) * 255
+    g = yy * 255
+    b = (1 - yy) * xx * 255
+    rgb = np.stack([r, g, b], axis=-1) + rng.normal(0, 6, (h, w, 3))
+    return np.clip(rgb, 0, 255).astype(np.uint8)
+
+arr = synthetic_rgb()
+
+print(f&quot;type:   {type(arr).__name__}&quot;)
+print(f&quot;dtype:  {arr.dtype}&quot;)
+print(f&quot;shape:  {arr.shape}     # (H, W, C)&quot;)
+print(f&quot;min:    {arr.min()}&quot;)
+print(f&quot;max:    {arr.max()}&quot;)
+print(f&quot;pixel at (0, 0): {arr[0, 0]}&quot;)
+</code></pre>
+<p>预期产量:<code>shape: (H, W, 3)</code>现在<code>dtype: uint8</code>范围<code>[0, 255]</code>这就是可行的解码表示,无论字节来自摄像头,图像解码器,或者这个合成发电机.</p>
+<h3>步骤2:分开道和重新排序布局</h3>
+<p>单独取出R,G,B,然后从HWC转换为PyTorch的CHW.</p>
+<pre><code class="language-python">R = arr[:, :, 0]
+G = arr[:, :, 1]
+B = arr[:, :, 2]
+print(f&quot;R shape: {R.shape}, mean: {R.mean():.1f}&quot;)
+print(f&quot;G shape: {G.shape}, mean: {G.mean():.1f}&quot;)
+print(f&quot;B shape: {B.shape}, mean: {B.mean():.1f}&quot;)
+
+arr_chw = arr.transpose(2, 0, 1)
+print(f&quot;\nHWC shape: {arr.shape}&quot;)
+print(f&quot;CHW shape: {arr_chw.shape}&quot;)
+</code></pre>
+<p>只有一个道,三个灰度平面.CHW只需要重新排序轴,如果内存布局允许,则不需要任何数据副本.</p>
+<h3>步骤3:灰度和HSV转换</h3>
+<p>按重量和灰度,然后是手动RGB到HSV.</p>
+<pre><code class="language-python">def rgb_to_grayscale(rgb):
+    weights = np.array([0.299, 0.587, 0.114], dtype=np.float32)
+    return (rgb.astype(np.float32) @ weights).astype(np.uint8)
+
+def rgb_to_hsv(rgb):
+    rgb_f = rgb.astype(np.float32) / 255.0
+    r, g, b = rgb_f[..., 0], rgb_f[..., 1], rgb_f[..., 2]
+    cmax = np.max(rgb_f, axis=-1)
+    cmin = np.min(rgb_f, axis=-1)
+    delta = cmax - cmin
+
+    h = np.zeros_like(cmax)
+    mask = delta &gt; 0
+    argmax = np.argmax(rgb_f, axis=-1)
+    rmax = mask &amp; (argmax == 0)
+    gmax = mask &amp; (argmax == 1)
+    bmax = mask &amp; (argmax == 2)
+    h[rmax] = ((g[rmax] - b[rmax]) / delta[rmax]) % 6
+    h[gmax] = ((b[gmax] - r[gmax]) / delta[gmax]) + 2
+    h[bmax] = ((r[bmax] - g[bmax]) / delta[bmax]) + 4
+    h = h * 60.0
+
+    s = np.divide(delta, cmax, out=np.zeros_like(delta), where=cmax &gt; 0)
+    v = cmax
+    return np.stack([h, s, v], axis=-1)
+
+gray = rgb_to_grayscale(arr)
+hsv = rgb_to_hsv(arr)
+print(f&quot;gray shape: {gray.shape}, range: [{gray.min()}, {gray.max()}]&quot;)
+print(f&quot;hsv   shape: {hsv.shape}&quot;)
+print(f&quot;hue range: [{hsv[..., 0].min():.1f}, {hsv[..., 0].max():.1f}] degrees&quot;)
+print(f&quot;sat range: [{hsv[..., 1].min():.2f}, {hsv[..., 1].max():.2f}]&quot;)
+print(f&quot;val range: [{hsv[..., 2].min():.2f}, {hsv[..., 2].max():.2f}]&quot;)
+</code></pre>
+<p>图表以度,和值出现在 [0, 1]. 这与OpenCV相匹配<code>hsv_full</code>会议.</p>
+<h3>步骤4:规范,标准化,并逆转</h3>
+<p>通过原始字节,到一个预先训练的图像网模型所期望的精确数,然后回来.</p>
+<pre><code class="language-python">mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+def preprocess_imagenet(rgb_uint8):
+    x = rgb_uint8.astype(np.float32) / 255.0
+    x = (x - mean) / std
+    x = x.transpose(2, 0, 1)
+    return x
+
+def deprocess_imagenet(chw_float32):
+    x = chw_float32.transpose(1, 2, 0)
+    x = x * std + mean
+    x = np.clip(x * 255.0, 0, 255).astype(np.uint8)
+    return x
+
+x = preprocess_imagenet(arr)
+print(f&quot;preprocessed shape: {x.shape}     # (C, H, W)&quot;)
+print(f&quot;preprocessed dtype: {x.dtype}&quot;)
+print(f&quot;preprocessed mean per channel:  {x.mean(axis=(1, 2)).round(3)}&quot;)
+print(f&quot;preprocessed std  per channel:  {x.std(axis=(1, 2)).round(3)}&quot;)
+
+roundtrip = deprocess_imagenet(x)
+max_diff = np.abs(roundtrip.astype(int) - arr.astype(int)).max()
+print(f&quot;roundtrip max pixel diff: {max_diff}    # should be 0 or 1&quot;)
+</code></pre>
+<p>预处理/减处理对是每个火视图的准确值.<code>transforms.Normalize</code>电话是在盖子下.</p>
+<h3>步骤5:从零开始重新尺寸</h3>
+<p>最近的邻居圆每一个输出坐标为一个源像素.双线交差发现四个周围的像素,并通过距离混合它们.下面的两个实现都使用结点一致的坐标,因此第一和最后的源像素保持固定.</p>
+<pre><code class="language-python">def resize_coordinates(source_length, target_length):
+    if target_length == 1:
+        return np.zeros(1, dtype=np.float32)
+    return np.linspace(0, source_length - 1, target_length, dtype=np.float32)
+
+def nearest_resize(image, target_height, target_width):
+    y = np.rint(resize_coordinates(image.shape[0], target_height)).astype(int)
+    x = np.rint(resize_coordinates(image.shape[1], target_width)).astype(int)
+    return image[y[:, None], x[None, :]]
+
+def bilinear_resize(image, target_height, target_width):
+    y = resize_coordinates(image.shape[0], target_height)
+    x = resize_coordinates(image.shape[1], target_width)
+    y0 = np.floor(y).astype(int)
+    x0 = np.floor(x).astype(int)
+    y1 = np.minimum(y0 + 1, image.shape[0] - 1)
+    x1 = np.minimum(x0 + 1, image.shape[1] - 1)
+    wy = (y - y0)[:, None, None]
+    wx = (x - x0)[None, :, None]
+
+    source = image.astype(np.float32)
+    top = source[y0[:, None], x0[None, :]] * (1 - wx)
+    top += source[y0[:, None], x1[None, :]] * wx
+    bottom = source[y1[:, None], x0[None, :]] * (1 - wx)
+    bottom += source[y1[:, None], x1[None, :]] * wx
+    result = top * (1 - wy) + bottom * wy
+    return np.clip(np.rint(result), 0, 255).astype(image.dtype)
+
+target_height = arr.shape[0] * 3
+target_width = arr.shape[1] * 3
+nearest = nearest_resize(arr, target_height, target_width)
+bilinear = bilinear_resize(arr, target_height, target_width)
+
+def local_roughness(x):
+    gy = np.diff(x.astype(float), axis=0)
+    gx = np.diff(x.astype(float), axis=1)
+    return float(np.abs(gy).mean() + np.abs(gx).mean())
+
+for name, out in [(&quot;nearest&quot;, nearest), (&quot;bilinear&quot;, bilinear)]:
+    print(f&quot;{name:&gt;8}  shape={out.shape}  roughness={local_roughness(out):6.2f}&quot;)
+</code></pre>
+<p>接近的比分在粗度上最高,因为它保持硬边缘.双线性比分更平滑,因为每个新的像素都在每个轴上混合了两个位置.可运行的伴侣用Catmull-Rom立方核将相同的可分离的想法扩展到每个轴的四个邻居,然后在没有图像库的情况下打印所有三个结果.</p>
+<h2>用它</h2>
+<p>皮托奇在批量,设备意识的光器上执行相同操作.下面的代码将更短的侧面改大小,取一个中心作物,标准化每个频道,并产生预训练模型预期的NCHW光器.</p>
+<pre><code class="language-python">import torch
+import torch.nn.functional as F
+
+image_hwc = torch.from_numpy(synthetic_rgb(256, 320))
+batch = image_hwc.permute(2, 0, 1).unsqueeze(0).float() / 255.0
+
+height, width = batch.shape[-2:]
+scale = 256 / min(height, width)
+resized_height = round(height * scale)
+resized_width = round(width * scale)
+batch = F.interpolate(
+    batch,
+    size=(resized_height, resized_width),
+    mode=&quot;bilinear&quot;,
+    align_corners=False,
+    antialias=True,
+)
+
+top = (resized_height - 224) // 2
+left = (resized_width - 224) // 2
+batch = batch[:, :, top:top + 224, left:left + 224]
+
+mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+batch = (batch - mean) / std
+
+print(f&quot;tensor dtype: {batch.dtype}&quot;)
+print(f&quot;batched shape: {tuple(batch.shape)}&quot;)
+print(f&quot;per-channel mean: {batch.mean(dim=(0, 2, 3)).tolist()}&quot;)
+print(f&quot;per-channel std:  {batch.std(dim=(0, 2, 3)).tolist()}&quot;)
+</code></pre>
+<p>按照这个顺序进行四步:将字节转换为浮动,将HWC换为NCHW,将较短的侧面的尺寸改为256,取一个224x224的中心作物,然后减去ImageNet的平均值并按其标准偏差划分.逆转这个顺序默默改变到达模型的结果.</p>
+<h2>运送它</h2>
+<p>这一课产生了:</p>
+<ul>
+<li><code>outputs/prompt-vision-preprocessing-audit.md</code>一个提示,将任何模型卡或数据集卡变成一个精确的预处理变量清单,团队必须遵守.</li>
+<li><code>outputs/skill-image-tensor-inspector.md</code>一个技能,在任何图像形的子或阵列中,报告d类型,布局,范围,以及它看起来是否原始,正常或标准.</li>
+</ul>
+<h2>运动</h2>
+<ol>
+<li>**(Easy)**创建一个2x2 RGB <code>uint8</code>转换HWC为CHW,然后再再转换,打印两种形状,证明回路保存了每一个值.</li>
+<li>**(Medium)**写下<code>standardize(img, mean, std)</code>它们的相反,<code>roundtrip_max_diff &lt;= 1</code>您的功能必须在HWC中的单个图像和NCHW中的一批相同的呼叫上工作.</li>
+<li>**(Hard)**运行一个1x1 conv,学习RGB的重量混合物,成一个灰色频道.<code>[0.299, 0.587, 0.114]</code>结它们,并检查输出与手册匹配<code>rgb_to_grayscale</code>其他经典的颜色空间转换可以写成1x1卷曲?</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Pixel</td>
+<td>&quot;A coloured square&quot;</td>
+<td>One sample of light intensity at one grid location — three numbers for colour, one for grayscale</td>
+</tr>
+<tr>
+<td>Channel</td>
+<td>&quot;The colour&quot;</td>
+<td>One of the parallel spatial grids stacked into an image tensor; last axis in HWC, first in CHW</td>
+</tr>
+<tr>
+<td>HWC / CHW</td>
+<td>&quot;The shape&quot;</td>
+<td>Axis orderings for an image tensor; disk and PIL use HWC, PyTorch and cuDNN use CHW</td>
+</tr>
+<tr>
+<td>Normalize</td>
+<td>&quot;Scale the image&quot;</td>
+<td>Divide by 255 so pixels live in [0, 1] — necessary but not sufficient</td>
+</tr>
+<tr>
+<td>Standardize</td>
+<td>&quot;Zero-center&quot;</td>
+<td>Subtract mean and divide by std per channel so the input distribution matches what the model was trained on</td>
+</tr>
+<tr>
+<td>Grayscale conversion</td>
+<td>&quot;Average the channels&quot;</td>
+<td>A weighted sum with coefficients 0.299/0.587/0.114 that matches human luminance perception</td>
+</tr>
+<tr>
+<td>Interpolation</td>
+<td>&quot;How resize picks pixels&quot;</td>
+<td>The rule that decides output values when the new grid does not align with the old one — nearest for labels, bilinear for training, bicubic for display</td>
+</tr>
+<tr>
+<td>Aspect ratio</td>
+<td>&quot;Width over height&quot;</td>
+<td>The ratio that distinguishes &quot;resize and pad&quot; from &quot;resize and stretch&quot;</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://web.archive.org/web/20251220000525/https://poynton.ca/PDFs/Guided_tour.pdf" rel="noreferrer" data-network="true">Charles Poynton — A Guided Tour of Color Space <small>↗ 需要联网</small></a>最清晰的技术处理为什么有这么多的颜色空间,</li>
+<li><a href="https://pytorch.org/vision/stable/transforms.html" rel="noreferrer" data-network="true">PyTorch Vision Transforms Docs <small>↗ 需要联网</small></a>你实际上将在生产中构成的全部转换管道</li>
+<li><a href="https://www.youtube.com/watch?v=F1kYBnY6mwg" rel="noreferrer" data-network="true">How JPEG Works (Colt McAnlis) <small>↗ 需要联网</small></a>对色子样本,DCT的明确视觉巡回,以及为什么JPEG编码为YCbCr而不是RGB</li>
+<li><a href="https://pytorch.org/vision/stable/models.html" rel="noreferrer" data-network="true">ImageNet Preprocessing Conventions (torchvision models) <small>↗ 需要联网</small></a>对真理的来源<code>mean=[0.485, 0.456, 0.406]</code>为什么动物园里的每个模特都会期待它</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Image Fundamentals — Pixels, Channels, Color Spaces</h1>
+<blockquote>
+<p>An image is a tensor of light samples. Every vision model you will ever use starts from this one fact.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 1 Lesson 12 (Tensor Operations), Phase 3 Lesson 11 (Intro to PyTorch)
+<strong>Time:</strong> ~45 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Explain how a continuous scene gets discretized into pixels and why sampling/quantization decisions set the ceiling on every downstream model</li>
+<li>Read, slice, and inspect images as NumPy arrays and switch fluently between HWC and CHW layouts</li>
+<li>Convert between RGB, grayscale, HSV, and YCbCr and justify why each color space exists</li>
+<li>Apply pixel-level preprocessing (normalize, standardize, resize, channel-first) exactly as pretrained PyTorch vision models expect it</li>
+</ul>
+<h2>The Problem</h2>
+<p>Every paper you will read, every pretrained weight you will download, every vision API you will call assumes a specific encoding of the input. Pass a <code>uint8</code> image where the model wants <code>float32</code> and it will still run — and silently produce garbage. Feed BGR to a network trained on RGB and accuracy collapses by ten points. Hand a model channels-last input when it expects channels-first and the first conv layer treats height as a feature channel. None of this throws an error. It just ruins your metrics and you spend a week hunting for a bug that lives in how you loaded the file.</p>
+<p>A convolution is not complicated once you know what it is sliding over. The hard part is that &quot;an image&quot; means different things to a camera, a JPEG decoder, PIL, OpenCV, torchvision, and a CUDA kernel. Each stack has its own axis order, byte range, and channel convention. A vision engineer who cannot keep these straight ships broken pipelines.</p>
+<p>This lesson fixes the foundation so the rest of the phase can build on it. By the end you will know what a pixel is, why there are three numbers per pixel instead of one, what &quot;normalize with ImageNet stats&quot; actually does, and how to move between the two or three layouts that every other lesson in this phase will assume.</p>
+<h2>The Concept</h2>
+<h3>The full preprocessing pipeline at a glance</h3>
+<p>Every production vision system is the same sequence of reversible transforms. Get one step wrong and the model sees a different input than it was trained on.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-c0112d663b2dbfefc14d.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>The two red and blue boxes are where 80% of silent failures live: missing standardization and wrong layout.</p>
+<h3>A pixel is a sample, not a square</h3>
+<p>A camera sensor counts photons that land on a grid of tiny detectors. Each detector integrates light for a fraction of a second and emits a voltage proportional to how many photons hit it. The sensor then discretizes that voltage into an integer. One detector becomes one pixel.</p>
+<pre><code>Continuous scene                 Sensor grid                     Digital image
+(infinite detail)                (H x W detectors)               (H x W integers)
+
+    ~~~~~                        +--+--+--+--+--+                 210 198 180 155 120
+   ~   ~   ~                     |  |  |  |  |  |                 205 195 178 152 118
+  ~ light ~      ----&gt;           +--+--+--+--+--+     ----&gt;       200 190 175 150 115
+   ~~~~~                         |  |  |  |  |  |                 195 185 170 148 112
+                                 +--+--+--+--+--+                 188 180 165 145 108
+</code></pre>
+<p>Two choices happen at this step and they fix the ceiling on everything downstream:</p>
+<ul>
+<li><strong>Spatial sampling</strong> decides how many detectors per degree of the scene. Too few, and edges become jagged (aliasing). Too many, and storage and compute explode.</li>
+<li><strong>Intensity quantization</strong> decides how finely the voltage is bucketed. 8 bits gives 256 levels and is standard for display. 10, 12, 16 bits give smoother gradients and matter for medical imaging, HDR, and raw sensor pipelines.</li>
+</ul>
+<p>A pixel is not a coloured square with area. It is a single measurement. When you resize or rotate, you are resampling that measurement grid.</p>
+<h3>Why three channels</h3>
+<p>One detector counts photons across the whole visible spectrum — that is grayscale. To get colour, the sensor covers the grid with a mosaic of red, green, and blue filters. After demosaicing, every spatial location has three integers: the response of the red-filtered detector, green-filtered, and blue-filtered nearby. Those three integers are a pixel's RGB triplet.</p>
+<pre><code>One pixel in memory:
+
+    (R, G, B) = (210, 140, 30)   &lt;- reddish-orange
+
+An H x W RGB image:
+
+    shape (H, W, 3)     stored as   H rows of W pixels of 3 values
+                                    each in [0, 255] for uint8
+</code></pre>
+<p>Three is not magic. Depth cameras add a Z channel. Satellites add infrared and ultraviolet bands. Medical scans often have one channel (X-ray, CT) or many (hyperspectral). The number of channels is the last axis; conv layers learn to mix across it.</p>
+<h3>Two layout conventions: HWC and CHW</h3>
+<p>Same tensor, two orderings. Every library picks one.</p>
+<pre><code>HWC (height, width, channels)           CHW (channels, height, width)
+
+   W -&gt;                                    H -&gt;
+  +-----+-----+-----+                     +-----+-----+
+H |R G B|R G B|R G B|                   C |R R R R R R|
+| +-----+-----+-----+                   | +-----+-----+
+v |R G B|R G B|R G B|                   v |G G G G G G|
+  +-----+-----+-----+                     +-----+-----+
+                                          |B B B B B B|
+                                          +-----+-----+
+
+   PIL, OpenCV, matplotlib,              PyTorch, most deep learning
+   almost every image file on disk       frameworks, cuDNN kernels
+</code></pre>
+<p>CHW exists because convolution kernels slide across H and W. Keeping the channel axis first means each kernel sees a contiguous 2D plane per channel, which vectorizes cleanly. Disk formats keep HWC because that matches how scanlines come out of a sensor.</p>
+<p>The one-line conversion you will type a thousand times:</p>
+<pre><code>img_chw = img_hwc.transpose(2, 0, 1)      # NumPy
+img_chw = img_hwc.permute(2, 0, 1)        # PyTorch tensor
+</code></pre>
+<p>Memory layout, visualised:</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-4d39cc260ac7744dfcc2.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>Byte ranges and dtype</h3>
+<p>Three conventions dominate:</p>
+<table>
+<thead>
+<tr>
+<th>Convention</th>
+<th>dtype</th>
+<th>Range</th>
+<th>Where you see it</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Raw</td>
+<td><code>uint8</code></td>
+<td>[0, 255]</td>
+<td>Files on disk, PIL, OpenCV output</td>
+</tr>
+<tr>
+<td>Normalized</td>
+<td><code>float32</code></td>
+<td>[0.0, 1.0]</td>
+<td>After <code>img.astype('float32') / 255</code></td>
+</tr>
+<tr>
+<td>Standardized</td>
+<td><code>float32</code></td>
+<td>roughly [-2, +2]</td>
+<td>After subtracting mean and dividing by std</td>
+</tr>
+</tbody>
+</table>
+<p>Convolutional networks were trained on standardized inputs. ImageNet stats <code>mean=[0.485, 0.456, 0.406]</code>, <code>std=[0.229, 0.224, 0.225]</code> are the arithmetic mean and standard deviation of the three channels over the full ImageNet training set, computed on [0, 1] normalized pixels. Feeding raw <code>uint8</code> into a model that expects standardized float is the single most common silent failure in applied vision.</p>
+<h3>Color spaces and why they exist</h3>
+<p>RGB is the capture format but it is not always the most useful representation for a model.</p>
+<pre><code> RGB               HSV                       YCbCr / YUV
+
+ R red             H hue (angle 0-360)       Y luminance (brightness)
+ G green           S saturation (0-1)        Cb chroma blue-yellow
+ B blue            V value/brightness (0-1)  Cr chroma red-green
+
+ Linear to         Separates color from      Separates brightness from
+ sensor output     brightness. Useful for    color. JPEG and most video
+                   color thresholding, UI    codecs compress the chroma
+                   sliders, simple filters   channels harder because the
+                                             human eye is less sensitive
+                                             to chroma detail than to Y.
+</code></pre>
+<p>For most modern CNNs you feed RGB. You meet other spaces when:</p>
+<ul>
+<li><strong>HSV</strong> — classical CV code, color-based segmentation, white-balancing.</li>
+<li><strong>YCbCr</strong> — reading JPEG internals, video pipelines, super-resolution models that operate on Y only.</li>
+<li><strong>Grayscale</strong> — OCR, document models, any case where color is nuisance variable rather than signal.</li>
+</ul>
+<p>Grayscale from RGB is a weighted sum, not an average, because the human eye is more sensitive to green than to red or blue:</p>
+<pre><code>Y = 0.299 R + 0.587 G + 0.114 B       (ITU-R BT.601, the classic weights)
+</code></pre>
+<h3>Aspect ratio, resizing, and interpolation</h3>
+<p>Every model has a fixed input size (224x224 for most ImageNet classifiers, 384x384 or 512x512 for modern detectors). Your images rarely match. The three resize choices that matter:</p>
+<ul>
+<li><strong>Resize shorter side, then center crop</strong> — the standard ImageNet recipe. Preserves aspect ratio, throws away a strip of edge pixels.</li>
+<li><strong>Resize and pad</strong> — preserves aspect ratio and every pixel, adds black bars. Standard for detection and OCR.</li>
+<li><strong>Resize directly to target</strong> — stretches the image. Cheap, distorts geometry, fine for many classification tasks.</li>
+</ul>
+<p>The interpolation method decides how intermediate pixels are computed when the new grid does not align with the old one:</p>
+<pre><code>Nearest neighbour     fastest, blocky, only choice for masks/labels
+Bilinear              fast, smooth, default for most image resizing
+Bicubic               slower, sharper on upscaling
+Lanczos               slowest, best quality, used for final display
+</code></pre>
+<p>Rule of thumb: bilinear for training, bicubic or lanczos for assets you will look at, nearest for anything containing integer class IDs.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-3d5b886ec6cc2c1a7d8e.png" alt="conv-output-size 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<h3>Step 1: Build an image tensor and inspect its shape</h3>
+<p>Start with a deterministic synthetic image so the first lab runs offline with only NumPy. File decoding is a separate boundary: once a JPEG or PNG decoder returns RGB bytes, every tensor operation below is the same.</p>
+<pre><code class="language-python">import numpy as np
+
+def synthetic_rgb(h=128, w=192, seed=0):
+    rng = np.random.default_rng(seed)
+    yy, xx = np.meshgrid(np.linspace(0, 1, h), np.linspace(0, 1, w), indexing=&quot;ij&quot;)
+    r = (np.sin(xx * 6) * 0.5 + 0.5) * 255
+    g = yy * 255
+    b = (1 - yy) * xx * 255
+    rgb = np.stack([r, g, b], axis=-1) + rng.normal(0, 6, (h, w, 3))
+    return np.clip(rgb, 0, 255).astype(np.uint8)
+
+arr = synthetic_rgb()
+
+print(f&quot;type:   {type(arr).__name__}&quot;)
+print(f&quot;dtype:  {arr.dtype}&quot;)
+print(f&quot;shape:  {arr.shape}     # (H, W, C)&quot;)
+print(f&quot;min:    {arr.min()}&quot;)
+print(f&quot;max:    {arr.max()}&quot;)
+print(f&quot;pixel at (0, 0): {arr[0, 0]}&quot;)
+</code></pre>
+<p>Expected output: <code>shape: (H, W, 3)</code>, <code>dtype: uint8</code>, range <code>[0, 255]</code>. That is the canonical decoded representation whether the bytes came from a camera, an image decoder, or this synthetic generator.</p>
+<h3>Step 2: Split channels and re-order layout</h3>
+<p>Pull out R, G, B separately, then convert from HWC to CHW for PyTorch.</p>
+<pre><code class="language-python">R = arr[:, :, 0]
+G = arr[:, :, 1]
+B = arr[:, :, 2]
+print(f&quot;R shape: {R.shape}, mean: {R.mean():.1f}&quot;)
+print(f&quot;G shape: {G.shape}, mean: {G.mean():.1f}&quot;)
+print(f&quot;B shape: {B.shape}, mean: {B.mean():.1f}&quot;)
+
+arr_chw = arr.transpose(2, 0, 1)
+print(f&quot;\nHWC shape: {arr.shape}&quot;)
+print(f&quot;CHW shape: {arr_chw.shape}&quot;)
+</code></pre>
+<p>Three grayscale planes, one per channel. CHW just reorders the axes; no data copy is strictly required when the memory layout allows it.</p>
+<h3>Step 3: Grayscale and HSV conversions</h3>
+<p>Weighted-sum grayscale, then a manual RGB-to-HSV.</p>
+<pre><code class="language-python">def rgb_to_grayscale(rgb):
+    weights = np.array([0.299, 0.587, 0.114], dtype=np.float32)
+    return (rgb.astype(np.float32) @ weights).astype(np.uint8)
+
+def rgb_to_hsv(rgb):
+    rgb_f = rgb.astype(np.float32) / 255.0
+    r, g, b = rgb_f[..., 0], rgb_f[..., 1], rgb_f[..., 2]
+    cmax = np.max(rgb_f, axis=-1)
+    cmin = np.min(rgb_f, axis=-1)
+    delta = cmax - cmin
+
+    h = np.zeros_like(cmax)
+    mask = delta &gt; 0
+    argmax = np.argmax(rgb_f, axis=-1)
+    rmax = mask &amp; (argmax == 0)
+    gmax = mask &amp; (argmax == 1)
+    bmax = mask &amp; (argmax == 2)
+    h[rmax] = ((g[rmax] - b[rmax]) / delta[rmax]) % 6
+    h[gmax] = ((b[gmax] - r[gmax]) / delta[gmax]) + 2
+    h[bmax] = ((r[bmax] - g[bmax]) / delta[bmax]) + 4
+    h = h * 60.0
+
+    s = np.divide(delta, cmax, out=np.zeros_like(delta), where=cmax &gt; 0)
+    v = cmax
+    return np.stack([h, s, v], axis=-1)
+
+gray = rgb_to_grayscale(arr)
+hsv = rgb_to_hsv(arr)
+print(f&quot;gray shape: {gray.shape}, range: [{gray.min()}, {gray.max()}]&quot;)
+print(f&quot;hsv   shape: {hsv.shape}&quot;)
+print(f&quot;hue range: [{hsv[..., 0].min():.1f}, {hsv[..., 0].max():.1f}] degrees&quot;)
+print(f&quot;sat range: [{hsv[..., 1].min():.2f}, {hsv[..., 1].max():.2f}]&quot;)
+print(f&quot;val range: [{hsv[..., 2].min():.2f}, {hsv[..., 2].max():.2f}]&quot;)
+</code></pre>
+<p>Hue comes out in degrees, saturation and value in [0, 1]. That matches the OpenCV <code>hsv_full</code> convention.</p>
+<h3>Step 4: Normalize, standardize, and reverse it</h3>
+<p>Go from raw bytes to the exact tensor a pretrained ImageNet model expects, then back.</p>
+<pre><code class="language-python">mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+def preprocess_imagenet(rgb_uint8):
+    x = rgb_uint8.astype(np.float32) / 255.0
+    x = (x - mean) / std
+    x = x.transpose(2, 0, 1)
+    return x
+
+def deprocess_imagenet(chw_float32):
+    x = chw_float32.transpose(1, 2, 0)
+    x = x * std + mean
+    x = np.clip(x * 255.0, 0, 255).astype(np.uint8)
+    return x
+
+x = preprocess_imagenet(arr)
+print(f&quot;preprocessed shape: {x.shape}     # (C, H, W)&quot;)
+print(f&quot;preprocessed dtype: {x.dtype}&quot;)
+print(f&quot;preprocessed mean per channel:  {x.mean(axis=(1, 2)).round(3)}&quot;)
+print(f&quot;preprocessed std  per channel:  {x.std(axis=(1, 2)).round(3)}&quot;)
+
+roundtrip = deprocess_imagenet(x)
+max_diff = np.abs(roundtrip.astype(int) - arr.astype(int)).max()
+print(f&quot;roundtrip max pixel diff: {max_diff}    # should be 0 or 1&quot;)
+</code></pre>
+<p>Per-channel mean should be close to zero, std close to one. The preprocess/deprocess pair is exactly what every torchvision <code>transforms.Normalize</code> call is doing under the hood.</p>
+<h3>Step 5: Resize from scratch</h3>
+<p>Nearest neighbor rounds each output coordinate to one source pixel. Bilinear interpolation finds the four surrounding pixels and blends them by distance. Both implementations below use endpoint-aligned coordinates so the first and last source pixels stay fixed.</p>
+<pre><code class="language-python">def resize_coordinates(source_length, target_length):
+    if target_length == 1:
+        return np.zeros(1, dtype=np.float32)
+    return np.linspace(0, source_length - 1, target_length, dtype=np.float32)
+
+def nearest_resize(image, target_height, target_width):
+    y = np.rint(resize_coordinates(image.shape[0], target_height)).astype(int)
+    x = np.rint(resize_coordinates(image.shape[1], target_width)).astype(int)
+    return image[y[:, None], x[None, :]]
+
+def bilinear_resize(image, target_height, target_width):
+    y = resize_coordinates(image.shape[0], target_height)
+    x = resize_coordinates(image.shape[1], target_width)
+    y0 = np.floor(y).astype(int)
+    x0 = np.floor(x).astype(int)
+    y1 = np.minimum(y0 + 1, image.shape[0] - 1)
+    x1 = np.minimum(x0 + 1, image.shape[1] - 1)
+    wy = (y - y0)[:, None, None]
+    wx = (x - x0)[None, :, None]
+
+    source = image.astype(np.float32)
+    top = source[y0[:, None], x0[None, :]] * (1 - wx)
+    top += source[y0[:, None], x1[None, :]] * wx
+    bottom = source[y1[:, None], x0[None, :]] * (1 - wx)
+    bottom += source[y1[:, None], x1[None, :]] * wx
+    result = top * (1 - wy) + bottom * wy
+    return np.clip(np.rint(result), 0, 255).astype(image.dtype)
+
+target_height = arr.shape[0] * 3
+target_width = arr.shape[1] * 3
+nearest = nearest_resize(arr, target_height, target_width)
+bilinear = bilinear_resize(arr, target_height, target_width)
+
+def local_roughness(x):
+    gy = np.diff(x.astype(float), axis=0)
+    gx = np.diff(x.astype(float), axis=1)
+    return float(np.abs(gy).mean() + np.abs(gx).mean())
+
+for name, out in [(&quot;nearest&quot;, nearest), (&quot;bilinear&quot;, bilinear)]:
+    print(f&quot;{name:&gt;8}  shape={out.shape}  roughness={local_roughness(out):6.2f}&quot;)
+</code></pre>
+<p>Nearest scores highest on roughness because it keeps hard edges. Bilinear is smoother because every new pixel blends two positions on each axis. The runnable companion extends the same separable idea to four neighbors per axis with a Catmull-Rom cubic kernel, then prints all three results without an image library.</p>
+<h2>Use It</h2>
+<p>PyTorch performs the same operations on batched, device-aware tensors. The code below resizes the shorter side, takes a center crop, standardizes each channel, and produces the NCHW tensor a pretrained model expects.</p>
+<pre><code class="language-python">import torch
+import torch.nn.functional as F
+
+image_hwc = torch.from_numpy(synthetic_rgb(256, 320))
+batch = image_hwc.permute(2, 0, 1).unsqueeze(0).float() / 255.0
+
+height, width = batch.shape[-2:]
+scale = 256 / min(height, width)
+resized_height = round(height * scale)
+resized_width = round(width * scale)
+batch = F.interpolate(
+    batch,
+    size=(resized_height, resized_width),
+    mode=&quot;bilinear&quot;,
+    align_corners=False,
+    antialias=True,
+)
+
+top = (resized_height - 224) // 2
+left = (resized_width - 224) // 2
+batch = batch[:, :, top:top + 224, left:left + 224]
+
+mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+batch = (batch - mean) / std
+
+print(f&quot;tensor dtype: {batch.dtype}&quot;)
+print(f&quot;batched shape: {tuple(batch.shape)}&quot;)
+print(f&quot;per-channel mean: {batch.mean(dim=(0, 2, 3)).tolist()}&quot;)
+print(f&quot;per-channel std:  {batch.std(dim=(0, 2, 3)).tolist()}&quot;)
+</code></pre>
+<p>Four steps, in this exact order: convert bytes to float and swap HWC to NCHW, resize the shorter side to 256, take a 224x224 center crop, then subtract the ImageNet mean and divide by its standard deviation. Reversing that order silently changes what reaches the model.</p>
+<h2>Ship It</h2>
+<p>This lesson produces:</p>
+<ul>
+<li><code>outputs/prompt-vision-preprocessing-audit.md</code> — a prompt that turns any model card or dataset card into a checklist of the exact preprocessing invariants a team must honour.</li>
+<li><code>outputs/skill-image-tensor-inspector.md</code> — a skill that, given any image-shaped tensor or array, reports dtype, layout, range, and whether it looks raw, normalized, or standardized.</li>
+</ul>
+<h2>Exercises</h2>
+<ol>
+<li><strong>(Easy)</strong> Create a 2x2 RGB <code>uint8</code> array with four distinct colors. Convert HWC to CHW and back, print both shapes, and prove the round trip preserves every value.</li>
+<li><strong>(Medium)</strong> Write <code>standardize(img, mean, std)</code> and its inverse that together pass a <code>roundtrip_max_diff &lt;= 1</code> test on any uint8 image. Your functions must work on a single image in HWC and on a batch in NCHW with the same call.</li>
+<li><strong>(Hard)</strong> Take a 3-channel ImageNet-standardized tensor and run it through a 1x1 conv that learns a weighted mixture of RGB into a single grayscale channel. Initialize the weights to <code>[0.299, 0.587, 0.114]</code>, freeze them, and verify the output matches your manual <code>rgb_to_grayscale</code> to within floating-point error. What other classical color-space transforms can be written as 1x1 convolutions?</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Pixel</td>
+<td>&quot;A coloured square&quot;</td>
+<td>One sample of light intensity at one grid location — three numbers for colour, one for grayscale</td>
+</tr>
+<tr>
+<td>Channel</td>
+<td>&quot;The colour&quot;</td>
+<td>One of the parallel spatial grids stacked into an image tensor; last axis in HWC, first in CHW</td>
+</tr>
+<tr>
+<td>HWC / CHW</td>
+<td>&quot;The shape&quot;</td>
+<td>Axis orderings for an image tensor; disk and PIL use HWC, PyTorch and cuDNN use CHW</td>
+</tr>
+<tr>
+<td>Normalize</td>
+<td>&quot;Scale the image&quot;</td>
+<td>Divide by 255 so pixels live in [0, 1] — necessary but not sufficient</td>
+</tr>
+<tr>
+<td>Standardize</td>
+<td>&quot;Zero-center&quot;</td>
+<td>Subtract mean and divide by std per channel so the input distribution matches what the model was trained on</td>
+</tr>
+<tr>
+<td>Grayscale conversion</td>
+<td>&quot;Average the channels&quot;</td>
+<td>A weighted sum with coefficients 0.299/0.587/0.114 that matches human luminance perception</td>
+</tr>
+<tr>
+<td>Interpolation</td>
+<td>&quot;How resize picks pixels&quot;</td>
+<td>The rule that decides output values when the new grid does not align with the old one — nearest for labels, bilinear for training, bicubic for display</td>
+</tr>
+<tr>
+<td>Aspect ratio</td>
+<td>&quot;Width over height&quot;</td>
+<td>The ratio that distinguishes &quot;resize and pad&quot; from &quot;resize and stretch&quot;</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://web.archive.org/web/20251220000525/https://poynton.ca/PDFs/Guided_tour.pdf" rel="noreferrer" data-network="true">Charles Poynton — A Guided Tour of Color Space <small>↗ 需要联网</small></a> — the clearest technical treatment of why there are so many color spaces and when each one matters</li>
+<li><a href="https://pytorch.org/vision/stable/transforms.html" rel="noreferrer" data-network="true">PyTorch Vision Transforms Docs <small>↗ 需要联网</small></a> — the full pipeline of transforms you will actually compose in production</li>
+<li><a href="https://www.youtube.com/watch?v=F1kYBnY6mwg" rel="noreferrer" data-network="true">How JPEG Works (Colt McAnlis) <small>↗ 需要联网</small></a> — a sharp visual tour of chroma subsampling, DCT, and why JPEG encodes YCbCr rather than RGB</li>
+<li><a href="https://pytorch.org/vision/stable/models.html" rel="noreferrer" data-network="true">ImageNet Preprocessing Conventions (torchvision models) <small>↗ 需要联网</small></a> — the source of truth for <code>mean=[0.485, 0.456, 0.406]</code> and why every model in the zoo expects it</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-04-computer-vision--01-image-fundamentals.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-04-computer-vision--01-image-fundamentals.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/04-computer-vision/01-image-fundamentals/code/main.py">phases/04-computer-vision/01-image-fundamentals/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Runnable companion for the Image Fundamentals lesson.
+Builds a deterministic RGB image and transforms it as a NumPy tensor.
+Implements nearest, bilinear, and bicubic resizing from scratch.
+See ../docs/en.md for the derivations and production-library comparison.
+&quot;&quot;&quot;
+
+import numpy as np
+
+
+IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+
+def synthetic_image(height=128, width=192, seed=0):
+    rng = np.random.default_rng(seed)
+    yy, xx = np.meshgrid(np.linspace(0, 1, height), np.linspace(0, 1, width), indexing=&quot;ij&quot;)
+    r = (np.sin(xx * 6) * 0.5 + 0.5) * 255
+    g = (yy * 255)
+    b = ((1 - yy) * xx * 255)
+    noise = rng.normal(0, 6, (height, width, 3))
+    rgb = np.stack([r, g, b], axis=-1) + noise
+    return np.clip(rgb, 0, 255).astype(np.uint8)
+
+
+def inspect(arr, label=&quot;image&quot;):
+    if arr.ndim == 2:
+        print(
+            f&quot;[{label}] dtype={arr.dtype} shape={arr.shape} &quot;
+            f&quot;min={arr.min()} max={arr.max()} mean={float(arr.mean()):.2f}&quot;
+        )
+        return
+    print(
+        f&quot;[{label}] dtype={arr.dtype} shape={arr.shape} &quot;
+        f&quot;min={arr.min()} max={arr.max()} &quot;
+        f&quot;per-channel mean=&quot;
+        f&quot;{arr.reshape(-1, arr.shape[-1]).mean(axis=0).round(2).tolist()}&quot;
+    )
+
+
+def hwc_to_chw(arr):
+    return arr.transpose(2, 0, 1)
+
+
+def chw_to_hwc(arr):
+    return arr.transpose(1, 2, 0)
+
+
+def rgb_to_grayscale(rgb):
+    weights = np.array([0.299, 0.587, 0.114], dtype=np.float32)
+    return (rgb.astype(np.float32) @ weights).astype(np.uint8)
+
+
+def rgb_to_hsv(rgb):
+    rgb_f = rgb.astype(np.float32) / 255.0
+    r, g, b = rgb_f[..., 0], rgb_f[..., 1], rgb_f[..., 2]
+    cmax = np.max(rgb_f, axis=-1)
+    cmin = np.min(rgb_f, axis=-1)
+    delta = cmax - cmin
+
+    h = np.zeros_like(cmax)
+    mask = delta &gt; 0
+    argmax = np.argmax(rgb_f, axis=-1)
+    rmax = mask &amp; (argmax == 0)
+    gmax = mask &amp; (argmax == 1)
+    bmax = mask &amp; (argmax == 2)
+    h[rmax] = ((g[rmax] - b[rmax]) / delta[rmax]) % 6
+    h[gmax] = ((b[gmax] - r[gmax]) / delta[gmax]) + 2
+    h[bmax] = ((r[bmax] - g[bmax]) / delta[bmax]) + 4
+    h = h * 60.0
+
+    s = np.divide(delta, cmax, out=np.zeros_like(delta), where=cmax &gt; 0)
+    v = cmax
+    return np.stack([h, s, v], axis=-1)
+
+
+def preprocess_imagenet(rgb_uint8):
+    x = rgb_uint8.astype(np.float32) / 255.0
+    x = (x - IMAGENET_MEAN) / IMAGENET_STD
+    x = x.transpose(2, 0, 1)
+    return x
+
+
+def deprocess_imagenet(chw_float32):
+    x = chw_float32.transpose(1, 2, 0)
+    x = x * IMAGENET_STD + IMAGENET_MEAN
+    x = np.clip(x * 255.0, 0, 255).astype(np.uint8)
+    return x
+
+
+def resize_coordinates(source_length, target_length):
+    if target_length &lt; 1:
+        raise ValueError(&quot;target length must be positive&quot;)
+    if source_length &lt; 1:
+        raise ValueError(&quot;source length must be positive&quot;)
+    if target_length == 1:
+        return np.zeros(1, dtype=np.float32)
+    return np.linspace(0, source_length - 1, target_length, dtype=np.float32)
+
+
+def nearest_resize(arr, target_height, target_width):
+    y = np.rint(resize_coordinates(arr.shape[0], target_height)).astype(int)
+    x = np.rint(resize_coordinates(arr.shape[1], target_width)).astype(int)
+    return arr[y[:, None], x[None, :]]
+
+
+def bilinear_resize(arr, target_height, target_width):
+    y = resize_coordinates(arr.shape[0], target_height)
+    x = resize_coordinates(arr.shape[1], target_width)
+    y0 = np.floor(y).astype(int)
+    x0 = np.floor(x).astype(int)
+    y1 = np.minimum(y0 + 1, arr.shape[0] - 1)
+    x1 = np.minimum(x0 + 1, arr.shape[1] - 1)
+    wy = (y - y0)[:, None, None]
+    wx = (x - x0)[None, :, None]
+
+    source = arr.astype(np.float32)
+    top = source[y0[:, None], x0[None, :]] * (1 - wx)
+    top += source[y0[:, None], x1[None, :]] * wx
+    bottom = source[y1[:, None], x0[None, :]] * (1 - wx)
+    bottom += source[y1[:, None], x1[None, :]] * wx
+    result = top * (1 - wy) + bottom * wy
+    return np.clip(np.rint(result), 0, 255).astype(arr.dtype)
+
+
+def cubic_weight(distance, tension=-0.5):
+    x = np.abs(distance)
+    inner = (tension + 2) * x**3 - (tension + 3) * x**2 + 1
+    outer = tension * x**3 - 5 * tension * x**2 + 8 * tension * x - 4 * tension
+    return np.where(x &lt;= 1, inner, np.where(x &lt; 2, outer, 0.0))
+
+
+def bicubic_resize(arr, target_height, target_width):
+    y = resize_coordinates(arr.shape[0], target_height)
+    x = resize_coordinates(arr.shape[1], target_width)
+    offsets = np.arange(-1, 3)
+
+    x_base = np.floor(x).astype(int)
+    x_neighbors = x_base[:, None] + offsets[None, :]
+    x_weights = cubic_weight(x[:, None] - x_neighbors)
+    x_weights /= x_weights.sum(axis=1, keepdims=True)
+    x_indices = np.clip(x_neighbors, 0, arr.shape[1] - 1)
+
+    source = arr.astype(np.float32)
+    horizontal = np.zeros((arr.shape[0], target_width, arr.shape[2]), dtype=np.float32)
+    for tap in range(4):
+        horizontal += source[:, x_indices[:, tap], :] * x_weights[None, :, tap, None]
+
+    y_base = np.floor(y).astype(int)
+    y_neighbors = y_base[:, None] + offsets[None, :]
+    y_weights = cubic_weight(y[:, None] - y_neighbors)
+    y_weights /= y_weights.sum(axis=1, keepdims=True)
+    y_indices = np.clip(y_neighbors, 0, arr.shape[0] - 1)
+
+    result = np.zeros((target_height, target_width, arr.shape[2]), dtype=np.float32)
+    for tap in range(4):
+        result += horizontal[y_indices[:, tap], :, :] * y_weights[:, tap, None, None]
+    return np.clip(np.rint(result), 0, 255).astype(arr.dtype)
+
+
+def resize_compare(arr, scale=3):
+    if not isinstance(scale, int) or scale &lt; 1:
+        raise ValueError(&quot;scale must be a positive integer&quot;)
+    target_height = arr.shape[0] * scale
+    target_width = arr.shape[1] * scale
+    return {
+        &quot;nearest&quot;: nearest_resize(arr, target_height, target_width),
+        &quot;bilinear&quot;: bilinear_resize(arr, target_height, target_width),
+        &quot;bicubic&quot;: bicubic_resize(arr, target_height, target_width),
+    }
+
+
+def local_roughness(x):
+    gy = np.diff(x.astype(np.float32), axis=0)
+    gx = np.diff(x.astype(np.float32), axis=1)
+    return float(np.abs(gy).mean() + np.abs(gx).mean())
+
+
+def main():
+    arr = synthetic_image()
+    print(&quot;source: deterministic synthetic RGB image (offline)&quot;)
+    inspect(arr, &quot;raw&quot;)
+
+    chw = hwc_to_chw(arr)
+    print(f&quot;HWC shape: {arr.shape}   CHW shape: {chw.shape}&quot;)
+
+    gray = rgb_to_grayscale(arr)
+    hsv = rgb_to_hsv(arr)
+    print(f&quot;grayscale shape: {gray.shape}&quot;)
+    print(f&quot;hsv hue range:   [{hsv[..., 0].min():.1f}, {hsv[..., 0].max():.1f}] deg&quot;)
+    print(f&quot;hsv sat range:   [{hsv[..., 1].min():.2f}, {hsv[..., 1].max():.2f}]&quot;)
+    print(f&quot;hsv val range:   [{hsv[..., 2].min():.2f}, {hsv[..., 2].max():.2f}]&quot;)
+
+    x = preprocess_imagenet(arr)
+    print(f&quot;preprocessed shape: {x.shape}  dtype: {x.dtype}&quot;)
+    print(f&quot;per-channel mean: {x.mean(axis=(1, 2)).round(3).tolist()}&quot;)
+    print(f&quot;per-channel std:  {x.std(axis=(1, 2)).round(3).tolist()}&quot;)
+
+    roundtrip = deprocess_imagenet(x)
+    max_diff = int(np.abs(roundtrip.astype(int) - arr.astype(int)).max())
+    print(f&quot;roundtrip max pixel diff: {max_diff}&quot;)
+
+    for name, out in resize_compare(arr, scale=3).items():
+        print(f&quot;{name:&gt;8}  shape={out.shape}  roughness={local_roughness(out):6.2f}&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/04-computer-vision/01-image-fundamentals/outputs/prompt-vision-preprocessing-audit.md">phases/04-computer-vision/01-image-fundamentals/outputs/prompt-vision-preprocessing-audit.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: prompt-vision-preprocessing-audit
+description: Turn any model card or dataset card into a checklist of the preprocessing invariants a vision pipeline must honour
+phase: 4
+lesson: 1
+---
+
+You are a vision-systems reviewer. Given a model card, a dataset card, or a paper&#39;s preprocessing section, extract the complete list of invariants the serving pipeline must honour, in this exact order:
+
+1. **Input shape** — height, width, and any fixed aspect-ratio assumptions. Flag if the model accepts variable sizes.
+2. **Channel order** — RGB or BGR. Name the library the model was trained with (torchvision, OpenCV, timm) and the channel convention it implies.
+3. **Dtype** — uint8, float16, float32. Is the model quantized (int8, int4)?
+4. **Value range** — [0, 255], [0, 1], or [-1, 1]. Extract whether pixels are divided by 255, by 127.5, or left raw.
+5. **Standardization** — per-channel mean and std. Quote the exact numbers. If ImageNet stats, name them explicitly.
+6. **Resize policy** — shorter-side resize + center crop, resize-and-pad, or direct stretch. Include the target size and interpolation method.
+7. **Color space** — RGB, YCbCr, grayscale, or other. Flag any models that operate on Y-only (super-resolution) or on LAB space.
+8. **Axis layout** — NCHW, NHWC, or batch-free. Name the framework.
+
+For each invariant, output:
+
+```
+[inv] &lt;name&gt;
+  value:  &lt;exact value from the source&gt;
+  source: &lt;file, section, or line&gt;
+  risk:   &lt;what fails silently if this is wrong&gt;
+```
+
+Then produce a one-line preprocessing summary in the form:
+
+```
+load -&gt; convert(&lt;colorspace&gt;) -&gt; resize(&lt;size&gt;, &lt;interp&gt;) -&gt; crop(&lt;size&gt;) -&gt; /&lt;divisor&gt; -&gt; -mean /std -&gt; transpose(&lt;layout&gt;) -&gt; dtype(&lt;dtype&gt;)
+```
+
+Rules:
+
+- Quote exact numbers. Never round ImageNet stats to two decimals.
+- If the card is silent on an invariant, mark it `unspecified` and add it to a &quot;questions to resolve&quot; section at the bottom.
+- Flag silent-failure risks explicitly: channel swap, missing standardization, and wrong layout are the three most common production bugs.
+- Do not invent defaults. If the card says &quot;standard preprocessing&quot; without specifying, that is an unspecified invariant.
+- When two sources disagree (paper vs. code), trust the code and note the disagreement.
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/04-computer-vision/01-image-fundamentals/outputs/skill-image-tensor-inspector.md">phases/04-computer-vision/01-image-fundamentals/outputs/skill-image-tensor-inspector.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: skill-image-tensor-inspector
+description: Inspect any image-shaped tensor or array and report dtype, layout, range, and whether it looks raw, normalized, or standardized
+version: 1.0.0
+phase: 4
+lesson: 1
+tags: [computer-vision, debugging, preprocessing, tensors]
+---
+
+# Image Tensor Inspector
+
+A diagnostic skill for any point in a vision pipeline where you are holding an image-shaped array and need to know exactly what state it is in.
+
+## When to use
+
+- A pretrained model returns garbage predictions and you suspect the preprocessing.
+- Migrating a pipeline between OpenCV and torchvision and the channel order is unclear.
+- Stacking layers from multiple frameworks and the batch axis keeps appearing in the wrong place.
+- Debugging a training loop where loss is stuck at `log(num_classes)`.
+
+## Inputs
+
+- `x`: any 2-D, 3-D, or 4-D array-like (NumPy, PyTorch, JAX).
+- Optional `expected`: a dict of invariants to check against, e.g. `{&quot;layout&quot;: &quot;CHW&quot;, &quot;range&quot;: &quot;standardized&quot;}`.
+
+## Steps
+
+1. **Resolve backend** — detect whether `x` is NumPy, Torch, or JAX. Convert to NumPy for inspection without altering the original.
+
+2. **Classify rank**:
+   - rank 2 -&gt; single-channel image (H, W).
+   - rank 3 -&gt; `HWC` if the last axis is 1, 3, or 4 and is strictly smaller than the other two; otherwise `CHW`.
+   - rank 4 -&gt; prefer `NCHW` if axis 1 is in {1, 3, 4} **and** either axis 2 or axis 3 is larger than 16; otherwise prefer `NHWC`. Pure axis-1 check misclassifies small-image NHWC batches like `(3, 4, 224, 3)`.
+   - Always flag ambiguous cases (e.g. `(1, 3, 3, 3)`) as `ambiguous` rather than guessing; require the caller to provide `expected`.
+
+3. **Classify dtype and range**:
+   - `uint8` in [0, 255] -&gt; `raw`.
+   - `float*` with min &gt;= 0 and max &lt;= 1.01 -&gt; `normalized`.
+   - `float*` with min &lt; 0 and |mean| &lt; 0.5 and 0.5 &lt;= std &lt;= 1.5 -&gt; `standardized`.
+   - Anything else -&gt; `unusual`, print the histogram.
+
+4. **Per-channel stats** — report mean and std per channel. Compare against ImageNet mean/std if the array looks standardized and surface a match confidence.
+
+5. **Report** in this exact block:
+
+```
+[inspector]
+  backend:   numpy | torch | jax
+  rank:      2 | 3 | 4
+  layout:    HW | HWC | CHW | NHWC | NCHW
+  dtype:     &lt;dtype&gt;
+  shape:     &lt;shape&gt;
+  range:     raw | normalized | standardized | unusual
+  min/max:   &lt;min&gt; / &lt;max&gt;
+  per-channel mean: [ ... ]
+  per-channel std:  [ ... ]
+  likely source:    camera | PIL | OpenCV | torchvision | random init
+  likely target:    display | training | inference
+```
+
+6. **Recommend next action** based on the `likely target`:
+   - For `display`: transpose to HWC, clip, convert to uint8.
+   - For `training`: standardize with dataset stats, transpose to CHW, add batch axis.
+   - For `inference`: match the exact invariants in the model card.
+
+## Rules
+
+- Never mutate the input. Print diagnostics only.
+- If `expected` is provided, flag every mismatch with `[expected X got Y]`.
+- Call out silent-failure risks when the layout or channel order is ambiguous.
+- Recommend one action at a time, not a list of options.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. A file on disk is decoded into a NumPy array with shape (224, 224, 3) and dtype uint8. What does each number represent?</legend><label class="option"><input type="radio" name="q0" value="0"> A floating-point brightness value ready to feed to a convolutional network</label><label class="option"><input type="radio" name="q0" value="1"> A sample of light intensity at one grid position, quantized to one of 256 levels per channel</label><label class="option"><input type="radio" name="q0" value="2"> One photon count per detector, normalized to the full dynamic range of the sensor</label><label class="option"><input type="radio" name="q0" value="3"> The probability that a pixel is that colour, between 0 and 1</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. You load an image with Pillow and get an array of shape (480, 640, 3). You pass it as a batched tensor (1, 480, 640, 3) to a PyTorch Conv2d with in_channels=3. What happens?</legend><label class="option"><input type="radio" name="q1" value="0"> PyTorch raises a RuntimeError: Conv2d expects NCHW, sees 480 channels where the weight expects 3, and refuses to run</label><label class="option"><input type="radio" name="q1" value="1"> Accuracy drops by a few percent but inference still works</label><label class="option"><input type="radio" name="q1" value="2"> Nothing — PyTorch auto-detects the layout</label><label class="option"><input type="radio" name="q1" value="3"> The first conv layer treats height as the channel axis, producing meaningless feature maps</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. Why do ImageNet pretrained models expect inputs standardized with mean=[0.485, 0.456, 0.406] and std=[0.229, 0.224, 0.225]?</legend><label class="option"><input type="radio" name="q2" value="0"> They are required by the ReLU activation function</label><label class="option"><input type="radio" name="q2" value="1"> Those are the RGB values of an average natural scene</label><label class="option"><input type="radio" name="q2" value="2"> They make the input strictly zero-mean unit-variance for any image</label><label class="option"><input type="radio" name="q2" value="3"> Those are the per-channel mean and standard deviation of the ImageNet training set in [0, 1] space, so subtracting them centers the distribution the model was trained on</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. You resize a segmentation mask (integer class IDs 0..20) from 500x500 to 224x224. Which interpolation method is correct?</legend><label class="option"><input type="radio" name="q3" value="0"> Bicubic — it preserves sharpness</label><label class="option"><input type="radio" name="q3" value="1"> Bilinear — it smooths the class boundaries</label><label class="option"><input type="radio" name="q3" value="2"> Nearest neighbour — it preserves valid integer class IDs instead of inventing fractional ones</label><label class="option"><input type="radio" name="q3" value="3"> Lanczos — highest quality</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. RGB grayscale conversion uses weights 0.299 R + 0.587 G + 0.114 B rather than 0.333 R + 0.333 G + 0.333 B. Why?</legend><label class="option"><input type="radio" name="q4" value="0"> Because green photons carry more energy than red or blue photons</label><label class="option"><input type="radio" name="q4" value="1"> Because human vision is most sensitive to green and least sensitive to blue, so the weighted sum matches perceived luminance</label><label class="option"><input type="radio" name="q4" value="2"> To match the behaviour of the Bayer filter on camera sensors</label><label class="option"><input type="radio" name="q4" value="3"> To compensate for JPEG compression artifacts in each channel</label><p data-feedback="4"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/03-deep-learning-core/13-debugging-neural-networks/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/04-computer-vision/02-convolutions-from-scratch/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/04-computer-vision/01-image-fundamentals/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

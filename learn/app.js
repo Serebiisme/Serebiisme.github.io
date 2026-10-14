@@ -1,10 +1,11 @@
-import { MESSAGE, offlineStatusFromMessage } from '/learn/offline-core.mjs';
+import { MESSAGE, offlineStatusFromMessage,prepareLearningDocument,waitForWorkerActivation,LEARNING_DOCUMENT_VERSION } from '/learn/offline-core.mjs';
 
 const grid = document.querySelector('#course-grid');
 const status = document.querySelector('#library-status');
 const template = document.querySelector('#course-card-template');
 const coursesById = new Map();
 let serviceWorkerRegistration;
+const hadController=Boolean(navigator.serviceWorker?.controller);
 
 function renderCourse(course, index) {
   const fragment = template.content.cloneNode(true);
@@ -23,10 +24,15 @@ function renderCourse(course, index) {
     fragment.querySelector('[data-course-link]').textContent = '进入合集';
     fragment.querySelector('[data-course-license]').textContent = '编写与来源';
   }
+  if(course.id==='ai-from-scratch') {
+    fragment.querySelector('.course-visual').replaceChildren(document.querySelector('#scratch-cover-template').content.cloneNode(true));
+    fragment.querySelector('.course-kicker').textContent='From scratch / 双语离线阅读';
+    fragment.querySelector('[data-offline-status]').textContent='进入课程，按阶段保存 · 中文草稿明确标注';
+  }
   fragment.querySelector('[data-course-number]').textContent =
     String(index + 1).padStart(2, '0');
   fragment.querySelector('[data-course-chapters]').textContent =
-    course.guideCount ? `${course.guideCount} 分区 · ${course.chapterCount} 节` : `${course.chapterCount} 章`;
+    course.phaseCount ? `${course.phaseCount} 阶段 · ${course.chapterCount} 课 · ${course.projectCount} 项目` : course.guideCount ? `${course.guideCount} 分区 · ${course.chapterCount} 节` : `${course.chapterCount} 章`;
   fragment.querySelector('[data-course-title]').textContent = course.title;
   fragment.querySelector('[data-course-author]').textContent =
     `作者：${course.author}`;
@@ -114,13 +120,15 @@ async function initializeOffline(courses) {
   });
 
   try {
-    await navigator.serviceWorker.register('/learn/sw.js', {
+    serviceWorkerRegistration=await navigator.serviceWorker.register('/learn/sw.js', {
       scope: '/learn/',
       type: 'module',
       updateViaCache: 'none',
     });
+    await waitForWorkerActivation(serviceWorkerRegistration);
     serviceWorkerRegistration = await navigator.serviceWorker.ready;
-    for (const course of courses) postCacheRequest(course);
+    if(prepareLearningDocument({storage:sessionStorage,version:LEARNING_DOCUMENT_VERSION,hadController})==='reload'){location.reload();return;}
+    for (const course of courses) if(course.autoCache!==false) postCacheRequest(course);
   } catch (error) {
     for (const course of courses) {
       renderOfflineStatus({ type: MESSAGE.error, courseId: course.id });

@@ -1,0 +1,607 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>编码器-解码器模型 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-07-transformers-deep-dive" data-lesson="07-transformers-deep-dive/08-t5-bart-encoder-decoder" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/07-transformers-deep-dive/">深入 Transformer</a> / LESSON 08</p><h1 class="lesson-title">编码器-解码器模型</h1><p>T5, BART — Encoder-Decoder Models</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>编码器-解码器模型</h1>
+<blockquote>
+<p>编码器理解.编码器生成.把它们重新组合起来,你就能为输入 →输出任务构建模型:翻译,总结,重写,转录.</p>
+</blockquote>
+<p><strong>Type:</strong> Learn
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 7 · 05 (Full Transformer), Phase 7 · 06 (BERT), Phase 7 · 07 (GPT)
+<strong>Time:</strong> ~45 minutes</p>
+<h2>问题</h2>
+<p>只有解码器的GPT和只有编码器的BERT每个都为不同的目标而沿着2017年的架构.</p>
+<ul>
+<li>翻译:英语 → 法语.</li>
+<li>总结:5000个标记文章 →200个标记总结.</li>
+<li>语音识别:音频代码 →文字代码.</li>
+<li>结构化提取:散文 → JSON.</li>
+</ul>
+<p>编码器生成出口,在每一步都会交叉地关注该表示.训练在输出侧进行一个接一个.与GPT相同的损失,只是根据编码器输出条件.</p>
+<p>现代游戏书的定义是两篇论文:</p>
+<ol>
+<li><strong>T5</strong>&quot;文本转移变换器&quot;.每一个NLP任务都被重构为文本输入,文本输出.单个架构,单个词汇库,单个损失.预训练在面具跨度预测 (输入中的腐败跨度,输出中解码它们).</li>
+<li><strong>BART</strong>&quot;双向和自动回归变压器&quot;. 否认自动编码器:通过多种方式 (混动,掩盖,删除,旋转) 破坏输入,请解码器重建原始.</li>
+</ol>
+<p>在2026年,编码器-解码器格式将继续存在输入结构的重要位置:</p>
+<ul>
+<li>语 (语音 →文字).</li>
+<li>谷歌的翻译堆.</li>
+<li>一些代码完成/修复模型具有不同的文本和编辑结构.</li>
+<li>结构性推理任务的Flan-T5和变体.</li>
+</ul>
+<p>只有解码器赢得了关注点,但解码器从来没有消失.</p>
+<h2>概念</h2>
+<p><img src="/learn/ai-from-scratch/files/phases/07-transformers-deep-dive/08-t5-bart-encoder-decoder/assets/encoder-decoder.svg" alt="Encoder-decoder with cross-attention" loading="lazy"></p>
+<h3>进而循环</h3>
+<pre><code>source tokens ─▶ encoder ─▶ (N_src, d_model)  ──┐
+                                                 │
+target tokens ─▶ decoder block                   │
+                 ├─▶ masked self-attention       │
+                 ├─▶ cross-attention ◀───────────┘
+                 └─▶ FFN
+                ↓
+              next-token logits
+</code></pre>
+<p>重要的是,编码器每输入一次运行.解码器运行自动降低式,但在每一步都会交叉处理 <em>相同</em>编码器输出.缓存编码器输出是长输入的免费加快.</p>
+<h3></h3>
+<p>选择输入的随机跨度 (平均长度3个代币,总数为15%). 替换每个跨度一个独特的哨兵:<code>&lt;extra_id_0&gt;</code>现在<code>&lt;extra_id_1&gt;</code>解码器只输出了被破坏的跨度,</p>
+<pre><code>source: The quick &lt;extra_id_0&gt; fox jumps &lt;extra_id_1&gt; dog
+target: &lt;extra_id_0&gt; brown &lt;extra_id_1&gt; over the lazy
+</code></pre>
+<p>具有竞争力,与MLM (BERT) 和前LM (UniLM) 在T5纸的缩.</p>
+<h3>多噪音排斥</h3>
+<p>音系统试验了五种噪音功能:</p>
+<ol>
+<li>标志掩盖.</li>
+<li>删除代码.</li>
+<li>填写文字 (掩盖一个跨度,解码器插入了正确的长度).</li>
+<li>换句话变化.</li>
+<li>文件转换.</li>
+</ol>
+<p>结合文本填写+句子变换产生了最佳下游数字.解码器总是重建原始.BART的输出是完整的序列,而不仅仅是损坏的跨度,因此预训计算高于T5.</p>
+<h3>推理</h3>
+<p>采用GPT的相同的自动降低性生成. 贪/束/顶部采样应用.束搜索 (45) 是翻译和总结的标准,因为输出分布比聊天更窄.</p>
+<h3>2026年,每种变体何时选择</h3>
+<table>
+<thead>
+<tr>
+<th>Task</th>
+<th>Encoder-decoder?</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Translation</td>
+<td>Yes, usually</td>
+<td>Clear source sequence; fixed output distribution; beam search works</td>
+</tr>
+<tr>
+<td>Speech-to-text</td>
+<td>Yes (Whisper)</td>
+<td>Input modality differs from output; encoder shapes audio features</td>
+</tr>
+<tr>
+<td>Chat / reasoning</td>
+<td>No, decoder-only</td>
+<td>No persistent &quot;input&quot; — the conversation is the sequence</td>
+</tr>
+<tr>
+<td>Code completion</td>
+<td>Usually no</td>
+<td>Decoder-only with long context wins; code models like Qwen 2.5 Coder are decoder-only</td>
+</tr>
+<tr>
+<td>Summarization</td>
+<td>Either works</td>
+<td>BART, PEGASUS beat earlier decoder-only baselines; modern decoder-only LLMs match them</td>
+</tr>
+<tr>
+<td>Structured extraction</td>
+<td>Either</td>
+<td>T5 is clean because &quot;text → text&quot; absorbs any output format</td>
+</tr>
+</tbody>
+</table>
+<p>自2022年以来的趋势:仅解码器接管了以前拥有的任务,因为 (a) 通过提示将指示调节的仅解码器LLM将其通用到任何东西, (b) 一个架构比两种更容易, (c) RLHF假设一个解码器. 编码器-解码器在输入方式不同的地方 (演讲,图像) 或光束搜索质量在哪里有意义.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-70bd17f03c822536cb45.png" alt="encoder-decoder 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<p>看到<code>code/main.py</code>我们将T5式的跨度腐败用于玩具体,这是这个课程中最有用的单一部分,因为它显示在每一个编码器-解码器预训练配方.</p>
+<h3>步骤1:跨度腐败</h3>
+<pre><code class="language-python">def corrupt_spans(tokens, mask_rate=0.15, mean_span=3.0, rng=None):
+    &quot;&quot;&quot;Pick spans summing to ~mask_rate of tokens. Return (corrupted_input, target).&quot;&quot;&quot;
+    n = len(tokens)
+    n_mask = max(1, int(n * mask_rate))
+    n_spans = max(1, int(round(n_mask / mean_span)))
+    ...
+</code></pre>
+<p>目标格式是T5公约: <code>&lt;sent0&gt; span0 &lt;sent1&gt; span1 ...</code>损坏的输入将未变的代币与守望器代币交换到跨度位置.</p>
+<h3>步骤2:检查回路</h3>
+<p>鉴于被破坏的输入和目标,重建原始句子.如果你的腐败是可逆的,前进通过是很清楚的.这是一个智力检查真正的训练从来没有这样做,但测试是便宜的,并捕获你的跨度账本中的一个-一个错误.</p>
+<h3>步骤3:BART噪音</h3>
+<p>五个功能:<code>token_mask</code>现在<code>token_delete</code>现在<code>text_infill</code>现在<code>sentence_permute</code>现在<code>document_rotate</code>两种组合,然后显示结果.</p>
+<h2>用它</h2>
+<p>抱脸的参考:</p>
+<pre><code class="language-python">from transformers import T5ForConditionalGeneration, T5Tokenizer
+tok = T5Tokenizer.from_pretrained(&quot;google/flan-t5-base&quot;)
+model = T5ForConditionalGeneration.from_pretrained(&quot;google/flan-t5-base&quot;)
+
+inputs = tok(&quot;translate English to French: Attention is all you need.&quot;, return_tensors=&quot;pt&quot;)
+out = model.generate(**inputs, max_new_tokens=32)
+print(tok.decode(out[0], skip_special_tokens=True))
+</code></pre>
+<p>任务名称进入输入文本.同样的模型处理数十项任务,因为每个任务都是输入和输出. 2026年,该模式已被指令调节的单独解码器模型普遍化,但T5先编码了它.</p>
+<h2>运送它</h2>
+<p>看到<code>outputs/skill-seq2seq-picker.md</code>技能选择编码器-解码器和解码器-仅用于新任务,因为输入输出结构,延迟和质量目标.</p>
+<h2>运动</h2>
+<ol>
+<li>**Easy.**跑步<code>code/main.py</code>检查是否将非传密源代币与解码目标代码连接,复制原始.</li>
+<li>**Medium.**实施BART的方案<code>text_infill</code>噪音:用单个取代随机度<code>&lt;mask&gt;</code>解码器必须推断正确的跨度长度加上内容.</li>
+<li>**Hard.**精细调节<code>flan-t5-small</code>在一个微小的英语 →猪拉丁体 (200对). 测量蓝色在一个持久的50对的集. 进行比较与细调<code>Llama-3.2-1B</code>根据相同的数据,使用相同的计算.</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Encoder-decoder</td>
+<td>&quot;Seq2seq transformer&quot;</td>
+<td>Two stacks: bidirectional encoder for input, causal decoder with cross-attention for output.</td>
+</tr>
+<tr>
+<td>Cross-attention</td>
+<td>&quot;Where source talks to target&quot;</td>
+<td>Decoder's Q × encoder's K/V. The only place encoder information enters the decoder.</td>
+</tr>
+<tr>
+<td>Span corruption</td>
+<td>&quot;T5's pretraining trick&quot;</td>
+<td>Replace random spans with sentinel tokens; decoder outputs the spans.</td>
+</tr>
+<tr>
+<td>Denoising objective</td>
+<td>&quot;BART's game&quot;</td>
+<td>Apply a noise function to the input, train the decoder to reconstruct the clean sequence.</td>
+</tr>
+<tr>
+<td>Sentinel token</td>
+<td>&quot;The <code>&lt;extra_id_N&gt;</code> placeholder&quot;</td>
+<td>Special tokens that tag corrupted spans in the source and re-tag them in the target.</td>
+</tr>
+<tr>
+<td>Flan</td>
+<td>&quot;Instruction-tuned T5&quot;</td>
+<td>T5 fine-tuned on &gt;1,800 tasks; made encoder-decoder competitive at instruction-following.</td>
+</tr>
+<tr>
+<td>Beam search</td>
+<td>&quot;Decoding strategy&quot;</td>
+<td>Keep top-k partial sequences at each step; standard for translation/summarization.</td>
+</tr>
+<tr>
+<td>Teacher forcing</td>
+<td>&quot;Training-time input&quot;</td>
+<td>During training, feed the true previous output token to the decoder, not the sampled one.</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/1910.10683" rel="noreferrer" data-network="true">Raffel et al. (2019). Exploring the Limits of Transfer Learning with a Unified Text-to-Text Transformer <small>↗ 需要联网</small></a>T5</li>
+<li><a href="https://arxiv.org/abs/1910.13461" rel="noreferrer" data-network="true">Lewis et al. (2019). BART: Denoising Sequence-to-Sequence Pre-training for Natural Language Generation, Translation, and Comprehension <small>↗ 需要联网</small></a></li>
+<li><a href="https://arxiv.org/abs/2210.11416" rel="noreferrer" data-network="true">Chung et al. (2022). Scaling Instruction-Finetuned Language Models <small>↗ 需要联网</small></a> 飞行器T5.</li>
+<li><a href="https://arxiv.org/abs/2212.04356" rel="noreferrer" data-network="true">Radford et al. (2022). Robust Speech Recognition via Large-Scale Weak Supervision <small>↗ 需要联网</small></a> 语,可谓的2026代码器-解码器.</li>
+<li><a href="https://github.com/huggingface/transformers/blob/main/src/transformers/models/t5/modeling_t5.py" rel="noreferrer" data-network="true">HuggingFace <code>modeling_t5.py</code> <small>↗ 需要联网</small></a>参考实施.</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>T5, BART — Encoder-Decoder Models</h1>
+<blockquote>
+<p>Encoders understand. Decoders generate. Put them back together and you get a model built for input → output tasks: translate, summarize, rewrite, transcribe.</p>
+</blockquote>
+<p><strong>Type:</strong> Learn
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 7 · 05 (Full Transformer), Phase 7 · 06 (BERT), Phase 7 · 07 (GPT)
+<strong>Time:</strong> ~45 minutes</p>
+<h2>The Problem</h2>
+<p>Decoder-only GPT and encoder-only BERT each strip down the 2017 architecture for a different goal. But many tasks are naturally input-output:</p>
+<ul>
+<li>Translation: English → French.</li>
+<li>Summarization: 5,000-token article → 200-token summary.</li>
+<li>Speech recognition: audio tokens → text tokens.</li>
+<li>Structured extraction: prose → JSON.</li>
+</ul>
+<p>For these, encoder-decoder makes the cleanest fit. The encoder produces a dense representation of the source. The decoder generates the output, cross-attending to that representation at every step. Training is shift-by-one on the output side. Same loss as GPT, just conditioned on the encoder output.</p>
+<p>Two papers defined the modern playbook:</p>
+<ol>
+<li><strong>T5</strong> (Raffel et al. 2019). &quot;Text-to-Text Transfer Transformer.&quot; Every NLP task reframed as text-in, text-out. Single architecture, single vocabulary, single loss. Pretrained on masked span prediction (corrupt spans in the input, decode them in the output).</li>
+<li><strong>BART</strong> (Lewis et al. 2019). &quot;Bidirectional and Auto-Regressive Transformer.&quot; Denoising autoencoder: corrupt input in multiple ways (shuffle, mask, delete, rotate), ask the decoder to reconstruct the original.</li>
+</ol>
+<p>In 2026 the encoder-decoder format lives on where input structure matters:</p>
+<ul>
+<li>Whisper (speech → text).</li>
+<li>Google's translation stack.</li>
+<li>Some code-completion / repair models that have distinct context-and-edit structures.</li>
+<li>Flan-T5 and variants for structured reasoning tasks.</li>
+</ul>
+<p>Decoder-only won the spotlight, but encoder-decoder never went away.</p>
+<h2>The Concept</h2>
+<p><img src="/learn/ai-from-scratch/files/phases/07-transformers-deep-dive/08-t5-bart-encoder-decoder/assets/encoder-decoder.svg" alt="Encoder-decoder with cross-attention" loading="lazy"></p>
+<h3>The forward loop</h3>
+<pre><code>source tokens ─▶ encoder ─▶ (N_src, d_model)  ──┐
+                                                 │
+target tokens ─▶ decoder block                   │
+                 ├─▶ masked self-attention       │
+                 ├─▶ cross-attention ◀───────────┘
+                 └─▶ FFN
+                ↓
+              next-token logits
+</code></pre>
+<p>Crucially, the encoder runs once per input. The decoder runs autoregressively but cross-attends to the <em>same</em> encoder output at every step. Caching the encoder output is a free speedup for long inputs.</p>
+<h3>T5 pretraining — span corruption</h3>
+<p>Pick random spans of the input (average length 3 tokens, 15% total). Replace each span with a unique sentinel: <code>&lt;extra_id_0&gt;</code>, <code>&lt;extra_id_1&gt;</code>, etc. The decoder outputs only the corrupted spans with their sentinel prefix:</p>
+<pre><code>source: The quick &lt;extra_id_0&gt; fox jumps &lt;extra_id_1&gt; dog
+target: &lt;extra_id_0&gt; brown &lt;extra_id_1&gt; over the lazy
+</code></pre>
+<p>Cheaper signal than predicting the whole sequence. Competitive with MLM (BERT) and prefix-LM (UniLM) in the T5 paper's ablation.</p>
+<h3>BART pretraining — multi-noise denoising</h3>
+<p>BART tries five noising functions:</p>
+<ol>
+<li>Token masking.</li>
+<li>Token deletion.</li>
+<li>Text infilling (mask a span, decoder inserts the right length).</li>
+<li>Sentence permutation.</li>
+<li>Document rotation.</li>
+</ol>
+<p>Combining text infilling + sentence permutation produced the best downstream numbers. The decoder always reconstructs the original. BART's output is the full sequence, not just the corrupted spans — so pretraining compute is higher than T5.</p>
+<h3>Inference</h3>
+<p>Same autoregressive generation as GPT. Greedy / beam / top-p sampling apply. Beam search (width 4–5) is standard for translation and summarization because the output distribution is narrower than chat.</p>
+<h3>When to pick each variant in 2026</h3>
+<table>
+<thead>
+<tr>
+<th>Task</th>
+<th>Encoder-decoder?</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Translation</td>
+<td>Yes, usually</td>
+<td>Clear source sequence; fixed output distribution; beam search works</td>
+</tr>
+<tr>
+<td>Speech-to-text</td>
+<td>Yes (Whisper)</td>
+<td>Input modality differs from output; encoder shapes audio features</td>
+</tr>
+<tr>
+<td>Chat / reasoning</td>
+<td>No, decoder-only</td>
+<td>No persistent &quot;input&quot; — the conversation is the sequence</td>
+</tr>
+<tr>
+<td>Code completion</td>
+<td>Usually no</td>
+<td>Decoder-only with long context wins; code models like Qwen 2.5 Coder are decoder-only</td>
+</tr>
+<tr>
+<td>Summarization</td>
+<td>Either works</td>
+<td>BART, PEGASUS beat earlier decoder-only baselines; modern decoder-only LLMs match them</td>
+</tr>
+<tr>
+<td>Structured extraction</td>
+<td>Either</td>
+<td>T5 is clean because &quot;text → text&quot; absorbs any output format</td>
+</tr>
+</tbody>
+</table>
+<p>The trend since ~2022: decoder-only takes over tasks that encoder-decoder used to own because (a) instruction-tuned decoder-only LLMs generalize to anything via prompting, (b) one architecture scales easier than two, (c) RLHF assumes a decoder. Encoder-decoder holds on where input modality differs (speech, images) or where beam search quality matters.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-70bd17f03c822536cb45.png" alt="encoder-decoder 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<p>See <code>code/main.py</code>. We implement T5-style span corruption for a toy corpus — the most useful single piece of this lesson because it shows up in every encoder-decoder pretraining recipe since.</p>
+<h3>Step 1: span corruption</h3>
+<pre><code class="language-python">def corrupt_spans(tokens, mask_rate=0.15, mean_span=3.0, rng=None):
+    &quot;&quot;&quot;Pick spans summing to ~mask_rate of tokens. Return (corrupted_input, target).&quot;&quot;&quot;
+    n = len(tokens)
+    n_mask = max(1, int(n * mask_rate))
+    n_spans = max(1, int(round(n_mask / mean_span)))
+    ...
+</code></pre>
+<p>The target format is the T5 convention: <code>&lt;sent0&gt; span0 &lt;sent1&gt; span1 ...</code>. The corrupted input interleaves unchanged tokens with the sentinel tokens at span locations.</p>
+<h3>Step 2: verify round-trip</h3>
+<p>Given the corrupted input and target, reconstruct the original sentence. If your corruption is reversible, the forward pass is well-defined. This is a sanity check — real training never does this, but the test is cheap and catches off-by-one bugs in your span bookkeeping.</p>
+<h3>Step 3: BART noising</h3>
+<p>Five functions: <code>token_mask</code>, <code>token_delete</code>, <code>text_infill</code>, <code>sentence_permute</code>, <code>document_rotate</code>. Compose two of them and show the result.</p>
+<h2>Use It</h2>
+<p>HuggingFace reference:</p>
+<pre><code class="language-python">from transformers import T5ForConditionalGeneration, T5Tokenizer
+tok = T5Tokenizer.from_pretrained(&quot;google/flan-t5-base&quot;)
+model = T5ForConditionalGeneration.from_pretrained(&quot;google/flan-t5-base&quot;)
+
+inputs = tok(&quot;translate English to French: Attention is all you need.&quot;, return_tensors=&quot;pt&quot;)
+out = model.generate(**inputs, max_new_tokens=32)
+print(tok.decode(out[0], skip_special_tokens=True))
+</code></pre>
+<p>The T5 trick: the task name goes into the input text. Same model handles dozens of tasks because each task is text-in, text-out. In 2026 this pattern has been generalized by instruction-tuned decoder-only models, but T5 codified it first.</p>
+<h2>Ship It</h2>
+<p>See <code>outputs/skill-seq2seq-picker.md</code>. The skill picks between encoder-decoder and decoder-only for a new task given input-output structure, latency, and quality targets.</p>
+<h2>Exercises</h2>
+<ol>
+<li><strong>Easy.</strong> Run <code>code/main.py</code>, apply span corruption to a 30-token sentence, verify that concatenating the non-sentinel source tokens with the decoded target spans reproduces the original.</li>
+<li><strong>Medium.</strong> Implement BART's <code>text_infill</code> noise: replace random spans with a single <code>&lt;mask&gt;</code> token, and the decoder must infer the correct span length plus contents. Show one example.</li>
+<li><strong>Hard.</strong> Fine-tune <code>flan-t5-small</code> on a tiny English → pig-Latin corpus (200 pairs). Measure BLEU on a held-out 50-pair set. Compare against fine-tuning <code>Llama-3.2-1B</code> on the same data with the same compute.</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Encoder-decoder</td>
+<td>&quot;Seq2seq transformer&quot;</td>
+<td>Two stacks: bidirectional encoder for input, causal decoder with cross-attention for output.</td>
+</tr>
+<tr>
+<td>Cross-attention</td>
+<td>&quot;Where source talks to target&quot;</td>
+<td>Decoder's Q × encoder's K/V. The only place encoder information enters the decoder.</td>
+</tr>
+<tr>
+<td>Span corruption</td>
+<td>&quot;T5's pretraining trick&quot;</td>
+<td>Replace random spans with sentinel tokens; decoder outputs the spans.</td>
+</tr>
+<tr>
+<td>Denoising objective</td>
+<td>&quot;BART's game&quot;</td>
+<td>Apply a noise function to the input, train the decoder to reconstruct the clean sequence.</td>
+</tr>
+<tr>
+<td>Sentinel token</td>
+<td>&quot;The <code>&lt;extra_id_N&gt;</code> placeholder&quot;</td>
+<td>Special tokens that tag corrupted spans in the source and re-tag them in the target.</td>
+</tr>
+<tr>
+<td>Flan</td>
+<td>&quot;Instruction-tuned T5&quot;</td>
+<td>T5 fine-tuned on &gt;1,800 tasks; made encoder-decoder competitive at instruction-following.</td>
+</tr>
+<tr>
+<td>Beam search</td>
+<td>&quot;Decoding strategy&quot;</td>
+<td>Keep top-k partial sequences at each step; standard for translation/summarization.</td>
+</tr>
+<tr>
+<td>Teacher forcing</td>
+<td>&quot;Training-time input&quot;</td>
+<td>During training, feed the true previous output token to the decoder, not the sampled one.</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/1910.10683" rel="noreferrer" data-network="true">Raffel et al. (2019). Exploring the Limits of Transfer Learning with a Unified Text-to-Text Transformer <small>↗ 需要联网</small></a> — T5.</li>
+<li><a href="https://arxiv.org/abs/1910.13461" rel="noreferrer" data-network="true">Lewis et al. (2019). BART: Denoising Sequence-to-Sequence Pre-training for Natural Language Generation, Translation, and Comprehension <small>↗ 需要联网</small></a> — BART.</li>
+<li><a href="https://arxiv.org/abs/2210.11416" rel="noreferrer" data-network="true">Chung et al. (2022). Scaling Instruction-Finetuned Language Models <small>↗ 需要联网</small></a> — Flan-T5.</li>
+<li><a href="https://arxiv.org/abs/2212.04356" rel="noreferrer" data-network="true">Radford et al. (2022). Robust Speech Recognition via Large-Scale Weak Supervision <small>↗ 需要联网</small></a> — Whisper, the canonical 2026 encoder-decoder.</li>
+<li><a href="https://github.com/huggingface/transformers/blob/main/src/transformers/models/t5/modeling_t5.py" rel="noreferrer" data-network="true">HuggingFace <code>modeling_t5.py</code> <small>↗ 需要联网</small></a> — reference implementation.</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-07-transformers-deep-dive--08-t5-bart-encoder-decoder.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-07-transformers-deep-dive--08-t5-bart-encoder-decoder.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/07-transformers-deep-dive/08-t5-bart-encoder-decoder/code/main.py">phases/07-transformers-deep-dive/08-t5-bart-encoder-decoder/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;T5 span corruption + BART denoising noise functions.
+
+Pure stdlib. Shows how encoder-decoder models turn any input into
+a supervised (corrupted_input -&gt; clean_spans) training pair.
+&quot;&quot;&quot;
+
+import random
+
+
+def sentinel(i):
+    return f&quot;&lt;extra_id_{i}&gt;&quot;
+
+
+def corrupt_spans(tokens, mask_rate=0.15, mean_span=3.0, rng=None):
+    &quot;&quot;&quot;T5-style span corruption.
+
+    Returns (corrupted_source, decoder_target) as lists of tokens (strings).
+    &quot;&quot;&quot;
+    if rng is None:
+        rng = random.Random()
+    n = len(tokens)
+    n_mask = max(1, int(round(n * mask_rate)))
+    n_spans = max(1, int(round(n_mask / mean_span)))
+    # Pick span start positions with no overlap.
+    positions = list(range(n))
+    rng.shuffle(positions)
+    starts = []
+    used = [False] * n
+    span_lengths = []
+    remaining = n_mask
+    for _ in range(n_spans):
+        if remaining &lt;= 0:
+            break
+        # pick a random starting point not yet used and with room
+        random_order = list(range(n))
+        rng.shuffle(random_order)
+        chosen_start = None
+        for start in random_order:
+            if used[start]:
+                continue
+            # span length
+            length = max(1, int(rng.gauss(mean_span, 1.0)))
+            length = min(length, remaining, n - start)
+            if length &lt; 1:
+                continue
+            if any(used[i] for i in range(start, start + length)):
+                continue
+            chosen_start = start
+            for i in range(start, start + length):
+                used[i] = True
+            starts.append(start)
+            span_lengths.append(length)
+            remaining -= length
+            break
+        if chosen_start is None:
+            break
+
+    ordered = sorted(zip(starts, span_lengths), key=lambda x: x[0])
+
+    source = []
+    target = []
+    prev_end = 0
+    for idx, (start, length) in enumerate(ordered):
+        source.extend(tokens[prev_end:start])
+        source.append(sentinel(idx))
+        target.append(sentinel(idx))
+        target.extend(tokens[start:start + length])
+        prev_end = start + length
+    source.extend(tokens[prev_end:])
+    target.append(sentinel(len(ordered)))  # closing sentinel
+    return source, target
+
+
+def round_trip(source, target):
+    &quot;&quot;&quot;Reconstruct original by replacing sentinels in source with corresponding target spans.&quot;&quot;&quot;
+    # Parse target into sentinel-&gt;span map
+    spans = {}
+    current_key = None
+    current_span = []
+    for tok in target:
+        if tok.startswith(&quot;&lt;extra_id_&quot;):
+            if current_key is not None:
+                spans[current_key] = current_span
+            current_key = tok
+            current_span = []
+        else:
+            current_span.append(tok)
+    # Last sentinel in target has no following span (closing marker).
+    out = []
+    for tok in source:
+        if tok.startswith(&quot;&lt;extra_id_&quot;):
+            out.extend(spans.get(tok, []))
+        else:
+            out.append(tok)
+    return out
+
+
+def token_mask(tokens, rate=0.15, rng=None, mask_token=&quot;&lt;mask&gt;&quot;):
+    if rng is None:
+        rng = random.Random()
+    return [mask_token if rng.random() &lt; rate else t for t in tokens]
+
+
+def token_delete(tokens, rate=0.15, rng=None):
+    if rng is None:
+        rng = random.Random()
+    return [t for t in tokens if rng.random() &gt;= rate]
+
+
+def text_infill(tokens, rate=0.15, mean_span=3.0, rng=None, mask_token=&quot;&lt;mask&gt;&quot;):
+    &quot;&quot;&quot;BART text infill: mask spans with a SINGLE mask; decoder infers length.&quot;&quot;&quot;
+    if rng is None:
+        rng = random.Random()
+    out = []
+    i = 0
+    n = len(tokens)
+    budget = int(n * rate)
+    while i &lt; n:
+        if budget &gt; 0 and rng.random() &lt; 0.3:
+            span_len = max(1, min(int(rng.gauss(mean_span, 1.0)), budget, n - i))
+            out.append(mask_token)
+            budget -= span_len
+            i += span_len
+        else:
+            out.append(tokens[i])
+            i += 1
+    return out
+
+
+def sentence_permute(sentences, rng=None):
+    if rng is None:
+        rng = random.Random()
+    sents = list(sentences)
+    rng.shuffle(sents)
+    return sents
+
+
+def document_rotate(tokens, rng=None):
+    if rng is None:
+        rng = random.Random()
+    if len(tokens) &lt;= 1:
+        return tokens
+    pivot = rng.randrange(1, len(tokens))
+    return tokens[pivot:] + tokens[:pivot]
+
+
+def main():
+    rng = random.Random(42)
+
+    sentence = (
+        &quot;the quick brown fox jumps over the lazy dog a stitch in time saves nine &quot;
+        &quot;language models learn statistical patterns subword tokenization helps rare words&quot;
+    ).split()
+
+    print(&quot;=== T5 span corruption ===&quot;)
+    source, target = corrupt_spans(sentence, mask_rate=0.20, mean_span=3.0, rng=rng)
+    print(&quot;corrupted source:&quot;)
+    print(&quot;  &quot; + &quot; &quot;.join(source))
+    print()
+    print(&quot;decoder target:&quot;)
+    print(&quot;  &quot; + &quot; &quot;.join(target))
+    print()
+    reconstructed = round_trip(source, target)
+    print(&quot;reconstruction matches original:&quot;,
+          &quot;YES&quot; if reconstructed == sentence else &quot;NO&quot;)
+    if reconstructed != sentence:
+        print(&quot;  reconstructed: &quot; + &quot; &quot;.join(reconstructed))
+
+    print()
+    print(&quot;=== BART noise functions ===&quot;)
+    print(&quot;original: &quot; + &quot; &quot;.join(sentence[:14]))
+    print()
+    print(&quot;token mask:     &quot; + &quot; &quot;.join(token_mask(sentence[:14], rate=0.2, rng=random.Random(1))))
+    print(&quot;token delete:   &quot; + &quot; &quot;.join(token_delete(sentence[:14], rate=0.2, rng=random.Random(2))))
+    print(&quot;text infill:    &quot; + &quot; &quot;.join(text_infill(sentence[:14], rate=0.3, rng=random.Random(3))))
+
+    sentences = [
+        [&quot;the&quot;, &quot;quick&quot;, &quot;brown&quot;, &quot;fox&quot;],
+        [&quot;a&quot;, &quot;stitch&quot;, &quot;in&quot;, &quot;time&quot;],
+        [&quot;language&quot;, &quot;models&quot;, &quot;learn&quot;, &quot;patterns&quot;],
+    ]
+    perm = sentence_permute(sentences, rng=random.Random(4))
+    print(&quot;sentence permute:&quot;)
+    for s in perm:
+        print(&quot;  &quot; + &quot; &quot;.join(s))
+
+    print()
+    print(&quot;document rotate: &quot; + &quot; &quot;.join(document_rotate(sentence[:14], rng=random.Random(5))))
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/07-transformers-deep-dive/08-t5-bart-encoder-decoder/outputs/skill-seq2seq-picker.md">phases/07-transformers-deep-dive/08-t5-bart-encoder-decoder/outputs/skill-seq2seq-picker.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: seq2seq-picker
+description: Choose encoder-decoder vs decoder-only for a new sequence-to-sequence task.
+version: 1.0.0
+phase: 7
+lesson: 8
+tags: [transformers, t5, bart, seq2seq]
+---
+
+Given a seq2seq task (translation / summarization / speech-to-text / structured extraction / rewrite), input and output length distributions, and quality vs latency priorities, output:
+
+1. Architecture. One of: encoder-decoder (T5 / BART / Whisper-style), decoder-only instruction-tuned, encoder-only + prompt template. One-sentence reason.
+2. Pretraining objective. Span corruption (T5), denoising (BART), next-token (decoder-only), or &quot;skip pretraining, fine-tune existing checkpoint.&quot; Name the checkpoint.
+3. Input formatting. Task prefix string (T5 style) vs system prompt (decoder-only) vs raw tokens (BART). Include BOS/EOS handling.
+4. Decoding strategy. Beam search width and length penalty (translation/summary), or nucleus/min-p (chat-like tasks). State which for the task.
+5. Eval. Task-appropriate metric: BLEU / ROUGE / WER / F1 / exact match. Include test split size.
+
+Refuse to recommend encoder-only for generative outputs. Refuse to recommend encoder-decoder when the input is already a conversation — decoder-only fits conversation memory naturally. Flag any choice of decoder-only for speech-to-text without mentioning Whisper as the baseline to beat.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原课程未提供测验。</p></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/07-transformers-deep-dive/07-gpt-causal-language-modeling/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/07-transformers-deep-dive/09-vision-transformers/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/07-transformers-deep-dive/08-t5-bart-encoder-decoder/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

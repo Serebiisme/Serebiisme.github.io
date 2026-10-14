@@ -1,0 +1,824 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>图像生成 GAN · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-04-computer-vision" data-lesson="04-computer-vision/09-image-generation-gans" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/04-computer-vision/">计算机视觉</a> / LESSON 09</p><h1 class="lesson-title">图像生成 GAN</h1><p>Image Generation — GANs</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>图像生成 GAN</h1>
+<blockquote>
+<p>两种神经网络在一个固定游戏中,一个抽奖,一个批评. 他们一起变得更好,直到图纸欺骗了批评者.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 4 Lesson 03 (CNNs), Phase 3 Lesson 06 (Optimizers), Phase 3 Lesson 07 (Regularization)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>解释生成器和分辨器之间的最小数游戏,以及为什么平衡与p_model =p_data相符</li>
+<li>在 PyTorch 中实现DCGAN,并使它在60行以下生成一致的32x32合成图像</li>
+<li>通过三个标准技巧稳定GAN训练:不和损失,光谱规范,TTUR (两次更新规则)</li>
+<li>阅读训练曲线,将健康的融合与模式崩,振荡和歧视者完全区分</li>
+</ul>
+<h2>问题</h2>
+<p>类别教导网络将图像映射到标签上. 生成逆转问题:样本新图像看起来像来自同一分布. 没有&quot;正确&quot;输出,你可以不同;只有一个你想模仿的分布.</p>
+<p>标准损失函数 (MSE,跨进) 无法测量&quot;这个样本是否来自真实分布&quot;.减少每像素错误会产生模糊的平均值,而不是现实样本.突破是学习损失:训练第二个网络,其工作是区分真实与假,并使用其判断力推出发电机.</p>
+<p>截至2018年,StyleGAN正在生产1024x1024面,无法与照片区分.从那以后,扩散模型已经在质量和可控制性方面占据了王位,但使扩散实用化的每一个技巧都是GAN上第一次理解的.</p>
+<h2>概念</h2>
+<h3>两家网络</h3>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-1819261a0202b100df38.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>其他<strong>generator</strong> G 取出噪音向量<code>z</code>它们可以通过一个图像来输出.<strong>discriminator</strong>图像的概率是真实的.</p>
+<h3>游戏</h3>
+<p>格希望D错误,D想要正确.</p>
+<pre><code>min_G max_D  E_x[log D(x)] + E_z[log(1 - D(G(z)))]
+</code></pre>
+<p>读到右到左:D是最大化真实 (<code>log D(real)</code>) 和假 (<code>log (1 - D(fake))</code>图像. G 正在尽量减少D的虚假信息准确性.<code>D(G(z))</code>为了高兴.</p>
+<p>士证明这个最小值有一个全球平衡<code>p_G = p_data</code>并且在生成和实际分布之间的森-申农分歧是零.</p>
+<h3>无化的损失</h3>
+<p>早期训练, 早期训练,<code>D(G(z))</code>对于每一个假冒,几乎是零,所以<code>log(1 - D(G(z)))</code>解决方案是翻转G的损失.</p>
+<pre><code>L_D = -E_x[log D(x)] - E_z[log(1 - D(G(z)))]
+L_G = -E_z[log D(G(z))]                          # non-saturating
+</code></pre>
+<p>现在什么时候?<code>D(G(z))</code>现在,每一个现代GAN列车都用这种变体.</p>
+<h3>DCGAN架构规则</h3>
+<p>拉德福德,梅茨,辛塔拉 (2015) 将多年的失败实验分成五项规则,使得GAN训练稳定:</p>
+<ol>
+<li>换成双脚 (两个网) 的聚合器.</li>
+<li>在发电机和分辨器中使用批量标准,除了G输出和D输入.</li>
+<li>移除更深层的结构上完全连接的层次.</li>
+<li>G 在所有层上使用ReLU,除了输出 (在 [-1, 1] 中输出的tanh).</li>
+<li>D 在所有层上使用LeakyReLU (负_斜率=0.2).</li>
+</ol>
+<p>现在,每一个基于的GAN (StyleGAN,BigGAN,GigaGAN) 都从这些规则开始,</p>
+<h3>失败模式及其签名</h3>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-546842ef598961eb2654.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><ul>
+<li><strong>Mode collapse</strong>修复:添加微批次分辨率,光谱规范或标签条件.</li>
+<li><strong>Discriminator wins</strong>修复:D较小,D学习率较低,或将标签滑滑在真实标签上.</li>
+<li><strong>Oscillation</strong>修复:TTUR (D学习比G快2倍2倍),或转向Wasserstein损失.</li>
+</ul>
+<h3>评估</h3>
+<p>没有实在的GAN,你怎么知道它们是有效的?</p>
+<ul>
+<li><strong>Sample inspection</strong>每一个时代结束时,只要看看64个样本.</li>
+<li><strong>FID (Fréchet Inception Distance)</strong> 距离在实体和生成集合的分类中.较低更好.</li>
+<li><strong>Inception Score</strong>年龄较大,较脆弱;更喜欢FID.</li>
+<li><strong>Precision/Recall for generative models</strong> 单独测量质量 (精度) 和覆盖性 (召回).</li>
+</ul>
+<p>对于小型合成数据运行,样本检查就足够了.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-58b06d9de7789fe80e9e.png" alt="cv-gan-image 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<h3>步骤1:发电机</h3>
+<p>通过 64 维噪音生成32x32图像的小型DCGAN发电机.</p>
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+class Generator(nn.Module):
+    def __init__(self, z_dim=64, img_channels=3, feat=64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.ConvTranspose2d(z_dim, feat * 4, kernel_size=4, stride=1, padding=0, bias=False),
+            nn.BatchNorm2d(feat * 4),
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(feat * 4, feat * 2, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(feat * 2),
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(feat * 2, feat, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(feat),
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(feat, img_channels, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.Tanh(),
+        )
+
+    def forward(self, z):
+        return self.net(z.view(z.size(0), -1, 1, 1))
+</code></pre>
+<p>转换了四个车辆,每个车辆都有<code>kernel_size=4, stride=2, padding=1</code>通过TANH,输出激活在 [-1, 1] 中.</p>
+<h3>第二步: 歧视者</h3>
+<p>漏的雷卢,步骤的电梯,以一个尺度的逻辑结束.</p>
+<pre><code class="language-python">class Discriminator(nn.Module):
+    def __init__(self, img_channels=3, feat=64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(img_channels, feat, kernel_size=4, stride=2, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(feat, feat * 2, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(feat * 2),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(feat * 2, feat * 4, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(feat * 4),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(feat * 4, 1, kernel_size=4, stride=1, padding=0),
+        )
+
+    def forward(self, x):
+        return self.net(x).view(-1)
+</code></pre>
+<p>最后一个缩一个<code>4x4</code>功能地图<code>1x1</code>输出是每张图像的单个 skalar;仅在损失计算过程中应用 sigmoid.</p>
+<h3>步骤3:培训步骤</h3>
+<p>换个方式:一次更新D,然后一次更新G,每批次.</p>
+<pre><code class="language-python">import torch.nn.functional as F
+
+def train_step(G, D, real, z, opt_g, opt_d, device):
+    real = real.to(device)
+    bs = real.size(0)
+
+    # D step
+    opt_d.zero_grad()
+    d_real = D(real)
+    d_fake = D(G(z).detach())
+    loss_d = (F.binary_cross_entropy_with_logits(d_real, torch.ones_like(d_real))
+              + F.binary_cross_entropy_with_logits(d_fake, torch.zeros_like(d_fake)))
+    loss_d.backward()
+    opt_d.step()
+
+    # G step
+    opt_g.zero_grad()
+    d_fake = D(G(z))
+    loss_g = F.binary_cross_entropy_with_logits(d_fake, torch.ones_like(d_fake))
+    loss_g.backward()
+    opt_g.step()
+
+    return loss_d.item(), loss_g.item()
+</code></pre>
+<p><code>G(z).detach()</code>在D步骤中,关键是:我们不希望更新时渐变流入G.忘记这是经典的初学者错误.</p>
+<h3>步骤4:合成形状的全训练循环</h3>
+<pre><code class="language-python">from torch.utils.data import DataLoader, TensorDataset
+import numpy as np
+
+def synthetic_images(num=2000, size=32, seed=0):
+    rng = np.random.default_rng(seed)
+    imgs = np.zeros((num, 3, size, size), dtype=np.float32) - 1.0
+    for i in range(num):
+        r = rng.uniform(6, 12)
+        cx, cy = rng.uniform(r, size - r, size=2)
+        yy, xx = np.meshgrid(np.arange(size), np.arange(size), indexing=&quot;ij&quot;)
+        mask = (xx - cx) ** 2 + (yy - cy) ** 2 &lt; r ** 2
+        color = rng.uniform(-0.5, 1.0, size=3)
+        for c in range(3):
+            imgs[i, c][mask] = color[c]
+    return torch.from_numpy(imgs)
+
+device = &quot;cuda&quot; if torch.cuda.is_available() else &quot;cpu&quot;
+data = synthetic_images()
+loader = DataLoader(TensorDataset(data), batch_size=64, shuffle=True)
+
+G = Generator(z_dim=64, img_channels=3, feat=32).to(device)
+D = Discriminator(img_channels=3, feat=32).to(device)
+opt_g = torch.optim.Adam(G.parameters(), lr=2e-4, betas=(0.5, 0.999))
+opt_d = torch.optim.Adam(D.parameters(), lr=2e-4, betas=(0.5, 0.999))
+
+for epoch in range(10):
+    for (batch,) in loader:
+        z = torch.randn(batch.size(0), 64, device=device)
+        ld, lg = train_step(G, D, batch, z, opt_g, opt_d, device)
+    print(f&quot;epoch {epoch}  D {ld:.3f}  G {lg:.3f}&quot;)
+</code></pre>
+<p><code>Adam(lr=2e-4, betas=(0.5, 0.999))</code>低的beta1 阻碍动力期来稳定对手的游戏.</p>
+<h3>步骤5:采样</h3>
+<pre><code class="language-python">@torch.no_grad()
+def sample(G, n=16, z_dim=64, device=&quot;cpu&quot;):
+    G.eval()
+    z = torch.randn(n, z_dim, device=device)
+    imgs = G(z)
+    imgs = (imgs + 1) / 2
+    return imgs.clamp(0, 1)
+</code></pre>
+<p>在采样之前,总是切换到评估模式.对于DCGAN来说,这是重要的,因为使用批量规范运行统计数据而不是批量统计数据.</p>
+<h3>步骤 6: 频谱规范化</h3>
+<p>网络保证的区别器中,BN的替代器是1-Lipschitz.</p>
+<pre><code class="language-python">from torch.nn.utils import spectral_norm
+
+def build_sn_discriminator(img_channels=3, feat=64):
+    return nn.Sequential(
+        spectral_norm(nn.Conv2d(img_channels, feat, 4, 2, 1)),
+        nn.LeakyReLU(0.2, inplace=True),
+        spectral_norm(nn.Conv2d(feat, feat * 2, 4, 2, 1)),
+        nn.LeakyReLU(0.2, inplace=True),
+        spectral_norm(nn.Conv2d(feat * 2, feat * 4, 4, 2, 1)),
+        nn.LeakyReLU(0.2, inplace=True),
+        spectral_norm(nn.Conv2d(feat * 4, 1, 4, 1, 0)),
+    )
+</code></pre>
+<p>换换<code>Discriminator</code>为了<code>build_sn_discriminator()</code>频谱规范是你能应用的最简单的单一强度升级.</p>
+<h2>用它</h2>
+<p>对于严格的生成,使用预训练的权重或转换为扩散.</p>
+<ul>
+<li><code>torch_fidelity</code>在你的发电机上计算FID/IS,而不需要编写定制的评估代码.</li>
+<li><code>pytorch-gan-zoo</code>其他国家<code>StudioGAN</code>试验的DCGAN,WGAN-GP,SN-GAN,StayGAN和BigGAN的实施方案.</li>
+</ul>
+<p>在2026年,GAN仍然是最好的选择:实时图像生成 (延迟 &lt;10 ms),风格转移,精确控制的图像到图像翻译 (Pix2Pix,CycleGAN).</p>
+<h2>运送它</h2>
+<p>这一课产生了:</p>
+<ul>
+<li><code>outputs/prompt-gan-training-triage.md</code>一个提示,读取训练曲线描述,选择失败模式 (模式崩,D-win,振荡) 加上单个建议的修复.</li>
+<li><code>outputs/skill-dcgan-scaffold.md</code>写一个DCGAN架子的技能<code>z_dim</code>目标<code>image_size</code>其他<code>num_channels</code>包括训练循环和样本节省器.</li>
+</ul>
+<h2>运动</h2>
+<ol>
+<li>**(Easy)**在每个时代结束时,将DCGAN训练在合成圈数据集上,并保存16个样本的网格.</li>
+<li>**(Medium)**换取分辨器的批量标准,用光谱标准. 训练两种版本一边. 哪个版本更快地融合?哪个种子之间的差异较低?</li>
+<li>**(Hard)**实施条件的DCGAN:将类标签输入到G和D (在G中对噪音进行一次性缩,在D中缩放类嵌入道).从第7课中训练合成&quot;圆与平方&quot;数据集,并通过采用特定标签进行样本测试来证明类调节工作.</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Generator (G)</td>
+<td>&quot;The draws-stuff net&quot;</td>
+<td>Maps noise to images; trained to fool the discriminator</td>
+</tr>
+<tr>
+<td>Discriminator (D)</td>
+<td>&quot;The critic&quot;</td>
+<td>Binary classifier; trained to distinguish real from generated images</td>
+</tr>
+<tr>
+<td>Minimax</td>
+<td>&quot;The game&quot;</td>
+<td>min over G, max over D of an adversarial loss; equilibrium is p_G = p_data</td>
+</tr>
+<tr>
+<td>Non-saturating loss</td>
+<td>&quot;The numerically sane version&quot;</td>
+<td>G's loss is -log(D(G(z))) instead of log(1 - D(G(z))) to avoid vanishing gradients early in training</td>
+</tr>
+<tr>
+<td>Mode collapse</td>
+<td>&quot;Generator makes one thing&quot;</td>
+<td>G produces only a small subset of the data distribution; fix with SN, minibatch discrimination, or larger batch</td>
+</tr>
+<tr>
+<td>TTUR</td>
+<td>&quot;Two learning rates&quot;</td>
+<td>D learns faster than G, typically by a factor of 2-4; stabilises training</td>
+</tr>
+<tr>
+<td>Spectral norm</td>
+<td>&quot;1-Lipschitz layer&quot;</td>
+<td>A weight-normalisation that bounds each layer's Lipschitz constant; stops D from becoming arbitrarily steep</td>
+</tr>
+<tr>
+<td>FID</td>
+<td>&quot;Fréchet Inception Distance&quot;</td>
+<td>Distance between Inception-v3 feature distributions of real and generated sets; the standard evaluation metric</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/1406.2661" rel="noreferrer" data-network="true">Generative Adversarial Networks (Goodfellow et al., 2014) <small>↗ 需要联网</small></a>报纸是这一切的起始.</li>
+<li><a href="https://arxiv.org/abs/1511.06434" rel="noreferrer" data-network="true">DCGAN (Radford, Metz, Chintala, 2015) <small>↗ 需要联网</small></a>使GAN可培训的建筑规则</li>
+<li><a href="https://arxiv.org/abs/1802.05957" rel="noreferrer" data-network="true">Spectral Normalization for GANs (Miyato et al., 2018) <small>↗ 需要联网</small></a>最有用的稳定技巧</li>
+<li><a href="https://arxiv.org/abs/2106.12423" rel="noreferrer" data-network="true">StyleGAN3 (Karras et al., 2021) <small>↗ 需要联网</small></a>苏塔甘;读起来像一个最伟大的成功专辑,</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Image Generation — GANs</h1>
+<blockquote>
+<p>A GAN is two neural networks in a fixed game. One draws, one critiques. They get better together until the drawings fool the critic.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 4 Lesson 03 (CNNs), Phase 3 Lesson 06 (Optimizers), Phase 3 Lesson 07 (Regularization)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Explain the minimax game between generator and discriminator and why the equilibrium corresponds to p_model = p_data</li>
+<li>Implement a DCGAN in PyTorch and get it to generate coherent 32x32 synthetic images in under 60 lines</li>
+<li>Stabilise GAN training with the three standard tricks: non-saturating loss, spectral norm, TTUR (two-timescale update rule)</li>
+<li>Read training curves that distinguish healthy convergence from mode collapse, oscillation, and discriminator-wins-completely</li>
+</ul>
+<h2>The Problem</h2>
+<p>Classification teaches a network to map images to labels. Generation inverts the problem: sample new images that look like they came from the same distribution. There is no &quot;correct&quot; output you can diff against; there is only a distribution you want to mimic.</p>
+<p>The standard loss functions (MSE, cross-entropy) cannot measure &quot;did this sample come from the real distribution.&quot; Minimising per-pixel error produces blurry averages, not realistic samples. The breakthrough was to learn the loss: train a second network whose job is to tell real from fake, and use its judgement to push the generator.</p>
+<p>GANs (Goodfellow et al., 2014) defined that framework. By 2018 StyleGAN was producing 1024x1024 faces indistinguishable from photographs. Diffusion models have since taken the throne on quality and controllability, but every trick that makes diffusion practical — normalisation choices, latent spaces, feature losses — was first understood on GANs.</p>
+<h2>The Concept</h2>
+<h3>The two networks</h3>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-1819261a0202b100df38.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>The <strong>generator</strong> G takes a vector of noise <code>z</code> and outputs an image. The <strong>discriminator</strong> D takes an image and outputs a single scalar: the probability that the image is real.</p>
+<h3>The game</h3>
+<p>G wants D to be wrong. D wants to be right. Formally:</p>
+<pre><code>min_G max_D  E_x[log D(x)] + E_z[log(1 - D(G(z)))]
+</code></pre>
+<p>Read right to left: D is maximising accuracy on real (<code>log D(real)</code>) and fake (<code>log (1 - D(fake))</code>) images. G is minimising D's accuracy on fakes — it wants <code>D(G(z))</code> to be high.</p>
+<p>Goodfellow proved that this minimax has a global equilibrium where <code>p_G = p_data</code>, D outputs 0.5 everywhere, and the Jensen-Shannon divergence between generated and real distributions is zero. The hard part is getting there.</p>
+<h3>Non-saturating loss</h3>
+<p>The form above is numerically unstable. Early in training, <code>D(G(z))</code> is near zero for every fake, so <code>log(1 - D(G(z)))</code> has vanishing gradients with respect to G. The fix: flip G's loss.</p>
+<pre><code>L_D = -E_x[log D(x)] - E_z[log(1 - D(G(z)))]
+L_G = -E_z[log D(G(z))]                          # non-saturating
+</code></pre>
+<p>Now when <code>D(G(z))</code> is near zero, G's loss is large and its gradient is informative. Every modern GAN trains with this variant.</p>
+<h3>DCGAN architecture rules</h3>
+<p>Radford, Metz, Chintala (2015) distilled years of failed experiments into five rules that make GAN training stable:</p>
+<ol>
+<li>Replace pooling with strided convs (both nets).</li>
+<li>Use batch norm in both generator and discriminator, except output of G and input of D.</li>
+<li>Remove fully connected layers on deeper architectures.</li>
+<li>G uses ReLU on all layers except output (tanh for output in [-1, 1]).</li>
+<li>D uses LeakyReLU (negative_slope=0.2) on all layers.</li>
+</ol>
+<p>Every modern conv-based GAN (StyleGAN, BigGAN, GigaGAN) still starts from these rules and replaces pieces one at a time.</p>
+<h3>Failure modes and their signatures</h3>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-546842ef598961eb2654.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><ul>
+<li><strong>Mode collapse</strong>: G finds one image that fools D and produces only that. Fix: add minibatch discrimination, spectral norm, or label-conditioning.</li>
+<li><strong>Discriminator wins</strong>: D becomes too strong too fast, G's gradients vanish. Fix: smaller D, lower D learning rate, or apply label smoothing on the real labels.</li>
+<li><strong>Oscillation</strong>: the two nets trade wins without ever approaching equilibrium. Fix: TTUR (D learns faster than G by a factor of 2-4), or switch to Wasserstein loss.</li>
+</ul>
+<h3>Evaluation</h3>
+<p>GANs have no ground truth, so how do you know they are working?</p>
+<ul>
+<li><strong>Sample inspection</strong> — just look at 64 samples at the end of every epoch. Non-negotiable.</li>
+<li><strong>FID (Fréchet Inception Distance)</strong> — distance between Inception-v3 feature distributions of real and generated sets. Lower is better. Community standard.</li>
+<li><strong>Inception Score</strong> — older, more brittle; prefer FID.</li>
+<li><strong>Precision/Recall for generative models</strong> — measures quality (precision) and coverage (recall) separately. More informative than FID alone.</li>
+</ul>
+<p>For a small synthetic-data run, sample inspection is enough.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-58b06d9de7789fe80e9e.png" alt="cv-gan-image 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<h3>Step 1: Generator</h3>
+<p>A small DCGAN generator that takes 64-dim noise and produces a 32x32 image.</p>
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+class Generator(nn.Module):
+    def __init__(self, z_dim=64, img_channels=3, feat=64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.ConvTranspose2d(z_dim, feat * 4, kernel_size=4, stride=1, padding=0, bias=False),
+            nn.BatchNorm2d(feat * 4),
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(feat * 4, feat * 2, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(feat * 2),
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(feat * 2, feat, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(feat),
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(feat, img_channels, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.Tanh(),
+        )
+
+    def forward(self, z):
+        return self.net(z.view(z.size(0), -1, 1, 1))
+</code></pre>
+<p>Four transposed convs, each with <code>kernel_size=4, stride=2, padding=1</code> so they cleanly double spatial size. Output activations in [-1, 1] via tanh.</p>
+<h3>Step 2: Discriminator</h3>
+<p>Mirror of the generator. LeakyReLU, strided convs, ends with a scalar logit.</p>
+<pre><code class="language-python">class Discriminator(nn.Module):
+    def __init__(self, img_channels=3, feat=64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(img_channels, feat, kernel_size=4, stride=2, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(feat, feat * 2, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(feat * 2),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(feat * 2, feat * 4, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(feat * 4),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(feat * 4, 1, kernel_size=4, stride=1, padding=0),
+        )
+
+    def forward(self, x):
+        return self.net(x).view(-1)
+</code></pre>
+<p>The last conv reduces a <code>4x4</code> feature map to <code>1x1</code>. Output is a single scalar per image; apply sigmoid only during loss computation.</p>
+<h3>Step 3: Training step</h3>
+<p>Alternate: update D once, then G once, every batch.</p>
+<pre><code class="language-python">import torch.nn.functional as F
+
+def train_step(G, D, real, z, opt_g, opt_d, device):
+    real = real.to(device)
+    bs = real.size(0)
+
+    # D step
+    opt_d.zero_grad()
+    d_real = D(real)
+    d_fake = D(G(z).detach())
+    loss_d = (F.binary_cross_entropy_with_logits(d_real, torch.ones_like(d_real))
+              + F.binary_cross_entropy_with_logits(d_fake, torch.zeros_like(d_fake)))
+    loss_d.backward()
+    opt_d.step()
+
+    # G step
+    opt_g.zero_grad()
+    d_fake = D(G(z))
+    loss_g = F.binary_cross_entropy_with_logits(d_fake, torch.ones_like(d_fake))
+    loss_g.backward()
+    opt_g.step()
+
+    return loss_d.item(), loss_g.item()
+</code></pre>
+<p><code>G(z).detach()</code> in the D step is critical: we do not want gradients flowing into G during its update. Forgetting that is the classic beginner bug.</p>
+<h3>Step 4: Full training loop on synthetic shapes</h3>
+<pre><code class="language-python">from torch.utils.data import DataLoader, TensorDataset
+import numpy as np
+
+def synthetic_images(num=2000, size=32, seed=0):
+    rng = np.random.default_rng(seed)
+    imgs = np.zeros((num, 3, size, size), dtype=np.float32) - 1.0
+    for i in range(num):
+        r = rng.uniform(6, 12)
+        cx, cy = rng.uniform(r, size - r, size=2)
+        yy, xx = np.meshgrid(np.arange(size), np.arange(size), indexing=&quot;ij&quot;)
+        mask = (xx - cx) ** 2 + (yy - cy) ** 2 &lt; r ** 2
+        color = rng.uniform(-0.5, 1.0, size=3)
+        for c in range(3):
+            imgs[i, c][mask] = color[c]
+    return torch.from_numpy(imgs)
+
+device = &quot;cuda&quot; if torch.cuda.is_available() else &quot;cpu&quot;
+data = synthetic_images()
+loader = DataLoader(TensorDataset(data), batch_size=64, shuffle=True)
+
+G = Generator(z_dim=64, img_channels=3, feat=32).to(device)
+D = Discriminator(img_channels=3, feat=32).to(device)
+opt_g = torch.optim.Adam(G.parameters(), lr=2e-4, betas=(0.5, 0.999))
+opt_d = torch.optim.Adam(D.parameters(), lr=2e-4, betas=(0.5, 0.999))
+
+for epoch in range(10):
+    for (batch,) in loader:
+        z = torch.randn(batch.size(0), 64, device=device)
+        ld, lg = train_step(G, D, batch, z, opt_g, opt_d, device)
+    print(f&quot;epoch {epoch}  D {ld:.3f}  G {lg:.3f}&quot;)
+</code></pre>
+<p><code>Adam(lr=2e-4, betas=(0.5, 0.999))</code> is the DCGAN default — the low beta1 keeps the momentum term from stabilising the adversarial game too much.</p>
+<h3>Step 5: Sampling</h3>
+<pre><code class="language-python">@torch.no_grad()
+def sample(G, n=16, z_dim=64, device=&quot;cpu&quot;):
+    G.eval()
+    z = torch.randn(n, z_dim, device=device)
+    imgs = G(z)
+    imgs = (imgs + 1) / 2
+    return imgs.clamp(0, 1)
+</code></pre>
+<p>Always switch to eval mode before sampling. For DCGAN this matters because batch norm running stats are used instead of the batch's stats.</p>
+<h3>Step 6: Spectral normalisation</h3>
+<p>A drop-in replacement for BN in the discriminator that guarantees the network is 1-Lipschitz. Fixes most &quot;D wins too hard&quot; failures.</p>
+<pre><code class="language-python">from torch.nn.utils import spectral_norm
+
+def build_sn_discriminator(img_channels=3, feat=64):
+    return nn.Sequential(
+        spectral_norm(nn.Conv2d(img_channels, feat, 4, 2, 1)),
+        nn.LeakyReLU(0.2, inplace=True),
+        spectral_norm(nn.Conv2d(feat, feat * 2, 4, 2, 1)),
+        nn.LeakyReLU(0.2, inplace=True),
+        spectral_norm(nn.Conv2d(feat * 2, feat * 4, 4, 2, 1)),
+        nn.LeakyReLU(0.2, inplace=True),
+        spectral_norm(nn.Conv2d(feat * 4, 1, 4, 1, 0)),
+    )
+</code></pre>
+<p>Swap <code>Discriminator</code> for <code>build_sn_discriminator()</code> and you often do not need the TTUR trick. Spectral norm is the easiest single robustness upgrade you can apply.</p>
+<h2>Use It</h2>
+<p>For serious generation, use pretrained weights or switch to diffusion. Two standard libraries:</p>
+<ul>
+<li><code>torch_fidelity</code> computes FID / IS on your generator without writing custom eval code.</li>
+<li><code>pytorch-gan-zoo</code> (legacy) and <code>StudioGAN</code> ship tested implementations of DCGAN, WGAN-GP, SN-GAN, StyleGAN, and BigGAN.</li>
+</ul>
+<p>In 2026, GANs are still the best choice for: real-time image generation (latency &lt;10 ms), style transfer, image-to-image translation with precise control (Pix2Pix, CycleGAN). Diffusion wins on photorealism and text conditioning.</p>
+<h2>Ship It</h2>
+<p>This lesson produces:</p>
+<ul>
+<li><code>outputs/prompt-gan-training-triage.md</code> — a prompt that reads a training curve description and picks the failure mode (mode collapse, D-wins, oscillation) plus the single recommended fix.</li>
+<li><code>outputs/skill-dcgan-scaffold.md</code> — a skill that writes a DCGAN scaffold from <code>z_dim</code>, target <code>image_size</code>, and <code>num_channels</code>, including training loop and sample saver.</li>
+</ul>
+<h2>Exercises</h2>
+<ol>
+<li><strong>(Easy)</strong> Train the DCGAN above on the synthetic circle dataset and save a grid of 16 samples at the end of each epoch. By which epoch do the generated circles become clearly circular?</li>
+<li><strong>(Medium)</strong> Replace the discriminator's batch norm with spectral norm. Train both versions side by side. Which one converges faster? Which one has lower variance across three seeds?</li>
+<li><strong>(Hard)</strong> Implement a conditional DCGAN: feed the class label into both G and D (concat one-hot to the noise in G, concat a class embedding channel in D). Train on the synthetic &quot;circles vs squares&quot; dataset from lesson 7 and show that class conditioning works by sampling with specific labels.</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Generator (G)</td>
+<td>&quot;The draws-stuff net&quot;</td>
+<td>Maps noise to images; trained to fool the discriminator</td>
+</tr>
+<tr>
+<td>Discriminator (D)</td>
+<td>&quot;The critic&quot;</td>
+<td>Binary classifier; trained to distinguish real from generated images</td>
+</tr>
+<tr>
+<td>Minimax</td>
+<td>&quot;The game&quot;</td>
+<td>min over G, max over D of an adversarial loss; equilibrium is p_G = p_data</td>
+</tr>
+<tr>
+<td>Non-saturating loss</td>
+<td>&quot;The numerically sane version&quot;</td>
+<td>G's loss is -log(D(G(z))) instead of log(1 - D(G(z))) to avoid vanishing gradients early in training</td>
+</tr>
+<tr>
+<td>Mode collapse</td>
+<td>&quot;Generator makes one thing&quot;</td>
+<td>G produces only a small subset of the data distribution; fix with SN, minibatch discrimination, or larger batch</td>
+</tr>
+<tr>
+<td>TTUR</td>
+<td>&quot;Two learning rates&quot;</td>
+<td>D learns faster than G, typically by a factor of 2-4; stabilises training</td>
+</tr>
+<tr>
+<td>Spectral norm</td>
+<td>&quot;1-Lipschitz layer&quot;</td>
+<td>A weight-normalisation that bounds each layer's Lipschitz constant; stops D from becoming arbitrarily steep</td>
+</tr>
+<tr>
+<td>FID</td>
+<td>&quot;Fréchet Inception Distance&quot;</td>
+<td>Distance between Inception-v3 feature distributions of real and generated sets; the standard evaluation metric</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/1406.2661" rel="noreferrer" data-network="true">Generative Adversarial Networks (Goodfellow et al., 2014) <small>↗ 需要联网</small></a> — the paper that started it all</li>
+<li><a href="https://arxiv.org/abs/1511.06434" rel="noreferrer" data-network="true">DCGAN (Radford, Metz, Chintala, 2015) <small>↗ 需要联网</small></a> — the architecture rules that made GANs trainable</li>
+<li><a href="https://arxiv.org/abs/1802.05957" rel="noreferrer" data-network="true">Spectral Normalization for GANs (Miyato et al., 2018) <small>↗ 需要联网</small></a> — the single most useful stabilisation trick</li>
+<li><a href="https://arxiv.org/abs/2106.12423" rel="noreferrer" data-network="true">StyleGAN3 (Karras et al., 2021) <small>↗ 需要联网</small></a> — the SOTA GAN; reads like a greatest-hits album of every trick from the last decade</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-04-computer-vision--09-image-generation-gans.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-04-computer-vision--09-image-generation-gans.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/04-computer-vision/09-image-generation-gans/code/main.py">phases/04-computer-vision/09-image-generation-gans/code/main.py</a><details><summary>查看原始文本</summary><pre><code>import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
+from torch.nn.utils import spectral_norm
+
+
+class Generator(nn.Module):
+    def __init__(self, z_dim=64, img_channels=3, feat=32):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.ConvTranspose2d(z_dim, feat * 4, 4, 1, 0, bias=False),
+            nn.BatchNorm2d(feat * 4),
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(feat * 4, feat * 2, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(feat * 2),
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(feat * 2, feat, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(feat),
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(feat, img_channels, 4, 2, 1, bias=False),
+            nn.Tanh(),
+        )
+
+    def forward(self, z):
+        return self.net(z.view(z.size(0), -1, 1, 1))
+
+
+class Discriminator(nn.Module):
+    def __init__(self, img_channels=3, feat=32, use_sn=False):
+        super().__init__()
+        layers = []
+        def conv(in_c, out_c, bn):
+            c = nn.Conv2d(in_c, out_c, 4, 2, 1, bias=not bn)
+            if use_sn:
+                c = spectral_norm(c)
+            layers.append(c)
+            if bn and not use_sn:
+                layers.append(nn.BatchNorm2d(out_c))
+            layers.append(nn.LeakyReLU(0.2, inplace=True))
+
+        conv(img_channels, feat, bn=False)
+        conv(feat, feat * 2, bn=True)
+        conv(feat * 2, feat * 4, bn=True)
+        last = nn.Conv2d(feat * 4, 1, 4, 1, 0)
+        layers.append(spectral_norm(last) if use_sn else last)
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x).view(-1)
+
+
+def train_step(G, D, real, z, opt_g, opt_d, device):
+    real = real.to(device)
+
+    opt_d.zero_grad()
+    d_real = D(real)
+    d_fake = D(G(z).detach())
+    loss_d = (F.binary_cross_entropy_with_logits(d_real, torch.ones_like(d_real))
+              + F.binary_cross_entropy_with_logits(d_fake, torch.zeros_like(d_fake)))
+    loss_d.backward()
+    opt_d.step()
+
+    opt_g.zero_grad()
+    d_fake = D(G(z))
+    loss_g = F.binary_cross_entropy_with_logits(d_fake, torch.ones_like(d_fake))
+    loss_g.backward()
+    opt_g.step()
+
+    return loss_d.item(), loss_g.item()
+
+
+def synthetic_circles(num=800, size=32, seed=0):
+    rng = np.random.default_rng(seed)
+    imgs = np.full((num, 3, size, size), -1.0, dtype=np.float32)
+    yy, xx = np.meshgrid(np.arange(size), np.arange(size), indexing=&quot;ij&quot;)
+    for i in range(num):
+        r = rng.uniform(6, 10)
+        cx, cy = rng.uniform(r, size - r, size=2)
+        mask = (xx - cx) ** 2 + (yy - cy) ** 2 &lt; r ** 2
+        color = rng.uniform(-0.3, 1.0, size=3)
+        for c in range(3):
+            imgs[i, c][mask] = color[c]
+    return torch.from_numpy(imgs)
+
+
+@torch.no_grad()
+def sample(G, n=8, z_dim=64, device=&quot;cpu&quot;):
+    G.eval()
+    z = torch.randn(n, z_dim, device=device)
+    out = G(z)
+    G.train()
+    return ((out + 1) / 2).clamp(0, 1)
+
+
+def main():
+    torch.manual_seed(0)
+    device = &quot;cuda&quot; if torch.cuda.is_available() else &quot;cpu&quot;
+    z_dim = 64
+
+    data = synthetic_circles(num=400)
+    loader = DataLoader(TensorDataset(data), batch_size=32, shuffle=True)
+
+    G = Generator(z_dim=z_dim, img_channels=3, feat=32).to(device)
+    D = Discriminator(img_channels=3, feat=32, use_sn=True).to(device)
+    opt_g = torch.optim.Adam(G.parameters(), lr=2e-4, betas=(0.5, 0.999))
+    opt_d = torch.optim.Adam(D.parameters(), lr=2e-4, betas=(0.5, 0.999))
+
+    print(f&quot;G params: {sum(p.numel() for p in G.parameters()):,}&quot;)
+    print(f&quot;D params: {sum(p.numel() for p in D.parameters()):,}&quot;)
+
+    for epoch in range(5):
+        ld_sum, lg_sum, n = 0.0, 0.0, 0
+        for (batch,) in loader:
+            z = torch.randn(batch.size(0), z_dim, device=device)
+            ld, lg = train_step(G, D, batch, z, opt_g, opt_d, device)
+            ld_sum += ld
+            lg_sum += lg
+            n += 1
+        print(f&quot;epoch {epoch}  D {ld_sum/n:.3f}  G {lg_sum/n:.3f}&quot;)
+
+    samples = sample(G, n=8, z_dim=z_dim, device=device)
+    print(f&quot;generated shape: {tuple(samples.shape)}  range [{samples.min():.2f}, {samples.max():.2f}]&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/04-computer-vision/09-image-generation-gans/outputs/prompt-gan-training-triage.md">phases/04-computer-vision/09-image-generation-gans/outputs/prompt-gan-training-triage.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: prompt-gan-training-triage
+description: Read a description of GAN training curves and pick the failure mode plus the single recommended fix
+phase: 4
+lesson: 9
+---
+
+You are a GAN training triage specialist. Given the training report below, pick exactly one failure mode and return exactly one fix. Never a list of options.
+
+## Inputs
+
+- `d_loss_trend`: average discriminator loss over last N epochs (numbers + trend direction).
+- `g_loss_trend`: same for generator.
+- `sample_notes`: short human description of what the samples look like.
+
+## Failure modes
+
+### 1. D wins completely
+Symptoms:
+- d_loss near zero and decreasing
+- g_loss increasing or &gt;&gt; 5
+- samples look random or stuck at one noise pattern
+
+Fix: Replace BatchNorm in D with `spectral_norm`. If still failing, lower D learning rate by 2x (TTUR in the opposite direction).
+
+### 2. Mode collapse
+Symptoms:
+- d_loss oscillates in moderate range (0.5-1.0)
+- g_loss low but varies
+- samples look like a small handful of images regardless of noise
+
+Fix: Add minibatch discrimination, or double the batch size, or add label conditioning if labels are available.
+
+### 3. Oscillation / no convergence
+Symptoms:
+- both losses swing widely epoch to epoch
+- samples flicker between different failure modes
+
+Fix: TTUR — set `d_lr = 4 * g_lr`, with `d_lr = 4e-4, g_lr = 1e-4`. Alternatively, switch to WGAN-GP which uses Earth-Mover distance and is more stable than BCE.
+
+### 4. Nash equilibrium / D uncertain (D outputs ~0.5)
+Symptoms:
+- d_loss near `log(4)` = 1.386 and static
+- g_loss near `log(2)` = 0.693 and static
+- samples look reasonable
+
+Interpretation: This is the equilibrium. Not a failure. Continue training or stop and evaluate FID.
+
+### 5. Vanishing generator gradient
+Symptoms:
+- d_loss tiny (&lt; 0.05)
+- g_loss very large (&gt;10)
+- samples are nonsense
+
+Fix: non-saturating generator loss (you may be using the saturating version). If D outputs **logits** (no final sigmoid), use `-log(sigmoid(D(G(z))))`; if D outputs **probabilities** (has final sigmoid), use `-log(D(G(z)))`. The saturating form is `log(1 - sigmoid(D(G(z))))` or `log(1 - D(G(z)))` respectively — avoid it.
+
+## Output
+
+```
+[triage]
+  failure:  &lt;name&gt;
+  evidence: d_loss trend + g_loss trend + sample description quoted
+  fix:      &lt;one concrete change&gt;
+  retry:    &lt;how many epochs to wait before re-triaging&gt;
+```
+
+## Rules
+
+- Always quote the numbers the user reported. Never paraphrase.
+- Propose exactly one fix at a time. If the first fix does not resolve it after retry, the user comes back and you pick the next failure mode from the list.
+- Never recommend &quot;train longer&quot; as a first response unless the pattern matches failure mode 4 (equilibrium).
+- If the user reports numbers that match no failure mode, say so and ask for `d_accuracy_on_real`, `d_accuracy_on_fake`, and a sample grid.
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/04-computer-vision/09-image-generation-gans/outputs/skill-dcgan-scaffold.md">phases/04-computer-vision/09-image-generation-gans/outputs/skill-dcgan-scaffold.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: skill-dcgan-scaffold
+description: Write a complete DCGAN scaffold from z_dim, image_size, and num_channels, including training loop and sample saver
+version: 1.0.0
+phase: 4
+lesson: 9
+tags: [computer-vision, gan, dcgan, scaffolding]
+---
+
+# DCGAN Scaffold
+
+Given three parameters, emit a runnable DCGAN project skeleton with the architecture sized correctly for the target image resolution.
+
+## When to use
+
+- Starting a new generative experiment on a small dataset.
+- Teaching DCGAN fundamentals with a working minimal example.
+- Prototyping conditional GANs (label injection happens in the same scaffold).
+
+## Inputs
+
+- `image_size`: one of 32, 64, 128 (must be a power of two).
+- `num_channels`: 1 (grayscale) or 3 (RGB).
+- `z_dim`: typically 64 or 128.
+- `with_spectral_norm`: yes | no; default yes.
+
+## Architecture sizing
+
+Number of transposed conv blocks in G and strided conv blocks in D depends on `image_size`:
+
+| image_size | G blocks | D blocks |
+|------------|----------|----------|
+| 32         | 4        | 4        |
+| 64         | 5        | 5        |
+| 128        | 6        | 6        |
+
+Each additional block doubles (G) or halves (D) the spatial dimension. Feature count starts at 32 and scales with `feat_base * 2^block_index`.
+
+## Output files
+
+- `model.py` — Generator + Discriminator classes
+- `train.py` — training loop, loss, optimiser setup
+- `sample.py` — sample grid saver
+- `config.json` — hyperparameters
+- `README.md` — 10-line quickstart
+
+## Report
+
+```
+[scaffold]
+  image_size:       &lt;int&gt;
+  num_channels:     &lt;int&gt;
+  z_dim:            &lt;int&gt;
+  spectral_norm:    yes | no
+
+[arch]
+  G blocks:         &lt;N&gt;, channels: [list]
+  D blocks:         &lt;N&gt;, channels: [list]
+  G params (est):   &lt;N&gt;
+  D params (est):   &lt;N&gt;
+
+[training defaults]
+  optimizer:   Adam(lr=2e-4, betas=(0.5, 0.999))
+  batch_size:  64
+  epochs:      50
+  sample_every: 1 epoch
+
+[files written]
+  - model.py
+  - train.py
+  - sample.py
+  - config.json
+  - README.md
+```
+
+## Rules
+
+- Always use `nn.Tanh()` on G&#39;s output and scale data to [-1, 1] during training.
+- Always use `LeakyReLU(0.2)` in D.
+- When `with_spectral_norm == yes`, wrap every conv in D with `spectral_norm()` and remove BatchNorm from D. Keep BatchNorm in G.
+- Never emit a scaffold for image_size &gt; 128 — DCGAN becomes unstable above that; point the user to StyleGAN or a diffusion model.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. Why does GAN training use the non-saturating generator loss -log(D(G(z))) instead of log(1 - D(G(z)))?</legend><label class="option"><input type="radio" name="q0" value="0"> They are mathematically different and produce better equilibria</label><label class="option"><input type="radio" name="q0" value="1"> It is required by PyTorch</label><label class="option"><input type="radio" name="q0" value="2"> It speeds up the discriminator</label><label class="option"><input type="radio" name="q0" value="3"> Early in training D(G(z)) is near zero, so log(1 - D(G(z))) has vanishing gradient; -log(D(G(z))) has large gradient there so G receives a useful signal</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. DCGAN&#39;s rules say to use strided convolutions instead of pooling. Why?</legend><label class="option"><input type="radio" name="q1" value="0"> Pooling is non-learnable and throws away information the generator might need; strided convs let the network learn its own downsampling, which empirically produces sharper generated images</label><label class="option"><input type="radio" name="q1" value="1"> Pooling is incompatible with batch norm</label><label class="option"><input type="radio" name="q1" value="2"> Pooling is slower on GPUs</label><label class="option"><input type="radio" name="q1" value="3"> Pooling breaks gradient flow</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. You train a GAN and notice G produces almost identical samples regardless of the input noise. Which failure is this?</legend><label class="option"><input type="radio" name="q2" value="0"> Oscillation</label><label class="option"><input type="radio" name="q2" value="1"> Vanishing gradients</label><label class="option"><input type="radio" name="q2" value="2"> Mode collapse — G has found a narrow region of the data distribution that consistently fools D and has no incentive to explore; fixes include spectral norm, minibatch discrimination, or a larger batch</label><label class="option"><input type="radio" name="q2" value="3"> The dataset is too small</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. Why do DCGAN training scripts use Adam with betas=(0.5, 0.999) instead of the default (0.9, 0.999)?</legend><label class="option"><input type="radio" name="q3" value="0"> It is a typo propagated through tutorials</label><label class="option"><input type="radio" name="q3" value="1"> A lower beta1 reduces momentum; in an adversarial game, heavy momentum keeps each optimizer in the wrong direction too long when the other network&#39;s behaviour changes, which causes instability</label><label class="option"><input type="radio" name="q3" value="2"> The default is broken</label><label class="option"><input type="radio" name="q3" value="3"> Adam is only supported with beta1=0.5 on CUDA</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. A colleague reports a GAN with D loss near zero and G loss increasing over training. What is happening and how do you fix it?</legend><label class="option"><input type="radio" name="q4" value="0"> The generator is correctly overfitting</label><label class="option"><input type="radio" name="q4" value="1"> Nothing — this is the equilibrium</label><label class="option"><input type="radio" name="q4" value="2"> The discriminator has become too strong and drives G&#39;s gradient to zero; fixes include a smaller D, spectral norm, label smoothing on real labels (0.9 instead of 1.0), or switching to WGAN-GP</label><label class="option"><input type="radio" name="q4" value="3"> Both nets are improving correctly</label><p data-feedback="4"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/04-computer-vision/08-instance-segmentation-mask-rcnn/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/04-computer-vision/10-image-generation-diffusion/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/04-computer-vision/09-image-generation-gans/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

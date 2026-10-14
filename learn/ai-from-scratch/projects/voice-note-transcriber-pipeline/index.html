@@ -1,0 +1,158 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>Voice Note Transcriber Pipeline · Serebii Labs</title></head><body data-pack="ai-from-scratch-project-voice-note-transcriber-pipeline" data-lesson="" data-project="voice-note-transcriber-pipeline"><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow">PROJECT / voice-note-transcriber-pipeline</p><h1 class="lesson-title">Voice Note Transcriber Pipeline</h1><p class="notice">本站中文导读 + 原作者英文全文 · 代码运行未验证</p><p>这是原课程的「Voice Note Transcriber Pipeline」实践项目。先阅读下方原始目标与阶段说明，再按课序实现功能、运行评分器并比较参考实现。英文全文未缩写；中文长文尚未翻译。</p><p>练习骨架 starter：原项目未提供，勿将 solution 当作骨架；参考实现 solution：9 个文件。运行前按 README 准备依赖与输入；模型、数据或在线服务不包含在离线阅读包中。</p><div class="save-panel"><button type="button" data-save>保存本项目阅读资料</button><span data-save-status role="status">未检测离线状态</span></div><p><a download href="/learn/ai-from-scratch/downloads/project-voice-note-transcriber-pipeline.zip">下载完整项目 ZIP（需联网，或单独保存）</a> <button data-save-download="/learn/ai-from-scratch/downloads/project-voice-note-transcriber-pipeline.zip" type="button">单独保存项目 ZIP</button></p><section><h2>学习目标（原作者）</h2><ul><li>Decode the audio clock before processing</li><li>Measure activity without claiming speech detection</li><li>Send real WAV bytes through a recognizer boundary</li><li>Export a transcript you can hear and correct</li></ul></section><section class="prose" lang="en"><h1>Voice Note Transcriber Pipeline</h1>
+<p>Turn a selected WAV into a transcript, WebVTT captions and an audio review page. You build PCM decoding, acoustic activity detection, a real HTTP recognition adapter and portable exports with audio hashes.</p>
+<p>Python 3.10 or newer. The required core uses standard libraries. Learn bytes and context managers first, then sample rate, channels and an injected provider callable.</p>
+<pre><code class="language-bash">python3 scripts/project_test.py voice-note-transcriber-pipeline --init my-voice-pipeline
+python3 scripts/project_test.py voice-note-transcriber-pipeline --stage 1 --path my-voice-pipeline --strict
+python3 scripts/project_test.py voice-note-transcriber-pipeline --all --solution --strict
+cd projects/voice-note-transcriber-pipeline/solution
+python3 pipeline.py --input fixtures/repair-note.wav --transcript-file fixtures/reference.json --out voice-output
+</code></pre>
+<p>Open voice-output/index.html to play the embedded audio and seek to a cue. The directory also contains audio.wav, captions.vtt and transcript.json. Keep the VTT beside the page for its download link.</p>
+<p>The original repair note was synthesized locally with the operating system's generic voice. Its companion transcript is supplied author text bound to the WAV's SHA256. The offline demo checks the pipeline with that speech fixture; it does not perform or claim speech recognition.</p>
+<h2>Transcribe your own audio</h2>
+<p>Use an explicit OpenAI-compatible audio/transcriptions endpoint that accepts multipart file and model fields:</p>
+<pre><code class="language-bash">python3 pipeline.py --input YOUR_NOTE.wav --endpoint http://127.0.0.1:8080/v1/audio/transcriptions --model YOUR_MODEL --out voice-output
+</code></pre>
+<p>The selected audio is uploaded only in endpoint mode. TRANSCRIPTION_API_KEY supplies authentication if your endpoint requires it. Remote recognizers require HTTPS; HTTP is accepted only for localhost and explicit loopback IP addresses. URL credentials and redirects are rejected. The adapter sends actual WAV bytes, checks response text, bounds request time and response size, and propagates non-timeout failures. Tests inspect its multipart request using controlled responses; they do not measure a live recognizer's accuracy.</p>
+<p>The core accepts mono signed 16-bit PCM WAV, up to 20 MB through the CLI. If you already use FFmpeg, convert a phone recording explicitly before running it:</p>
+<pre><code class="language-bash">ffmpeg -i YOUR_NOTE.m4a -ac 1 -ar 16000 -c:a pcm_s16le YOUR_NOTE.wav
+</code></pre>
+<p>FFmpeg is optional and is not installed by this project. Whole-clip recognition is the default. --segment opts into RMS-based activity splitting, which can omit quiet speech or include loud background noise. These timestamps describe selected segments, not word alignments.</p>
+<h2>Review and correct</h2>
+<p>Edit the text fields in an exported transcript.json while keeping its audio hash, then rerender without contacting a recognizer:</p>
+<pre><code class="language-bash">python3 pipeline.py --input YOUR_NOTE.wav --review-file EDITED_TRANSCRIPT.json --out corrected-output
+</code></pre>
+<p>Finite ordered cues must stay inside the audio duration. Unsupported encodings, overlapping spans, empty text and a mismatched audio hash fail visibly.</p>
+<ol>
+<li><a href="/learn/ai-from-scratch/projects/voice-note-transcriber-pipeline/#01-pcm">Decode the audio clock</a></li>
+<li><a href="/learn/ai-from-scratch/projects/voice-note-transcriber-pipeline/#02-activity">Measure acoustic activity</a></li>
+<li><a href="/learn/ai-from-scratch/projects/voice-note-transcriber-pipeline/#03-transcribe">Send WAV through a recognizer</a></li>
+<li><a href="/learn/ai-from-scratch/projects/voice-note-transcriber-pipeline/#04-captions">Export and review captions</a></li>
+</ol>
+<p><a href="https://docs.python.org/3/library/wave.html" rel="noreferrer" data-network="true">Python WAV API <small>↗ 需要联网</small></a> and <a href="https://www.w3.org/TR/webvtt1/" rel="noreferrer" data-network="true">WebVTT specification <small>↗ 需要联网</small></a>. The implementations, spoken sentence and tests are original.</p>
+</section><section id="01-pcm"><h2>01-pcm · 原始阶段说明</h2><div class="prose" lang="en"><h1>Decode the audio clock before processing</h1>
+<blockquote>
+<p>The integer samples 0, 16384 and -16384 become 0, 0.5 and -0.5. A sample index of 800 at 16000 Hz means 0.05 seconds. Interpreting the same index at 8000 Hz would double the timestamp without changing a single byte.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Stage:</strong> 1 of 4
+<strong>Time:</strong> About 2 hours</p>
+<h2>The useful boundary</h2>
+<p>Read the WAV header before interpreting bytes. The core accepts uncompressed mono signed 16-bit PCM and normalizes samples by 32768. Preserve the actual sample rate: every later timestamp is a sample index divided by that rate. Unsupported stereo or compressed input must fail visibly.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-ba262b121ece817f8ae7.png" alt="pj-voice-note-transcriber-pipeline-1 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Work the example</h2>
+<p>The integer samples 0, 16384 and -16384 become 0, 0.5 and -0.5. A sample index of 800 at 16000 Hz means 0.05 seconds. Interpreting the same index at 8000 Hz would double the timestamp without changing a single byte.</p>
+<p>Write the returned fields and the expected side-effect count before coding. Keep a second input that should fail so the successful example cannot become a hard-coded answer.</p>
+<h2>Build the contract</h2>
+<p>Implement <code>decode_wav(data), encode_wav(samples, rate=16000) in pcm.py</code> in your learner workspace. Preserve the exported names and continue using earlier stages rather than duplicating their policies.</p>
+<p>The authored repair-note.wav is a 5.685-second spoken sentence synthesized locally with the operating system voice. Its companion reference.json contains author-supplied text and a hash of the original WAV. It is a speech fixture, not proof that the project recognized speech. The generation tool is not needed to run the committed fixture.</p>
+<h2>Hints</h2>
+<p>Check channels, sample width and compression type before unpacking. Verify the byte count equals the declared frame count times two. Test negative samples and clipping at the largest positive signed value.</p>
+<h2>Verify your work</h2>
+<pre><code class="language-bash">python3 scripts/project_test.py voice-note-transcriber-pipeline --init my-voice-note-transcriber-pipeline
+python3 scripts/project_test.py voice-note-transcriber-pipeline --stage 1 --path my-voice-note-transcriber-pipeline --strict
+</code></pre>
+<p>Initialize once. Cumulative tests import your workspace and preserve your earlier source. A reference-solution run verifies the teaching implementation and never grants a learner certificate. Optional SDK checks require the dependencies and commands in the project README.</p>
+<h2>Inspect the result</h2>
+<p>Why can valid sample values still yield incorrect captions if the sample rate is guessed? Which conversion should happen before processing a phone voice note?</p>
+<p>The completed project produces audio.wav, captions.vtt, transcript.json and an HTML page with embedded playback and cue-seek buttons.</p>
+<pre><code class="language-bash">cd projects/voice-note-transcriber-pipeline/solution
+python3 pipeline.py --input fixtures/repair-note.wav --transcript-file fixtures/reference.json --out voice-output
+</code></pre>
+<p>Replace the fixture with a small input from your own workflow. Keep expected outcomes and observed evidence together, then retain a separate set of cases for evaluation. Provider request tests establish serialization and control flow; they do not establish model quality.</p>
+<h2>Primary reference</h2>
+<p><a href="https://docs.python.org/3/library/wave.html" rel="noreferrer" data-network="true">Official API documentation <small>↗ 需要联网</small></a>. The implementation, policy choices and examples are original.</p>
+</div></section><section id="02-activity"><h2>02-activity · 原始阶段说明</h2><div class="prose" lang="en"><h1>Measure activity without claiming speech detection</h1>
+<blockquote>
+<p>At 1000 Hz, forty samples of amplitude 0.5, twenty silent samples and forty active samples merge into [0,100] when gap_ms is 40. The merged span lasts 100 ms. A 20 ms isolated burst is discarded when min_ms is 40.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Stage:</strong> 2 of 4
+<strong>Time:</strong> About 2 hours</p>
+<h2>The useful boundary</h2>
+<p>Compute root-mean-square energy for each frame. Mark frames above the threshold, merge neighboring active spans separated by a short enough gap, and discard spans shorter than the minimum. Return half-open sample intervals so slicing and timestamps share one coordinate system.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-7a90f26332233ea7f6c5.png" alt="pj-voice-note-transcriber-pipeline-2 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Work the example</h2>
+<p>At 1000 Hz, forty samples of amplitude 0.5, twenty silent samples and forty active samples merge into [0,100] when gap_ms is 40. The merged span lasts 100 ms. A 20 ms isolated burst is discarded when min_ms is 40.</p>
+<p>Write the returned fields and the expected side-effect count before coding. Keep a second input that should fail so the successful example cannot become a hard-coded answer.</p>
+<h2>Build the contract</h2>
+<p>Implement <code>activity(samples, rate, frame_ms=20, threshold=0.02, min_ms=40, gap_ms=40) in activity.py</code> in your learner workspace. Preserve the exported names and continue using earlier stages rather than duplicating their policies.</p>
+<p>Reject nonfinite samples or parameters and invalid negative bounds. Acoustic energy does not identify words, language or speakers: a fan can pass and quiet speech can fail. The CLI sends the whole clip by default; --segment explicitly opts into this lossy energy-based split.</p>
+<h2>Hints</h2>
+<p>Draw the active frame indices before merging. Separate the gap condition from the minimum-duration filter. Try a threshold just above and just below a frame's RMS and explain the changed output.</p>
+<h2>Verify your work</h2>
+<pre><code class="language-bash">python3 scripts/project_test.py voice-note-transcriber-pipeline --init my-voice-note-transcriber-pipeline
+python3 scripts/project_test.py voice-note-transcriber-pipeline --stage 2 --path my-voice-note-transcriber-pipeline --strict
+</code></pre>
+<p>Initialize once. Cumulative tests import your workspace and preserve your earlier source. A reference-solution run verifies the teaching implementation and never grants a learner certificate. Optional SDK checks require the dependencies and commands in the project README.</p>
+<h2>Inspect the result</h2>
+<p>What information can be lost by removing quiet regions? How would you evaluate this detector on your own recording conditions?</p>
+<p>The completed project produces audio.wav, captions.vtt, transcript.json and an HTML page with embedded playback and cue-seek buttons.</p>
+<pre><code class="language-bash">cd projects/voice-note-transcriber-pipeline/solution
+python3 pipeline.py --input fixtures/repair-note.wav --transcript-file fixtures/reference.json --out voice-output
+</code></pre>
+<p>Replace the fixture with a small input from your own workflow. Keep expected outcomes and observed evidence together, then retain a separate set of cases for evaluation. Provider request tests establish serialization and control flow; they do not establish model quality.</p>
+<h2>Primary reference</h2>
+<p><a href="https://docs.python.org/3/library/wave.html" rel="noreferrer" data-network="true">Official API documentation <small>↗ 需要联网</small></a>. The implementation, policy choices and examples are original.</p>
+</div></section><section id="03-transcribe"><h2>03-transcribe · 原始阶段说明</h2><div class="prose" lang="en"><h1>Send real WAV bytes through a recognizer boundary</h1>
+<blockquote>
+<p>A provider timeout followed by success records attempts=2. Each output row retains start, end, text and the SHA256 of the exact encoded segment. A second segment cannot overlap the previous one, and fractional sample indices are invalid.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Stage:</strong> 3 of 4
+<strong>Time:</strong> About 2 hours</p>
+<h2>The useful boundary</h2>
+<p>Encode each selected span as a complete WAV before calling the provider. The real HTTP adapter sends multipart form data with model and file fields to an explicitly configured audio/transcriptions endpoint. It parses the returned text and rejects an empty or malformed result. Endpoint selection is the explicit upload boundary.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-9a1c81edc38ada011e12.png" alt="pj-voice-note-transcriber-pipeline-3 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Work the example</h2>
+<p>A provider timeout followed by success records attempts=2. Each output row retains start, end, text and the SHA256 of the exact encoded segment. A second segment cannot overlap the previous one, and fractional sample indices are invalid.</p>
+<p>Write the returned fields and the expected side-effect count before coding. Keep a second input that should fail so the successful example cannot become a hard-coded answer.</p>
+<h2>Build the contract</h2>
+<p>Implement <code>transcribe(...) in transcribe.py; http_recognizer(endpoint, model, api_key, timeout) in provider.py</code> in your learner workspace. Preserve the exported names and continue using earlier stages rather than duplicating their policies.</p>
+<p>Allow zero through five retries, retry only TimeoutError, and count attempts. The adapter requires HTTPS remotely and permits HTTP only for localhost or an explicit loopback IPv4/IPv6 address. Validate a hostname and port, rejecting URL credentials, fragments and whitespace. Reject every redirect with a dedicated urllib opener whose HTTPRedirectHandler.redirect_request returns None; credentials and audio stay tied to the selected endpoint. It also checks a WAV signature, a 20 MB upload bound, a 1 MB response bound and a timeout of at most 120 seconds. TRANSCRIPTION_API_KEY supplies optional authentication. Controlled transport tests verify real multipart serialization; they do not measure recognition accuracy.</p>
+<h2>Hints</h2>
+<p>Capture the outgoing request in a test and confirm it contains the WAV bytes rather than a filename string. Return a distinct held-out sentence from the test endpoint. Keep source hashes next to text so a reviewed transcript can be related to its actual audio.</p>
+<h2>Verify your work</h2>
+<pre><code class="language-bash">python3 scripts/project_test.py voice-note-transcriber-pipeline --init my-voice-note-transcriber-pipeline
+python3 scripts/project_test.py voice-note-transcriber-pipeline --stage 3 --path my-voice-note-transcriber-pipeline --strict
+</code></pre>
+<p>Initialize once. Cumulative tests import your workspace and preserve your earlier source. A reference-solution run verifies the teaching implementation and never grants a learner certificate. Optional SDK checks require the dependencies and commands in the project README.</p>
+<h2>Inspect the result</h2>
+<p>Why should an authentication error fail immediately instead of consuming the timeout retry budget? What does the audio hash establish, and what does it not establish?</p>
+<p>The completed project produces audio.wav, captions.vtt, transcript.json and an HTML page with embedded playback and cue-seek buttons.</p>
+<pre><code class="language-bash">cd projects/voice-note-transcriber-pipeline/solution
+python3 pipeline.py --input fixtures/repair-note.wav --transcript-file fixtures/reference.json --out voice-output
+</code></pre>
+<p>Replace the fixture with a small input from your own workflow. Keep expected outcomes and observed evidence together, then retain a separate set of cases for evaluation. Provider request tests establish serialization and control flow; they do not establish model quality.</p>
+<h2>Primary reference</h2>
+<p><a href="https://docs.python.org/3/library/wave.html" rel="noreferrer" data-network="true">Official API documentation <small>↗ 需要联网</small></a>. The implementation, policy choices and examples are original.</p>
+</div></section><section id="04-captions"><h2>04-captions · 原始阶段说明</h2><div class="prose" lang="en"><h1>Export a transcript you can hear and correct</h1>
+<blockquote>
+<p>The fixture CLI pairs the original spoken clip with its supplied reference text and labels the method clearly. Real recognition instead uses --endpoint. After inspecting playback, edit the rows in transcript.json and run --review-file to rerender; the report must match the original audio hash.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Stage:</strong> 4 of 4
+<strong>Time:</strong> About 2 hours</p>
+<h2>The useful boundary</h2>
+<p>Render segment times as WebVTT at the output boundary. Validate finite, ordered, nonoverlapping cues with nonempty text. Save the original WAV and a JSON report, then build a local review page with embedded audio and buttons that seek to each segment. The captions describe segment boundaries, not inferred word alignment.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-38cd785f73961b3e625f.png" alt="pj-voice-note-transcriber-pipeline-4 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Work the example</h2>
+<p>The fixture CLI pairs the original spoken clip with its supplied reference text and labels the method clearly. Real recognition instead uses --endpoint. After inspecting playback, edit the rows in transcript.json and run --review-file to rerender; the report must match the original audio hash.</p>
+<p>Write the returned fields and the expected side-effect count before coding. Keep a second input that should fail so the successful example cannot become a hard-coded answer.</p>
+<h2>Build the contract</h2>
+<p>Implement <code>stamp, captions in captions.py; export_transcript and the CLI in pipeline.py</code> in your learner workspace. Preserve the exported names and continue using earlier stages rather than duplicating their policies.</p>
+<p>Write audio.wav, captions.vtt, transcript.json and index.html. Reject cues ending beyond the audio duration. Escape transcription text and method labels in HTML. A supplied transcript-file is a hash-bound reference mode and cannot be combined with segmentation. No provider call occurs in reference or review mode.</p>
+<p><code>export_transcript</code> returns the same object written to transcript.json: <code>schema_version=1</code>, the supplied <code>method</code>, <code>audio_sha256</code> of the original WAV bytes, <code>duration_seconds</code> and the unchanged <code>rows</code>. Each row contains start and end in seconds plus text; provider rows can also carry segment hashes and attempt counts. Keep those extra fields when exporting. Compute duration from the decoded sample count divided by the actual sample rate. Embed the WAV as a base64 audio source so playback continues to work when the HTML is opened locally.</p>
+<h2>Hints</h2>
+<p>Open the exported page, play the actual audio and click a cue. Compare the JSON row with its WebVTT timestamp. Change a caption to an HTML-like string in a test and confirm it renders as text.</p>
+<h2>Verify your work</h2>
+<pre><code class="language-bash">python3 scripts/project_test.py voice-note-transcriber-pipeline --init my-voice-note-transcriber-pipeline
+python3 scripts/project_test.py voice-note-transcriber-pipeline --stage 4 --path my-voice-note-transcriber-pipeline --strict
+</code></pre>
+<p>Initialize once. Cumulative tests import your workspace and preserve your earlier source. A reference-solution run verifies the teaching implementation and never grants a learner certificate. Optional SDK checks require the dependencies and commands in the project README.</p>
+<h2>Inspect the result</h2>
+<p>Which fields would need updating after trimming the audio? Why is an editable reference transcript a useful integration test without being a speech-recognition benchmark?</p>
+<p>The completed project produces audio.wav, captions.vtt, transcript.json and an HTML page with embedded playback and cue-seek buttons.</p>
+<pre><code class="language-bash">cd projects/voice-note-transcriber-pipeline/solution
+python3 pipeline.py --input fixtures/repair-note.wav --transcript-file fixtures/reference.json --out voice-output
+</code></pre>
+<p>Replace the fixture with a small input from your own workflow. Keep expected outcomes and observed evidence together, then retain a separate set of cases for evaluation. Provider request tests establish serialization and control flow; they do not establish model quality.</p>
+<h2>Primary reference</h2>
+<p><a href="https://docs.python.org/3/library/wave.html" rel="noreferrer" data-network="true">Official API documentation <small>↗ 需要联网</small></a>. The implementation, policy choices and examples are original.</p>
+</div></section><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

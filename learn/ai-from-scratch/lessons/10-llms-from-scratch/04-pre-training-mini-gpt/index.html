@@ -1,0 +1,1827 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>预训练小型GPT (124M参数) · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-10-llms-from-scratch" data-lesson="10-llms-from-scratch/04-pre-training-mini-gpt" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/10-llms-from-scratch/">从零构建大语言模型</a> / LESSON 04</p><h1 class="lesson-title">预训练小型GPT (124M参数)</h1><p>Pre-Training a Mini GPT (124M Parameters)</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>预训练小型GPT (124M参数)</h1>
+<blockquote>
+<p>GPT-2 Small有12400万个参数.这就是12个变压器层,12个注意力头,768维嵌入式.你可以从零开始训练它在几小时内.大多数人从来没有这样做.他们使用预训练的检查站.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python (with numpy)
+<strong>Prerequisites:</strong> Phase 10, Lessons 01-03 (Tokenizers, Building a Tokenizer, Data Pipelines)
+<strong>Time:</strong> ~120 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>从零开始实现完整的GPT-2架构 (124M参数):代币嵌入,定位嵌入,变压器块和语言模型头</li>
+<li>通过使用交叉缩损失下一个代码预测来训练GPT模型在文本体内</li>
+<li>实现自动降低文字生成,采用温度采样和顶k/topp过</li>
+<li>监测训练损失曲线,验证模型学习一致的语言模式</li>
+</ul>
+<h2>问题</h2>
+<p>你知道变压器是什么. 你已经阅读了图表. 你可以说&quot;注意力就是你需要的&quot;并画一个白板上标记的框&quot;多头注意力&quot;.</p>
+<p>没有什么意味着你明白模型生成文字时会发生什么.</p>
+<p>在GPT-2小 (含重量绑定) 中有124,438,272个参数. 每个都通过运行训练循环来设置:前进通过,计算损失,倒退通过,更新权重. 十二个变压器块. 每街区有12个注意力头. 它们是768维的嵌入空间. 词汇总数为50,257个代币. 每次模型生成代币时,所有1.24亿参数都参与一个单一的矩阵乘法链,该链接采用代币ID的序列,并产生了对下一个代币的概率分布.</p>
+<p>如果你从未自己构建过这个模型,你就在使用黑盒子.你可以使用API.你可以调整.但是当某种东西发生错误时 - - 当模型幻觉,重复,拒绝遵循指令时 - - 你没有什么心理模型为什么.</p>
+<p>这一课构建了GPT-2小从零开始.不是在 PyTorch.在 numpy. 每个矩阵乘法都可见. 每个梯度都由你的代码计算.你会看到12400万个数字如何阴谋预测下一个词.</p>
+<h2>概念</h2>
+<h3>GPT架构</h3>
+<p>GPT是一个自动降低语言模型. &quot;自动降低&quot;意味着它一次生成一个代币,每个代币都基于所有之前的代币.</p>
+<p>以下是从代币ID到下一个代币概率的完整计算图:</p>
+<ol>
+<li>标签 ID 进入. 形状: (批量大小,seq_len).</li>
+<li>标志嵌入查找.每个ID映射到768维向量. 形状: (批量大小,seq_len,768).</li>
+<li>位置嵌入式查找.每个位置 (0, 1, 2, ...) 映射到768维向量.相同的形状.</li>
+<li>添加代币嵌入 + 位置嵌入.</li>
+<li>通过12个变压器块.</li>
+<li>终极层正常化.</li>
+<li>线性投影到词汇尺寸. 形状: (批量尺寸,seq_len,vocacab_size).</li>
+<li>软max 得到概率.</li>
+</ol>
+<p>没有曲,没有重复,只有嵌入,注意力,传输网络,以及层规范堆了12次.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-a88780891e1c49f40836.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>变压器块</h3>
+<p>12个块中的每块都遵循相同的模式.前标准架构 (GPT-2 使用前标准,而不是后标准像原始变压器):</p>
+<ol>
+<li>标准层</li>
+<li>多头自律</li>
+<li>剩余连接 (添加输入回)</li>
+<li>标准层</li>
+<li>输送输送网络 (MLP)</li>
+<li>剩余连接 (添加输入回)</li>
+</ol>
+<p>由于这些变化,在转移过程中,渐变在达到区块1时消失.通过它们,渐变可以直接从损失到任何层通过&quot;跳转&quot;路径流动.这就是为什么你可以堆叠12,32甚至96个区块 (据传GPT-4使用120).</p>
+<h3>注意:核心机制</h3>
+<p>自我注意让每个代币看看之前的代币,</p>
+<p>对于每个代币位置,从输入计算三个向量:</p>
+<ul>
+<li><strong>Query (Q)</strong>&quot;我在找什么?&quot;</li>
+<li><strong>Key (K)</strong>&quot;我含有什么?&quot;</li>
+<li><strong>Value (V)</strong>&quot;我带着什么信息?&quot;</li>
+</ul>
+<pre><code>Q = input @ W_q    (768 -&gt; 768)
+K = input @ W_k    (768 -&gt; 768)
+V = input @ W_v    (768 -&gt; 768)
+
+attention_scores = Q @ K^T / sqrt(d_k)
+attention_scores = mask(attention_scores)   # causal mask: -inf for future positions
+attention_weights = softmax(attention_scores)
+output = attention_weights @ V
+</code></pre>
+<p>原因面具是使GPT具有自动降低性.第5位置可以关注0-5位置,但不能关注6,7,8等.这可以防止模型在训练期间通过观察未来代币&quot;欺骗&quot;.</p>
+<p><strong>Multi-head attention</strong>根据&quot;一头&quot;的定义,一个头可以追踪语法关系 (主体-动词协议).另一个头可以追踪语义相似性 (同义词).另一个头可以追踪位置接近性 (近距离的词).所有12个头的输出都是连锁的,并投射到768个维度.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-8090eab7d59f65676229.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>没有它,点产品会变得更大,使软max 进入渐变率接近零的区域.这是最初的&quot;注意力是你需要的&quot;论文中的关键见解之一.</p>
+<h3>基维缓存:为什么推理是快速的</h3>
+<p>在训练过程中,你一次处理整个序列.在推断过程中,你一次生成一个代币.没有优化,生成代币N需要重新计算所有N-1前代币的注意力.这就是每生成的代币O(N^2) 或为长度N的序列O(N^3) 总数.</p>
+<p>凯维缓存解决了这个问题. 计算每个代币的K和V后,存储它们. 在生成代币N+1时,你只需要计算Q为新代币,并从所有之前的代币中查找缓存的K和V. 这将每代币成本从O(N) 降低到O(1) 对于K和V计算. 关注分数计算仍然是O(N) 因为你关注所有前位置,但你避免输入上的冗余矩阵乘法.</p>
+<p>对于12层和12个头的GPT-2,KV缓存存储2 (K + V) x12层 x12头 x64个值 =每代币的18.432值.对于1024代币序列,这在FP32中约为75MB.对于128层的Llama 3 405B,单个序列的KV缓存存量可以超过10GB.这就是为什么长文本推理是内存绑定的原因.</p>
+<h3>预填与解码:两阶段的推理</h3>
+<p>当你向法学士发送提示时, 推断发生在两个不同的阶段.</p>
+<p><strong>Prefill</strong>处理整个提示符并行.所有代币都已知,所以模型可以同时计算所有位置的注意力.这个阶段是计算的 - - GPU在完成全吞吐量矩阵乘法.对于一个A100上的1000代币提示符,预填需要大约20-50ms.</p>
+<p><strong>Decode</strong>发行一个接一个的代币. 每个新的代币都取决于所有以前的代币. 这一阶段是记忆的 - - 瓶是从GPU记忆中读取模型重量和KV缓存,而不是矩阵数学本身.  GPU 的计算核心大部分都在等待内存读数. 对于GPT-2,每一步解码都需要大约同一个时间,不管木需要多少FLOP,因为内存带宽是限制.</p>
+<p>这种区别对于生产系统来说很重要.使用GPU计算预填输量 (更多FLOPS =更快的预填).用存储带宽 (更快的存储器 =更快的解码) 解码输量.这就是为什么NVIDIA的H100专注于提升存储带宽比A100 - 它直接加快代币生成.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-f317f7e58eaea4e81dbf.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>训练循环</h3>
+<p>训练一个LLM是下一个代币预测.给定代币 [0, 1, 2, ..., N-1],预测代币 [1, 2, 3, ..., N].损失函数是模型预测概率分布和实际下一个代币之间的交叉透.</p>
+<p>一个训练步骤:</p>
+<ol>
+<li><strong>Forward pass</strong>通过所有12个区块进行分数,每个位置都获得分数 (前软最大分数).</li>
+<li><strong>Compute loss</strong>: 记录和目标代币之间的交叉值 (输入转移到一个位置).</li>
+<li><strong>Backward pass</strong>计算所有124M参数的梯度,使用后延.</li>
+<li><strong>Optimizer step</strong>基普特-2使用亚当学习速度加热和阴茎衰退.</li>
+</ol>
+<p>学习率的时间表比你可能预期的更重要.GPT-2在前2000步的时间里从0升至学习率的最高水平,然后在一个曲线下分解.开始学习率高导致模型的分歧.保持高水平的模式导致后来的训练中振荡.每一个主要的LLM都使用了升温然后衰变模式.</p>
+<h3>简体中文版-2 小号:数字</h3>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Shape</th>
+<th>Parameters</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Token embeddings</td>
+<td>(50257, 768)</td>
+<td>38,597,376</td>
+</tr>
+<tr>
+<td>Position embeddings</td>
+<td>(1024, 768)</td>
+<td>786,432</td>
+</tr>
+<tr>
+<td>Per-block attention (W_q, W_k, W_v, W_out)</td>
+<td>4 x (768, 768)</td>
+<td>2,359,296</td>
+</tr>
+<tr>
+<td>Per-block FFN (up + down)</td>
+<td>(768, 3072) + (3072, 768)</td>
+<td>4,718,592</td>
+</tr>
+<tr>
+<td>Per-block LayerNorms (2x)</td>
+<td>2 x 768 x 2</td>
+<td>3,072</td>
+</tr>
+<tr>
+<td>Final LayerNorm</td>
+<td>768 x 2</td>
+<td>1,536</td>
+</tr>
+<tr>
+<td><strong>Total per block</strong></td>
+<td></td>
+<td><strong>7,080,960</strong></td>
+</tr>
+<tr>
+<td><strong>Total (12 blocks)</strong></td>
+<td></td>
+<td><strong>85,054,464 + 39,383,808 = 124,438,272</strong></td>
+</tr>
+</tbody>
+</table>
+<p>输出投影 (logits头) 与代币嵌入矩阵共享重量. 这称为重量绑定 - 它减少参数数数量38M,提高性能,因为它迫使模型使用相同的表示空间输入和输出.</p>
+<h2>建立它</h2>
+<h3>步骤1: 嵌入层</h3>
+<p>符号嵌入式将每一个可能的50,257个符号映射到768维向量.位置嵌入式添加有关每个符号在序列中的位置的信息.这两个是相结合的.</p>
+<pre><code class="language-python">import numpy as np
+
+class Embedding:
+    def __init__(self, vocab_size, embed_dim, max_seq_len):
+        self.token_embed = np.random.randn(vocab_size, embed_dim) * 0.02
+        self.pos_embed = np.random.randn(max_seq_len, embed_dim) * 0.02
+
+    def forward(self, token_ids):
+        seq_len = token_ids.shape[-1]
+        tok_emb = self.token_embed[token_ids]
+        pos_emb = self.pos_embed[:seq_len]
+        return tok_emb + pos_emb
+</code></pre>
+<p>开始的0.02标准偏差来自GPT-2论文.太大,初步前进通过产生极端值,破坏了训练的稳定性.太小,初始输出几乎是所有输入相同的,使早期梯度信号无用.</p>
+<h3>步骤2: 用因果面具自卫</h3>
+<p>原因面具在软max之前将未来位置设置为负无限,确保每个位置只能关注自己和以前的位置.</p>
+<pre><code class="language-python">def attention(Q, K, V, mask=None):
+    d_k = Q.shape[-1]
+    scores = Q @ K.transpose(0, -1, -2 if Q.ndim == 4 else 1) / np.sqrt(d_k)
+    if mask is not None:
+        scores = scores + mask
+    weights = np.exp(scores - scores.max(axis=-1, keepdims=True))
+    weights = weights / weights.sum(axis=-1, keepdims=True)
+    return weights @ V
+</code></pre>
+<p>软max实现将最大值减去,然后将其减去.如果没有, exp(large_number) 过度流到无限.这是一个数值稳定技巧,不会改变输出,因为软max(x - c) =软max(x) 对任何常数 c.</p>
+<h3>步骤3:多头注意力</h3>
+<p>根据768维输入的数据,分为12个,每个头有64维度.每个头独立计算注意力.</p>
+<pre><code class="language-python">class MultiHeadAttention:
+    def __init__(self, embed_dim, num_heads):
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        self.W_q = np.random.randn(embed_dim, embed_dim) * 0.02
+        self.W_k = np.random.randn(embed_dim, embed_dim) * 0.02
+        self.W_v = np.random.randn(embed_dim, embed_dim) * 0.02
+        self.W_out = np.random.randn(embed_dim, embed_dim) * 0.02
+
+    def forward(self, x, mask=None):
+        batch, seq_len, d = x.shape
+        Q = (x @ self.W_q).reshape(batch, seq_len, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        K = (x @ self.W_k).reshape(batch, seq_len, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        V = (x @ self.W_v).reshape(batch, seq_len, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+
+        scores = Q @ K.transpose(0, 1, 3, 2) / np.sqrt(self.head_dim)
+        if mask is not None:
+            scores = scores + mask
+        weights = np.exp(scores - scores.max(axis=-1, keepdims=True))
+        weights = weights / weights.sum(axis=-1, keepdims=True)
+        attn_out = weights @ V
+
+        attn_out = attn_out.transpose(0, 2, 1, 3).reshape(batch, seq_len, d)
+        return attn_out @ self.W_out
+</code></pre>
+<p>转型转型转型舞蹈是多头关注最困惑的部分. 这就是发生的事情: (批量,seq_len,768) 数变成 (批量,seq_len,12,64),然后 (批量,12,seq_len,64). 现在,每一个12个头都有一个自己的矩阵 (seq_len, 64) 关注之后,我们逆转了这个过程: (批次,12次,seq_len,64) 变成 (批次,seq_len,12次,64) 变成 (批次,seq_len,768).</p>
+<h3>步骤4:变压器块</h3>
+<p>一个完整的变压器块:LayerNorm,多头注意力与残余,LayerNorm,向与残余.</p>
+<pre><code class="language-python">class LayerNorm:
+    def __init__(self, dim, eps=1e-5):
+        self.gamma = np.ones(dim)
+        self.beta = np.zeros(dim)
+        self.eps = eps
+
+    def forward(self, x):
+        mean = x.mean(axis=-1, keepdims=True)
+        var = x.var(axis=-1, keepdims=True)
+        return self.gamma * (x - mean) / np.sqrt(var + self.eps) + self.beta
+
+
+class FeedForward:
+    def __init__(self, embed_dim, ff_dim):
+        self.W1 = np.random.randn(embed_dim, ff_dim) * 0.02
+        self.b1 = np.zeros(ff_dim)
+        self.W2 = np.random.randn(ff_dim, embed_dim) * 0.02
+        self.b2 = np.zeros(embed_dim)
+
+    def forward(self, x):
+        h = x @ self.W1 + self.b1
+        h = np.maximum(0, h)  # GELU approximation: ReLU for simplicity
+        return h @ self.W2 + self.b2
+
+
+class TransformerBlock:
+    def __init__(self, embed_dim, num_heads, ff_dim):
+        self.ln1 = LayerNorm(embed_dim)
+        self.attn = MultiHeadAttention(embed_dim, num_heads)
+        self.ln2 = LayerNorm(embed_dim)
+        self.ffn = FeedForward(embed_dim, ff_dim)
+
+    def forward(self, x, mask=None):
+        x = x + self.attn.forward(self.ln1.forward(x), mask)
+        x = x + self.ffn.forward(self.ln2.forward(x))
+        return x
+</code></pre>
+<p>传输网络将768维输入扩大到3072维度 (4x),应用非线性,然后将其投射回768. 这种扩展-缩减模式为模型提供了&quot;更广泛&quot;的内部表示,可以在每个位置工作.GPT-2使用GELU激活,但我们在这里使用ReLU为了简单化 - 区别对于理解架构来说是微小的.</p>
+<h3>步骤5:完整的GPT模型</h3>
+<p>堆12个变压器块,在前面添加嵌入层,后面添加输出投影.</p>
+<pre><code class="language-python">class MiniGPT:
+    def __init__(self, vocab_size=50257, embed_dim=768, num_heads=12,
+                 num_layers=12, max_seq_len=1024, ff_dim=3072):
+        self.embedding = Embedding(vocab_size, embed_dim, max_seq_len)
+        self.blocks = [
+            TransformerBlock(embed_dim, num_heads, ff_dim)
+            for _ in range(num_layers)
+        ]
+        self.ln_f = LayerNorm(embed_dim)
+        self.vocab_size = vocab_size
+        self.embed_dim = embed_dim
+
+    def forward(self, token_ids):
+        seq_len = token_ids.shape[-1]
+        mask = np.triu(np.full((seq_len, seq_len), -1e9), k=1)
+
+        x = self.embedding.forward(token_ids)
+        for block in self.blocks:
+            x = block.forward(x, mask)
+        x = self.ln_f.forward(x)
+
+        logits = x @ self.embedding.token_embed.T
+        return logits
+
+    def count_parameters(self):
+        total = 0
+        total += self.embedding.token_embed.size
+        total += self.embedding.pos_embed.size
+        for block in self.blocks:
+            total += block.attn.W_q.size + block.attn.W_k.size
+            total += block.attn.W_v.size + block.attn.W_out.size
+            total += block.ffn.W1.size + block.ffn.b1.size
+            total += block.ffn.W2.size + block.ffn.b2.size
+            total += block.ln1.gamma.size + block.ln1.beta.size
+            total += block.ln2.gamma.size + block.ln2.beta.size
+        total += self.ln_f.gamma.size + self.ln_f.beta.size
+        return total
+</code></pre>
+<p>注意重量结合:<code>logits = x @ self.embedding.token_embed.T</code>输出投影重复使用代币嵌入矩阵 (转换). 这不仅仅是节省参数的技巧. 这意味着模型使用相同的向量空间来理解代币 (嵌入) 和预测它们 (输出).</p>
+<h3>第六步:训练循环</h3>
+<p>对于一个真正的训练运行在124M参数,你需要一个GPU和PyTorch.这个训练循环展示了一个小型模型的机械,它运行在纯粹的 numpy.我们使用一个小模型 (4层, 4头, 128 个) 让它可处理.</p>
+<pre><code class="language-python">def cross_entropy_loss(logits, targets):
+    batch, seq_len, vocab_size = logits.shape
+    logits_flat = logits.reshape(-1, vocab_size)
+    targets_flat = targets.reshape(-1)
+
+    max_logits = logits_flat.max(axis=-1, keepdims=True)
+    log_softmax = logits_flat - max_logits - np.log(
+        np.exp(logits_flat - max_logits).sum(axis=-1, keepdims=True)
+    )
+
+    loss = -log_softmax[np.arange(len(targets_flat)), targets_flat].mean()
+    return loss
+
+
+def train_mini_gpt(text, vocab_size=256, embed_dim=128, num_heads=4,
+                   num_layers=4, seq_len=64, num_steps=200, lr=3e-4):
+    tokens = np.array(list(text.encode(&quot;utf-8&quot;)[:2048]))
+    model = MiniGPT(
+        vocab_size=vocab_size, embed_dim=embed_dim, num_heads=num_heads,
+        num_layers=num_layers, max_seq_len=seq_len, ff_dim=embed_dim * 4
+    )
+
+    print(f&quot;Model parameters: {model.count_parameters():,}&quot;)
+    print(f&quot;Training tokens: {len(tokens):,}&quot;)
+    print(f&quot;Config: {num_layers} layers, {num_heads} heads, {embed_dim} dims&quot;)
+    print()
+
+    for step in range(num_steps):
+        start_idx = np.random.randint(0, max(1, len(tokens) - seq_len - 1))
+        batch_tokens = tokens[start_idx:start_idx + seq_len + 1]
+
+        input_ids = batch_tokens[:-1].reshape(1, -1)
+        target_ids = batch_tokens[1:].reshape(1, -1)
+
+        logits = model.forward(input_ids)
+        loss = cross_entropy_loss(logits, target_ids)
+
+        if step % 20 == 0:
+            print(f&quot;Step {step:4d} | Loss: {loss:.4f}&quot;)
+
+    return model
+</code></pre>
+<p>随着训练的进步,损失会下降,因为模型学会预测常见模式: &quot;th&quot;后&quot;t&quot;,时间后空间等等.</p>
+<p>在生产中,你会使用亚当优化器,加上梯度,学习速度加热,和梯度剪辑.前进-通过-损失-后退更新循环是相同的.优化器更复杂.</p>
+<h3>步骤7: 创建文字</h3>
+<p>生成使用训练模型以一次预测一个代币.每个预测都是从输出分布中采样 (或贪地用 argmax)</p>
+<pre><code class="language-python">def generate(model, prompt_tokens, max_new_tokens=100, temperature=0.8):
+    tokens = list(prompt_tokens)
+    seq_len = model.embedding.pos_embed.shape[0]
+
+    for _ in range(max_new_tokens):
+        context = np.array(tokens[-seq_len:]).reshape(1, -1)
+        logits = model.forward(context)
+        next_logits = logits[0, -1, :]
+
+        next_logits = next_logits / temperature
+        probs = np.exp(next_logits - next_logits.max())
+        probs = probs / probs.sum()
+
+        next_token = np.random.choice(len(probs), p=probs)
+        tokens.append(next_token)
+
+    return tokens
+</code></pre>
+<p>温度控制随机性.温度1.0使用原始分布.温度0.5加快它 (更确定性 - 模型更频繁地选择其顶级选择).温度1.5平坦化它 (更随机性 - - 低概率的代币获得更大的机会).温度0.0是贪的解码 (总是选择最高概率的代币).</p>
+<p>其他<code>tokens[-seq_len:]</code>窗口是必要的,因为模型的最大文本长度是1024 GPT-2.一旦你超过了它,你必须放弃最古老的代币.这是每个人都谈论的&quot;文本窗口&quot;.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-beb170fe9f49e920f09a.png" alt="sampling-decoder 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>用它</h2>
+<h3>完整的培训和演示</h3>
+<pre><code class="language-python">corpus = &quot;&quot;&quot;The transformer architecture has revolutionized natural language processing.
+Attention mechanisms allow the model to focus on relevant parts of the input.
+Self-attention computes relationships between all pairs of positions in a sequence.
+Multi-head attention splits the representation into multiple subspaces.
+Each attention head can learn different types of relationships.
+The feedforward network provides nonlinear transformations at each position.
+Residual connections enable gradient flow through deep networks.
+Layer normalization stabilizes training by normalizing activations.
+Position embeddings give the model information about token ordering.
+The causal mask ensures autoregressive generation during training.
+Pre-training on large text corpora teaches the model general language understanding.
+Fine-tuning adapts the pre-trained model to specific downstream tasks.&quot;&quot;&quot;
+
+model = train_mini_gpt(corpus, num_steps=200)
+
+prompt = list(&quot;The transformer&quot;.encode(&quot;utf-8&quot;))
+output_tokens = generate(model, prompt, max_new_tokens=100, temperature=0.8)
+generated_text = bytes(output_tokens).decode(&quot;utf-8&quot;, errors=&quot;replace&quot;)
+print(f&quot;\nGenerated: {generated_text}&quot;)
+</code></pre>
+<p>在一个小模板的小体积上,生成的文本最好是半一致的. 它将从训练文本中学习一些字节级别的模式,但不能将GPT-2的方法概括为40GB的训练数据和完整的124M参数架构. 问题不是输出质量. 问题是,你可以追踪每一步:嵌入搜索,注意力计算, 输送转换, 逻辑投影,软max, 每个操作都可见.</p>
+<h2>运送它</h2>
+<p>这一课产生了<code>outputs/prompt-gpt-architecture-analyzer.md</code>通过GPT模型的结构选择进行分析,给它提供模型卡或技术报告,</p>
+<h2>运动</h2>
+<ol>
+<li>
+<p>修改模型以使用24层和16个头,而不是12/12. 计算参数. 翻倍深度与翻倍宽度 (嵌入维度) 相比如何?</p>
+</li>
+<li>
+<p>执行GELU激活函数 (GELU(x) = x * 0.5 * (1 + erf(x / sqrt(2)))) 并在输送网络中取代ReLU. 每次激活时进行500步的训练,并比较最终损失.</p>
+</li>
+<li>
+<p>添加一个KV缓存到生成函数. 存储K和V缩器在第一次前传后,然后再用于后续代币. 测量加快速度:生成200个代币,无论是没有缓存,并比较墙钟时间.</p>
+</li>
+<li>
+<p>实施顶级k样本 (只考虑k最有可能的代币) 和顶级p样本 (核心样本:考虑积累概率超过p的最小代币集合). 进行0.8温度的输出质量与顶级k=50相比,顶级p=0.95.</p>
+</li>
+<li>
+<p>建立训练损失曲线计画器.训练模型1000步,图片损失与步骤.确定三个阶段:快速初始下降 (学习普通字节),慢的中期 (学习字节模式) 和平原 (在小体积上加载).无论您正在训练128维模型还是GPT-4.</p>
+</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Autoregressive</td>
+<td>&quot;It generates one word at a time&quot;</td>
+<td>Each output token is conditioned on all previous tokens -- the model predicts P(token_n | token_0, ..., token_{n-1})</td>
+</tr>
+<tr>
+<td>Causal mask</td>
+<td>&quot;It can't see the future&quot;</td>
+<td>An upper-triangular matrix of -infinity values that prevents attention to future positions during training</td>
+</tr>
+<tr>
+<td>Multi-head attention</td>
+<td>&quot;Multiple attention patterns&quot;</td>
+<td>Splitting Q, K, V into parallel heads (e.g., 12 heads of 64 dims each for GPT-2) so each head can learn different relationship types</td>
+</tr>
+<tr>
+<td>KV Cache</td>
+<td>&quot;Caching for speed&quot;</td>
+<td>Storing computed Key and Value tensors from previous tokens to avoid redundant computation during autoregressive generation</td>
+</tr>
+<tr>
+<td>Prefill</td>
+<td>&quot;Processing the prompt&quot;</td>
+<td>The first inference phase where all prompt tokens are processed in parallel -- compute-bound on GPU FLOPS</td>
+</tr>
+<tr>
+<td>Decode</td>
+<td>&quot;Generating tokens&quot;</td>
+<td>The second inference phase where tokens are generated one at a time -- memory-bound on GPU bandwidth</td>
+</tr>
+<tr>
+<td>Weight tying</td>
+<td>&quot;Sharing embeddings&quot;</td>
+<td>Using the same matrix for input token embeddings and the output projection head -- saves 38M params in GPT-2</td>
+</tr>
+<tr>
+<td>Residual connection</td>
+<td>&quot;Skip connection&quot;</td>
+<td>Adding the input directly to the output of a sublayer (x + sublayer(x)) -- enables gradient flow in deep networks</td>
+</tr>
+<tr>
+<td>Layer normalization</td>
+<td>&quot;Normalizing activations&quot;</td>
+<td>Normalizing across the feature dimension to mean 0 and variance 1, with learnable scale and bias parameters</td>
+</tr>
+<tr>
+<td>Cross-entropy loss</td>
+<td>&quot;How wrong the predictions are&quot;</td>
+<td>-log(probability assigned to the correct next token), averaged over all positions -- the standard LLM training objective</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf" rel="noreferrer" data-network="true">Radford et al., 2019 -- &quot;Language Models are Unsupervised Multitask Learners&quot; (GPT-2) <small>↗ 需要联网</small></a>-- 引入了124M到1.5B参数家族的GPT-2论文</li>
+<li><a href="https://arxiv.org/abs/1706.03762" rel="noreferrer" data-network="true">Vaswani et al., 2017 -- &quot;Attention Is All You Need&quot; <small>↗ 需要联网</small></a>-- 原始的变压器纸, 具有扩展的点点产品关注和多头关注</li>
+<li><a href="https://arxiv.org/abs/2407.21783" rel="noreferrer" data-network="true">Llama 3 Technical Report <small>↗ 需要联网</small></a>-- 如何Meta将GPT架构扩展到405B参数,使用16K的GPU</li>
+<li><a href="https://arxiv.org/abs/2211.05102" rel="noreferrer" data-network="true">Pope et al., 2022 -- &quot;Efficiently Scaling Transformer Inference&quot; <small>↗ 需要联网</small></a>-- 论文正式化了预填与解码和KV缓存分析</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Pre-Training a Mini GPT (124M Parameters)</h1>
+<blockquote>
+<p>GPT-2 Small has 124 million parameters. That's 12 transformer layers, 12 attention heads, and 768-dimensional embeddings. You can train it from scratch on a single GPU in a few hours. Most people never do this. They use pre-trained checkpoints. But if you don't train one yourself, you don't actually understand what's happening inside the model you're building products on.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python (with numpy)
+<strong>Prerequisites:</strong> Phase 10, Lessons 01-03 (Tokenizers, Building a Tokenizer, Data Pipelines)
+<strong>Time:</strong> ~120 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Implement the full GPT-2 architecture (124M parameters) from scratch: token embeddings, positional embeddings, transformer blocks, and the language model head</li>
+<li>Train a GPT model on a text corpus using next-token prediction with cross-entropy loss</li>
+<li>Implement autoregressive text generation with temperature sampling and top-k/top-p filtering</li>
+<li>Monitor training loss curves and validate that the model learns coherent language patterns</li>
+</ul>
+<h2>The Problem</h2>
+<p>You know what a transformer is. You have read the diagrams. You can recite &quot;attention is all you need&quot; and draw boxes labeled &quot;Multi-Head Attention&quot; on a whiteboard.</p>
+<p>None of that means you understand what happens when a model generates text.</p>
+<p>There are 124,438,272 parameters in GPT-2 Small (with weight tying). Every single one of them was set by running a training loop: forward pass, compute loss, backward pass, update weights. Twelve transformer blocks. Twelve attention heads per block. A 768-dimensional embedding space. A vocabulary of 50,257 tokens. Every time the model generates a token, all 124 million parameters participate in a single matrix multiplication chain that takes a sequence of token IDs and produces a probability distribution over the next token.</p>
+<p>If you have never built this yourself, you are working with a black box. You can use the API. You can fine-tune. But when something goes wrong -- when the model hallucinates, when it repeats itself, when it refuses to follow instructions -- you have no mental model for <em>why</em>.</p>
+<p>This lesson builds GPT-2 Small from scratch. Not in PyTorch. In numpy. Every matrix multiplication is visible. Every gradient is computed by your code. You will see exactly how 124 million numbers conspire to predict the next word.</p>
+<h2>The Concept</h2>
+<h3>The GPT Architecture</h3>
+<p>GPT is an autoregressive language model. &quot;Autoregressive&quot; means it generates one token at a time, each conditioned on all previous tokens. The architecture is a stack of transformer decoder blocks.</p>
+<p>Here is the full computation graph from token IDs to next-token probabilities:</p>
+<ol>
+<li>Token IDs come in. Shape: (batch_size, seq_len).</li>
+<li>Token embedding lookup. Each ID maps to a 768-dimensional vector. Shape: (batch_size, seq_len, 768).</li>
+<li>Position embedding lookup. Each position (0, 1, 2, ...) maps to a 768-dimensional vector. Same shape.</li>
+<li>Add token embeddings + position embeddings.</li>
+<li>Pass through 12 transformer blocks.</li>
+<li>Final layer normalization.</li>
+<li>Linear projection to vocabulary size. Shape: (batch_size, seq_len, vocab_size).</li>
+<li>Softmax to get probabilities.</li>
+</ol>
+<p>That is the entire model. No convolutions. No recurrence. Just embeddings, attention, feedforward networks, and layer norms stacked 12 times.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-a88780891e1c49f40836.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>The Transformer Block</h3>
+<p>Each of the 12 blocks follows the same pattern. Pre-norm architecture (GPT-2 uses pre-norm, not post-norm like the original transformer):</p>
+<ol>
+<li>LayerNorm</li>
+<li>Multi-Head Self-Attention</li>
+<li>Residual connection (add input back)</li>
+<li>LayerNorm</li>
+<li>Feed-Forward Network (MLP)</li>
+<li>Residual connection (add input back)</li>
+</ol>
+<p>The residual connections are critical. Without them, gradients vanish by the time they reach block 1 during backpropagation. With them, gradients can flow directly from the loss to any layer through the &quot;skip&quot; path. This is why you can stack 12, 32, or even 96 blocks (GPT-4 is rumored to use 120).</p>
+<h3>Attention: The Core Mechanism</h3>
+<p>Self-attention lets every token look at every previous token and decide how much to attend to each one. Here is the math.</p>
+<p>For each token position, compute three vectors from the input:</p>
+<ul>
+<li><strong>Query (Q)</strong>: &quot;What am I looking for?&quot;</li>
+<li><strong>Key (K)</strong>: &quot;What do I contain?&quot;</li>
+<li><strong>Value (V)</strong>: &quot;What information do I carry?&quot;</li>
+</ul>
+<pre><code>Q = input @ W_q    (768 -&gt; 768)
+K = input @ W_k    (768 -&gt; 768)
+V = input @ W_v    (768 -&gt; 768)
+
+attention_scores = Q @ K^T / sqrt(d_k)
+attention_scores = mask(attention_scores)   # causal mask: -inf for future positions
+attention_weights = softmax(attention_scores)
+output = attention_weights @ V
+</code></pre>
+<p>The causal mask is what makes GPT autoregressive. Position 5 can attend to positions 0-5 but not 6, 7, 8, and so on. This prevents the model from &quot;cheating&quot; by looking at future tokens during training.</p>
+<p><strong>Multi-head attention</strong> splits the 768-dimensional space into 12 heads of 64 dimensions each. Each head learns a different attention pattern. One head might track syntactic relationships (subject-verb agreement). Another might track semantic similarity (synonyms). Another might track positional proximity (nearby words). The outputs from all 12 heads are concatenated and projected back to 768 dimensions.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-8090eab7d59f65676229.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>The division by sqrt(d_k) -- sqrt(64) = 8 -- is scaling. Without it, the dot products grow large for high-dimensional vectors, pushing softmax into regions where gradients are nearly zero. This was one of the key insights in the original &quot;Attention Is All You Need&quot; paper.</p>
+<h3>KV Cache: Why Inference Is Fast</h3>
+<p>During training, you process the entire sequence at once. During inference, you generate one token at a time. Without optimization, generating token N requires recomputing attention for all N-1 previous tokens. That is O(N^2) per generated token, or O(N^3) total for a sequence of length N.</p>
+<p>KV Cache solves this. After computing K and V for each token, store them. When generating token N+1, you only need to compute Q for the new token and look up the cached K and V from all previous tokens. This reduces per-token cost from O(N) to O(1) for the K and V computation. The attention score calculation is still O(N) because you attend to all previous positions, but you avoid redundant matrix multiplications on the input.</p>
+<p>For GPT-2 with 12 layers and 12 heads, the KV cache stores 2 (K + V) x 12 layers x 12 heads x 64 dims = 18,432 values per token. For a 1024-token sequence, that is about 75MB in FP32. For Llama 3 405B with 128 layers, the KV cache for a single sequence can exceed 10GB. This is why long-context inference is memory-bound.</p>
+<h3>Prefill vs Decode: Two Phases of Inference</h3>
+<p>When you send a prompt to an LLM, inference happens in two distinct phases.</p>
+<p><strong>Prefill</strong> processes your entire prompt in parallel. All tokens are known, so the model can compute attention for all positions simultaneously. This phase is compute-bound -- the GPU is doing matrix multiplications at full throughput. For a 1000-token prompt on an A100, prefill takes roughly 20-50ms.</p>
+<p><strong>Decode</strong> generates tokens one at a time. Each new token depends on all previous tokens. This phase is memory-bound -- the bottleneck is reading the model weights and KV cache from GPU memory, not the matrix math itself. The GPU's compute cores sit mostly idle waiting for memory reads. For GPT-2, each decode step takes about the same time regardless of how many FLOPs the matmuls require, because memory bandwidth is the constraint.</p>
+<p>This distinction matters for production systems. Prefill throughput scales with GPU compute (more FLOPS = faster prefill). Decode throughput scales with memory bandwidth (faster memory = faster decode). That is why NVIDIA's H100 focused on memory bandwidth improvements over the A100 -- it directly speeds up token generation.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-f317f7e58eaea4e81dbf.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>The Training Loop</h3>
+<p>Training an LLM is next-token prediction. Given tokens [0, 1, 2, ..., N-1], predict tokens [1, 2, 3, ..., N]. The loss function is cross-entropy between the model's predicted probability distribution and the actual next token.</p>
+<p>One training step:</p>
+<ol>
+<li><strong>Forward pass</strong>: Run the batch through all 12 blocks. Get logits (pre-softmax scores) for each position.</li>
+<li><strong>Compute loss</strong>: Cross-entropy between logits and target tokens (the input shifted by one position).</li>
+<li><strong>Backward pass</strong>: Compute gradients for all 124M parameters using backpropagation.</li>
+<li><strong>Optimizer step</strong>: Update weights. GPT-2 uses Adam with learning rate warmup and cosine decay.</li>
+</ol>
+<p>The learning rate schedule matters more than you might expect. GPT-2 warms up from 0 to the peak learning rate over the first 2,000 steps, then decays following a cosine curve. Starting with a high learning rate causes the model to diverge. Keeping a constant high rate causes oscillation in later training. The warmup-then-decay pattern is used by every major LLM.</p>
+<h3>GPT-2 Small: The Numbers</h3>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Shape</th>
+<th>Parameters</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Token embeddings</td>
+<td>(50257, 768)</td>
+<td>38,597,376</td>
+</tr>
+<tr>
+<td>Position embeddings</td>
+<td>(1024, 768)</td>
+<td>786,432</td>
+</tr>
+<tr>
+<td>Per-block attention (W_q, W_k, W_v, W_out)</td>
+<td>4 x (768, 768)</td>
+<td>2,359,296</td>
+</tr>
+<tr>
+<td>Per-block FFN (up + down)</td>
+<td>(768, 3072) + (3072, 768)</td>
+<td>4,718,592</td>
+</tr>
+<tr>
+<td>Per-block LayerNorms (2x)</td>
+<td>2 x 768 x 2</td>
+<td>3,072</td>
+</tr>
+<tr>
+<td>Final LayerNorm</td>
+<td>768 x 2</td>
+<td>1,536</td>
+</tr>
+<tr>
+<td><strong>Total per block</strong></td>
+<td></td>
+<td><strong>7,080,960</strong></td>
+</tr>
+<tr>
+<td><strong>Total (12 blocks)</strong></td>
+<td></td>
+<td><strong>85,054,464 + 39,383,808 = 124,438,272</strong></td>
+</tr>
+</tbody>
+</table>
+<p>The output projection (logits head) shares weights with the token embedding matrix. This is called weight tying -- it reduces the parameter count by 38M and improves performance because it forces the model to use the same representation space for input and output.</p>
+<h2>Build It</h2>
+<h3>Step 1: Embedding Layer</h3>
+<p>Token embeddings map each of the 50,257 possible tokens to a 768-dimensional vector. Position embeddings add information about where each token sits in the sequence. The two are summed.</p>
+<pre><code class="language-python">import numpy as np
+
+class Embedding:
+    def __init__(self, vocab_size, embed_dim, max_seq_len):
+        self.token_embed = np.random.randn(vocab_size, embed_dim) * 0.02
+        self.pos_embed = np.random.randn(max_seq_len, embed_dim) * 0.02
+
+    def forward(self, token_ids):
+        seq_len = token_ids.shape[-1]
+        tok_emb = self.token_embed[token_ids]
+        pos_emb = self.pos_embed[:seq_len]
+        return tok_emb + pos_emb
+</code></pre>
+<p>The 0.02 standard deviation for initialization comes from the GPT-2 paper. Too large and the initial forward passes produce extreme values that destabilize training. Too small and the initial outputs are nearly identical for all inputs, making early gradient signals useless.</p>
+<h3>Step 2: Self-Attention with Causal Mask</h3>
+<p>Single-head attention first. The causal mask sets future positions to negative infinity before softmax, ensuring each position can only attend to itself and earlier positions.</p>
+<pre><code class="language-python">def attention(Q, K, V, mask=None):
+    d_k = Q.shape[-1]
+    scores = Q @ K.transpose(0, -1, -2 if Q.ndim == 4 else 1) / np.sqrt(d_k)
+    if mask is not None:
+        scores = scores + mask
+    weights = np.exp(scores - scores.max(axis=-1, keepdims=True))
+    weights = weights / weights.sum(axis=-1, keepdims=True)
+    return weights @ V
+</code></pre>
+<p>The softmax implementation subtracts the maximum before exponentiating. Without this, exp(large_number) overflows to infinity. This is a numerical stability trick that does not change the output because softmax(x - c) = softmax(x) for any constant c.</p>
+<h3>Step 3: Multi-Head Attention</h3>
+<p>Split the 768-dimensional input into 12 heads of 64 dimensions each. Each head computes attention independently. Concatenate the results and project back to 768 dimensions.</p>
+<pre><code class="language-python">class MultiHeadAttention:
+    def __init__(self, embed_dim, num_heads):
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        self.W_q = np.random.randn(embed_dim, embed_dim) * 0.02
+        self.W_k = np.random.randn(embed_dim, embed_dim) * 0.02
+        self.W_v = np.random.randn(embed_dim, embed_dim) * 0.02
+        self.W_out = np.random.randn(embed_dim, embed_dim) * 0.02
+
+    def forward(self, x, mask=None):
+        batch, seq_len, d = x.shape
+        Q = (x @ self.W_q).reshape(batch, seq_len, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        K = (x @ self.W_k).reshape(batch, seq_len, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        V = (x @ self.W_v).reshape(batch, seq_len, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+
+        scores = Q @ K.transpose(0, 1, 3, 2) / np.sqrt(self.head_dim)
+        if mask is not None:
+            scores = scores + mask
+        weights = np.exp(scores - scores.max(axis=-1, keepdims=True))
+        weights = weights / weights.sum(axis=-1, keepdims=True)
+        attn_out = weights @ V
+
+        attn_out = attn_out.transpose(0, 2, 1, 3).reshape(batch, seq_len, d)
+        return attn_out @ self.W_out
+</code></pre>
+<p>The reshape-transpose-reshape dance is the most confusing part of multi-head attention. Here is what happens: the (batch, seq_len, 768) tensor becomes (batch, seq_len, 12, 64), then (batch, 12, seq_len, 64). Now each of the 12 heads has its own (seq_len, 64) matrix to run attention on. After attention, we reverse the process: (batch, 12, seq_len, 64) becomes (batch, seq_len, 12, 64) becomes (batch, seq_len, 768).</p>
+<h3>Step 4: Transformer Block</h3>
+<p>One complete transformer block: LayerNorm, multi-head attention with residual, LayerNorm, feedforward with residual.</p>
+<pre><code class="language-python">class LayerNorm:
+    def __init__(self, dim, eps=1e-5):
+        self.gamma = np.ones(dim)
+        self.beta = np.zeros(dim)
+        self.eps = eps
+
+    def forward(self, x):
+        mean = x.mean(axis=-1, keepdims=True)
+        var = x.var(axis=-1, keepdims=True)
+        return self.gamma * (x - mean) / np.sqrt(var + self.eps) + self.beta
+
+
+class FeedForward:
+    def __init__(self, embed_dim, ff_dim):
+        self.W1 = np.random.randn(embed_dim, ff_dim) * 0.02
+        self.b1 = np.zeros(ff_dim)
+        self.W2 = np.random.randn(ff_dim, embed_dim) * 0.02
+        self.b2 = np.zeros(embed_dim)
+
+    def forward(self, x):
+        h = x @ self.W1 + self.b1
+        h = np.maximum(0, h)  # GELU approximation: ReLU for simplicity
+        return h @ self.W2 + self.b2
+
+
+class TransformerBlock:
+    def __init__(self, embed_dim, num_heads, ff_dim):
+        self.ln1 = LayerNorm(embed_dim)
+        self.attn = MultiHeadAttention(embed_dim, num_heads)
+        self.ln2 = LayerNorm(embed_dim)
+        self.ffn = FeedForward(embed_dim, ff_dim)
+
+    def forward(self, x, mask=None):
+        x = x + self.attn.forward(self.ln1.forward(x), mask)
+        x = x + self.ffn.forward(self.ln2.forward(x))
+        return x
+</code></pre>
+<p>The feedforward network expands the 768-dimensional input to 3,072 dimensions (4x), applies a nonlinearity, then projects back to 768. This expansion-contraction pattern gives the model a &quot;wider&quot; internal representation to work with at each position. GPT-2 uses GELU activation, but we use ReLU here for simplicity -- the difference is minor for understanding the architecture.</p>
+<h3>Step 5: Full GPT Model</h3>
+<p>Stack 12 transformer blocks. Add the embedding layer at the front and the output projection at the back.</p>
+<pre><code class="language-python">class MiniGPT:
+    def __init__(self, vocab_size=50257, embed_dim=768, num_heads=12,
+                 num_layers=12, max_seq_len=1024, ff_dim=3072):
+        self.embedding = Embedding(vocab_size, embed_dim, max_seq_len)
+        self.blocks = [
+            TransformerBlock(embed_dim, num_heads, ff_dim)
+            for _ in range(num_layers)
+        ]
+        self.ln_f = LayerNorm(embed_dim)
+        self.vocab_size = vocab_size
+        self.embed_dim = embed_dim
+
+    def forward(self, token_ids):
+        seq_len = token_ids.shape[-1]
+        mask = np.triu(np.full((seq_len, seq_len), -1e9), k=1)
+
+        x = self.embedding.forward(token_ids)
+        for block in self.blocks:
+            x = block.forward(x, mask)
+        x = self.ln_f.forward(x)
+
+        logits = x @ self.embedding.token_embed.T
+        return logits
+
+    def count_parameters(self):
+        total = 0
+        total += self.embedding.token_embed.size
+        total += self.embedding.pos_embed.size
+        for block in self.blocks:
+            total += block.attn.W_q.size + block.attn.W_k.size
+            total += block.attn.W_v.size + block.attn.W_out.size
+            total += block.ffn.W1.size + block.ffn.b1.size
+            total += block.ffn.W2.size + block.ffn.b2.size
+            total += block.ln1.gamma.size + block.ln1.beta.size
+            total += block.ln2.gamma.size + block.ln2.beta.size
+        total += self.ln_f.gamma.size + self.ln_f.beta.size
+        return total
+</code></pre>
+<p>Notice the weight tying: <code>logits = x @ self.embedding.token_embed.T</code>. The output projection reuses the token embedding matrix (transposed). This is not just a parameter-saving trick. It means the model uses the same vector space for understanding tokens (embeddings) and predicting them (output).</p>
+<h3>Step 6: Training Loop</h3>
+<p>For a real training run on 124M parameters, you would need a GPU and PyTorch. This training loop demonstrates the mechanics on a small model that runs in pure numpy. We use a tiny model (4 layers, 4 heads, 128 dims) to make it tractable.</p>
+<pre><code class="language-python">def cross_entropy_loss(logits, targets):
+    batch, seq_len, vocab_size = logits.shape
+    logits_flat = logits.reshape(-1, vocab_size)
+    targets_flat = targets.reshape(-1)
+
+    max_logits = logits_flat.max(axis=-1, keepdims=True)
+    log_softmax = logits_flat - max_logits - np.log(
+        np.exp(logits_flat - max_logits).sum(axis=-1, keepdims=True)
+    )
+
+    loss = -log_softmax[np.arange(len(targets_flat)), targets_flat].mean()
+    return loss
+
+
+def train_mini_gpt(text, vocab_size=256, embed_dim=128, num_heads=4,
+                   num_layers=4, seq_len=64, num_steps=200, lr=3e-4):
+    tokens = np.array(list(text.encode(&quot;utf-8&quot;)[:2048]))
+    model = MiniGPT(
+        vocab_size=vocab_size, embed_dim=embed_dim, num_heads=num_heads,
+        num_layers=num_layers, max_seq_len=seq_len, ff_dim=embed_dim * 4
+    )
+
+    print(f&quot;Model parameters: {model.count_parameters():,}&quot;)
+    print(f&quot;Training tokens: {len(tokens):,}&quot;)
+    print(f&quot;Config: {num_layers} layers, {num_heads} heads, {embed_dim} dims&quot;)
+    print()
+
+    for step in range(num_steps):
+        start_idx = np.random.randint(0, max(1, len(tokens) - seq_len - 1))
+        batch_tokens = tokens[start_idx:start_idx + seq_len + 1]
+
+        input_ids = batch_tokens[:-1].reshape(1, -1)
+        target_ids = batch_tokens[1:].reshape(1, -1)
+
+        logits = model.forward(input_ids)
+        loss = cross_entropy_loss(logits, target_ids)
+
+        if step % 20 == 0:
+            print(f&quot;Step {step:4d} | Loss: {loss:.4f}&quot;)
+
+    return model
+</code></pre>
+<p>The loss starts near ln(vocab_size) -- for a 256-token byte-level vocabulary, that is ln(256) = 5.55. A random model assigns equal probability to every token. As training progresses, the loss drops because the model learns to predict common patterns: &quot;th&quot; after &quot;t&quot;, space after a period, and so on.</p>
+<p>In production, you would use Adam optimizer with gradient accumulation, learning rate warmup, and gradient clipping. The forward-pass-loss-backward-update loop is identical. The optimizer is more sophisticated.</p>
+<h3>Step 7: Text Generation</h3>
+<p>Generation uses the trained model to predict one token at a time. Each prediction is sampled from the output distribution (or taken greedily as the argmax).</p>
+<pre><code class="language-python">def generate(model, prompt_tokens, max_new_tokens=100, temperature=0.8):
+    tokens = list(prompt_tokens)
+    seq_len = model.embedding.pos_embed.shape[0]
+
+    for _ in range(max_new_tokens):
+        context = np.array(tokens[-seq_len:]).reshape(1, -1)
+        logits = model.forward(context)
+        next_logits = logits[0, -1, :]
+
+        next_logits = next_logits / temperature
+        probs = np.exp(next_logits - next_logits.max())
+        probs = probs / probs.sum()
+
+        next_token = np.random.choice(len(probs), p=probs)
+        tokens.append(next_token)
+
+    return tokens
+</code></pre>
+<p>Temperature controls randomness. Temperature 1.0 uses the raw distribution. Temperature 0.5 sharpens it (more deterministic -- the model picks its top choices more often). Temperature 1.5 flattens it (more random -- low-probability tokens get a bigger chance). Temperature 0.0 is greedy decoding (always pick the highest probability token).</p>
+<p>The <code>tokens[-seq_len:]</code> window is necessary because the model has a maximum context length (1024 for GPT-2). Once you exceed it, you must drop the oldest tokens. This is the &quot;context window&quot; that everyone talks about.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-beb170fe9f49e920f09a.png" alt="sampling-decoder 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Use It</h2>
+<h3>Full Training and Generation Demo</h3>
+<pre><code class="language-python">corpus = &quot;&quot;&quot;The transformer architecture has revolutionized natural language processing.
+Attention mechanisms allow the model to focus on relevant parts of the input.
+Self-attention computes relationships between all pairs of positions in a sequence.
+Multi-head attention splits the representation into multiple subspaces.
+Each attention head can learn different types of relationships.
+The feedforward network provides nonlinear transformations at each position.
+Residual connections enable gradient flow through deep networks.
+Layer normalization stabilizes training by normalizing activations.
+Position embeddings give the model information about token ordering.
+The causal mask ensures autoregressive generation during training.
+Pre-training on large text corpora teaches the model general language understanding.
+Fine-tuning adapts the pre-trained model to specific downstream tasks.&quot;&quot;&quot;
+
+model = train_mini_gpt(corpus, num_steps=200)
+
+prompt = list(&quot;The transformer&quot;.encode(&quot;utf-8&quot;))
+output_tokens = generate(model, prompt, max_new_tokens=100, temperature=0.8)
+generated_text = bytes(output_tokens).decode(&quot;utf-8&quot;, errors=&quot;replace&quot;)
+print(f&quot;\nGenerated: {generated_text}&quot;)
+</code></pre>
+<p>On a small corpus with a small model, the generated text will be semi-coherent at best. It will learn some byte-level patterns from the training text but cannot generalize the way GPT-2 does with 40GB of training data and the full 124M parameter architecture. The point is not the output quality. The point is that you can trace every step: embedding lookup, attention computation, feedforward transformation, logit projection, softmax, and sampling. Every operation is visible.</p>
+<h2>Ship It</h2>
+<p>This lesson produces <code>outputs/prompt-gpt-architecture-analyzer.md</code> -- a prompt that analyzes the architecture choices in any GPT-style model. Feed it a model card or technical report and it breaks down the parameter allocation, attention design, and scaling decisions.</p>
+<h2>Exercises</h2>
+<ol>
+<li>
+<p>Modify the model to use 24 layers and 16 heads instead of 12/12. Count the parameters. How does doubling the depth compare to doubling the width (embedding dimension)?</p>
+</li>
+<li>
+<p>Implement the GELU activation function (GELU(x) = x * 0.5 * (1 + erf(x / sqrt(2)))) and replace the ReLU in the feedforward network. Run training for 500 steps with each activation and compare the final loss.</p>
+</li>
+<li>
+<p>Add a KV cache to the generation function. Store K and V tensors for each layer after the first forward pass, and reuse them for subsequent tokens. Measure the speedup: generate 200 tokens with and without the cache and compare wall-clock time.</p>
+</li>
+<li>
+<p>Implement top-k sampling (only consider the k highest-probability tokens) and top-p sampling (nucleus sampling: consider the smallest set of tokens whose cumulative probability exceeds p). Compare the output quality at temperature 0.8 with top-k=50 vs top-p=0.95.</p>
+</li>
+<li>
+<p>Build a training loss curve plotter. Train the model for 1000 steps and plot loss vs step. Identify the three phases: rapid initial descent (learning common bytes), slower middle phase (learning byte patterns), and plateau (overfitting on the small corpus). The shape of this curve is the same whether you are training a 128-dim model or GPT-4.</p>
+</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Autoregressive</td>
+<td>&quot;It generates one word at a time&quot;</td>
+<td>Each output token is conditioned on all previous tokens -- the model predicts P(token_n | token_0, ..., token_{n-1})</td>
+</tr>
+<tr>
+<td>Causal mask</td>
+<td>&quot;It can't see the future&quot;</td>
+<td>An upper-triangular matrix of -infinity values that prevents attention to future positions during training</td>
+</tr>
+<tr>
+<td>Multi-head attention</td>
+<td>&quot;Multiple attention patterns&quot;</td>
+<td>Splitting Q, K, V into parallel heads (e.g., 12 heads of 64 dims each for GPT-2) so each head can learn different relationship types</td>
+</tr>
+<tr>
+<td>KV Cache</td>
+<td>&quot;Caching for speed&quot;</td>
+<td>Storing computed Key and Value tensors from previous tokens to avoid redundant computation during autoregressive generation</td>
+</tr>
+<tr>
+<td>Prefill</td>
+<td>&quot;Processing the prompt&quot;</td>
+<td>The first inference phase where all prompt tokens are processed in parallel -- compute-bound on GPU FLOPS</td>
+</tr>
+<tr>
+<td>Decode</td>
+<td>&quot;Generating tokens&quot;</td>
+<td>The second inference phase where tokens are generated one at a time -- memory-bound on GPU bandwidth</td>
+</tr>
+<tr>
+<td>Weight tying</td>
+<td>&quot;Sharing embeddings&quot;</td>
+<td>Using the same matrix for input token embeddings and the output projection head -- saves 38M params in GPT-2</td>
+</tr>
+<tr>
+<td>Residual connection</td>
+<td>&quot;Skip connection&quot;</td>
+<td>Adding the input directly to the output of a sublayer (x + sublayer(x)) -- enables gradient flow in deep networks</td>
+</tr>
+<tr>
+<td>Layer normalization</td>
+<td>&quot;Normalizing activations&quot;</td>
+<td>Normalizing across the feature dimension to mean 0 and variance 1, with learnable scale and bias parameters</td>
+</tr>
+<tr>
+<td>Cross-entropy loss</td>
+<td>&quot;How wrong the predictions are&quot;</td>
+<td>-log(probability assigned to the correct next token), averaged over all positions -- the standard LLM training objective</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf" rel="noreferrer" data-network="true">Radford et al., 2019 -- &quot;Language Models are Unsupervised Multitask Learners&quot; (GPT-2) <small>↗ 需要联网</small></a> -- the GPT-2 paper that introduced the 124M to 1.5B parameter family</li>
+<li><a href="https://arxiv.org/abs/1706.03762" rel="noreferrer" data-network="true">Vaswani et al., 2017 -- &quot;Attention Is All You Need&quot; <small>↗ 需要联网</small></a> -- the original transformer paper with scaled dot-product attention and multi-head attention</li>
+<li><a href="https://arxiv.org/abs/2407.21783" rel="noreferrer" data-network="true">Llama 3 Technical Report <small>↗ 需要联网</small></a> -- how Meta scaled the GPT architecture to 405B parameters with 16K GPUs</li>
+<li><a href="https://arxiv.org/abs/2211.05102" rel="noreferrer" data-network="true">Pope et al., 2022 -- &quot;Efficiently Scaling Transformer Inference&quot; <small>↗ 需要联网</small></a> -- the paper that formalized prefill vs decode and KV cache analysis</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-10-llms-from-scratch--04-pre-training-mini-gpt.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-10-llms-from-scratch--04-pre-training-mini-gpt.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/10-llms-from-scratch/04-pre-training-mini-gpt/code/main.py">phases/10-llms-from-scratch/04-pre-training-mini-gpt/code/main.py</a><details><summary>查看原始文本</summary><pre><code>import numpy as np
+
+
+class Embedding:
+    def __init__(self, vocab_size, embed_dim, max_seq_len):
+        self.token_embed = np.random.randn(vocab_size, embed_dim) * 0.02
+        self.pos_embed = np.random.randn(max_seq_len, embed_dim) * 0.02
+
+    def forward(self, token_ids):
+        seq_len = token_ids.shape[-1]
+        tok_emb = self.token_embed[token_ids]
+        pos_emb = self.pos_embed[:seq_len]
+        return tok_emb + pos_emb
+
+
+class LayerNorm:
+    def __init__(self, dim, eps=1e-5):
+        self.gamma = np.ones(dim)
+        self.beta = np.zeros(dim)
+        self.eps = eps
+
+    def forward(self, x):
+        mean = x.mean(axis=-1, keepdims=True)
+        var = x.var(axis=-1, keepdims=True)
+        return self.gamma * (x - mean) / np.sqrt(var + self.eps) + self.beta
+
+
+class MultiHeadAttention:
+    def __init__(self, embed_dim, num_heads):
+        assert embed_dim % num_heads == 0, f&quot;embed_dim {embed_dim} not divisible by num_heads {num_heads}&quot;
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        self.W_q = np.random.randn(embed_dim, embed_dim) * 0.02
+        self.W_k = np.random.randn(embed_dim, embed_dim) * 0.02
+        self.W_v = np.random.randn(embed_dim, embed_dim) * 0.02
+        self.W_out = np.random.randn(embed_dim, embed_dim) * 0.02
+
+    def forward(self, x, mask=None):
+        batch, seq_len, d = x.shape
+        Q = (x @ self.W_q).reshape(batch, seq_len, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        K = (x @ self.W_k).reshape(batch, seq_len, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        V = (x @ self.W_v).reshape(batch, seq_len, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+
+        scores = Q @ K.transpose(0, 1, 3, 2) / np.sqrt(self.head_dim)
+        if mask is not None:
+            scores = scores + mask
+        weights = np.exp(scores - scores.max(axis=-1, keepdims=True))
+        weights = weights / weights.sum(axis=-1, keepdims=True)
+        attn_out = weights @ V
+
+        attn_out = attn_out.transpose(0, 2, 1, 3).reshape(batch, seq_len, d)
+        return attn_out @ self.W_out
+
+
+class FeedForward:
+    def __init__(self, embed_dim, ff_dim):
+        self.W1 = np.random.randn(embed_dim, ff_dim) * 0.02
+        self.b1 = np.zeros(ff_dim)
+        self.W2 = np.random.randn(ff_dim, embed_dim) * 0.02
+        self.b2 = np.zeros(embed_dim)
+
+    def forward(self, x):
+        h = x @ self.W1 + self.b1
+        h = np.maximum(0, h)
+        return h @ self.W2 + self.b2
+
+
+class TransformerBlock:
+    def __init__(self, embed_dim, num_heads, ff_dim):
+        self.ln1 = LayerNorm(embed_dim)
+        self.attn = MultiHeadAttention(embed_dim, num_heads)
+        self.ln2 = LayerNorm(embed_dim)
+        self.ffn = FeedForward(embed_dim, ff_dim)
+
+    def forward(self, x, mask=None):
+        x = x + self.attn.forward(self.ln1.forward(x), mask)
+        x = x + self.ffn.forward(self.ln2.forward(x))
+        return x
+
+
+class MiniGPT:
+    def __init__(self, vocab_size=50257, embed_dim=768, num_heads=12,
+                 num_layers=12, max_seq_len=1024, ff_dim=3072):
+        self.embedding = Embedding(vocab_size, embed_dim, max_seq_len)
+        self.blocks = [
+            TransformerBlock(embed_dim, num_heads, ff_dim)
+            for _ in range(num_layers)
+        ]
+        self.ln_f = LayerNorm(embed_dim)
+        self.vocab_size = vocab_size
+        self.embed_dim = embed_dim
+
+    def forward(self, token_ids):
+        seq_len = token_ids.shape[-1]
+        mask = np.triu(np.full((seq_len, seq_len), -1e9), k=1)
+
+        x = self.embedding.forward(token_ids)
+        for block in self.blocks:
+            x = block.forward(x, mask)
+        x = self.ln_f.forward(x)
+
+        logits = x @ self.embedding.token_embed.T
+        return logits
+
+    def count_parameters(self):
+        total = 0
+        total += self.embedding.token_embed.size
+        total += self.embedding.pos_embed.size
+        for block in self.blocks:
+            total += block.attn.W_q.size + block.attn.W_k.size
+            total += block.attn.W_v.size + block.attn.W_out.size
+            total += block.ffn.W1.size + block.ffn.b1.size
+            total += block.ffn.W2.size + block.ffn.b2.size
+            total += block.ln1.gamma.size + block.ln1.beta.size
+            total += block.ln2.gamma.size + block.ln2.beta.size
+        total += self.ln_f.gamma.size + self.ln_f.beta.size
+        return total
+
+
+def cross_entropy_loss(logits, targets):
+    batch, seq_len, vocab_size = logits.shape
+    logits_flat = logits.reshape(-1, vocab_size)
+    targets_flat = targets.reshape(-1)
+
+    max_logits = logits_flat.max(axis=-1, keepdims=True)
+    log_softmax = logits_flat - max_logits - np.log(
+        np.exp(logits_flat - max_logits).sum(axis=-1, keepdims=True)
+    )
+
+    loss = -log_softmax[np.arange(len(targets_flat)), targets_flat].mean()
+    return loss
+
+
+def generate(model, prompt_tokens, max_new_tokens=100, temperature=0.8):
+    tokens = list(prompt_tokens)
+    seq_len = model.embedding.pos_embed.shape[0]
+
+    for _ in range(max_new_tokens):
+        context = np.array(tokens[-seq_len:]).reshape(1, -1)
+        logits = model.forward(context)
+        next_logits = logits[0, -1, :]
+
+        next_logits = next_logits / temperature
+        probs = np.exp(next_logits - next_logits.max())
+        probs = probs / probs.sum()
+
+        next_token = np.random.choice(len(probs), p=probs)
+        tokens.append(next_token)
+
+    return tokens
+
+
+def layernorm_backward(dy, x, ln):
+    mean = x.mean(axis=-1, keepdims=True)
+    var = x.var(axis=-1, keepdims=True)
+    std_inv = 1.0 / np.sqrt(var + ln.eps)
+    x_hat = (x - mean) * std_inv
+    n = x.shape[-1]
+
+    grad_gamma = (dy * x_hat).sum(axis=(0, 1))
+    grad_beta = dy.sum(axis=(0, 1))
+
+    dx_hat = dy * ln.gamma
+    dvar = (dx_hat * (x - mean) * -0.5 * std_inv ** 3).sum(axis=-1, keepdims=True)
+    dmean = (-dx_hat * std_inv).sum(axis=-1, keepdims=True)
+    dmean += dvar * (-2.0 / n) * (x - mean).sum(axis=-1, keepdims=True)
+    dx = dx_hat * std_inv + dvar * 2.0 * (x - mean) / n + dmean / n
+
+    return dx, grad_gamma, grad_beta
+
+
+def ffn_backward(dy, x_in, ffn):
+    h = x_in @ ffn.W1 + ffn.b1
+    h_relu = np.maximum(0, h)
+
+    grad_W2 = h_relu.reshape(-1, h_relu.shape[-1]).T @ dy.reshape(-1, dy.shape[-1])
+    grad_b2 = dy.reshape(-1, dy.shape[-1]).sum(axis=0)
+
+    dh_relu = dy @ ffn.W2.T
+    dh = dh_relu * (h &gt; 0).astype(float)
+
+    grad_W1 = x_in.reshape(-1, x_in.shape[-1]).T @ dh.reshape(-1, dh.shape[-1])
+    grad_b1 = dh.reshape(-1, dh.shape[-1]).sum(axis=0)
+
+    dx = dh @ ffn.W1.T
+
+    return dx, grad_W1, grad_b1, grad_W2, grad_b2
+
+
+def train_mini_gpt(text, vocab_size=256, embed_dim=128, num_heads=4,
+                   num_layers=4, seq_len=64, num_steps=200, lr=3e-4):
+    tokens = np.array(list(text.encode(&quot;utf-8&quot;)[:2048]))
+    model = MiniGPT(
+        vocab_size=vocab_size, embed_dim=embed_dim, num_heads=num_heads,
+        num_layers=num_layers, max_seq_len=seq_len, ff_dim=embed_dim * 4
+    )
+
+    print(f&quot;Model parameters: {model.count_parameters():,}&quot;)
+    print(f&quot;Training tokens: {len(tokens):,}&quot;)
+    print(f&quot;Config: {num_layers} layers, {num_heads} heads, {embed_dim} dims&quot;)
+    print()
+
+    for step in range(num_steps):
+        start_idx = np.random.randint(0, max(1, len(tokens) - seq_len - 1))
+        batch_tokens = tokens[start_idx:start_idx + seq_len + 1]
+
+        input_ids = batch_tokens[:-1].reshape(1, -1)
+        target_ids = batch_tokens[1:].reshape(1, -1)
+
+        mask = np.triu(np.full((seq_len, seq_len), -1e9), k=1)
+        x = model.embedding.forward(input_ids)
+        block_inputs = [x]
+        for block in model.blocks:
+            x = block.forward(x, mask)
+            block_inputs.append(x)
+        x_pre_ln = x
+        x_normed = model.ln_f.forward(x_pre_ln)
+        logits = x_normed @ model.embedding.token_embed.T
+
+        loss = cross_entropy_loss(logits, target_ids)
+
+        batch_size, s_len, v_size = logits.shape
+        probs = np.exp(logits - logits.max(axis=-1, keepdims=True))
+        probs = probs / probs.sum(axis=-1, keepdims=True)
+        dlogits = probs.copy()
+        dlogits[np.arange(batch_size)[:, None], np.arange(s_len), target_ids] -= 1.0
+        dlogits /= (batch_size * s_len)
+
+        grad_token_embed = np.zeros_like(model.embedding.token_embed)
+        for b in range(batch_size):
+            grad_token_embed += dlogits[b].T @ x_normed[b]
+
+        dx_normed = dlogits @ model.embedding.token_embed
+
+        dx_pre_ln, grad_ln_gamma, grad_ln_beta = layernorm_backward(
+            dx_normed, x_pre_ln, model.ln_f
+        )
+
+        dx = dx_pre_ln
+        for i in range(len(model.blocks) - 1, -1, -1):
+            block = model.blocks[i]
+            block_in = block_inputs[i]
+
+            ln2_in = block_in + block.attn.forward(block.ln1.forward(block_in), mask)
+            ln2_out = block.ln2.forward(ln2_in)
+
+            dffn, gW1, gb1, gW2, gb2 = ffn_backward(dx, ln2_out, block.ffn)
+
+            dln2_out = dffn
+            dln2_in, g_ln2_gamma, g_ln2_beta = layernorm_backward(
+                dln2_out, ln2_in, block.ln2
+            )
+
+            dx = dx + dln2_in
+
+            block.ffn.W1 -= lr * gW1
+            block.ffn.b1 -= lr * gb1
+            block.ffn.W2 -= lr * gW2
+            block.ffn.b2 -= lr * gb2
+            block.ln2.gamma -= lr * g_ln2_gamma
+            block.ln2.beta -= lr * g_ln2_beta
+
+        model.ln_f.gamma -= lr * grad_ln_gamma
+        model.ln_f.beta -= lr * grad_ln_beta
+        model.embedding.token_embed -= lr * grad_token_embed
+
+        if step % 20 == 0:
+            print(f&quot;Step {step:4d} | Loss: {loss:.4f}&quot;)
+
+    return model
+
+
+def parameter_breakdown():
+    configs = [
+        (&quot;GPT-2 Small&quot;, 50257, 768, 12, 12, 1024, 3072),
+        (&quot;GPT-2 Medium&quot;, 50257, 1024, 16, 24, 1024, 4096),
+        (&quot;GPT-2 Large&quot;, 50257, 1280, 20, 36, 1024, 5120),
+        (&quot;GPT-2 XL&quot;, 50257, 1600, 25, 48, 1024, 6400),
+    ]
+
+    print(&quot;GPT-2 Family Parameter Counts&quot;)
+    print(&quot;=&quot; * 65)
+    print(f&quot;{&#39;Model&#39;:&lt;16} {&#39;Layers&#39;:&gt;6} {&#39;Heads&#39;:&gt;6} {&#39;Dims&#39;:&gt;6} {&#39;Params&#39;:&gt;14}&quot;)
+    print(&quot;-&quot; * 65)
+
+    for name, vocab, dim, heads, layers, seq_len, ff in configs:
+        token_emb = vocab * dim
+        pos_emb = seq_len * dim
+        per_block_attn = 4 * dim * dim
+        per_block_ff = 2 * dim * ff + dim + ff
+        per_block_ln = 4 * dim
+        per_block = per_block_attn + per_block_ff + per_block_ln
+        final_ln = 2 * dim
+        total = token_emb + pos_emb + layers * per_block + final_ln
+        print(f&quot;{name:&lt;16} {layers:&gt;6} {heads:&gt;6} {dim:&gt;6} {total:&gt;14,}&quot;)
+
+    print()
+
+
+def memory_estimate():
+    print(&quot;Memory Requirements for Inference (FP16)&quot;)
+    print(&quot;=&quot; * 65)
+
+    models = [
+        (&quot;GPT-2 Small (124M)&quot;, 124e6, 12, 12, 64, 1024),
+        (&quot;Llama 3 8B&quot;, 8e9, 32, 32, 128, 8192),
+        (&quot;Llama 3 70B&quot;, 70e9, 80, 64, 128, 8192),
+        (&quot;Llama 3 405B&quot;, 405e9, 126, 128, 128, 131072),
+    ]
+
+    print(f&quot;{&#39;Model&#39;:&lt;24} {&#39;Weights&#39;:&gt;10} {&#39;KV Cache&#39;:&gt;12} {&#39;Total&#39;:&gt;10}&quot;)
+    print(&quot;-&quot; * 65)
+
+    for name, params, layers, heads, head_dim, max_seq in models:
+        weight_bytes = params * 2
+        kv_per_token = 2 * layers * heads * head_dim * 2
+        kv_full = kv_per_token * max_seq
+        total = weight_bytes + kv_full
+
+        def fmt(b):
+            if b &gt;= 1e9:
+                return f&quot;{b / 1e9:.1f} GB&quot;
+            return f&quot;{b / 1e6:.0f} MB&quot;
+
+        print(f&quot;{name:&lt;24} {fmt(weight_bytes):&gt;10} {fmt(kv_full):&gt;12} {fmt(total):&gt;10}&quot;)
+
+    print()
+
+
+if __name__ == &quot;__main__&quot;:
+    np.random.seed(42)
+
+    parameter_breakdown()
+    memory_estimate()
+
+    corpus = &quot;&quot;&quot;The transformer architecture has revolutionized natural language processing.
+Attention mechanisms allow the model to focus on relevant parts of the input.
+Self-attention computes relationships between all pairs of positions in a sequence.
+Multi-head attention splits the representation into multiple subspaces.
+Each attention head can learn different types of relationships.
+The feedforward network provides nonlinear transformations at each position.
+Residual connections enable gradient flow through deep networks.
+Layer normalization stabilizes training by normalizing activations.
+Position embeddings give the model information about token ordering.
+The causal mask ensures autoregressive generation during training.
+Pre-training on large text corpora teaches the model general language understanding.
+Fine-tuning adapts the pre-trained model to specific downstream tasks.&quot;&quot;&quot;
+
+    print(&quot;Training Mini GPT&quot;)
+    print(&quot;=&quot; * 65)
+    model = train_mini_gpt(corpus, num_steps=200)
+
+    prompt = list(&quot;The transformer&quot;.encode(&quot;utf-8&quot;))
+    print(f&quot;\nPrompt: &#39;The transformer&#39;&quot;)
+    print(&quot;Generating...&quot;)
+    output_tokens = generate(model, prompt, max_new_tokens=100, temperature=0.8)
+    generated_text = bytes(output_tokens).decode(&quot;utf-8&quot;, errors=&quot;replace&quot;)
+    print(f&quot;Generated: {generated_text}&quot;)
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/10-llms-from-scratch/04-pre-training-mini-gpt/code/main.rs">phases/10-llms-from-scratch/04-pre-training-mini-gpt/code/main.rs</a><details><summary>查看原始文本</summary><pre><code>// Mini-GPT forward pass, stdlib only.
+// Topic: embedding + pos embedding, N transformer blocks (LayerNorm, MHA, FFN), LM head.
+// References (cited in spirit, not as deps):
+//   - Karpathy nanoGPT / llm.c:    https://github.com/karpathy/llm.c/blob/master/train_gpt2.c
+//   - candle gpt-bigcode:          https://github.com/huggingface/candle/blob/main/candle-transformers/src/models/bigcode.rs
+//   - GPT-2 paper:                 https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf
+//
+// Compile + run:  rustc --edition 2021 main.rs -o /tmp/mini &amp;&amp; /tmp/mini
+
+use std::f32::consts::PI;
+
+// Tensor3 = [n, d_model]. We keep batch=1 implicit, matching the lesson script.
+struct Mat {
+    rows: usize,
+    cols: usize,
+    data: Vec&lt;f32&gt;,
+}
+
+impl Mat {
+    fn zeros(rows: usize, cols: usize) -&gt; Self {
+        Mat { rows, cols, data: vec![0.0; rows * cols] }
+    }
+    #[inline] fn at(&amp;self, i: usize, j: usize) -&gt; f32 { self.data[i * self.cols + j] }
+    #[inline] fn set(&amp;mut self, i: usize, j: usize, v: f32) { self.data[i * self.cols + j] = v; }
+
+    fn matmul(&amp;self, b: &amp;Mat) -&gt; Mat {
+        assert_eq!(self.cols, b.rows);
+        let mut out = Mat::zeros(self.rows, b.cols);
+        for i in 0..self.rows {
+            for k in 0..self.cols {
+                let aik = self.at(i, k);
+                if aik == 0.0 { continue; }
+                let row_base = i * out.cols;
+                let bk_base = k * b.cols;
+                for j in 0..b.cols {
+                    out.data[row_base + j] += aik * b.data[bk_base + j];
+                }
+            }
+        }
+        out
+    }
+
+    fn add_(&amp;mut self, b: &amp;Mat) {
+        assert_eq!(self.rows, b.rows);
+        assert_eq!(self.cols, b.cols);
+        for i in 0..self.data.len() { self.data[i] += b.data[i]; }
+    }
+
+    fn add_rowwise_(&amp;mut self, bias: &amp;[f32]) {
+        assert_eq!(self.cols, bias.len());
+        for i in 0..self.rows {
+            let base = i * self.cols;
+            for j in 0..self.cols { self.data[base + j] += bias[j]; }
+        }
+    }
+}
+
+struct Rng { state: u64 }
+impl Rng {
+    fn new(seed: u64) -&gt; Self { Rng { state: seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1 } }
+    fn next_u32(&amp;mut self) -&gt; u32 {
+        self.state = self.state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (self.state &gt;&gt; 33) as u32
+    }
+    fn uniform(&amp;mut self) -&gt; f32 { (self.next_u32() as f32 + 1.0) / (u32::MAX as f32 + 2.0) }
+    fn gauss(&amp;mut self) -&gt; f32 {
+        let u1 = self.uniform();
+        let u2 = self.uniform();
+        (-2.0 * u1.ln()).sqrt() * (2.0 * PI * u2).cos()
+    }
+    // sample categorical from probability vector (must sum to 1)
+    fn choice(&amp;mut self, probs: &amp;[f32]) -&gt; usize {
+        let r = self.uniform();
+        let mut acc = 0.0;
+        for (i, p) in probs.iter().enumerate() {
+            acc += *p;
+            if r &lt;= acc { return i; }
+        }
+        probs.len() - 1
+    }
+}
+
+fn randn_mat(rows: usize, cols: usize, scale: f32, rng: &amp;mut Rng) -&gt; Mat {
+    let mut m = Mat::zeros(rows, cols);
+    for v in m.data.iter_mut() { *v = rng.gauss() * scale; }
+    m
+}
+
+struct Embedding {
+    token_embed: Mat, // [vocab, d]
+    pos_embed: Mat,   // [max_seq, d]
+}
+
+impl Embedding {
+    fn new(vocab: usize, d: usize, max_seq: usize, rng: &amp;mut Rng) -&gt; Self {
+        Embedding {
+            token_embed: randn_mat(vocab, d, 0.02, rng),
+            pos_embed: randn_mat(max_seq, d, 0.02, rng),
+        }
+    }
+    fn forward(&amp;self, ids: &amp;[usize]) -&gt; Mat {
+        let n = ids.len();
+        let d = self.token_embed.cols;
+        let mut out = Mat::zeros(n, d);
+        for (i, &amp;t) in ids.iter().enumerate() {
+            for j in 0..d {
+                out.set(i, j, self.token_embed.at(t, j) + self.pos_embed.at(i, j));
+            }
+        }
+        out
+    }
+}
+
+struct LayerNorm {
+    gamma: Vec&lt;f32&gt;,
+    beta: Vec&lt;f32&gt;,
+    eps: f32,
+}
+
+impl LayerNorm {
+    fn new(d: usize) -&gt; Self {
+        LayerNorm { gamma: vec![1.0; d], beta: vec![0.0; d], eps: 1e-5 }
+    }
+    fn forward(&amp;self, x: &amp;Mat) -&gt; Mat {
+        let mut out = Mat::zeros(x.rows, x.cols);
+        let d = x.cols as f32;
+        for i in 0..x.rows {
+            let base = i * x.cols;
+            let mut mean = 0.0f32;
+            for j in 0..x.cols { mean += x.data[base + j]; }
+            mean /= d;
+            let mut var = 0.0f32;
+            for j in 0..x.cols {
+                let dx = x.data[base + j] - mean;
+                var += dx * dx;
+            }
+            var /= d;
+            let inv = 1.0 / (var + self.eps).sqrt();
+            for j in 0..x.cols {
+                let n = (x.data[base + j] - mean) * inv;
+                out.data[base + j] = self.gamma[j] * n + self.beta[j];
+            }
+        }
+        out
+    }
+}
+
+struct MultiHeadAttention {
+    n_heads: usize,
+    head_dim: usize,
+    wq: Mat,
+    wk: Mat,
+    wv: Mat,
+    wo: Mat,
+}
+
+impl MultiHeadAttention {
+    fn new(d: usize, n_heads: usize, rng: &amp;mut Rng) -&gt; Self {
+        assert_eq!(d % n_heads, 0);
+        MultiHeadAttention {
+            n_heads,
+            head_dim: d / n_heads,
+            wq: randn_mat(d, d, 0.02, rng),
+            wk: randn_mat(d, d, 0.02, rng),
+            wv: randn_mat(d, d, 0.02, rng),
+            wo: randn_mat(d, d, 0.02, rng),
+        }
+    }
+
+    // Causal MHA forward. mask = upper triangle of -1e9 baked into the inner loop.
+    fn forward(&amp;self, x: &amp;Mat) -&gt; Mat {
+        let n = x.rows;
+        let d = x.cols;
+        let q = x.matmul(&amp;self.wq);
+        let k = x.matmul(&amp;self.wk);
+        let v = x.matmul(&amp;self.wv);
+
+        let mut attn_concat = Mat::zeros(n, d);
+        let inv_sqrt = 1.0 / (self.head_dim as f32).sqrt();
+
+        for h in 0..self.n_heads {
+            let hoff = h * self.head_dim;
+            // Per-head scores [n, n]
+            let mut scores = vec![0.0f32; n * n];
+            for i in 0..n {
+                for j in 0..n {
+                    let mut s = 0.0f32;
+                    for kk in 0..self.head_dim {
+                        s += q.at(i, hoff + kk) * k.at(j, hoff + kk);
+                    }
+                    scores[i * n + j] = s * inv_sqrt;
+                    if j &gt; i { scores[i * n + j] = -1e9; }
+                }
+            }
+            // softmax row-wise
+            for i in 0..n {
+                let row = &amp;mut scores[i * n..(i + 1) * n];
+                let mut m = f32::NEG_INFINITY;
+                for &amp;v in row.iter() { if v &gt; m { m = v; } }
+                let mut s = 0.0f32;
+                for v in row.iter_mut() { *v = (*v - m).exp(); s += *v; }
+                let inv = 1.0 / s;
+                for v in row.iter_mut() { *v *= inv; }
+            }
+            // weights @ V for this head, write into concat columns [hoff .. hoff + head_dim]
+            for i in 0..n {
+                for kk in 0..self.head_dim {
+                    let mut s = 0.0f32;
+                    for j in 0..n {
+                        s += scores[i * n + j] * v.at(j, hoff + kk);
+                    }
+                    attn_concat.set(i, hoff + kk, s);
+                }
+            }
+        }
+
+        attn_concat.matmul(&amp;self.wo)
+    }
+}
+
+struct FeedForward {
+    w1: Mat,
+    b1: Vec&lt;f32&gt;,
+    w2: Mat,
+    b2: Vec&lt;f32&gt;,
+}
+
+impl FeedForward {
+    fn new(d: usize, ff: usize, rng: &amp;mut Rng) -&gt; Self {
+        FeedForward {
+            w1: randn_mat(d, ff, 0.02, rng),
+            b1: vec![0.0; ff],
+            w2: randn_mat(ff, d, 0.02, rng),
+            b2: vec![0.0; d],
+        }
+    }
+    fn forward(&amp;self, x: &amp;Mat) -&gt; Mat {
+        let mut h = x.matmul(&amp;self.w1);
+        h.add_rowwise_(&amp;self.b1);
+        for v in h.data.iter_mut() { if *v &lt; 0.0 { *v = 0.0; } } // ReLU
+        let mut y = h.matmul(&amp;self.w2);
+        y.add_rowwise_(&amp;self.b2);
+        y
+    }
+}
+
+struct Block {
+    ln1: LayerNorm,
+    attn: MultiHeadAttention,
+    ln2: LayerNorm,
+    ffn: FeedForward,
+}
+
+impl Block {
+    fn new(d: usize, n_heads: usize, ff: usize, rng: &amp;mut Rng) -&gt; Self {
+        Block {
+            ln1: LayerNorm::new(d),
+            attn: MultiHeadAttention::new(d, n_heads, rng),
+            ln2: LayerNorm::new(d),
+            ffn: FeedForward::new(d, ff, rng),
+        }
+    }
+    fn forward(&amp;self, x: &amp;Mat) -&gt; Mat {
+        // pre-LN, residual
+        let mut y = self.attn.forward(&amp;self.ln1.forward(x));
+        y.add_(x);
+        let mut z = self.ffn.forward(&amp;self.ln2.forward(&amp;y));
+        z.add_(&amp;y);
+        z
+    }
+}
+
+struct MiniGPT {
+    embedding: Embedding,
+    blocks: Vec&lt;Block&gt;,
+    ln_f: LayerNorm,
+    vocab: usize,
+    d_model: usize,
+    max_seq: usize,
+}
+
+impl MiniGPT {
+    fn new(vocab: usize, d: usize, n_heads: usize, n_layers: usize, max_seq: usize, ff: usize, rng: &amp;mut Rng) -&gt; Self {
+        let embedding = Embedding::new(vocab, d, max_seq, rng);
+        let blocks = (0..n_layers).map(|_| Block::new(d, n_heads, ff, rng)).collect();
+        let ln_f = LayerNorm::new(d);
+        MiniGPT { embedding, blocks, ln_f, vocab, d_model: d, max_seq }
+    }
+
+    fn forward(&amp;self, ids: &amp;[usize]) -&gt; Mat {
+        assert!(ids.len() &lt;= self.max_seq);
+        let mut x = self.embedding.forward(ids);
+        for b in &amp;self.blocks { x = b.forward(&amp;x); }
+        x = self.ln_f.forward(&amp;x);
+        // LM head shares token embedding matrix: logits = x @ token_embed^T
+        // Compute directly into [n, vocab]. token_embed is [vocab, d_model].
+        let n = x.rows;
+        let mut logits = Mat::zeros(n, self.vocab);
+        for i in 0..n {
+            for t in 0..self.vocab {
+                let mut s = 0.0f32;
+                for j in 0..self.d_model {
+                    s += x.at(i, j) * self.embedding.token_embed.at(t, j);
+                }
+                logits.set(i, t, s);
+            }
+        }
+        logits
+    }
+
+    fn count_parameters(&amp;self) -&gt; usize {
+        let mut total = self.embedding.token_embed.data.len() + self.embedding.pos_embed.data.len();
+        for b in &amp;self.blocks {
+            total += b.attn.wq.data.len() + b.attn.wk.data.len() + b.attn.wv.data.len() + b.attn.wo.data.len();
+            total += b.ffn.w1.data.len() + b.ffn.b1.len() + b.ffn.w2.data.len() + b.ffn.b2.len();
+            total += b.ln1.gamma.len() + b.ln1.beta.len() + b.ln2.gamma.len() + b.ln2.beta.len();
+        }
+        total += self.ln_f.gamma.len() + self.ln_f.beta.len();
+        total
+    }
+}
+
+fn cross_entropy_loss(logits: &amp;Mat, targets: &amp;[usize]) -&gt; f32 {
+    let n = logits.rows;
+    let v = logits.cols;
+    assert_eq!(targets.len(), n, &quot;targets length must equal logits rows&quot;);
+    let mut total = 0.0f32;
+    for i in 0..n {
+        let row = &amp;logits.data[i * v..(i + 1) * v];
+        let t = targets[i];
+        assert!(t &lt; v, &quot;target index out of range for logits cols&quot;);
+        let mut m = f32::NEG_INFINITY;
+        for &amp;x in row { if x &gt; m { m = x; } }
+        let mut s = 0.0f32;
+        for &amp;x in row { s += (x - m).exp(); }
+        let log_sum = s.ln();
+        let log_softmax_t = row[t] - m - log_sum;
+        total += -log_softmax_t;
+    }
+    total / n as f32
+}
+
+fn generate(model: &amp;MiniGPT, prompt: &amp;[usize], max_new: usize, temperature: f32, rng: &amp;mut Rng) -&gt; Vec&lt;usize&gt; {
+    assert!(!prompt.is_empty(), &quot;prompt must be non-empty&quot;);
+    assert!(temperature &gt; 0.0, &quot;temperature must be &gt; 0&quot;);
+    let mut tokens: Vec&lt;usize&gt; = prompt.to_vec();
+    let max_seq = model.max_seq;
+    for _ in 0..max_new {
+        let start = if tokens.len() &gt; max_seq { tokens.len() - max_seq } else { 0 };
+        let ctx = &amp;tokens[start..];
+        let logits = model.forward(ctx);
+        let last_row = &amp;logits.data[(ctx.len() - 1) * logits.cols..ctx.len() * logits.cols];
+        let scaled: Vec&lt;f32&gt; = last_row.iter().map(|x| x / temperature).collect();
+        let mut m = f32::NEG_INFINITY;
+        for &amp;x in &amp;scaled { if x &gt; m { m = x; } }
+        let exps: Vec&lt;f32&gt; = scaled.iter().map(|x| (x - m).exp()).collect();
+        let s: f32 = exps.iter().sum();
+        let probs: Vec&lt;f32&gt; = exps.into_iter().map(|x| x / s).collect();
+        let next = rng.choice(&amp;probs);
+        tokens.push(next);
+    }
+    tokens
+}
+
+fn parameter_breakdown() {
+    println!(&quot;GPT-2 family parameter counts (analytical)&quot;);
+    println!(&quot;{}&quot;, &quot;=&quot;.repeat(65));
+    println!(&quot;{:&lt;16} {:&gt;6} {:&gt;6} {:&gt;6} {:&gt;14}&quot;, &quot;Model&quot;, &quot;Layers&quot;, &quot;Heads&quot;, &quot;Dims&quot;, &quot;Params&quot;);
+    println!(&quot;{}&quot;, &quot;-&quot;.repeat(65));
+    let configs: [(&amp;str, usize, usize, usize, usize, usize, usize); 4] = [
+        (&quot;GPT-2 Small&quot;,  50257, 768,  12, 12, 1024, 3072),
+        (&quot;GPT-2 Medium&quot;, 50257, 1024, 16, 24, 1024, 4096),
+        (&quot;GPT-2 Large&quot;,  50257, 1280, 20, 36, 1024, 5120),
+        (&quot;GPT-2 XL&quot;,     50257, 1600, 25, 48, 1024, 6400),
+    ];
+    for (name, vocab, dim, heads, layers, seq_len, ff) in configs {
+        let token_emb = vocab * dim;
+        let pos_emb = seq_len * dim;
+        let per_block_attn = 4 * dim * dim;
+        let per_block_ff = 2 * dim * ff + dim + ff;
+        let per_block_ln = 4 * dim;
+        let per_block = per_block_attn + per_block_ff + per_block_ln;
+        let final_ln = 2 * dim;
+        let total = token_emb + pos_emb + layers * per_block + final_ln;
+        println!(&quot;{:&lt;16} {:&gt;6} {:&gt;6} {:&gt;6} {:&gt;14}&quot;, name, layers, heads, dim, total);
+    }
+    println!();
+}
+
+fn memory_estimate() {
+    println!(&quot;Inference memory (FP16)&quot;);
+    println!(&quot;{}&quot;, &quot;=&quot;.repeat(65));
+    println!(&quot;{:&lt;24} {:&gt;10} {:&gt;12} {:&gt;10}&quot;, &quot;Model&quot;, &quot;Weights&quot;, &quot;KV Cache&quot;, &quot;Total&quot;);
+    println!(&quot;{}&quot;, &quot;-&quot;.repeat(65));
+    let models: [(&amp;str, f64, usize, usize, usize, usize); 4] = [
+        (&quot;GPT-2 Small (124M)&quot;, 124e6,  12,  12,  64, 1024),
+        (&quot;Llama 3 8B&quot;,          8e9,  32,  32, 128, 8192),
+        (&quot;Llama 3 70B&quot;,        70e9,  80,  64, 128, 8192),
+        (&quot;Llama 3 405B&quot;,      405e9, 126, 128, 128, 131072),
+    ];
+    let fmt = |b: f64| -&gt; String {
+        if b &gt;= 1e9 { format!(&quot;{:.1} GB&quot;, b / 1e9) } else { format!(&quot;{:.0} MB&quot;, b / 1e6) }
+    };
+    for (name, params, layers, heads, head_dim, max_seq) in models {
+        let weight_bytes = params * 2.0;
+        let kv_per_tok = 2.0 * layers as f64 * heads as f64 * head_dim as f64 * 2.0;
+        let kv_full = kv_per_tok * max_seq as f64;
+        let total = weight_bytes + kv_full;
+        println!(&quot;{:&lt;24} {:&gt;10} {:&gt;12} {:&gt;10}&quot;, name, fmt(weight_bytes), fmt(kv_full), fmt(total));
+    }
+    println!();
+}
+
+fn main() {
+    parameter_breakdown();
+    memory_estimate();
+
+    // Tiny demo on byte-level vocab.
+    let corpus: &amp;str = &quot;The transformer architecture has revolutionized natural language processing. \
+Attention mechanisms allow the model to focus on relevant parts of the input. \
+Self-attention computes relationships between all pairs of positions in a sequence.&quot;;
+
+    let tokens: Vec&lt;usize&gt; = corpus.bytes().map(|b| b as usize).collect();
+
+    println!(&quot;=== Mini-GPT forward pass demo ===&quot;);
+    let vocab = 256usize;
+    let d_model = 32usize;
+    let n_heads = 4usize;
+    let n_layers = 2usize;
+    let max_seq = 32usize;
+    let ff = d_model * 4;
+
+    let mut rng = Rng::new(42);
+    let model = MiniGPT::new(vocab, d_model, n_heads, n_layers, max_seq, ff, &amp;mut rng);
+    println!(&quot;config: vocab={}, d={}, heads={}, layers={}, seq={}&quot;, vocab, d_model, n_heads, n_layers, max_seq);
+    println!(&quot;parameters: {}&quot;, model.count_parameters());
+
+    let input = &amp;tokens[..max_seq.min(tokens.len() - 1)];
+    let target: Vec&lt;usize&gt; = tokens[1..1 + input.len()].to_vec();
+
+    let start = std::time::Instant::now();
+    let logits = model.forward(input);
+    let elapsed = start.elapsed();
+
+    println!(&quot;forward pass: {} tokens -&gt; logits shape ({}, {})&quot;,
+        input.len(), logits.rows, logits.cols);
+    println!(&quot;forward latency: {:.2}ms&quot;, elapsed.as_secs_f64() * 1000.0);
+
+    let loss = cross_entropy_loss(&amp;logits, &amp;target);
+    println!(&quot;cross-entropy loss vs next-token target: {:.4}&quot;, loss);
+    println!(&quot;(random init loss ~ ln(vocab) = {:.4})&quot;, (vocab as f32).ln());
+
+    // Generation demo with a random model is gibberish, but exercises the autoregressive loop.
+    let prompt: Vec&lt;usize&gt; = &quot;The &quot;.bytes().map(|b| b as usize).collect();
+    let mut gen_rng = Rng::new(123);
+    let out = generate(&amp;model, &amp;prompt, 24, 1.0, &amp;mut gen_rng);
+    let bytes: Vec&lt;u8&gt; = out.iter().map(|&amp;t| t as u8).collect();
+    let s = String::from_utf8_lossy(&amp;bytes);
+    println!(&quot;\ngenerated (random weights, expect gibberish):&quot;);
+    println!(&quot;  {:?}&quot;, s);
+
+    println!(&quot;\n=== microbench: 50 forwards (n=32, d=32, 2 layers) ===&quot;);
+    let start = std::time::Instant::now();
+    let mut sink = 0.0f32;
+    for _ in 0..50 {
+        let l = model.forward(input);
+        sink += l.at(0, 0);
+    }
+    let elapsed = start.elapsed();
+    println!(&quot;50 forwards in {:.2}ms ({:.1}/sec)  sink={:.4}&quot;,
+        elapsed.as_secs_f64() * 1000.0,
+        50.0 / elapsed.as_secs_f64(),
+        sink,
+    );
+}
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/10-llms-from-scratch/04-pre-training-mini-gpt/outputs/prompt-gpt-architecture-analyzer.md">phases/10-llms-from-scratch/04-pre-training-mini-gpt/outputs/prompt-gpt-architecture-analyzer.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: prompt-gpt-architecture-analyzer
+description: Analyze architecture choices in any GPT-style transformer model
+version: 1.0.0
+phase: 10
+lesson: 4
+tags: [gpt, transformer, architecture, attention, kv-cache, scaling, pre-training]
+---
+
+# GPT Architecture Analyzer
+
+When evaluating a GPT-style model from a technical report, model card, or training log, use this framework to break down the architecture and identify design tradeoffs.
+
+## Analysis Protocol
+
+### 1. Parameter Allocation Breakdown
+
+Compute the exact parameter count for each component:
+
+- **Token embeddings**: vocab_size x embed_dim
+- **Position embeddings**: max_seq_len x embed_dim
+- **Per-block attention**: 4 x embed_dim x embed_dim (Q, K, V, output projections)
+- **Per-block FFN**: 2 x embed_dim x ff_dim + embed_dim + ff_dim (two linear layers + biases)
+- **Per-block LayerNorm**: 4 x embed_dim (two norms, each with scale + bias)
+- **Final LayerNorm**: 2 x embed_dim
+- **Output head**: vocab_size x embed_dim (or 0 if weight-tied with token embeddings)
+
+Flag if any single component exceeds 40% of total parameters. The embedding matrix dominates in small models. Attention and FFN dominate in large models.
+
+### 2. Attention Design Analysis
+
+Evaluate the attention configuration:
+
+- **Head dimension**: embed_dim / num_heads. Standard is 64 (GPT-2) or 128 (Llama 3). Below 32 limits per-head expressiveness. Above 128 wastes compute with little benefit.
+- **Heads per layer**: More heads = more diverse attention patterns but more memory for KV cache.
+- **Grouped Query Attention (GQA)**: Does the model share K/V heads across multiple Q heads? Llama 3 uses GQA with 8 KV heads for 32 Q heads. This reduces KV cache by 4x.
+- **Context length**: Max position embeddings. RoPE allows extrapolation beyond training length. Absolute position embeddings do not.
+
+### 3. Memory Budget
+
+For inference at the model&#39;s maximum context length:
+
+- **Weights (FP16)**: total_params x 2 bytes
+- **KV Cache (FP16)**: 2 x num_layers x num_kv_heads x head_dim x max_seq_len x 2 bytes
+- **Activations**: batch_size x seq_len x embed_dim x 2 bytes x num_layers (approximate)
+
+Flag if KV cache exceeds weight memory. This happens for long-context models (128K+) and indicates the model is memory-bound during decode.
+
+### 4. Compute Profile
+
+- **Prefill FLOPS per token**: approximately 2 x total_params (one matmul per parameter, forward pass)
+- **Decode FLOPS per token**: same as prefill but on a single token
+- **Prefill bottleneck**: compute-bound (GPU TFLOPS)
+- **Decode bottleneck**: memory-bound (GPU memory bandwidth)
+- **Arithmetic intensity**: FLOPS per byte of memory accessed. Below 100 = memory-bound.
+
+### 5. Scaling Decisions
+
+Evaluate against known scaling laws:
+
+- **Chinchilla optimal**: For a given compute budget C, optimal model size N and token count D satisfy N ~ D (roughly equal scaling). A 7B model needs ~140B tokens.
+- **Llama 3 overtrained**: Meta trained Llama 3 8B on 15T tokens (100x Chinchilla optimal). Overtraining small models on more data produces better per-token inference cost.
+- **Width vs depth**: Deeper models (more layers) are generally more sample-efficient than wider models (larger embed_dim) for the same parameter count.
+
+## Red Flags
+
+- **FFN ratio not 4x**: Standard is ff_dim = 4 x embed_dim. Llama uses 8/3 x embed_dim with SwiGLU. Deviations should be justified.
+- **No weight tying**: The output head should share weights with token embeddings unless vocab_size is very large relative to embed_dim.
+- **No GQA above 13B**: Models above 13B without grouped-query attention will have excessively large KV caches.
+- **No RoPE for long context**: Absolute position embeddings do not extrapolate beyond training length. Models targeting 32K+ context should use rotary embeddings.
+- **Learning rate too high for model size**: Larger models need lower peak learning rates. GPT-2 Small uses 6e-4. Llama 3 405B uses 8e-5.
+
+## Output Format
+
+1. **Parameter Table**: component-by-component parameter counts with percentages
+2. **Memory Budget**: weights, KV cache, and activation memory at max context length
+3. **Compute Profile**: prefill and decode throughput estimates for A100/H100
+4. **Design Assessment**: what the model gets right and what is non-standard
+5. **Scaling Verdict**: whether the model is appropriately sized for its training data
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. What training objective does GPT use during pre-training?</legend><label class="option"><input type="radio" name="q0" value="0"> Sentence classification</label><label class="option"><input type="radio" name="q0" value="1"> Next-token prediction: given previous tokens, predict the next one</label><label class="option"><input type="radio" name="q0" value="2"> Image-text alignment</label><label class="option"><input type="radio" name="q0" value="3"> Masked language modeling (predicting masked tokens)</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. How many transformer layers, attention heads, and embedding dimensions does GPT-2 Small (124M) have?</legend><label class="option"><input type="radio" name="q1" value="0"> 24 layers, 16 heads, 1024 dims</label><label class="option"><input type="radio" name="q1" value="1"> 6 layers, 6 heads, 512 dims</label><label class="option"><input type="radio" name="q1" value="2"> 48 layers, 25 heads, 1600 dims</label><label class="option"><input type="radio" name="q1" value="3"> 12 layers, 12 heads, 768 dims</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. What is the role of the causal attention mask in GPT?</legend><label class="option"><input type="radio" name="q2" value="0"> It prevents each token from attending to future tokens, ensuring the model can only use past context for predictions</label><label class="option"><input type="radio" name="q2" value="1"> It reduces memory usage during training</label><label class="option"><input type="radio" name="q2" value="2"> It masks out low-confidence attention scores</label><label class="option"><input type="radio" name="q2" value="3"> It prevents attention to padding tokens</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. What does &#39;temperature&#39; control during text generation?</legend><label class="option"><input type="radio" name="q3" value="0"> The randomness of token selection: lower temperature makes outputs more deterministic, higher makes them more diverse</label><label class="option"><input type="radio" name="q3" value="1"> The speed of generation</label><label class="option"><input type="radio" name="q3" value="2"> The number of tokens generated</label><label class="option"><input type="radio" name="q3" value="3"> The model&#39;s confidence threshold</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. Why does pre-training require significantly more compute than fine-tuning?</legend><label class="option"><input type="radio" name="q4" value="0"> Pre-training processes trillions of tokens from scratch to learn general language patterns, while fine-tuning adjusts an already-capable model on thousands of examples</label><label class="option"><input type="radio" name="q4" value="1"> Pre-training uses a different architecture</label><label class="option"><input type="radio" name="q4" value="2"> Pre-training uses larger batch sizes</label><label class="option"><input type="radio" name="q4" value="3"> Fine-tuning doesn&#39;t use gradients</label><p data-feedback="4"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/10-llms-from-scratch/03-data-pipelines/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/10-llms-from-scratch/05-scaling-distributed/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/10-llms-from-scratch/04-pre-training-mini-gpt/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

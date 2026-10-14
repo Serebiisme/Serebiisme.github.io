@@ -1,0 +1,1771 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>系统设计 从问题到部署模型 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-02-ml-fundamentals" data-lesson="02-ml-fundamentals/19-ml-system-design" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/02-ml-fundamentals/">机器学习基础</a> / LESSON 19</p><h1 class="lesson-title">系统设计 从问题到部署模型</h1><p>ML System Design — From Problem to Deployed Model</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>系统设计 从问题到部署模型</h1>
+<blockquote>
+<p>模型是系统的一部分. 设计决定模型预测什么,谁对它采取行动,成本多少,以及它失败时会发生什么.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 2, Lessons 09 (Model Evaluation) and 13 (ML Pipelines)
+<strong>Time:</strong> ~110 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>设置一个业务问题作为一个ML任务,一个预测,一个使用它的决定,以及一个理由,为什么规则不够</li>
+<li>区分离离线,在线,商业和防线指标,并将每个模型与微不足道和论的基线进行比较</li>
+<li>从交通数量来估计批量和在线推断的每日成本,延迟和延迟</li>
+<li>选择一个推出模式 (影子,鱼,A/B测试) 和每个故障模式的安全默认</li>
+<li>确定模型改变其下一个版本训练数据的反循环</li>
+<li>写一个ML设计文件,并与固定检查清单进行比分</li>
+</ul>
+<h2>问题</h2>
+<p>一家订阅公司要求&quot;一个缩模型&quot;.一个数据科学家训练了一个加坡加大分类器,报告AUC为0.91.</p>
+<p>原因与算法无关.没有人决定一个分数开始的操作.分数每周一次到来,但保留团队每天都打电话给客户.标签来自取消表,其中还存储了取消原因,所以一个功能包含了答案.没有人比较了模型与支持团队已经使用的规则:打电话给任何人休息两周.</p>
+<p>设计失败是一个页面的设计文件询问它们中的每一个.这个课程教导了该文件中的决定.你建立了一个工具包,将批量和在线服务价格进行比较,将模型与基线进行比较,并与检查清单进行设计文件的评分.</p>
+<h2>概念</h2>
+<h3>从业务目标到 ML任务</h3>
+<p>企业目标不是一个 ML 任务.</p>
+<ol>
+<li>模型预测什么,以及对哪个实体 (用户,支付,存储,项目)?</li>
+<li>预言使用哪个决定,谁或什么决定?</li>
+<li>预测是什么时候需要的,</li>
+<li>你怎么知道这个决定是更好的呢?</li>
+</ol>
+<table>
+<thead>
+<tr>
+<th>Business goal</th>
+<th>Prediction</th>
+<th>Decision that uses it</th>
+<th>ML task</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Reduce churn</td>
+<td>Probability that a user cancels in the next 30 days</td>
+<td>Send a save offer to the top 5 percent each night</td>
+<td>Binary classification</td>
+</tr>
+<tr>
+<td>Cut fraud losses</td>
+<td>Probability that a payment is fraud</td>
+<td>Approve, review, or block within 100 ms</td>
+<td>Binary classification</td>
+</tr>
+<tr>
+<td>Keep shelves stocked</td>
+<td>Units sold per store per day next week</td>
+<td>Order quantity for each store</td>
+<td>Forecasting</td>
+</tr>
+<tr>
+<td>Show relevant items</td>
+<td>Relevance score for a (user, item) pair</td>
+<td>Order of items in the feed</td>
+<td>Ranking</td>
+</tr>
+</tbody>
+</table>
+<p>&quot;预测&quot;让视野,实体和行动都开放. &quot;预测用户在未来30天内是否会取消,以便今晚的工作可以选择谁得到报价&quot;解决了所有三个问题.</p>
+<h3>什么时候不使用 ML</h3>
+<p>谷歌机器学习规则中的第1条规定,不要害怕在不使用机器学习的情况下推出产品.机器学习需要数据,而简单的论通常会让你走出一条路.</p>
+<ul>
+<li>一个简短的规则能达到目标,保持正确.一个规则更便宜地运行,测试和解释.</li>
+<li>你没有标签,也没有实用的方法来收集它们.</li>
+<li>没有人会根据预测做任何事情,所以更好的预测不会改变任何事情.</li>
+<li>预测时间存在的数据不包含信号.</li>
+<li>一个错误是不可接受的,没有人可以检查输出.</li>
+<li>建立和运行系统的成本比更好的决定更高.</li>
+</ul>
+<p>当一个规则变得长而脆弱时,ML开始付出代价.同一个指南的第3规则更喜欢ML而不是复杂的论,因为学习模型更容易更新和维护.</p>
+<h3>测量表的三个层</h3>
+<p>测量一个 ML 系统的三个层次,加上一个限制:</p>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>When you can measure it</th>
+<th>Churn example</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Offline metric</td>
+<td>Before launch, on held-out past data</td>
+<td>F1 at the offer threshold, precision in the top 5 percent</td>
+</tr>
+<tr>
+<td>Online metric</td>
+<td>During launch, on live traffic</td>
+<td>Offer acceptance rate, share of users scored, score distribution</td>
+</tr>
+<tr>
+<td>Business metric</td>
+<td>Weeks after launch, with an experiment</td>
+<td>30-day churn rate in the treated group versus a holdout group</td>
+</tr>
+<tr>
+<td>Guardrail metric</td>
+<td>All the time</td>
+<td>Offer cost per saved user, unsubscribe rate, p99 latency</td>
+</tr>
+</tbody>
+</table>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-102931f46b109b36bbbb.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>线上测量取决于人们如何对决策反应. 商业测量缓慢移动,并带来公司其他一切的噪音. 商业测量取决于人们如何对决策反应.</p>
+<p>选择与决定相匹配的离线指标.如果工作与最前5%的用户联系,请在最前5%的用户中测量精度.AUC平均超过每一个门,包括你从来没有使用的门.同样的指南的第二规则说,在决定ML系统将做什么之前,首先设计和实施指标.</p>
+<h3>基线</h3>
+<p>只有一个指标值就意味着什么.如果最好的替代方案达到0.30,一个F1是好的,如果规则达到0.60,则是差的.</p>
+<ul>
+<li>**Trivial baseline.**我们在模型评估课中使用了这个检查.</li>
+<li>**Heuristic baseline.**根据领域知识的规则,或者一个特征的门,</li>
+<li>**Current system.**无论今天做出决定,即使是一个有电子表格的人.</li>
+</ul>
+<p>升降率是模型分数减去最强基线的分数. 在查看结果之前设定最低升降率,并使其足够大,以支付额外的系统. 轻微的基线通常很弱. 精灵的基线是最难击败的.</p>
+<h3>数据和标签要求</h3>
+<p>在训练之前回答以下问题:</p>
+<ul>
+<li>**Label source.**标签是什么桌子或活动,谁拥有标签?</li>
+<li>**Label delay.**预测到底会到达什么时间? 欺诈收费可以在付款几周后到达. 缩标签到达30天的视界结束时.</li>
+<li>**Label quality.**谁赋予标签,而且有多少次是错误的?</li>
+<li>**Availability at prediction time.**预测时,每个特征都存在吗?系统在结果泄露后写出标签的特征.</li>
+<li>**Volume per class.**两百个积极的例子只限于简单的模型.</li>
+<li>**Time split.**我们在时间系列课程中分类数据按时间,同样的原因.</li>
+</ul>
+<h3>延迟,吞吐量和成本预算</h3>
+<p>每个服务设计都结合了三个数字:</p>
+<ul>
+<li>**Latency budget.**报价检查需要50ms,每晚报价需要几个小时.</li>
+<li>**Peak throughput.**测量系统以最繁忙的分钟,而不是每天平均.</li>
+<li>**Cost budget.**按每天的美元或每1000个预测的美元来表达,这样你可以比较设计.</li>
+</ul>
+<p>利特尔的定律连接了前两种.正在进行的请求数量等于吞吐量时间延迟.每秒400次请求和每秒50秒,任何时候都在进行20次请求.</p>
+<h3>批量推断与在线推断</h3>
+<p>预测有两个基本方法:</p>
+<ul>
+<li>**Batch inference.**计划中的工作将每个实体进行分数,并将分数写入表格或关键值存储器.应用程序在请求时读取存储的分数.</li>
+<li>**Online inference.**申请在请求时间向模型服务发送功能,并等待得分.</li>
+</ul>
+<table>
+<thead>
+<tr>
+<th>Property</th>
+<th>Batch</th>
+<th>Online</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Freshness</td>
+<td>As old as the last run, plus the run time</td>
+<td>Uses the data of the request</td>
+</tr>
+<tr>
+<td>Request latency</td>
+<td>One key-value read, a few ms</td>
+<td>Feature fetch plus model time</td>
+</tr>
+<tr>
+<td>Cost driver</td>
+<td>Number of entities times runs per day</td>
+<td>Replicas sized for peak QPS</td>
+</tr>
+<tr>
+<td>New entities</td>
+<td>No score until the next run</td>
+<td>Scored on the first request</td>
+</tr>
+<tr>
+<td>When it breaks</td>
+<td>Old scores stay readable</td>
+<td>Requests fail or time out</td>
+</tr>
+</tbody>
+</table>
+<p>在本课程中,工具包的价格都会增加.每天的实体数量和运行数量增加.较短的延迟限制意味着更多运行.在线成本随着峰值流量增加,因为你在峰值之间支付空置复制.一个小时的批量工作不能以任何价格达到一个小时以下的延迟限制.</p>
+<p>一个夜间批量工作会给已知用户分数,而一个在线路径则会给新用户和需要新数据的请求分数.</p>
+<h3>部署模式</h3>
+<p>新型车型将通过几个阶段到达用户:</p>
+<ol>
+<li>**Shadow.**系统记录预测,从来没有使用过它们.你将延迟,错误率和预测分布与当前模型进行比较.</li>
+<li>**Canary.**现在,我们在新车型上做出了很少的交通决定,通常是1到5%.</li>
+<li>**A/B test.**随机用户的分类看到每个模型. 你用统计测试来测量业务指标,</li>
+</ol>
+<p>任何阶段都需要一个需要几分钟的翻转. 保持旧模型版本部署和配置交换流量.<a href="/learn/ai-from-scratch/lessons/17-infrastructure-and-production/20-shadow-canary-progressive/">shadow and canary lesson</a>其他<a href="/learn/ai-from-scratch/lessons/17-infrastructure-and-production/21-ab-testing-llm-features/">A/B testing lesson</a>现在,我们要去.</p>
+<h3>反循环</h3>
+<p>模型的决定改变了其下一个版本的数据时存在反循环.Sculley等人列出了ML系统中技术债务的主要来源中直接和隐藏的反循环.三个常见情况:</p>
+<ul>
+<li>**Interventions hide the label.**车型发送报价,报价让一些用户留下来.下个月,高风险用户看起来很忠诚,再训练的模型发现,他们的功能并不能预测车.</li>
+<li>**Blocked actions have no outcome.**欺诈模式阻了支付,因此支付永远不会收到收费回收标签. 训练有素的模型从被封锁区域看到更少的欺诈例子.</li>
+<li>**Exposure limits feedback.**排名模型显示了其顶级项目,所以只有这些项目收集了点击.</li>
+</ul>
+<p>修复共享一个想法:保留一些模型没有影响的数据. 保持一个小的随机组,从来没有得到干预. 给一个小部分的流量随机决定. 记录分数和决定,以便后来的训练可以分辨影响的数据从清洁数据.</p>
+<h3>失败模式和安全默认</h3>
+<p>系统的每个部分都会迟早失败.</p>
+<table>
+<thead>
+<tr>
+<th>Failure</th>
+<th>Result without a plan</th>
+<th>Safe default</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Model service times out</td>
+<td>The request fails</td>
+<td>Use the heuristic baseline</td>
+</tr>
+<tr>
+<td>Nightly batch job fails</td>
+<td>Scores go missing or get old</td>
+<td>Serve the last good scores for a fixed time, then the rule</td>
+</tr>
+<tr>
+<td>Feature is missing or out of range</td>
+<td>The model scores bad input</td>
+<td>Use the documented default value and log the event</td>
+</tr>
+<tr>
+<td>New entity with no history</td>
+<td>No score exists</td>
+<td>Use the rule or the population average</td>
+</tr>
+<tr>
+<td>Score distribution moves suddenly</td>
+<td>Wrong decisions at scale</td>
+<td>Pause automatic actions and alert a person</td>
+</tr>
+</tbody>
+</table>
+<p>对于大多数失败,从你的测量部分的统基线也是默认的,所以先构建它.</p>
+<h3>设计文件</h3>
+<p>设计文件在训练开始之前将上述每一个决定都记录在一个地方.本课程的检查器将其编写成JSON版本.六个项目阻止了审查,因为每个项目都使系统不安全或无用的:</p>
+<table>
+<thead>
+<tr>
+<th>Section</th>
+<th>Question it answers</th>
+<th>Blocking</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Problem</td>
+<td>What is predicted, which decision uses it, and why rules are not enough?</td>
+<td>The decision</td>
+</tr>
+<tr>
+<td>Metrics</td>
+<td>Which offline, online, business, and guardrail metrics apply?</td>
+<td>The business metric</td>
+</tr>
+<tr>
+<td>Baselines</td>
+<td>Which trivial, heuristic, and current-system baselines apply?</td>
+<td>A heuristic or current baseline</td>
+</tr>
+<tr>
+<td>Data</td>
+<td>Where do labels come from, how late, and does each feature exist at prediction time?</td>
+<td>No leakage</td>
+</tr>
+<tr>
+<td>Budgets and serving</td>
+<td>Which latency, peak QPS, cost, and staleness limits apply, and which serving mode fits them?</td>
+<td>No</td>
+</tr>
+<tr>
+<td>Rollout</td>
+<td>Which shadow, canary, and A/B stages apply, and how do you roll back?</td>
+<td>Shadow or canary, plus rollback</td>
+</tr>
+<tr>
+<td>Feedback loops</td>
+<td>How can the model change its own future data, and what keeps clean data?</td>
+<td>No</td>
+</tr>
+<tr>
+<td>Failure modes</td>
+<td>What is the default action for each failure?</td>
+<td>A default for every failure</td>
+</tr>
+<tr>
+<td>Monitoring</td>
+<td>What do you watch after launch?</td>
+<td>No</td>
+</tr>
+</tbody>
+</table>
+<figure><img src="/learn/ai-from-scratch/figures/figure-fa969abf23e8b6f75748.png" alt="mlprod-serving-cost 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<p>编码在<code>code/main.py</code>只有标准库使用. 它有三个工具:服务成本模型,基线比较器和设计文件检查器.</p>
+<h3>步骤1:描述工作量和价格</h3>
+<p>工作负载包含了交通数量和预算.成本模型包含了价格.价格是演习的圆数量,而不是供应商报价.</p>
+<pre><code class="language-python">@dataclass(frozen=True)
+class Workload:
+    name: str
+    entities: int
+    requests_per_day: int
+    peak_qps: float
+    max_staleness_hours: float
+    latency_budget_ms: float
+
+
+@dataclass(frozen=True)
+class CostModel:
+    batch_dollars_per_million: float = 0.40
+    batch_job_hours: float = 1.0
+    lookup_dollars_per_million: float = 0.25
+    lookup_latency_ms: float = 4.0
+    replica_dollars_per_hour: float = 0.50
+    replica_qps: float = 200.0
+    min_replicas: int = 2
+    online_latency_ms: float = 35.0
+</code></pre>
+<h3>步骤2:批量价格和在线服务</h3>
+<p>运行时间在延迟限制内完成. 运行之间的时间是限量减值的工作时间. 每个运行都得分每个实体,无论有人是否要求该分数.</p>
+<pre><code class="language-python">def batch_plan(workload: Workload, costs: CostModel) -&gt; ServingPlan:
+    refresh_hours = workload.max_staleness_hours - costs.batch_job_hours
+    if refresh_hours &lt;= 0:
+        return ServingPlan(
+            &quot;batch&quot;, False, math.inf, costs.lookup_latency_ms, math.inf, 0.0,
+            &quot;staleness limit is shorter than one batch job&quot;,
+        )
+    runs_per_day = 24.0 / refresh_hours
+    predictions = workload.entities * runs_per_day
+    dollars = (
+        predictions / 1e6 * costs.batch_dollars_per_million
+        + workload.requests_per_day / 1e6 * costs.lookup_dollars_per_million
+    )
+    ...
+</code></pre>
+<p>在线服务为处理峰值的复制品支付了足够的费用,</p>
+<pre><code class="language-python">def online_plan(workload: Workload, costs: CostModel) -&gt; ServingPlan:
+    replicas = max(costs.min_replicas, math.ceil(workload.peak_qps / costs.replica_qps))
+    dollars = replicas * costs.replica_dollars_per_hour * 24.0
+    feasible = costs.online_latency_ms &lt;= workload.latency_budget_ms
+    ...
+</code></pre>
+<p><code>choose_serving</code>能保持符合延迟和延迟限制的计划,并返回最便宜的计划.<code>None</code>没有计划合适,这告诉你改变预算.</p>
+<h3>步骤3:将模型与其基线进行比较</h3>
+<p>测量器将模型和每个基线都用相同的指标来评分. 它测量了起伏率与最强的基线相比,而不是最弱的基线.</p>
+<pre><code class="language-python">def compare_to_baselines(
+    y_true: list,
+    model_pred: list,
+    baselines: dict[str, list],
+    metric,
+    metric_name: str,
+    higher_is_better: bool = True,
+    min_lift: float = 0.02,
+) -&gt; BaselineReport:
+    if not baselines:
+        raise ValueError(&quot;a model needs at least one baseline&quot;)
+    scores = {name: metric(y_true, pred) for name, pred in baselines.items()}
+    pick = max if higher_is_better else min
+    best_name = pick(scores, key=scores.get)
+    model_score = metric(y_true, model_pred)
+    lift = model_score - scores[best_name] if higher_is_better else scores[best_name] - model_score
+    return BaselineReport(metric_name, {&quot;model&quot;: model_score, **scores}, best_name, lift, min_lift)
+</code></pre>
+<p>论的基线是一个特征的规则.<code>fit_rule</code>测试了每个功能值作为训练数据的门值,并保持了最佳F1的门值. 演示训练了合成转换数据的小物流回归,并将其与三个基线进行比较.</p>
+<h3>步骤4: 打出一个设计文件</h3>
+<p>每个检查列表项目都有一个键,一个重量,一个阻旗,一个消息,一个检查功能.一个阻项目有重量2.</p>
+<pre><code class="language-python">CheckItem(&quot;decision&quot;, 2, True, &quot;name the action that uses each prediction&quot;, lambda d: _text(d, &quot;problem.decision&quot;)),
+CheckItem(&quot;baselines&quot;, 2, True, &quot;add a heuristic or current-system baseline&quot;, check_baselines),
+CheckItem(&quot;no_leakage&quot;, 2, True, &quot;confirm every feature exists at prediction time&quot;,
+          lambda d: get_path(d, &quot;data.features_available_at_prediction_time&quot;) is True),
+CheckItem(&quot;serving_fit&quot;, 1, False, &quot;pick a serving mode that meets the staleness, latency, and cost budgets&quot;,
+          check_serving_fit),
+</code></pre>
+<p><code>check_serving_fit</code>通过使用成本模型. 它会读取文件中的工作负载数量,并定价选择的模式. 检查失败,当该模式错过延迟限制,延迟预算或每日成本预算时. 文件中写&quot;批量&quot;的3分钟停滞限制, 成本模型没有混合计划,所以写&quot;混合&quot;的文件会失败这个检查,直到你在练习1中添加该计划.</p>
+<p><code>review_design_doc</code>判决只有当分数达到0.85并且没有任何阻项失败时才&quot;准备进行审查&quot;.</p>
+<h3>步骤5:运行</h3>
+<pre><code class="language-bash">python3 code/main.py
+</code></pre>
+<pre><code class="language-console">nightly churn scores
+  ok batch        $0.91/day      4 ms  1.0 runs per day over 2,000,000 entities
+  ok online      $24.00/day     35 ms  2 replicas sized for 40 peak QPS
+  choose: batch
+
+feed ranking, 2-hour freshness
+  ok batch       $48.50/day      4 ms  24.0 runs per day over 5,000,000 entities
+  ok online      $24.00/day     35 ms  2 replicas sized for 120 peak QPS
+  choose: online
+
+=== Model versus baselines (churn, metric F1) ===
+  model                    0.564
+  days_idle &gt; 12.8688      0.500
+  random at base rate      0.232
+  majority class           0.000
+  model beats the strongest baseline (days_idle &gt; 12.8688) by +0.064
+</code></pre>
+<p>基本线在F1上得分0因为它从来没有预测转变. 适合的规则是真正的竞争对手. 模型击败了0.064,因此模型赢得了它的位置. 具有较弱的功能,规则可以赢得,然后规则是部署的正确系统.</p>
+<p>设计文件审查打印了6个阻塞项的弱文件,以及一个1.00的完整文件.</p>
+<pre><code class="language-bash">python3 code/main.py my_design_doc.json
+</code></pre>
+<h2>用它</h2>
+<p>工具包的每个部分都将团队在生产中使用的工具映射出来.</p>
+<p>**Baselines.**作为估计器, scikit-learn 提供了微不足道的基线,</p>
+<pre><code class="language-python">from sklearn.dummy import DummyClassifier, DummyRegressor
+from sklearn.metrics import f1_score
+
+majority = DummyClassifier(strategy=&quot;most_frequent&quot;).fit(X_train, y_train)
+base_rate = DummyClassifier(strategy=&quot;stratified&quot;, random_state=0).fit(X_train, y_train)
+mean_value = DummyRegressor(strategy=&quot;mean&quot;).fit(X_train, y_reg_train)
+
+print(f1_score(y_test, majority.predict(X_test)))
+</code></pre>
+<p><code>most_frequent</code>匹配<code>majority_baseline</code>其他<code>stratified</code>匹配<code>base_rate_baseline</code>由于论来自你的领域,所以论没有论的基线.</p>
+<p>**Batch serving.**工作流程安排器 (如Apache Airflow或Dagster) 运行了分数工作.该工作将分数写入仓库表或Redis或DynamoDB等关键值存储器中.</p>
+<p>**Online serving.**模型服务器如KServe,BentoML,NVIDIA Triton和TorchServe包装一个模型后面HTTP或gRPC终端点.一个载载模型的简单的网络服务也适用于小型模型.</p>
+<p>**Rollouts.**库伯内特工具如Argo Rollouts分开了加拿大版本的流量.像GrowthBook和Statsig这样的实验平台将用户分为A/B组,并计算了统计数据.</p>
+<p>**Design review.**布雷克等人发表了ML测试成绩,该成绩包括28项测试和生产ML系统的监测需求.我们的检查器较小,它提出了这些测试之前的设计问题.</p>
+<h2>运送它</h2>
+<p>这一课产生了<code>outputs/skill-ml-design-review.md</code>技能检查ML设计文档的部分,并首先命名阻塞空白.它还检查了使用选择,以及本课程的批量和在线成本算法.</p>
+<h2>运动</h2>
+<ol>
+<li>加入一个混合计划<code>choose_serving</code>通过网络进行分数,对已知用户进行分数和新用户进行分数.</li>
+<li>调整转动数据,直到模型不再超过规则. 报告移动电梯的最小变化系数.</li>
+<li>添加一个<code>budgets.max_dollars_per_1k_predictions</code>写一个没有它失败的测试.</li>
+<li>写一个JSON设计文件来检查支付欺诈. 运行检查器,并修复每个阻塞项.</li>
+<li>模拟转换反循环,删除获得报价的用户标签,重新训练,并测量F1的变化.</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ML task</td>
+<td>&quot;Build a churn model&quot;</td>
+<td>A prediction target, an entity, a horizon, and the decision that uses the prediction</td>
+</tr>
+<tr>
+<td>Offline metric</td>
+<td>&quot;The model score&quot;</td>
+<td>A metric computed on held-out past data before launch</td>
+</tr>
+<tr>
+<td>Online metric</td>
+<td>&quot;Live numbers&quot;</td>
+<td>A metric measured on real traffic while the model runs</td>
+</tr>
+<tr>
+<td>Business metric</td>
+<td>&quot;The goal&quot;</td>
+<td>The company outcome that the decision must change, measured with an experiment</td>
+</tr>
+<tr>
+<td>Guardrail metric</td>
+<td>&quot;Do no harm&quot;</td>
+<td>A metric that must not get worse when the new model launches</td>
+</tr>
+<tr>
+<td>Baseline</td>
+<td>&quot;The dumb model&quot;</td>
+<td>A trivial, heuristic, or current-system predictor that the model must beat by a set margin</td>
+</tr>
+<tr>
+<td>Batch inference</td>
+<td>&quot;Precomputed scores&quot;</td>
+<td>A scheduled job scores every entity and stores the results for lookup</td>
+</tr>
+<tr>
+<td>Online inference</td>
+<td>&quot;Real-time model&quot;</td>
+<td>The model scores each request when it arrives</td>
+</tr>
+<tr>
+<td>Shadow deployment</td>
+<td>&quot;Dark launch&quot;</td>
+<td>The new model scores live traffic, and nobody uses its output</td>
+</tr>
+<tr>
+<td>Canary release</td>
+<td>&quot;Slow rollout&quot;</td>
+<td>The new model decides for a small, growing share of traffic, with a rollback ready</td>
+</tr>
+<tr>
+<td>Feedback loop</td>
+<td>&quot;The model trains itself&quot;</td>
+<td>The model's decisions change the data that trains its next version</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://papers.nips.cc/paper/2015/hash/86df7dcfd896fcaf2674f757a2463eba-Abstract.html" rel="noreferrer" data-network="true">Sculley et al., Hidden Technical Debt in Machine Learning Systems (NeurIPS 2015) <small>↗ 需要联网</small></a>系统成本在模型周围</li>
+<li><a href="https://developers.google.com/machine-learning/guides/rules-of-ml" rel="noreferrer" data-network="true">Google, Rules of Machine Learning <small>↗ 需要联网</small></a>:第一模型的实践规则,指标和培训服务一致性</li>
+<li><a href="https://research.google/pubs/the-ml-test-score-a-rubric-for-ml-production-readiness-and-technical-debt-reduction/" rel="noreferrer" data-network="true">Breck et al., The ML Test Score (IEEE Big Data 2017) <small>↗ 需要联网</small></a>: 28项测量生产准备的测试</li>
+<li><a href="https://experimentguide.com/" rel="noreferrer" data-network="true">Kohavi, Tang, and Xu, Trustworthy Online Controlled Experiments (Cambridge University Press, 2020) <small>↗ 需要联网</small></a>如何执行正确答案的A/B测试</li>
+<li><a href="https://martinfowler.com/articles/cd4ml.html" rel="noreferrer" data-network="true">Sato, Wider, and Windheuser, Continuous Delivery for Machine Learning (2019) <small>↗ 需要联网</small></a>:版本数据,模型和部署管道</li>
+<li><a href="https://cloud.google.com/architecture/mlops-continuous-delivery-and-automation-pipelines-in-machine-learning" rel="noreferrer" data-network="true">Google Cloud, MLOps: Continuous delivery and automation pipelines in machine learning <small>↗ 需要联网</small></a>:培训和服务自动化的三个成熟水平</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>ML System Design — From Problem to Deployed Model</h1>
+<blockquote>
+<p>A model is one part of a system. The design decides what the model predicts, who acts on it, what it costs, and what happens when it fails.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 2, Lessons 09 (Model Evaluation) and 13 (ML Pipelines)
+<strong>Time:</strong> ~110 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Frame a business problem as an ML task with a prediction, a decision that uses it, and a reason why rules are not enough</li>
+<li>Separate offline, online, business, and guardrail metrics, and compare every model against trivial and heuristic baselines</li>
+<li>Estimate the daily cost, latency, and staleness of batch and online inference from traffic numbers</li>
+<li>Choose a rollout pattern (shadow, canary, A/B test) and a safe default for each failure mode</li>
+<li>Identify feedback loops in which the model changes the data that trains its next version</li>
+<li>Write an ML design document and score it against a fixed checklist</li>
+</ul>
+<h2>The Problem</h2>
+<p>A subscription company asks for &quot;a churn model&quot;. A data scientist trains a gradient-boosted classifier and reports an AUC of 0.91. Three months later, nobody uses it.</p>
+<p>The reasons have nothing to do with the algorithm. Nobody decided which action a score starts. The scores arrive once a week, but the retention team calls customers every day. The label came from a cancellations table that also stored the cancellation reason, so one feature contained the answer. Nobody compared the model with the rule the support team already used: call anyone idle for two weeks.</p>
+<p>Each of these failures happened before training started. They are design failures, and a one-page design document asks about each of them. This lesson teaches the decisions in that document. You build a toolkit that prices batch and online serving, compares a model with its baselines, and scores a design document against a checklist.</p>
+<h2>The Concept</h2>
+<h3>From a business goal to an ML task</h3>
+<p>A business goal is not an ML task. You turn it into one with four questions:</p>
+<ol>
+<li>What exactly does the model predict, and for which entity (user, payment, store, item)?</li>
+<li>Which decision uses the prediction, and who or what makes that decision?</li>
+<li>When is the prediction needed, and which data exists at that moment?</li>
+<li>How will you know that the decision got better?</li>
+</ol>
+<table>
+<thead>
+<tr>
+<th>Business goal</th>
+<th>Prediction</th>
+<th>Decision that uses it</th>
+<th>ML task</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Reduce churn</td>
+<td>Probability that a user cancels in the next 30 days</td>
+<td>Send a save offer to the top 5 percent each night</td>
+<td>Binary classification</td>
+</tr>
+<tr>
+<td>Cut fraud losses</td>
+<td>Probability that a payment is fraud</td>
+<td>Approve, review, or block within 100 ms</td>
+<td>Binary classification</td>
+</tr>
+<tr>
+<td>Keep shelves stocked</td>
+<td>Units sold per store per day next week</td>
+<td>Order quantity for each store</td>
+<td>Forecasting</td>
+</tr>
+<tr>
+<td>Show relevant items</td>
+<td>Relevance score for a (user, item) pair</td>
+<td>Order of items in the feed</td>
+<td>Ranking</td>
+</tr>
+</tbody>
+</table>
+<p>The second column needs the most care. &quot;Predict churn&quot; leaves the horizon, the entity, and the action open. &quot;Predict whether this user cancels in the next 30 days, so that tonight's job can pick who gets an offer&quot; fixes all three.</p>
+<h3>When not to use ML</h3>
+<p>Rule #1 in Google's Rules of Machine Learning says not to be afraid to launch a product without machine learning. Machine learning needs data, and a simple heuristic often gets you part of the way. Do not use ML in these cases:</p>
+<ul>
+<li>A short rule reaches the goal and stays correct. A rule is cheaper to run, test, and explain.</li>
+<li>You have no labels and no practical way to collect them.</li>
+<li>Nobody acts on the prediction, so a better prediction changes nothing.</li>
+<li>The data that exists at prediction time does not contain the signal.</li>
+<li>One error is unacceptable and no person can check the output.</li>
+<li>Building and running the system costs more than the better decisions are worth.</li>
+</ul>
+<p>When a rule gets long and fragile, ML starts to pay off. Rule #3 of the same guide prefers ML over a complex heuristic, because a learned model is easier to update and maintain.</p>
+<h3>Three layers of metrics</h3>
+<p>You measure an ML system at three layers, plus a set of limits:</p>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>When you can measure it</th>
+<th>Churn example</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Offline metric</td>
+<td>Before launch, on held-out past data</td>
+<td>F1 at the offer threshold, precision in the top 5 percent</td>
+</tr>
+<tr>
+<td>Online metric</td>
+<td>During launch, on live traffic</td>
+<td>Offer acceptance rate, share of users scored, score distribution</td>
+</tr>
+<tr>
+<td>Business metric</td>
+<td>Weeks after launch, with an experiment</td>
+<td>30-day churn rate in the treated group versus a holdout group</td>
+</tr>
+<tr>
+<td>Guardrail metric</td>
+<td>All the time</td>
+<td>Offer cost per saved user, unsubscribe rate, p99 latency</td>
+</tr>
+</tbody>
+</table>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-102931f46b109b36bbbb.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>The layers often disagree. An offline metric scores past data, and the past did not contain your model. An online metric depends on how people react to the decision. A business metric moves slowly and carries noise from everything else in the company.</p>
+<p>Pick the offline metric that matches the decision. If the job contacts the top 5 percent of users, measure precision in the top 5 percent. AUC averages over every threshold, including thresholds that you never use. Rule #2 of the same guide says to design and implement metrics first, before you decide what the ML system will do.</p>
+<h3>Baselines</h3>
+<p>A metric value means nothing alone. An F1 of 0.56 is good if the best alternative reaches 0.30 and poor if a rule reaches 0.60. Compare every model with three kinds of baseline:</p>
+<ul>
+<li><strong>Trivial baseline.</strong> Always predict the majority class, or always predict the training mean. We used this check in the model evaluation lesson.</li>
+<li><strong>Heuristic baseline.</strong> A rule from domain knowledge, or a one-feature threshold that you fit on the training data.</li>
+<li><strong>Current system.</strong> Whatever makes the decision today, even when it is a person with a spreadsheet.</li>
+</ul>
+<p>The lift is the model score minus the score of the strongest baseline. Set a minimum lift before you look at the results, and make it large enough to pay for the extra system. The trivial baseline is usually weak. The heuristic baseline is the hard one to beat.</p>
+<h3>Data and label requirements</h3>
+<p>Answer these questions before you train:</p>
+<ul>
+<li><strong>Label source.</strong> Which table or event defines the label, and who owns it?</li>
+<li><strong>Label delay.</strong> How long after the prediction does the true outcome arrive? Fraud chargebacks can arrive weeks after the payment. Churn labels arrive at the end of the 30-day horizon.</li>
+<li><strong>Label quality.</strong> Who assigns the label, and how often is it wrong?</li>
+<li><strong>Availability at prediction time.</strong> Does every feature exist at the moment of the prediction? A feature that the system writes after the outcome leaks the label into training.</li>
+<li><strong>Volume per class.</strong> How many positive examples exist? Two hundred positives limit you to simple models.</li>
+<li><strong>Time split.</strong> Hold out the most recent period. We split data by time in the time-series lesson for the same reason.</li>
+</ul>
+<h3>Latency, throughput, and cost budgets</h3>
+<p>Three numbers bound every serving design:</p>
+<ul>
+<li><strong>Latency budget.</strong> The p99 latency is the time that 99 of 100 requests stay under. A payment check can need 50 ms. A nightly report can take hours.</li>
+<li><strong>Peak throughput.</strong> Size the system for the busiest minute, not for the daily average. Peak QPS is often several times the average.</li>
+<li><strong>Cost budget.</strong> Express it as dollars per day or dollars per 1000 predictions, so that you can compare designs.</li>
+</ul>
+<p>Little's law connects the first two. The number of requests in progress equals throughput times latency. At 400 requests per second and 50 ms each, 20 requests are in progress at any moment.</p>
+<h3>Batch inference versus online inference</h3>
+<p>There are two basic ways to serve predictions:</p>
+<ul>
+<li><strong>Batch inference.</strong> A scheduled job scores every entity and writes the scores to a table or a key-value store. The application reads the stored score at request time.</li>
+<li><strong>Online inference.</strong> The application sends the features to a model service at request time and waits for the score.</li>
+</ul>
+<table>
+<thead>
+<tr>
+<th>Property</th>
+<th>Batch</th>
+<th>Online</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Freshness</td>
+<td>As old as the last run, plus the run time</td>
+<td>Uses the data of the request</td>
+</tr>
+<tr>
+<td>Request latency</td>
+<td>One key-value read, a few ms</td>
+<td>Feature fetch plus model time</td>
+</tr>
+<tr>
+<td>Cost driver</td>
+<td>Number of entities times runs per day</td>
+<td>Replicas sized for peak QPS</td>
+</tr>
+<tr>
+<td>New entities</td>
+<td>No score until the next run</td>
+<td>Scored on the first request</td>
+</tr>
+<tr>
+<td>When it breaks</td>
+<td>Old scores stay readable</td>
+<td>Requests fail or time out</td>
+</tr>
+</tbody>
+</table>
+<p>The toolkit in this lesson prices both. Batch cost grows with the number of entities and with the number of runs per day. A shorter staleness limit means more runs. Online cost grows with peak traffic, because you pay for idle replicas between peaks. A batch job that takes one hour cannot meet a staleness limit under one hour at any price.</p>
+<p>A hybrid design is common. A nightly batch job scores known users, and an online path scores new users and requests that need fresh data.</p>
+<h3>Deployment patterns</h3>
+<p>A new model reaches users in stages:</p>
+<ol>
+<li><strong>Shadow.</strong> The new model receives a copy of live traffic. The system logs its predictions and never uses them. You compare latency, error rate, and prediction distribution with the current model.</li>
+<li><strong>Canary.</strong> The new model makes real decisions for a small share of traffic, often 1 to 5 percent. You widen the share in steps and roll back when a guardrail breaks.</li>
+<li><strong>A/B test.</strong> A random split of users sees each model. You measure the business metric with a statistical test, and you need enough traffic and enough time to see the difference.</li>
+</ol>
+<p>Every stage needs a rollback that takes minutes. Keep the old model version deployed and switch traffic with configuration. The LLM serving phase covers the same three patterns for language models in the <a href="/learn/ai-from-scratch/lessons/17-infrastructure-and-production/20-shadow-canary-progressive/">shadow and canary lesson</a> and the <a href="/learn/ai-from-scratch/lessons/17-infrastructure-and-production/21-ab-testing-llm-features/">A/B testing lesson</a>.</p>
+<h3>Feedback loops</h3>
+<p>A feedback loop exists when the model's decisions change the data that trains its next version. Sculley et al. list direct and hidden feedback loops among the main sources of technical debt in ML systems. Three common cases:</p>
+<ul>
+<li><strong>Interventions hide the label.</strong> A churn model sends offers, and the offers keep some users. Next month, high-risk users look loyal, and the retrained model learns that their features do not predict churn.</li>
+<li><strong>Blocked actions have no outcome.</strong> A fraud model blocks a payment, so that payment never gets a chargeback label. Retrained models see fewer fraud examples from the blocked region.</li>
+<li><strong>Exposure limits feedback.</strong> A ranking model shows its top items, so only those items collect clicks.</li>
+</ul>
+<p>The fixes share one idea: keep some data that the model did not influence. Hold out a small random group that never gets the intervention. Give a small share of traffic a random decision. Log the score and the decision with each example, so that later training can tell influenced data from clean data.</p>
+<h3>Failure modes and safe defaults</h3>
+<p>Every part of the system fails sooner or later. Decide the default action for each failure in the design, not during the incident:</p>
+<table>
+<thead>
+<tr>
+<th>Failure</th>
+<th>Result without a plan</th>
+<th>Safe default</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Model service times out</td>
+<td>The request fails</td>
+<td>Use the heuristic baseline</td>
+</tr>
+<tr>
+<td>Nightly batch job fails</td>
+<td>Scores go missing or get old</td>
+<td>Serve the last good scores for a fixed time, then the rule</td>
+</tr>
+<tr>
+<td>Feature is missing or out of range</td>
+<td>The model scores bad input</td>
+<td>Use the documented default value and log the event</td>
+</tr>
+<tr>
+<td>New entity with no history</td>
+<td>No score exists</td>
+<td>Use the rule or the population average</td>
+</tr>
+<tr>
+<td>Score distribution moves suddenly</td>
+<td>Wrong decisions at scale</td>
+<td>Pause automatic actions and alert a person</td>
+</tr>
+</tbody>
+</table>
+<p>The heuristic baseline from your metric section is also the default for most failures, so build it first.</p>
+<h3>The design document</h3>
+<p>The design document records every decision above in one place, before training starts. The checker in this lesson scores a JSON version of it. Six items block a review, because each one makes the system unsafe or useless:</p>
+<table>
+<thead>
+<tr>
+<th>Section</th>
+<th>Question it answers</th>
+<th>Blocking</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Problem</td>
+<td>What is predicted, which decision uses it, and why rules are not enough?</td>
+<td>The decision</td>
+</tr>
+<tr>
+<td>Metrics</td>
+<td>Which offline, online, business, and guardrail metrics apply?</td>
+<td>The business metric</td>
+</tr>
+<tr>
+<td>Baselines</td>
+<td>Which trivial, heuristic, and current-system baselines apply?</td>
+<td>A heuristic or current baseline</td>
+</tr>
+<tr>
+<td>Data</td>
+<td>Where do labels come from, how late, and does each feature exist at prediction time?</td>
+<td>No leakage</td>
+</tr>
+<tr>
+<td>Budgets and serving</td>
+<td>Which latency, peak QPS, cost, and staleness limits apply, and which serving mode fits them?</td>
+<td>No</td>
+</tr>
+<tr>
+<td>Rollout</td>
+<td>Which shadow, canary, and A/B stages apply, and how do you roll back?</td>
+<td>Shadow or canary, plus rollback</td>
+</tr>
+<tr>
+<td>Feedback loops</td>
+<td>How can the model change its own future data, and what keeps clean data?</td>
+<td>No</td>
+</tr>
+<tr>
+<td>Failure modes</td>
+<td>What is the default action for each failure?</td>
+<td>A default for every failure</td>
+</tr>
+<tr>
+<td>Monitoring</td>
+<td>What do you watch after launch?</td>
+<td>No</td>
+</tr>
+</tbody>
+</table>
+<figure><img src="/learn/ai-from-scratch/figures/figure-fa969abf23e8b6f75748.png" alt="mlprod-serving-cost 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<p>The code in <code>code/main.py</code> uses only the standard library. It has three tools: a serving cost model, a baseline comparator, and a design-document checker.</p>
+<h3>Step 1: Describe the workload and the prices</h3>
+<p>A workload holds the traffic numbers and the budgets. A cost model holds the prices. The prices are round numbers for the exercise, not vendor quotes.</p>
+<pre><code class="language-python">@dataclass(frozen=True)
+class Workload:
+    name: str
+    entities: int
+    requests_per_day: int
+    peak_qps: float
+    max_staleness_hours: float
+    latency_budget_ms: float
+
+
+@dataclass(frozen=True)
+class CostModel:
+    batch_dollars_per_million: float = 0.40
+    batch_job_hours: float = 1.0
+    lookup_dollars_per_million: float = 0.25
+    lookup_latency_ms: float = 4.0
+    replica_dollars_per_hour: float = 0.50
+    replica_qps: float = 200.0
+    min_replicas: int = 2
+    online_latency_ms: float = 35.0
+</code></pre>
+<h3>Step 2: Price batch and online serving</h3>
+<p>A batch job must finish inside the staleness limit. The time between runs is the limit minus the job time. Each run scores every entity, whether or not anyone asks for that score.</p>
+<pre><code class="language-python">def batch_plan(workload: Workload, costs: CostModel) -&gt; ServingPlan:
+    refresh_hours = workload.max_staleness_hours - costs.batch_job_hours
+    if refresh_hours &lt;= 0:
+        return ServingPlan(
+            &quot;batch&quot;, False, math.inf, costs.lookup_latency_ms, math.inf, 0.0,
+            &quot;staleness limit is shorter than one batch job&quot;,
+        )
+    runs_per_day = 24.0 / refresh_hours
+    predictions = workload.entities * runs_per_day
+    dollars = (
+        predictions / 1e6 * costs.batch_dollars_per_million
+        + workload.requests_per_day / 1e6 * costs.lookup_dollars_per_million
+    )
+    ...
+</code></pre>
+<p>Online serving pays for enough replicas to handle the peak, with a minimum of two for availability:</p>
+<pre><code class="language-python">def online_plan(workload: Workload, costs: CostModel) -&gt; ServingPlan:
+    replicas = max(costs.min_replicas, math.ceil(workload.peak_qps / costs.replica_qps))
+    dollars = replicas * costs.replica_dollars_per_hour * 24.0
+    feasible = costs.online_latency_ms &lt;= workload.latency_budget_ms
+    ...
+</code></pre>
+<p><code>choose_serving</code> keeps the plans that meet the latency and staleness limits and returns the cheapest one. It returns <code>None</code> when no plan fits, which tells you to change the budgets.</p>
+<h3>Step 3: Compare a model with its baselines</h3>
+<p>The comparator scores the model and every baseline with the same metric. It measures the lift against the strongest baseline, not the weakest.</p>
+<pre><code class="language-python">def compare_to_baselines(
+    y_true: list,
+    model_pred: list,
+    baselines: dict[str, list],
+    metric,
+    metric_name: str,
+    higher_is_better: bool = True,
+    min_lift: float = 0.02,
+) -&gt; BaselineReport:
+    if not baselines:
+        raise ValueError(&quot;a model needs at least one baseline&quot;)
+    scores = {name: metric(y_true, pred) for name, pred in baselines.items()}
+    pick = max if higher_is_better else min
+    best_name = pick(scores, key=scores.get)
+    model_score = metric(y_true, model_pred)
+    lift = model_score - scores[best_name] if higher_is_better else scores[best_name] - model_score
+    return BaselineReport(metric_name, {&quot;model&quot;: model_score, **scores}, best_name, lift, min_lift)
+</code></pre>
+<p>The heuristic baseline is a one-feature rule. <code>fit_rule</code> tries each value of the feature as a threshold on the training data and keeps the threshold with the best F1. The demo trains a small logistic regression on synthetic churn data and compares it with three baselines.</p>
+<h3>Step 4: Score a design document</h3>
+<p>Each checklist item has a key, a weight, a blocking flag, a message, and a check function. A blocking item has weight 2.</p>
+<pre><code class="language-python">CheckItem(&quot;decision&quot;, 2, True, &quot;name the action that uses each prediction&quot;, lambda d: _text(d, &quot;problem.decision&quot;)),
+CheckItem(&quot;baselines&quot;, 2, True, &quot;add a heuristic or current-system baseline&quot;, check_baselines),
+CheckItem(&quot;no_leakage&quot;, 2, True, &quot;confirm every feature exists at prediction time&quot;,
+          lambda d: get_path(d, &quot;data.features_available_at_prediction_time&quot;) is True),
+CheckItem(&quot;serving_fit&quot;, 1, False, &quot;pick a serving mode that meets the staleness, latency, and cost budgets&quot;,
+          check_serving_fit),
+</code></pre>
+<p><code>check_serving_fit</code> reuses the cost model. It reads the workload numbers from the document and prices the chosen mode. The check fails when that mode misses the staleness limit, the latency budget, or the daily cost budget. A document that says &quot;batch&quot; with a three-minute staleness limit fails this check. The cost model has no hybrid plan, so a document that says &quot;hybrid&quot; fails this check until you add that plan in Exercise 1.</p>
+<p><code>review_design_doc</code> adds the weights of the passed items and divides by the total. The verdict is &quot;ready for review&quot; only when the score reaches 0.85 and no blocking item fails.</p>
+<h3>Step 5: Run it</h3>
+<pre><code class="language-bash">python3 code/main.py
+</code></pre>
+<pre><code class="language-console">nightly churn scores
+  ok batch        $0.91/day      4 ms  1.0 runs per day over 2,000,000 entities
+  ok online      $24.00/day     35 ms  2 replicas sized for 40 peak QPS
+  choose: batch
+
+feed ranking, 2-hour freshness
+  ok batch       $48.50/day      4 ms  24.0 runs per day over 5,000,000 entities
+  ok online      $24.00/day     35 ms  2 replicas sized for 120 peak QPS
+  choose: online
+
+=== Model versus baselines (churn, metric F1) ===
+  model                    0.564
+  days_idle &gt; 12.8688      0.500
+  random at base rate      0.232
+  majority class           0.000
+  model beats the strongest baseline (days_idle &gt; 12.8688) by +0.064
+</code></pre>
+<p>The majority baseline scores 0 on F1, because it never predicts churn. The fitted rule is the real competitor. The model beats it by 0.064, so the model earns its place. With weaker features the rule can win, and then the rule is the right system to deploy.</p>
+<p>The design-document review prints the weak document with six blocking items and the complete document with a score of 1.00. Pass a path to review your own document:</p>
+<pre><code class="language-bash">python3 code/main.py my_design_doc.json
+</code></pre>
+<h2>Use It</h2>
+<p>Each part of the toolkit maps to tools that teams use in production.</p>
+<p><strong>Baselines.</strong> scikit-learn provides the trivial baselines as estimators, so they fit into the same pipeline as the model:</p>
+<pre><code class="language-python">from sklearn.dummy import DummyClassifier, DummyRegressor
+from sklearn.metrics import f1_score
+
+majority = DummyClassifier(strategy=&quot;most_frequent&quot;).fit(X_train, y_train)
+base_rate = DummyClassifier(strategy=&quot;stratified&quot;, random_state=0).fit(X_train, y_train)
+mean_value = DummyRegressor(strategy=&quot;mean&quot;).fit(X_train, y_reg_train)
+
+print(f1_score(y_test, majority.predict(X_test)))
+</code></pre>
+<p><code>most_frequent</code> matches <code>majority_baseline</code>, and <code>stratified</code> matches <code>base_rate_baseline</code>. scikit-learn has no heuristic baseline, because the heuristic comes from your domain.</p>
+<p><strong>Batch serving.</strong> A workflow scheduler such as Apache Airflow or Dagster runs the scoring job. The job writes scores to a warehouse table or to a key-value store such as Redis or DynamoDB.</p>
+<p><strong>Online serving.</strong> Model servers such as KServe, BentoML, NVIDIA Triton, and TorchServe wrap a model behind an HTTP or gRPC endpoint. A plain web service with a loaded model also works for small models.</p>
+<p><strong>Rollouts.</strong> Kubernetes tools such as Argo Rollouts split traffic for canary releases. Experiment platforms such as GrowthBook and Statsig assign users to A/B groups and compute the statistics.</p>
+<p><strong>Design review.</strong> Breck et al. published the ML Test Score, a rubric of 28 tests and monitoring needs for production ML systems. Our checker is smaller. It asks the design questions that come before those tests.</p>
+<h2>Ship It</h2>
+<p>This lesson produces <code>outputs/skill-ml-design-review.md</code>. The skill reviews an ML design document section by section and names the blocking gaps first. It also checks the serving choice with the batch and online cost arithmetic from this lesson.</p>
+<h2>Exercises</h2>
+<ol>
+<li>Add a hybrid plan to <code>choose_serving</code>. Score known users in batch and new users online. Compare its daily cost.</li>
+<li>Change the churn data until the model no longer beats the rule. Report the smallest coefficient change that removes the lift.</li>
+<li>Add a <code>budgets.max_dollars_per_1k_predictions</code> item to the checklist. Write a test that fails without it.</li>
+<li>Write a JSON design document for a payment fraud check. Run the checker and fix every blocking item.</li>
+<li>Simulate the churn feedback loop. Remove the labels of users who got an offer, retrain, and measure the change in F1.</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ML task</td>
+<td>&quot;Build a churn model&quot;</td>
+<td>A prediction target, an entity, a horizon, and the decision that uses the prediction</td>
+</tr>
+<tr>
+<td>Offline metric</td>
+<td>&quot;The model score&quot;</td>
+<td>A metric computed on held-out past data before launch</td>
+</tr>
+<tr>
+<td>Online metric</td>
+<td>&quot;Live numbers&quot;</td>
+<td>A metric measured on real traffic while the model runs</td>
+</tr>
+<tr>
+<td>Business metric</td>
+<td>&quot;The goal&quot;</td>
+<td>The company outcome that the decision must change, measured with an experiment</td>
+</tr>
+<tr>
+<td>Guardrail metric</td>
+<td>&quot;Do no harm&quot;</td>
+<td>A metric that must not get worse when the new model launches</td>
+</tr>
+<tr>
+<td>Baseline</td>
+<td>&quot;The dumb model&quot;</td>
+<td>A trivial, heuristic, or current-system predictor that the model must beat by a set margin</td>
+</tr>
+<tr>
+<td>Batch inference</td>
+<td>&quot;Precomputed scores&quot;</td>
+<td>A scheduled job scores every entity and stores the results for lookup</td>
+</tr>
+<tr>
+<td>Online inference</td>
+<td>&quot;Real-time model&quot;</td>
+<td>The model scores each request when it arrives</td>
+</tr>
+<tr>
+<td>Shadow deployment</td>
+<td>&quot;Dark launch&quot;</td>
+<td>The new model scores live traffic, and nobody uses its output</td>
+</tr>
+<tr>
+<td>Canary release</td>
+<td>&quot;Slow rollout&quot;</td>
+<td>The new model decides for a small, growing share of traffic, with a rollback ready</td>
+</tr>
+<tr>
+<td>Feedback loop</td>
+<td>&quot;The model trains itself&quot;</td>
+<td>The model's decisions change the data that trains its next version</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://papers.nips.cc/paper/2015/hash/86df7dcfd896fcaf2674f757a2463eba-Abstract.html" rel="noreferrer" data-network="true">Sculley et al., Hidden Technical Debt in Machine Learning Systems (NeurIPS 2015) <small>↗ 需要联网</small></a>: feedback loops, entanglement, and the system costs around a model</li>
+<li><a href="https://developers.google.com/machine-learning/guides/rules-of-ml" rel="noreferrer" data-network="true">Google, Rules of Machine Learning <small>↗ 需要联网</small></a>: practical rules for the first model, metrics, and training-serving consistency</li>
+<li><a href="https://research.google/pubs/the-ml-test-score-a-rubric-for-ml-production-readiness-and-technical-debt-reduction/" rel="noreferrer" data-network="true">Breck et al., The ML Test Score (IEEE Big Data 2017) <small>↗ 需要联网</small></a>: 28 tests that measure production readiness</li>
+<li><a href="https://experimentguide.com/" rel="noreferrer" data-network="true">Kohavi, Tang, and Xu, Trustworthy Online Controlled Experiments (Cambridge University Press, 2020) <small>↗ 需要联网</small></a>: how to run A/B tests that give correct answers</li>
+<li><a href="https://martinfowler.com/articles/cd4ml.html" rel="noreferrer" data-network="true">Sato, Wider, and Windheuser, Continuous Delivery for Machine Learning (2019) <small>↗ 需要联网</small></a>: versioned data, models, and deployment pipelines</li>
+<li><a href="https://cloud.google.com/architecture/mlops-continuous-delivery-and-automation-pipelines-in-machine-learning" rel="noreferrer" data-network="true">Google Cloud, MLOps: Continuous delivery and automation pipelines in machine learning <small>↗ 需要联网</small></a>: three maturity levels for training and serving automation</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-02-ml-fundamentals--19-ml-system-design.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-02-ml-fundamentals--19-ml-system-design.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/02-ml-fundamentals/19-ml-system-design/code/main.py">phases/02-ml-fundamentals/19-ml-system-design/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;ML system design toolkit: serving cost, baseline comparison, design-doc review.
+
+Lesson: phases/02-ml-fundamentals/19-ml-system-design/docs/en.md
+The prices in CostModel are round numbers for the exercise, not vendor quotes.
+Run with no arguments for the demo, or pass a JSON design doc path to review it.
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import json
+import math
+import random
+import sys
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class Workload:
+    name: str
+    entities: int
+    requests_per_day: int
+    peak_qps: float
+    max_staleness_hours: float
+    latency_budget_ms: float
+
+
+@dataclass(frozen=True)
+class CostModel:
+    batch_dollars_per_million: float = 0.40
+    batch_job_hours: float = 1.0
+    lookup_dollars_per_million: float = 0.25
+    lookup_latency_ms: float = 4.0
+    replica_dollars_per_hour: float = 0.50
+    replica_qps: float = 200.0
+    min_replicas: int = 2
+    online_latency_ms: float = 35.0
+
+
+@dataclass(frozen=True)
+class ServingPlan:
+    mode: str
+    feasible: bool
+    dollars_per_day: float
+    latency_ms: float
+    worst_staleness_hours: float
+    predictions_per_day: float
+    reason: str
+
+
+def batch_plan(workload: Workload, costs: CostModel) -&gt; ServingPlan:
+    refresh_hours = workload.max_staleness_hours - costs.batch_job_hours
+    if refresh_hours &lt;= 0:
+        return ServingPlan(
+            &quot;batch&quot;, False, math.inf, costs.lookup_latency_ms, math.inf, 0.0,
+            &quot;staleness limit is shorter than one batch job&quot;,
+        )
+    runs_per_day = 24.0 / refresh_hours
+    predictions = workload.entities * runs_per_day
+    dollars = (
+        predictions / 1e6 * costs.batch_dollars_per_million
+        + workload.requests_per_day / 1e6 * costs.lookup_dollars_per_million
+    )
+    feasible = costs.lookup_latency_ms &lt;= workload.latency_budget_ms
+    reason = f&quot;{runs_per_day:.1f} runs per day over {workload.entities:,} entities&quot;
+    if not feasible:
+        reason = &quot;key-value lookup is slower than the latency budget&quot;
+    return ServingPlan(
+        &quot;batch&quot;, feasible, dollars, costs.lookup_latency_ms,
+        workload.max_staleness_hours, predictions, reason,
+    )
+
+
+def online_plan(workload: Workload, costs: CostModel) -&gt; ServingPlan:
+    replicas = max(costs.min_replicas, math.ceil(workload.peak_qps / costs.replica_qps))
+    dollars = replicas * costs.replica_dollars_per_hour * 24.0
+    feasible = costs.online_latency_ms &lt;= workload.latency_budget_ms
+    reason = f&quot;{replicas} replicas sized for {workload.peak_qps:g} peak QPS&quot;
+    if not feasible:
+        reason = &quot;model latency is slower than the latency budget&quot;
+    return ServingPlan(
+        &quot;online&quot;, feasible, dollars, costs.online_latency_ms, 0.0,
+        float(workload.requests_per_day), reason,
+    )
+
+
+def choose_serving(workload: Workload, costs: CostModel = CostModel()) -&gt; tuple[ServingPlan | None, list[ServingPlan]]:
+    plans = [batch_plan(workload, costs), online_plan(workload, costs)]
+    feasible = [plan for plan in plans if plan.feasible]
+    best = min(feasible, key=lambda plan: plan.dollars_per_day) if feasible else None
+    return best, plans
+
+
+def check_lengths(y_true: list, y_pred: list) -&gt; None:
+    if len(y_true) != len(y_pred):
+        raise ValueError(f&quot;y_true has {len(y_true)} values and y_pred has {len(y_pred)}&quot;)
+    if not y_true:
+        raise ValueError(&quot;a metric needs at least one value&quot;)
+
+
+def f1_score(y_true: list[int], y_pred: list[int]) -&gt; float:
+    check_lengths(y_true, y_pred)
+    tp = sum(1 for t, p in zip(y_true, y_pred) if t == 1 and p == 1)
+    fp = sum(1 for t, p in zip(y_true, y_pred) if t == 0 and p == 1)
+    fn = sum(1 for t, p in zip(y_true, y_pred) if t == 1 and p == 0)
+    return 0.0 if tp == 0 else 2 * tp / (2 * tp + fp + fn)
+
+
+def mean_absolute_error(y_true: list[float], y_pred: list[float]) -&gt; float:
+    check_lengths(y_true, y_pred)
+    return sum(abs(t - p) for t, p in zip(y_true, y_pred)) / len(y_true)
+
+
+def majority_baseline(y_train: list[int], n: int) -&gt; list[int]:
+    top = max(sorted(set(y_train)), key=y_train.count)
+    return [top] * n
+
+
+def mean_baseline(y_train: list[float], n: int) -&gt; list[float]:
+    return [sum(y_train) / len(y_train)] * n
+
+
+def base_rate_baseline(y_train: list[int], n: int, seed: int = 0) -&gt; list[int]:
+    rate = sum(y_train) / len(y_train)
+    rng = random.Random(seed)
+    return [1 if rng.random() &lt; rate else 0 for _ in range(n)]
+
+
+def fit_rule(rows: list[dict], labels: list[int], feature: str) -&gt; float:
+    candidates = sorted(set(row[feature] for row in rows))
+    best_threshold, best_score = candidates[0], -1.0
+    for threshold in candidates:
+        score = f1_score(labels, apply_rule(rows, feature, threshold))
+        if score &gt; best_score:
+            best_threshold, best_score = threshold, score
+    return best_threshold
+
+
+def apply_rule(rows: list[dict], feature: str, threshold: float) -&gt; list[int]:
+    return [1 if row[feature] &gt; threshold else 0 for row in rows]
+
+
+@dataclass(frozen=True)
+class BaselineReport:
+    metric: str
+    scores: dict[str, float]
+    best_baseline: str
+    lift: float
+    min_lift: float
+
+    @property
+    def beats_baselines(self) -&gt; bool:
+        return self.lift &gt;= self.min_lift
+
+
+def compare_to_baselines(
+    y_true: list,
+    model_pred: list,
+    baselines: dict[str, list],
+    metric,
+    metric_name: str,
+    higher_is_better: bool = True,
+    min_lift: float = 0.02,
+) -&gt; BaselineReport:
+    if not baselines:
+        raise ValueError(&quot;a model needs at least one baseline&quot;)
+    scores = {name: metric(y_true, pred) for name, pred in baselines.items()}
+    pick = max if higher_is_better else min
+    best_name = pick(scores, key=scores.get)
+    model_score = metric(y_true, model_pred)
+    lift = model_score - scores[best_name] if higher_is_better else scores[best_name] - model_score
+    return BaselineReport(metric_name, {&quot;model&quot;: model_score, **scores}, best_name, lift, min_lift)
+
+
+FEATURES = (&quot;days_idle&quot;, &quot;tickets&quot;, &quot;tenure_months&quot;)
+
+
+def make_churn_data(n: int, seed: int) -&gt; tuple[list[dict], list[int]]:
+    rng = random.Random(seed)
+    rows, labels = [], []
+    for _ in range(n):
+        idle = rng.expovariate(1 / 10)
+        tickets = rng.choice([0, 0, 0, 1, 1, 2, 3, 5])
+        tenure = rng.uniform(1, 60)
+        z = -2.6 + 0.12 * idle + 0.45 * tickets - 0.035 * tenure
+        labels.append(1 if rng.random() &lt; 1 / (1 + math.exp(-z)) else 0)
+        rows.append({&quot;days_idle&quot;: idle, &quot;tickets&quot;: tickets, &quot;tenure_months&quot;: tenure})
+    return rows, labels
+
+
+class LogisticModel:
+    def __init__(self, epochs: int = 300, lr: float = 0.5):
+        self.epochs = epochs
+        self.lr = lr
+        self.means: dict[str, float] = {}
+        self.stds: dict[str, float] = {}
+        self.weights = [0.0] * len(FEATURES)
+        self.bias = 0.0
+        self.threshold = 0.5
+
+    def _vector(self, row: dict) -&gt; list[float]:
+        return [(row[k] - self.means[k]) / self.stds[k] for k in FEATURES]
+
+    def fit(self, rows: list[dict], labels: list[int]) -&gt; &quot;LogisticModel&quot;:
+        n = len(rows)
+        for k in FEATURES:
+            self.means[k] = sum(r[k] for r in rows) / n
+            spread = math.sqrt(sum((r[k] - self.means[k]) ** 2 for r in rows) / n)
+            self.stds[k] = spread or 1.0
+        vectors = [self._vector(r) for r in rows]
+        for _ in range(self.epochs):
+            grad_w = [0.0] * len(FEATURES)
+            grad_b = 0.0
+            for x, y in zip(vectors, labels):
+                error = self._sigmoid(x) - y
+                for j, xj in enumerate(x):
+                    grad_w[j] += error * xj
+                grad_b += error
+            self.weights = [w - self.lr * g / n for w, g in zip(self.weights, grad_w)]
+            self.bias -= self.lr * grad_b / n
+        probabilities = [self._sigmoid(x) for x in vectors]
+        grid = [t / 100 for t in range(5, 96, 5)]
+        self.threshold = max(grid, key=lambda t: f1_score(labels, [1 if p &gt;= t else 0 for p in probabilities]))
+        return self
+
+    def _sigmoid(self, x: list[float]) -&gt; float:
+        z = sum(w * xj for w, xj in zip(self.weights, x)) + self.bias
+        return 1 / (1 + math.exp(-max(-50.0, min(50.0, z))))
+
+    def predict(self, rows: list[dict]) -&gt; list[int]:
+        return [1 if self._sigmoid(self._vector(r)) &gt;= self.threshold else 0 for r in rows]
+
+
+ML_TASKS = {
+    &quot;binary_classification&quot;, &quot;multiclass_classification&quot;, &quot;regression&quot;,
+    &quot;ranking&quot;, &quot;forecasting&quot;, &quot;anomaly_detection&quot;, &quot;clustering&quot;,
+}
+STRONG_BASELINE_KINDS = {&quot;heuristic&quot;, &quot;current_system&quot;}
+
+
+def get_path(doc: dict, path: str):
+    node = doc
+    for part in path.split(&quot;.&quot;):
+        if not isinstance(node, dict) or part not in node:
+            return None
+        node = node[part]
+    return node
+
+
+def _text(doc: dict, path: str) -&gt; bool:
+    value = get_path(doc, path)
+    return isinstance(value, str) and value.strip() != &quot;&quot;
+
+
+def _items(doc: dict, path: str) -&gt; bool:
+    value = get_path(doc, path)
+    return isinstance(value, list) and len(value) &gt; 0
+
+
+def _positive(doc: dict, path: str) -&gt; bool:
+    value = get_path(doc, path)
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value &gt; 0
+
+
+def _choice(doc: dict, path: str, allowed: set[str]) -&gt; bool:
+    value = get_path(doc, path)
+    return isinstance(value, str) and value in allowed
+
+
+def check_baselines(doc: dict) -&gt; bool:
+    baselines = get_path(doc, &quot;baselines&quot;)
+    if not isinstance(baselines, list):
+        return False
+    return any(isinstance(b, dict) and isinstance(b.get(&quot;kind&quot;), str) and b[&quot;kind&quot;] in STRONG_BASELINE_KINDS for b in baselines)
+
+
+def check_rollout(doc: dict) -&gt; bool:
+    stages = get_path(doc, &quot;rollout.stages&quot;)
+    if not isinstance(stages, list) or not all(isinstance(stage, str) for stage in stages):
+        return False
+    return bool({&quot;shadow&quot;, &quot;canary&quot;} &amp; set(stages)) and _text(doc, &quot;rollout.rollback&quot;)
+
+
+def check_failure_modes(doc: dict) -&gt; bool:
+    modes = get_path(doc, &quot;failure_modes&quot;)
+    if not isinstance(modes, list) or not modes:
+        return False
+    return all(isinstance(m, dict) and str(m.get(&quot;default_action&quot;, &quot;&quot;)).strip() for m in modes)
+
+
+def workload_from_doc(doc: dict) -&gt; Workload | None:
+    needed = {
+        &quot;entities&quot;: &quot;serving.entities&quot;,
+        &quot;requests_per_day&quot;: &quot;serving.requests_per_day&quot;,
+        &quot;peak_qps&quot;: &quot;budgets.peak_qps&quot;,
+        &quot;max_staleness_hours&quot;: &quot;serving.max_staleness_hours&quot;,
+        &quot;latency_budget_ms&quot;: &quot;budgets.latency_ms_p99&quot;,
+    }
+    values = {key: get_path(doc, path) for key, path in needed.items()}
+    for value in values.values():
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or value &lt; 0:
+            return None
+    return Workload(name=str(get_path(doc, &quot;title&quot;) or &quot;design doc&quot;), **values)
+
+
+def check_serving_fit(doc: dict, costs: CostModel = CostModel()) -&gt; bool:
+    workload = workload_from_doc(doc)
+    mode = get_path(doc, &quot;serving.mode&quot;)
+    budget = get_path(doc, &quot;budgets.max_dollars_per_day&quot;)
+    if workload is None or not isinstance(mode, str) or not _positive(doc, &quot;budgets.max_dollars_per_day&quot;):
+        return False
+    _, plans = choose_serving(workload, costs)
+    chosen = {plan.mode: plan for plan in plans}.get(mode)
+    return chosen is not None and chosen.feasible and chosen.dollars_per_day &lt;= budget
+
+
+@dataclass(frozen=True)
+class CheckItem:
+    key: str
+    weight: int
+    blocking: bool
+    message: str
+    check: object
+
+
+CHECKLIST = [
+    CheckItem(&quot;business_goal&quot;, 1, False, &quot;state the business goal in one sentence&quot;, lambda d: _text(d, &quot;problem.business_goal&quot;)),
+    CheckItem(&quot;ml_task&quot;, 1, False, &quot;name the ML task type&quot;, lambda d: _choice(d, &quot;problem.ml_task&quot;, ML_TASKS)),
+    CheckItem(&quot;decision&quot;, 2, True, &quot;name the action that uses each prediction&quot;, lambda d: _text(d, &quot;problem.decision&quot;)),
+    CheckItem(&quot;why_not_rules&quot;, 1, False, &quot;explain why a rule or lookup is not enough&quot;, lambda d: _text(d, &quot;problem.why_not_rules&quot;)),
+    CheckItem(&quot;offline_metric&quot;, 1, False, &quot;list the offline metrics&quot;, lambda d: _items(d, &quot;metrics.offline&quot;)),
+    CheckItem(&quot;online_metric&quot;, 1, False, &quot;list the online metrics&quot;, lambda d: _items(d, &quot;metrics.online&quot;)),
+    CheckItem(&quot;business_metric&quot;, 2, True, &quot;list the business metric the model must move&quot;, lambda d: _items(d, &quot;metrics.business&quot;)),
+    CheckItem(&quot;guardrails&quot;, 1, False, &quot;list guardrail metrics that must not get worse&quot;, lambda d: _items(d, &quot;metrics.guardrails&quot;)),
+    CheckItem(&quot;baselines&quot;, 2, True, &quot;add a heuristic or current-system baseline&quot;, check_baselines),
+    CheckItem(&quot;label_source&quot;, 1, False, &quot;say where the labels come from&quot;, lambda d: _text(d, &quot;data.label_source&quot;)),
+    CheckItem(&quot;label_delay&quot;, 1, False, &quot;give the label delay in days&quot;, lambda d: isinstance(get_path(d, &quot;data.label_delay_days&quot;), (int, float))),
+    CheckItem(&quot;no_leakage&quot;, 2, True, &quot;confirm every feature exists at prediction time&quot;, lambda d: get_path(d, &quot;data.features_available_at_prediction_time&quot;) is True),
+    CheckItem(&quot;budgets&quot;, 1, False, &quot;set latency, peak QPS, and daily cost budgets&quot;, lambda d: all(_positive(d, p) for p in (&quot;budgets.latency_ms_p99&quot;, &quot;budgets.peak_qps&quot;, &quot;budgets.max_dollars_per_day&quot;))),
+    CheckItem(&quot;serving_fit&quot;, 1, False, &quot;pick a serving mode that meets the staleness, latency, and cost budgets&quot;, check_serving_fit),
+    CheckItem(&quot;rollout&quot;, 2, True, &quot;plan a shadow or canary stage and a rollback&quot;, check_rollout),
+    CheckItem(&quot;feedback_loop&quot;, 1, False, &quot;describe the feedback loop risk and its mitigation&quot;, lambda d: _text(d, &quot;feedback_loop.risk&quot;) and _text(d, &quot;feedback_loop.mitigation&quot;)),
+    CheckItem(&quot;failure_modes&quot;, 2, True, &quot;give every failure mode a default action&quot;, check_failure_modes),
+    CheckItem(&quot;monitoring&quot;, 1, False, &quot;list what you monitor after launch&quot;, lambda d: _items(d, &quot;monitoring&quot;)),
+]
+
+
+@dataclass(frozen=True)
+class Review:
+    score: float
+    verdict: str
+    passed: list[str]
+    failed: list[tuple[str, bool, str]]
+
+
+def review_design_doc(doc: dict, ready_score: float = 0.85) -&gt; Review:
+    total = sum(item.weight for item in CHECKLIST)
+    passed, failed, earned = [], [], 0
+    for item in CHECKLIST:
+        if item.check(doc):
+            passed.append(item.key)
+            earned += item.weight
+        else:
+            failed.append((item.key, item.blocking, item.message))
+    score = earned / total
+    blocked = any(blocking for _, blocking, _ in failed)
+    verdict = &quot;ready for review&quot; if score &gt;= ready_score and not blocked else &quot;revise&quot;
+    failed.sort(key=lambda entry: (not entry[1], entry[0]))
+    return Review(score, verdict, passed, failed)
+
+
+WEAK_DOC = {
+    &quot;title&quot;: &quot;Churn model v1&quot;,
+    &quot;problem&quot;: {&quot;business_goal&quot;: &quot;Reduce churn&quot;, &quot;ml_task&quot;: &quot;binary_classification&quot;},
+    &quot;metrics&quot;: {&quot;offline&quot;: [&quot;AUC&quot;]},
+    &quot;baselines&quot;: [{&quot;name&quot;: &quot;always predict no churn&quot;, &quot;kind&quot;: &quot;trivial&quot;}],
+    &quot;data&quot;: {&quot;label_source&quot;: &quot;cancellations table&quot;, &quot;features_available_at_prediction_time&quot;: False},
+    &quot;serving&quot;: {&quot;mode&quot;: &quot;online&quot;},
+}
+
+STRONG_DOC = {
+    &quot;title&quot;: &quot;Churn save-offer model&quot;,
+    &quot;problem&quot;: {
+        &quot;business_goal&quot;: &quot;Cut monthly subscriber churn from 4.0 to 3.5 percent&quot;,
+        &quot;ml_task&quot;: &quot;binary_classification&quot;,
+        &quot;decision&quot;: &quot;Send a save offer to the 5 percent of users with the highest churn score each night&quot;,
+        &quot;why_not_rules&quot;: &quot;The idle-days rule reaches F1 0.50 and misses churners who still log in&quot;,
+    },
+    &quot;metrics&quot;: {
+        &quot;offline&quot;: [&quot;F1 at the offer threshold&quot;, &quot;precision at top 5 percent&quot;],
+        &quot;online&quot;: [&quot;offer acceptance rate&quot;, &quot;score distribution&quot;],
+        &quot;business&quot;: [&quot;30-day churn rate in the treated group versus a holdout&quot;],
+        &quot;guardrails&quot;: [&quot;offer cost per saved user&quot;, &quot;unsubscribe rate&quot;],
+    },
+    &quot;baselines&quot;: [
+        {&quot;name&quot;: &quot;majority class&quot;, &quot;kind&quot;: &quot;trivial&quot;},
+        {&quot;name&quot;: &quot;days idle above a fitted threshold&quot;, &quot;kind&quot;: &quot;heuristic&quot;},
+    ],
+    &quot;data&quot;: {
+        &quot;label_source&quot;: &quot;billing cancellations joined 30 days after the score date&quot;,
+        &quot;label_delay_days&quot;: 30,
+        &quot;features_available_at_prediction_time&quot;: True,
+    },
+    &quot;budgets&quot;: {&quot;latency_ms_p99&quot;: 100, &quot;peak_qps&quot;: 40, &quot;max_dollars_per_day&quot;: 5},
+    &quot;serving&quot;: {&quot;mode&quot;: &quot;batch&quot;, &quot;entities&quot;: 2000000, &quot;requests_per_day&quot;: 300000, &quot;max_staleness_hours&quot;: 24},
+    &quot;rollout&quot;: {&quot;stages&quot;: [&quot;shadow&quot;, &quot;canary&quot;, &quot;ab_test&quot;], &quot;rollback&quot;: &quot;Point the job back to the previous model version&quot;},
+    &quot;feedback_loop&quot;: {
+        &quot;risk&quot;: &quot;Users who accept offers stay, so future labels under-count churn&quot;,
+        &quot;mitigation&quot;: &quot;Keep a 5 percent random holdout that never gets offers&quot;,
+    },
+    &quot;failure_modes&quot;: [
+        {&quot;mode&quot;: &quot;nightly job fails&quot;, &quot;default_action&quot;: &quot;Serve yesterday&#39;s scores for up to 48 hours&quot;},
+        {&quot;mode&quot;: &quot;score missing for a new user&quot;, &quot;default_action&quot;: &quot;Use the idle-days rule&quot;},
+    ],
+    &quot;monitoring&quot;: [&quot;input drift on days_idle&quot;, &quot;share of users scored&quot;, &quot;offer acceptance rate&quot;],
+}
+
+SCENARIOS = [
+    Workload(&quot;nightly churn scores&quot;, 2_000_000, 300_000, 40, 24, 100),
+    Workload(&quot;feed ranking, 2-hour freshness&quot;, 5_000_000, 2_000_000, 120, 2, 80),
+    Workload(&quot;fraud check at payment&quot;, 10_000_000, 800_000, 60, 0.05, 50),
+]
+
+
+def print_serving(costs: CostModel = CostModel()) -&gt; None:
+    print(&quot;=== Batch versus online serving ===&quot;)
+    for workload in SCENARIOS:
+        best, plans = choose_serving(workload, costs)
+        print(f&quot;\n{workload.name}&quot;)
+        for plan in plans:
+            cost = &quot;n/a&quot; if math.isinf(plan.dollars_per_day) else f&quot;${plan.dollars_per_day:,.2f}/day&quot;
+            state = &quot;ok &quot; if plan.feasible else &quot;no &quot;
+            print(f&quot;  {state}{plan.mode:7s} {cost:&gt;14s}  {plan.latency_ms:5.0f} ms  {plan.reason}&quot;)
+        print(f&quot;  choose: {best.mode if best else &#39;none, change the budgets&#39;}&quot;)
+
+
+def print_baselines() -&gt; None:
+    print(&quot;\n=== Model versus baselines (churn, metric F1) ===&quot;)
+    train_rows, train_y = make_churn_data(2000, seed=1)
+    test_rows, test_y = make_churn_data(1000, seed=2)
+    model = LogisticModel().fit(train_rows, train_y)
+    threshold = fit_rule(train_rows, train_y, &quot;days_idle&quot;)
+    report = compare_to_baselines(
+        test_y,
+        model.predict(test_rows),
+        {
+            &quot;majority class&quot;: majority_baseline(train_y, len(test_y)),
+            &quot;random at base rate&quot;: base_rate_baseline(train_y, len(test_y)),
+            f&quot;days_idle &gt; {threshold:g}&quot;: apply_rule(test_rows, &quot;days_idle&quot;, threshold),
+        },
+        f1_score,
+        &quot;F1&quot;,
+    )
+    for name, score in sorted(report.scores.items(), key=lambda kv: -kv[1]):
+        print(f&quot;  {name:24s} {score:.3f}&quot;)
+    verdict = &quot;beats&quot; if report.beats_baselines else &quot;does not beat&quot;
+    print(f&quot;  model {verdict} the strongest baseline ({report.best_baseline}) by {report.lift:+.3f}&quot;)
+
+
+def print_review(doc: dict) -&gt; None:
+    review = review_design_doc(doc)
+    print(f&quot;\n{doc.get(&#39;title&#39;, &#39;design doc&#39;)}: score {review.score:.2f}, verdict: {review.verdict}&quot;)
+    for key, blocking, message in review.failed:
+        tag = &quot;BLOCKING&quot; if blocking else &quot;missing &quot;
+        print(f&quot;  {tag} {key}: {message}&quot;)
+
+
+def main(argv: list[str]) -&gt; int:
+    if len(argv) &gt; 1:
+        with open(argv[1], encoding=&quot;utf-8&quot;) as handle:
+            print_review(json.load(handle))
+        return 0
+    print_serving()
+    print_baselines()
+    print(&quot;\n=== Design doc review ===&quot;)
+    print_review(WEAK_DOC)
+    print_review(STRONG_DOC)
+    return 0
+
+
+if __name__ == &quot;__main__&quot;:
+    sys.exit(main(sys.argv))
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/02-ml-fundamentals/19-ml-system-design/code/tests/test_main.py">phases/02-ml-fundamentals/19-ml-system-design/code/tests/test_main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Tests for the ML system design toolkit.&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import copy
+import math
+import os
+import sys
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(HERE))
+
+from main import (  # noqa: E402
+    STRONG_DOC,
+    WEAK_DOC,
+    CostModel,
+    LogisticModel,
+    Workload,
+    apply_rule,
+    base_rate_baseline,
+    batch_plan,
+    choose_serving,
+    compare_to_baselines,
+    f1_score,
+    fit_rule,
+    make_churn_data,
+    majority_baseline,
+    mean_absolute_error,
+    mean_baseline,
+    online_plan,
+    review_design_doc,
+    workload_from_doc,
+)
+
+
+class ServingCostTests(unittest.TestCase):
+    def test_batch_cost_counts_every_entity_each_run(self) -&gt; None:
+        costs = CostModel(batch_dollars_per_million=1.0, lookup_dollars_per_million=0.0, batch_job_hours=1.0)
+        plan = batch_plan(Workload(&quot;w&quot;, 1_000_000, 10, 1, 25, 100), costs)
+        self.assertAlmostEqual(plan.predictions_per_day, 1_000_000.0)
+        self.assertAlmostEqual(plan.dollars_per_day, 1.0)
+
+    def test_batch_is_infeasible_when_staleness_is_shorter_than_the_job(self) -&gt; None:
+        plan = batch_plan(Workload(&quot;w&quot;, 1000, 10, 1, 0.5, 100), CostModel(batch_job_hours=1.0))
+        self.assertFalse(plan.feasible)
+        self.assertTrue(math.isinf(plan.dollars_per_day))
+
+    def test_online_replicas_cover_peak_qps(self) -&gt; None:
+        costs = CostModel(replica_qps=100, replica_dollars_per_hour=1.0, min_replicas=1)
+        plan = online_plan(Workload(&quot;w&quot;, 10, 10, 250, 1, 100), costs)
+        self.assertAlmostEqual(plan.dollars_per_day, 3 * 24.0)
+
+    def test_online_is_infeasible_when_model_is_too_slow(self) -&gt; None:
+        plan = online_plan(Workload(&quot;w&quot;, 10, 10, 5, 1, 20), CostModel(online_latency_ms=35))
+        self.assertFalse(plan.feasible)
+
+    def test_choose_serving_prefers_cheaper_feasible_plan(self) -&gt; None:
+        best, _ = choose_serving(Workload(&quot;nightly&quot;, 2_000_000, 300_000, 40, 24, 100))
+        self.assertEqual(best.mode, &quot;batch&quot;)
+        best, _ = choose_serving(Workload(&quot;fresh&quot;, 5_000_000, 2_000_000, 120, 2, 80))
+        self.assertEqual(best.mode, &quot;online&quot;)
+
+    def test_choose_serving_returns_none_when_no_plan_fits(self) -&gt; None:
+        best, plans = choose_serving(Workload(&quot;impossible&quot;, 1000, 1000, 10, 0.1, 1))
+        self.assertIsNone(best)
+        self.assertEqual(len(plans), 2)
+
+
+class BaselineTests(unittest.TestCase):
+    def test_metrics(self) -&gt; None:
+        self.assertAlmostEqual(f1_score([1, 1, 0, 0], [1, 0, 1, 0]), 0.5)
+        self.assertEqual(f1_score([1, 0], [0, 0]), 0.0)
+        self.assertAlmostEqual(mean_absolute_error([1.0, 3.0], [2.0, 2.0]), 1.0)
+
+    def test_trivial_baselines(self) -&gt; None:
+        self.assertEqual(majority_baseline([0, 0, 1], 3), [0, 0, 0])
+        self.assertEqual(mean_baseline([1.0, 3.0], 2), [2.0, 2.0])
+        preds = base_rate_baseline([1, 0, 0, 0], 4000, seed=3)
+        self.assertAlmostEqual(sum(preds) / len(preds), 0.25, delta=0.03)
+
+    def test_metrics_reject_length_mismatch(self) -&gt; None:
+        with self.assertRaises(ValueError):
+            f1_score([1, 0, 1], [1, 0])
+        with self.assertRaises(ValueError):
+            mean_absolute_error([1.0], [1.0, 2.0])
+        with self.assertRaises(ValueError):
+            mean_absolute_error([], [])
+
+    def test_fit_rule_separates_close_values(self) -&gt; None:
+        rows = [{&quot;x&quot;: v} for v in (1.04, 1.06)]
+        threshold = fit_rule(rows, [0, 1], &quot;x&quot;)
+        self.assertEqual(apply_rule(rows, &quot;x&quot;, threshold), [0, 1])
+
+    def test_fit_rule_finds_separating_threshold(self) -&gt; None:
+        rows = [{&quot;x&quot;: v} for v in (1.0, 2.0, 3.0, 8.0, 9.0)]
+        threshold = fit_rule(rows, [0, 0, 0, 1, 1], &quot;x&quot;)
+        self.assertEqual(apply_rule(rows, &quot;x&quot;, threshold), [0, 0, 0, 1, 1])
+
+    def test_lift_is_measured_against_the_strongest_baseline(self) -&gt; None:
+        y = [1, 1, 0, 0]
+        report = compare_to_baselines(
+            y, [1, 1, 0, 0], {&quot;weak&quot;: [0, 0, 0, 0], &quot;strong&quot;: [1, 0, 0, 0]}, f1_score, &quot;F1&quot;
+        )
+        self.assertEqual(report.best_baseline, &quot;strong&quot;)
+        self.assertAlmostEqual(report.lift, 1.0 - 2 / 3)
+        self.assertTrue(report.beats_baselines)
+
+    def test_lower_is_better_metric(self) -&gt; None:
+        report = compare_to_baselines(
+            [1.0, 2.0], [1.1, 2.1], {&quot;mean&quot;: [1.5, 1.5]}, mean_absolute_error, &quot;MAE&quot;, higher_is_better=False
+        )
+        self.assertAlmostEqual(report.lift, 0.5 - 0.1)
+
+    def test_compare_requires_a_baseline(self) -&gt; None:
+        with self.assertRaises(ValueError):
+            compare_to_baselines([1], [1], {}, f1_score, &quot;F1&quot;)
+
+    def test_model_beats_rule_on_churn_data(self) -&gt; None:
+        train_rows, train_y = make_churn_data(1500, seed=1)
+        test_rows, test_y = make_churn_data(800, seed=2)
+        model = LogisticModel(epochs=150).fit(train_rows, train_y)
+        threshold = fit_rule(train_rows, train_y, &quot;days_idle&quot;)
+        report = compare_to_baselines(
+            test_y, model.predict(test_rows),
+            {&quot;rule&quot;: apply_rule(test_rows, &quot;days_idle&quot;, threshold)}, f1_score, &quot;F1&quot;,
+        )
+        self.assertTrue(report.beats_baselines)
+
+
+class DesignDocTests(unittest.TestCase):
+    def test_strong_doc_is_ready(self) -&gt; None:
+        review = review_design_doc(STRONG_DOC)
+        self.assertEqual(review.verdict, &quot;ready for review&quot;)
+        self.assertAlmostEqual(review.score, 1.0)
+        self.assertEqual(review.failed, [])
+
+    def test_weak_doc_lists_blocking_items_first(self) -&gt; None:
+        review = review_design_doc(WEAK_DOC)
+        self.assertEqual(review.verdict, &quot;revise&quot;)
+        self.assertTrue(review.failed[0][1])
+        keys = {key for key, _, _ in review.failed}
+        self.assertIn(&quot;no_leakage&quot;, keys)
+        self.assertIn(&quot;baselines&quot;, keys)
+
+    def test_one_blocking_gap_prevents_ready(self) -&gt; None:
+        doc = copy.deepcopy(STRONG_DOC)
+        doc[&quot;failure_modes&quot;][0][&quot;default_action&quot;] = &quot;&quot;
+        review = review_design_doc(doc)
+        self.assertGreater(review.score, 0.85)
+        self.assertEqual(review.verdict, &quot;revise&quot;)
+
+    def test_serving_fit_rejects_batch_for_minutes_of_staleness(self) -&gt; None:
+        doc = copy.deepcopy(STRONG_DOC)
+        doc[&quot;serving&quot;][&quot;max_staleness_hours&quot;] = 0.1
+        failed = {key for key, _, _ in review_design_doc(doc).failed}
+        self.assertIn(&quot;serving_fit&quot;, failed)
+
+    def test_workload_rejects_negative_and_non_finite_numbers(self) -&gt; None:
+        for key, value in ((&quot;entities&quot;, -1), (&quot;requests_per_day&quot;, float(&quot;nan&quot;)), (&quot;max_staleness_hours&quot;, float(&quot;inf&quot;))):
+            doc = copy.deepcopy(STRONG_DOC)
+            doc[&quot;serving&quot;][key] = value
+            with self.subTest(key=key):
+                self.assertIsNone(workload_from_doc(doc))
+
+    def test_malformed_fields_fail_checks_without_errors(self) -&gt; None:
+        doc = copy.deepcopy(STRONG_DOC)
+        doc[&quot;problem&quot;][&quot;ml_task&quot;] = [&quot;regression&quot;]
+        doc[&quot;baselines&quot;] = [{&quot;kind&quot;: [&quot;heuristic&quot;]}]
+        doc[&quot;serving&quot;][&quot;mode&quot;] = {&quot;batch&quot;: True}
+        doc[&quot;rollout&quot;][&quot;stages&quot;] = [{&quot;name&quot;: &quot;shadow&quot;}]
+        failed = {key for key, _, _ in review_design_doc(doc).failed}
+        self.assertTrue({&quot;ml_task&quot;, &quot;baselines&quot;, &quot;serving_fit&quot;, &quot;rollout&quot;} &lt;= failed)
+
+    def test_infinite_or_boolean_budget_fails(self) -&gt; None:
+        for budget in (float(&quot;inf&quot;), True):
+            doc = copy.deepcopy(STRONG_DOC)
+            doc[&quot;budgets&quot;][&quot;max_dollars_per_day&quot;] = budget
+            with self.subTest(budget=budget):
+                failed = {key for key, _, _ in review_design_doc(doc).failed}
+                self.assertTrue({&quot;budgets&quot;, &quot;serving_fit&quot;} &lt;= failed)
+
+    def test_hybrid_mode_fails_without_a_hybrid_plan(self) -&gt; None:
+        doc = copy.deepcopy(STRONG_DOC)
+        doc[&quot;serving&quot;][&quot;mode&quot;] = &quot;hybrid&quot;
+        failed = {key for key, _, _ in review_design_doc(doc).failed}
+        self.assertIn(&quot;serving_fit&quot;, failed)
+
+    def test_workload_from_doc_needs_all_numbers(self) -&gt; None:
+        self.assertIsNotNone(workload_from_doc(STRONG_DOC))
+        self.assertIsNone(workload_from_doc(WEAK_DOC))
+
+
+if __name__ == &quot;__main__&quot;:
+    unittest.main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/02-ml-fundamentals/19-ml-system-design/outputs/skill-ml-design-review.md">phases/02-ml-fundamentals/19-ml-system-design/outputs/skill-ml-design-review.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: skill-ml-design-review
+description: Review an ML system design document before training starts, blocking gaps first
+version: 1.0.0
+phase: 2
+lesson: 19
+tags: [ml-system-design, design-review, baselines, serving, rollout]
+---
+
+# ML Design Review
+
+Use this skill when someone shares a design document, a proposal, or a plan for a model that will make real decisions. Review the document in the order below. Report the blocking gaps first, then the other gaps, then the questions.
+
+## Step 1: Check the six blocking items
+
+Stop the review and ask for a fix when any of these items is missing:
+
+1. **Decision.** The document names the action that uses each prediction and who or what takes it.
+2. **Business metric.** The document names the company outcome that the decision must change and how an experiment measures it.
+3. **Strong baseline.** The document compares the model with a heuristic rule or with the current system. A majority-class baseline alone does not count.
+4. **No leakage.** The document confirms that every feature exists at the moment of the prediction.
+5. **Rollout and rollback.** The plan has a shadow or canary stage and a rollback that takes minutes.
+6. **Failure defaults.** Every failure mode has a default action, such as the heuristic rule or the last good score.
+
+## Step 2: Check the problem framing
+
+- The prediction names an entity, a target, and a horizon, such as &quot;user cancels in the next 30 days&quot;.
+- The document says why a rule or a lookup table is not enough.
+- The ML task type matches the decision: classification, regression, ranking, forecasting, or anomaly detection.
+
+## Step 3: Check the metrics
+
+| Layer | Ask |
+|---|---|
+| Offline | Does the metric match the decision threshold? Use precision in the top 5 percent if the job acts on the top 5 percent. |
+| Online | Which live signals show that the model works: acceptance rate, share of requests scored, score distribution? |
+| Business | Which experiment measures the outcome, and how long until the result? |
+| Guardrails | Which metrics must not get worse: cost, latency, complaints, unsubscribes? |
+
+## Step 4: Check the data and labels
+
+- Where the labels come from and who owns that table
+- The label delay in days, and what the team monitors until labels arrive
+- The number of positive examples
+- A time-based holdout set, with the most recent period held out
+
+## Step 5: Check the serving choice with arithmetic
+
+Ask for five numbers: entities, requests per day, peak QPS, maximum staleness in hours, and the p99 latency budget. Then price both modes:
+
+```text
+batch runs per day   = 24 / (max_staleness_hours - batch_job_hours)
+batch cost per day   = entities * runs per day * price per prediction + lookups * price per lookup
+online replicas      = max(2, ceil(peak_qps / qps per replica))
+online cost per day  = replicas * price per replica hour * 24
+```
+
+- Batch cannot work when the staleness limit is shorter than one batch job.
+- Online cannot work when model latency is above the p99 budget.
+- When both work, prefer the cheaper one, and check how many batch scores nobody reads.
+- New entities with no history need an online path or a rule.
+
+## Step 6: Check feedback loops
+
+Ask how the model&#39;s decisions change its future training data:
+
+- Does an intervention, such as an offer or a block, hide the true outcome?
+- Do only the items that the model shows collect feedback?
+- Is there a random holdout group or an exploration share that keeps clean data?
+- Does the system log the score and the decision with each example?
+
+## Step 7: Write the review
+
+Use this format:
+
+```text
+Verdict: ready for review | revise
+Blocking: &lt;list, or &quot;none&quot;&gt;
+Missing: &lt;list of non-blocking gaps&gt;
+Serving check: &lt;batch $/day, online $/day, chosen mode, pass or fail&gt;
+Questions: &lt;at most five questions for the author&gt;
+```
+
+To score a JSON version of the document, run `python3 code/main.py path/to/design_doc.json` from the lesson folder.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. A team reports an offline AUC of 0.91 for a churn model. What is missing before anyone can call the model useful?</legend><label class="option"><input type="radio" name="q0" value="0"> The decision that uses each score and a baseline to compare against</label><label class="option"><input type="radio" name="q0" value="1"> A larger gradient-boosted model with more trees and a tuned learning rate</label><label class="option"><input type="radio" name="q0" value="2"> An AUC above 0.95, because production systems reject lower scores</label><label class="option"><input type="radio" name="q0" value="3"> A GPU server, because churn models need accelerators to serve traffic</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. What is a guardrail metric?</legend><label class="option"><input type="radio" name="q1" value="0"> A metric that only the security team is allowed to read</label><label class="option"><input type="radio" name="q1" value="1"> The metric with the largest value on the validation set</label><label class="option"><input type="radio" name="q1" value="2"> The offline metric that the training job minimizes on each batch</label><label class="option"><input type="radio" name="q1" value="3"> A metric that must not get worse when the new model launches</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. Scores must be at most 30 minutes old, and one full batch run takes one hour. What follows?</legend><label class="option"><input type="radio" name="q2" value="0"> Batch inference still works if you run the job twice as often each day</label><label class="option"><input type="radio" name="q2" value="1"> Online inference cannot work, because it is slower than a key-value lookup read</label><label class="option"><input type="radio" name="q2" value="2"> Batch inference works if you add replicas to the key-value store</label><label class="option"><input type="radio" name="q2" value="3"> Batch inference cannot meet the limit, so the design needs online scoring</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. A churn model scores F1 0.56. The majority baseline scores 0.00, and a one-feature rule scores 0.46. What is the lift?</legend><label class="option"><input type="radio" name="q3" value="0"> 0.51, the average gain over the two baselines in the comparison</label><label class="option"><input type="radio" name="q3" value="1"> 0.10, measured against the rule, which is the strongest baseline</label><label class="option"><input type="radio" name="q3" value="2"> 0.56, measured against the majority baseline, which scores zero</label><label class="option"><input type="radio" name="q3" value="3"> 0.00, because lift is only defined against the current production system</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. A fraud model blocks risky payments, and the team retrains it each month on labeled payments. What problem does this create?</legend><label class="option"><input type="radio" name="q4" value="0"> Blocked payments never get a fraud label, so the training data loses examples</label><label class="option"><input type="radio" name="q4" value="1"> The monthly retraining schedule makes the model overfit to the most recent month</label><label class="option"><input type="radio" name="q4" value="2"> Blocking payments raises the p99 latency of the model service above its budget</label><label class="option"><input type="radio" name="q4" value="3"> Labeled payments leak the label because the label is stored in the same table</label><p data-feedback="4"></p></fieldset><fieldset><legend>6. Which rollout stage lets a new model score live traffic while nobody uses its output?</legend><label class="option"><input type="radio" name="q5" value="0"> Canary release</label><label class="option"><input type="radio" name="q5" value="1"> A/B test with a holdout</label><label class="option"><input type="radio" name="q5" value="2"> Shadow deployment</label><label class="option"><input type="radio" name="q5" value="3"> Full rollout with rollback</label><p data-feedback="5"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/02-ml-fundamentals/18-feature-selection/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/02-ml-fundamentals/20-model-monitoring-and-drift/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/02-ml-fundamentals/19-ml-system-design/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

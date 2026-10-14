@@ -1,0 +1,797 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>SAM 3 和开放词库分类 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-04-computer-vision" data-lesson="04-computer-vision/24-sam3-open-vocab-segmentation" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/04-computer-vision/">计算机视觉</a> / LESSON 24</p><h1 class="lesson-title">SAM 3 和开放词库分类</h1><p>SAM 3 &amp; Open-Vocabulary Segmentation</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>SAM 3 和开放词库分类</h1>
+<blockquote>
+<p>给模型一个短信提示和图像,并为每一个匹配的对象提供面具.</p>
+</blockquote>
+<p><strong>Type:</strong> Use + Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 4 Lesson 07 (U-Net), Phase 4 Lesson 08 (Mask R-CNN), Phase 4 Lesson 18 (CLIP)
+<strong>Time:</strong> ~60 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>区分SAM (仅视觉提示),GroundedSAM/SAM 2 (检测器+SAM),和SAM 3 (通过即时概念分类的本地文本提示)</li>
+<li>解释SAM3架构:共享脊柱+图像探测器+基于内存的视频追踪器+存在头+离合探测器-追踪器设计</li>
+<li>拥抱脸<code>transformers</code>通过文字提示检测,细分和视频跟踪的SAM3集成</li>
+<li>根据延迟,概念复杂性和部署目标,选择SAM 3,GroundedSAM 2,YOLO-World和SAM-MI</li>
+</ul>
+<h2>问题</h2>
+<p>2023 SAM只是一个视觉提示模型:你点击一个点或绘制一个盒子,它返回一个面具.为&quot;给我这张照片中的所有的色&quot;你需要一个探测器 (Grounding DINO) 来制作盒子,然后 SAM 进行分区分.Grounded SAM 将这变成了管道,但这是两个结的模型的尾,不可避免的错误积累.</p>
+<p>SAM 3 (Meta,Nov 2025,ICLR 2026) 已经崩了.它接受一个短名词短语或图像示范作为提示,并将所有匹配的面具和实例ID返回在一个前进通行.**Promptable Concept Segmentation (PCS)**结合2026年3月的Object Multiplex更新 (SAM 3.1) 功能,它通过视频有效地追踪相同概念的多个实例.</p>
+<p>这一课讲述了这所代表的结构转变. 2D Seg,检测和文本图像接地已经融入了一个模型.生产问题不再是&quot;我连接哪个管道&quot;,而是&quot;哪个可调用模型处理我的使用情况端到端&quot;.</p>
+<h2>概念</h2>
+<h3>现在,我们有三代人</h3>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-2446b1ca837d4b1d34ac.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>快速的概念分类</h3>
+<p>概念提示是一个短名词 (<code>&quot;yellow school bus&quot;</code>现在<code>&quot;striped red umbrella&quot;</code>现在<code>&quot;hand holding a mug&quot;</code>模型返回每个与概念相匹配的图像中的实例的细分面具,加上每个匹配的独特实例ID.</p>
+<p>这与经典视觉提示SAM有三个方面不同:</p>
+<ol>
+<li>没有需要每次提示一个文本提示返回所有匹配.</li>
+<li>开放词汇 这个概念可以用自然语言描述任何东西.</li>
+<li>返回一次多次实例,而不是每次提示一次.</li>
+</ol>
+<h3>建筑的关键部分</h3>
+<ul>
+<li><strong>Shared backbone</strong>单个ViT处理图像. 检测器头和基于内存的跟踪器都从图像中读取.</li>
+<li><strong>Presence head</strong>预测概念是否存在于图像中. 脱离&quot;这是在这里吗?&quot;和&quot;它在哪里?&quot; 减少缺失概念的虚假积极性.</li>
+<li><strong>Decoupled detector-tracker</strong>图像级检测和视频级追踪具有分开的头部,因此它们不会干扰.</li>
+<li><strong>Memory bank</strong>存储视频跟踪的每次实例功能在框架中 (使用 SAM 2 的机制相同).</li>
+</ul>
+<h3>规模培训</h3>
+<p>SAM3训练在<strong>4 million unique concepts</strong>通过人工智能+人类审查进行反复注释和纠正的数据引擎生成.<strong>SA-CO benchmark</strong>含有270万个独特概念,比以前的基准标准大50倍.SAM3在SA-CO上达到75-80%的人类性能,并且在图像+视频PCS上翻倍现有系统.</p>
+<h3>SAM 3.1 物体多重</h3>
+<p>2026年3月更新: <strong>Object Multiplex</strong>之前,跟踪N实例意味着N个独立的内存库.多复合式将这些存储器分解成一个共享内存,每次查询.结果:在不牺牲准确性的情况下,多对象的跟踪速度更快.</p>
+<h3>在2026年,地面 SAM仍然重要</h3>
+<ul>
+<li>当你需要一个特定的开放词汇检测器 (DINO-X,佛罗伦萨-2) 换成时.</li>
+<li>当SAM3许可证 (HF上锁定) 是一个阻塞器时.</li>
+<li>当你需要对探测器门的控制比SAM3暴露的更高.</li>
+<li>用于探测器组件的研究/除工作.</li>
+</ul>
+<p>对于大多数生产工作,SAM3是最简单的答案.</p>
+<h3>约洛世界vs三星</h3>
+<ul>
+<li><strong>YOLO-World</strong> 只有开口语音检测器 (没有面具).实时.最好在高光率的盒子中使用.</li>
+<li><strong>SAM 3</strong>完整的细分+跟踪.</li>
+</ul>
+<p>产品分类:YOLO-World用于快速检测 (机器人导航,快速仪表板),SAM 3用于任何需要面具或跟踪的东西.</p>
+<h3>SAM-MI 的效率</h3>
+<p>SAM-MI (2025-2026) 解决了 SAM 的解码器瓶.</p>
+<ul>
+<li><strong>Sparse point prompting</strong>使用一些精心选择的点,而不是密集的提示;减少了96%的解码器调用.</li>
+<li><strong>Shallow mask aggregation</strong>将粗的面具预测合并成一个更尖的面具.</li>
+<li><strong>Decoupled mask injection</strong>解码器接收预先计算的面具功能,而不是重新运行.</li>
+</ul>
+<p>结果:在开放词汇基准上,速度比 Grounded-SAM高达1.6x.</p>
+<h3>三种模型的输出格式</h3>
+<p>所有的输出都返回相同的总体结构 (盒子+标签+分数+面具+身份证),这有助于您的下游管道不需要分行于哪个模型运行.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-bee30fd41f053671af21.png" alt="cv3-open-vocab 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<h3>第一个步骤:快速建设</h3>
+<p>建立一个帮助程序,将用户句子变成SAM 3概念提示列表.这是&quot;用户输入的&quot;与&quot;模型消耗的&quot;交往的边界.</p>
+<pre><code class="language-python">def split_concepts(sentence):
+    &quot;&quot;&quot;
+    Heuristic splitter for multi-concept prompts.
+    Returns list of short noun phrases.
+    &quot;&quot;&quot;
+    for sep in [&quot;,&quot;, &quot;;&quot;, &quot;and&quot;, &quot;or&quot;, &quot;&amp;&quot;]:
+        if sep in sentence:
+            parts = [p.strip() for p in sentence.replace(&quot;and &quot;, &quot;,&quot;).split(&quot;,&quot;)]
+            return [p for p in parts if p]
+    return [sentence.strip()]
+
+print(split_concepts(&quot;cats, dogs and balloons&quot;))
+</code></pre>
+<p>通过前进传输,SAM 3接受一个概念;对于多概念查询,循环或批量.</p>
+<h3>后处理辅助员</h3>
+<p>让SAM3的原始输出成为一个清洁的检测清单,符合我们4期16课管道合同.</p>
+<pre><code class="language-python">from dataclasses import dataclass
+from typing import List
+
+@dataclass
+class ConceptDetection:
+    concept: str
+    instance_id: int
+    box: tuple          # (x1, y1, x2, y2)
+    score: float
+    mask_rle: str       # run-length encoded
+
+
+def rle_encode(binary_mask):
+    flat = binary_mask.flatten().astype(&quot;uint8&quot;)
+    runs = []
+    prev, count = flat[0], 0
+    for v in flat:
+        if v == prev:
+            count += 1
+        else:
+            runs.append((int(prev), count))
+            prev, count = v, 1
+    runs.append((int(prev), count))
+    return &quot;;&quot;.join(f&quot;{v}x{c}&quot; for v, c in runs)
+</code></pre>
+<p>尽管在高分辨率面具中,RLE也能保持响应有效载荷. SAM 2, SAM 3,Grounded SAM 2中也能使用相同的格式.</p>
+<h3>步骤3: 统一的开口语句分区接口</h3>
+<p>包装您的任何后端 (SAM 3,Grounded SAM 2,YOLO-World + SAM 2) 单一方法.后端时,您的下游代码不会改变.</p>
+<pre><code class="language-python">from abc import ABC, abstractmethod
+import numpy as np
+
+class OpenVocabSeg(ABC):
+    @abstractmethod
+    def detect(self, image: np.ndarray, concept: str) -&gt; List[ConceptDetection]:
+        ...
+
+
+class StubOpenVocabSeg(OpenVocabSeg):
+    &quot;&quot;&quot;
+    Deterministic stub used for pipeline testing when real models are not loaded.
+    &quot;&quot;&quot;
+    def detect(self, image, concept):
+        h, w = image.shape[:2]
+        return [
+            ConceptDetection(
+                concept=concept,
+                instance_id=0,
+                box=(w * 0.2, h * 0.3, w * 0.5, h * 0.8),
+                score=0.89,
+                mask_rle=&quot;0x100;1x50;0x200&quot;,
+            ),
+            ConceptDetection(
+                concept=concept,
+                instance_id=1,
+                box=(w * 0.55, h * 0.25, w * 0.85, h * 0.75),
+                score=0.74,
+                mask_rle=&quot;0x80;1x40;0x220&quot;,
+            ),
+        ]
+</code></pre>
+<p>真正的<code>SAM3OpenVocabSeg</code>亚级将包装<code>transformers.Sam3Model</code>其他<code>Sam3Processor</code>现在,我们要去.</p>
+<h3>步骤4:拥抱脸SAM 3使用 (参考)</h3>
+<p>对于实际模型来说,<code>transformers</code>整合:</p>
+<pre><code class="language-python">from transformers import Sam3Processor, Sam3Model
+import torch
+
+processor = Sam3Processor.from_pretrained(&quot;facebook/sam3&quot;)
+model = Sam3Model.from_pretrained(&quot;facebook/sam3&quot;).eval()
+
+inputs = processor(images=pil_image, return_tensors=&quot;pt&quot;)
+inputs = processor.set_text_prompt(inputs, &quot;yellow school bus&quot;)
+
+with torch.no_grad():
+    outputs = model(**inputs)
+
+masks = processor.post_process_masks(
+    outputs.masks, inputs.original_sizes, inputs.reshaped_input_sizes
+)
+boxes = outputs.boxes
+scores = outputs.scores
+</code></pre>
+<p>一个提示,所有匹配都在一个电话回来.</p>
+<h3>步骤5:测量Grounded SAM 2免费给你的</h3>
+<p>坦诚的基准:当你用真实管道中的SAM3取代地面SAM2时会发生什么?</p>
+<ul>
+<li>延迟:SAM 3节省一个前进传输 (没有单独的探测器),但模型本身更重;通常是净中性或略有加速.</li>
+<li>精度: SAM 3 在罕见或组合概念 (&quot;条纹红色雨&quot;) 上显著提高.</li>
+<li>灵活性:地面 SAM 2 允许您交换探测器 (DINO-X,Florence-2,地面 DINO 1.5);SAM 3 是单色的.</li>
+</ul>
+<p>总结: SAM 3 是2026年开口语分类的默认. 基于 SAM 2 仍然是正确的答案,当你需要探测器灵活性或不同的许可条款时.</p>
+<h2>用它</h2>
+<p>生产部署模式:</p>
+<ul>
+<li><strong>Real-time annotation</strong> SAM 3 + CVAT的标签即文字提示功能.注释符选择标签名称; SAM 3 预标签每个匹配的实例. 审查和纠正.</li>
+<li><strong>Video analytics</strong> SAM 3.1 对象多重跟踪;输送框架到基于内存的跟踪器.</li>
+<li><strong>Robotics</strong> SAM 3用于开口音符操作 (&quot;挑起红杯&quot;);运行为规划原始.</li>
+<li><strong>Medical imaging</strong> SAM 3 调整了医疗概念;需要在HF上请求访问.</li>
+</ul>
+<p>超分析将SAM3包装在Python包中:</p>
+<pre><code class="language-python">from ultralytics import SAM
+
+model = SAM(&quot;sam3.pt&quot;)
+results = model(image_path, prompts=&quot;yellow school bus&quot;)
+</code></pre>
+<p>类似于YOLO和SAM2.</p>
+<h2>运送它</h2>
+<p>这一课产生了:</p>
+<ul>
+<li><code>outputs/prompt-open-vocab-stack-picker.md</code>一个提示,根据延迟,概念复杂性和许可,选择SAM 3 /Grounded SAM 2 /YOLO-World /SAM-MI.</li>
+<li><code>outputs/skill-concept-prompt-designer.md</code>将用户的言论转化为精确的SAM3概念提示 (分开,分歧,反弹).</li>
+</ul>
+<h2>运动</h2>
+<ol>
+<li>**(Easy)**运行 SAM 3 在 10 个图像上,使用您选择的概念提示. 进行 SAM 2 + Grounding DINO 1.5 的相比较. 报告每个模型错过哪些概念.</li>
+<li>**(Medium)**在 SAM 3 上建立一个&quot;点击加入/点击排除&quot;UI:一个文本提示返回候选实例;用户点击保持哪些被认为是正确的.输出最终概念集合为JSON.</li>
+<li>**(Hard)**根据定制概念组 (例如5种电子组件) 进行精细调节,每个图像都有20个标签. 进行相同测试组的零射SAM3进行比较;测量面具IoU改善.</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Open-vocabulary segmentation</td>
+<td>&quot;Segment by text&quot;</td>
+<td>Produce masks for objects described in natural language, not a fixed label set</td>
+</tr>
+<tr>
+<td>PCS</td>
+<td>&quot;Promptable Concept Segmentation&quot;</td>
+<td>SAM 3's core task — given a noun-phrase or image exemplar, segment all matching instances</td>
+</tr>
+<tr>
+<td>Concept prompt</td>
+<td>&quot;The text input&quot;</td>
+<td>Short noun phrase or image exemplar; not a full sentence</td>
+</tr>
+<tr>
+<td>Presence head</td>
+<td>&quot;Is it here?&quot;</td>
+<td>SAM 3 module that decides whether the concept exists in the image before localisation</td>
+</tr>
+<tr>
+<td>SA-CO</td>
+<td>&quot;SAM 3 benchmark&quot;</td>
+<td>270K-concept open-vocabulary segmentation benchmark; 50x larger than prior open-vocab benchmarks</td>
+</tr>
+<tr>
+<td>Object Multiplex</td>
+<td>&quot;SAM 3.1 update&quot;</td>
+<td>Shared-memory multi-object tracking; fast joint tracking of many instances</td>
+</tr>
+<tr>
+<td>Grounded SAM 2</td>
+<td>&quot;Modular pipeline&quot;</td>
+<td>Detector + SAM 2 cascade; still relevant when detector swap matters</td>
+</tr>
+<tr>
+<td>SAM-MI</td>
+<td>&quot;Efficient SAM variant&quot;</td>
+<td>Mask Injection for 1.6x speedup over Grounded-SAM</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2511.16719" rel="noreferrer" data-network="true">SAM 3: Segment Anything with Concepts (arXiv 2511.16719) <small>↗ 需要联网</small></a></li>
+<li><a href="https://ai.meta.com/blog/segment-anything-model-3/" rel="noreferrer" data-network="true">SAM 3.1 Object Multiplex (Meta AI, March 2026) <small>↗ 需要联网</small></a></li>
+<li><a href="https://huggingface.co/facebook/sam3" rel="noreferrer" data-network="true">SAM 3 model page on Hugging Face <small>↗ 需要联网</small></a></li>
+<li><a href="https://pyimagesearch.com/2026/01/19/grounded-sam-2-from-open-set-detection-to-segmentation-and-tracking/" rel="noreferrer" data-network="true">Grounded SAM 2 tutorial (PyImageSearch) <small>↗ 需要联网</small></a></li>
+<li><a href="https://docs.ultralytics.com/models/sam-3/" rel="noreferrer" data-network="true">Ultralytics SAM 3 docs <small>↗ 需要联网</small></a></li>
+<li><a href="https://arxiv.org/abs/2512.04585" rel="noreferrer" data-network="true">SAM3-I: Instruction-aware SAM (arXiv 2512.04585) <small>↗ 需要联网</small></a></li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>SAM 3 &amp; Open-Vocabulary Segmentation</h1>
+<blockquote>
+<p>Give a model a text prompt and an image and get masks for every matching object. SAM 3 made that a single forward pass.</p>
+</blockquote>
+<p><strong>Type:</strong> Use + Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 4 Lesson 07 (U-Net), Phase 4 Lesson 08 (Mask R-CNN), Phase 4 Lesson 18 (CLIP)
+<strong>Time:</strong> ~60 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Distinguish SAM (visual prompts only), Grounded SAM / SAM 2 (detector + SAM), and SAM 3 (native text prompts via Promptable Concept Segmentation)</li>
+<li>Explain the SAM 3 architecture: shared backbone + image detector + memory-based video tracker + presence head + decoupled detector-tracker design</li>
+<li>Use Hugging Face <code>transformers</code> SAM 3 integration for text-prompted detection, segmentation, and video tracking</li>
+<li>Pick between SAM 3, Grounded SAM 2, YOLO-World, and SAM-MI based on latency, concept complexity, and deployment target</li>
+</ul>
+<h2>The Problem</h2>
+<p>The 2023 SAM was a visual-prompt-only model: you click a point or draw a box and it returns a mask. For &quot;give me all the oranges in this photo&quot; you needed a detector (Grounding DINO) to produce boxes, then SAM to segment each. Grounded SAM turned this into a pipeline, but it was a cascade of two frozen models with inevitable error accumulation.</p>
+<p>SAM 3 (Meta, Nov 2025, ICLR 2026) collapsed the cascade. It accepts a short noun phrase or an image exemplar as prompt and returns all matching masks and instance IDs in a single forward pass. That is <strong>Promptable Concept Segmentation (PCS)</strong>. Combined with the March 2026 Object Multiplex update (SAM 3.1), it tracks multiple instances of the same concept through video efficiently.</p>
+<p>This lesson is about the structural shift this represents. 2D seg, detection, and text-image grounding have merged into one model. The production question is no longer &quot;which pipeline do I chain together&quot; but &quot;which promptable model handles my use case end-to-end.&quot;</p>
+<h2>The Concept</h2>
+<h3>The three generations</h3>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-2446b1ca837d4b1d34ac.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>Promptable Concept Segmentation</h3>
+<p>A &quot;concept prompt&quot; is a short noun phrase (<code>&quot;yellow school bus&quot;</code>, <code>&quot;striped red umbrella&quot;</code>, <code>&quot;hand holding a mug&quot;</code>) or an image exemplar. The model returns segmentation masks for every instance in the image that matches the concept, plus a unique instance ID per match.</p>
+<p>This differs from classic visual-prompt SAM in three ways:</p>
+<ol>
+<li>No per-instance prompting required — one text prompt returns all matches.</li>
+<li>Open-vocabulary — the concept can be anything describable in natural language.</li>
+<li>Returns multiple instances at once rather than one mask per prompt.</li>
+</ol>
+<h3>Key architectural pieces</h3>
+<ul>
+<li><strong>Shared backbone</strong> — a single ViT processes the image. Both the detector head and the memory-based tracker read from it.</li>
+<li><strong>Presence head</strong> — predicts whether the concept is present in the image at all. Decouples &quot;is this here?&quot; from &quot;where is it?&quot;. Reduces false positives on absent concepts.</li>
+<li><strong>Decoupled detector-tracker</strong> — image-level detection and video-level tracking have separate heads so they do not interfere.</li>
+<li><strong>Memory bank</strong> — stores per-instance features across frames for video tracking (same mechanism SAM 2 used).</li>
+</ul>
+<h3>Training at scale</h3>
+<p>SAM 3 was trained on <strong>4 million unique concepts</strong> generated by a data engine that iteratively annotates and corrects using AI + human review. The new <strong>SA-CO benchmark</strong> contains 270K unique concepts, 50x larger than prior benchmarks. SAM 3 reaches 75-80% of human performance on SA-CO and doubles existing systems on image + video PCS.</p>
+<h3>SAM 3.1 Object Multiplex</h3>
+<p>March 2026 update: <strong>Object Multiplex</strong> introduces a shared-memory mechanism for joint tracking of many instances of the same concept at once. Previously, tracking N instances meant N separate memory banks. Multiplex collapses that into one shared memory with per-instance queries. Result: substantially faster multi-object tracking without sacrificing accuracy.</p>
+<h3>Where Grounded SAM still matters in 2026</h3>
+<ul>
+<li>When you need a specific open-vocabulary detector swapped in (DINO-X, Florence-2).</li>
+<li>When the SAM 3 license (gated on HF) is a blocker.</li>
+<li>When you need more control over the detector threshold than SAM 3 exposes.</li>
+<li>For research / ablation work on the detector component.</li>
+</ul>
+<p>Modular pipelines still have a place. For most production work, SAM 3 is the simpler answer.</p>
+<h3>YOLO-World vs SAM 3</h3>
+<ul>
+<li><strong>YOLO-World</strong> — open-vocabulary detector only (no masks). Real-time. Best when you need boxes at high fps.</li>
+<li><strong>SAM 3</strong> — full segmentation + tracking. Slower but richer output.</li>
+</ul>
+<p>Production split: YOLO-World for fast detection-only pipelines (robotics navigation, fast dashboards), SAM 3 for anything that needs masks or tracking.</p>
+<h3>SAM-MI efficiency</h3>
+<p>SAM-MI (2025-2026) addresses SAM's decoder bottleneck. Key ideas:</p>
+<ul>
+<li><strong>Sparse point prompting</strong> — uses a few well-chosen points instead of dense prompts; reduces decoder calls by 96%.</li>
+<li><strong>Shallow mask aggregation</strong> — merges rough mask predictions into one sharper mask.</li>
+<li><strong>Decoupled mask injection</strong> — decoder receives pre-computed mask features instead of re-running.</li>
+</ul>
+<p>Result: ~1.6× speedup over Grounded-SAM on open-vocabulary benchmarks.</p>
+<h3>Output format for the three models</h3>
+<p>All return the same general structure (boxes + labels + scores + masks + IDs), which is helpful — your pipeline downstream does not have to branch on which model ran.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-bee30fd41f053671af21.png" alt="cv3-open-vocab 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<h3>Step 1: Prompt construction</h3>
+<p>Build a helper that turns a user sentence into a list of SAM 3 concept prompts. This is the boundary where &quot;what the user typed&quot; meets &quot;what the model consumes&quot;.</p>
+<pre><code class="language-python">def split_concepts(sentence):
+    &quot;&quot;&quot;
+    Heuristic splitter for multi-concept prompts.
+    Returns list of short noun phrases.
+    &quot;&quot;&quot;
+    for sep in [&quot;,&quot;, &quot;;&quot;, &quot;and&quot;, &quot;or&quot;, &quot;&amp;&quot;]:
+        if sep in sentence:
+            parts = [p.strip() for p in sentence.replace(&quot;and &quot;, &quot;,&quot;).split(&quot;,&quot;)]
+            return [p for p in parts if p]
+    return [sentence.strip()]
+
+print(split_concepts(&quot;cats, dogs and balloons&quot;))
+</code></pre>
+<p>SAM 3 accepts one concept per forward pass; for multi-concept queries, loop or batch them.</p>
+<h3>Step 2: Post-processing helpers</h3>
+<p>Turn SAM 3's raw outputs into a clean list of detections that match our Phase 4 Lesson 16 pipeline contract.</p>
+<pre><code class="language-python">from dataclasses import dataclass
+from typing import List
+
+@dataclass
+class ConceptDetection:
+    concept: str
+    instance_id: int
+    box: tuple          # (x1, y1, x2, y2)
+    score: float
+    mask_rle: str       # run-length encoded
+
+
+def rle_encode(binary_mask):
+    flat = binary_mask.flatten().astype(&quot;uint8&quot;)
+    runs = []
+    prev, count = flat[0], 0
+    for v in flat:
+        if v == prev:
+            count += 1
+        else:
+            runs.append((int(prev), count))
+            prev, count = v, 1
+    runs.append((int(prev), count))
+    return &quot;;&quot;.join(f&quot;{v}x{c}&quot; for v, c in runs)
+</code></pre>
+<p>RLE keeps response payloads small even for many high-resolution masks. The same format works across SAM 2, SAM 3, Grounded SAM 2.</p>
+<h3>Step 3: A unified open-vocab segmentation interface</h3>
+<p>Wrap whatever backend you have (SAM 3, Grounded SAM 2, YOLO-World + SAM 2) behind a single method. Your downstream code does not change when the backend does.</p>
+<pre><code class="language-python">from abc import ABC, abstractmethod
+import numpy as np
+
+class OpenVocabSeg(ABC):
+    @abstractmethod
+    def detect(self, image: np.ndarray, concept: str) -&gt; List[ConceptDetection]:
+        ...
+
+
+class StubOpenVocabSeg(OpenVocabSeg):
+    &quot;&quot;&quot;
+    Deterministic stub used for pipeline testing when real models are not loaded.
+    &quot;&quot;&quot;
+    def detect(self, image, concept):
+        h, w = image.shape[:2]
+        return [
+            ConceptDetection(
+                concept=concept,
+                instance_id=0,
+                box=(w * 0.2, h * 0.3, w * 0.5, h * 0.8),
+                score=0.89,
+                mask_rle=&quot;0x100;1x50;0x200&quot;,
+            ),
+            ConceptDetection(
+                concept=concept,
+                instance_id=1,
+                box=(w * 0.55, h * 0.25, w * 0.85, h * 0.75),
+                score=0.74,
+                mask_rle=&quot;0x80;1x40;0x220&quot;,
+            ),
+        ]
+</code></pre>
+<p>The real <code>SAM3OpenVocabSeg</code> subclass would wrap <code>transformers.Sam3Model</code> and <code>Sam3Processor</code>.</p>
+<h3>Step 4: Hugging Face SAM 3 usage (reference)</h3>
+<p>For the actual model, the <code>transformers</code> integration:</p>
+<pre><code class="language-python">from transformers import Sam3Processor, Sam3Model
+import torch
+
+processor = Sam3Processor.from_pretrained(&quot;facebook/sam3&quot;)
+model = Sam3Model.from_pretrained(&quot;facebook/sam3&quot;).eval()
+
+inputs = processor(images=pil_image, return_tensors=&quot;pt&quot;)
+inputs = processor.set_text_prompt(inputs, &quot;yellow school bus&quot;)
+
+with torch.no_grad():
+    outputs = model(**inputs)
+
+masks = processor.post_process_masks(
+    outputs.masks, inputs.original_sizes, inputs.reshaped_input_sizes
+)
+boxes = outputs.boxes
+scores = outputs.scores
+</code></pre>
+<p>One prompt, all matches returned in a single call.</p>
+<h3>Step 5: Measure what Grounded SAM 2 gave you for free</h3>
+<p>An honest benchmark: what happens when you replace Grounded SAM 2 with SAM 3 in a real pipeline?</p>
+<ul>
+<li>Latency: SAM 3 saves one forward pass (no separate detector) but the model itself is heavier; usually net-neutral or a slight speedup.</li>
+<li>Accuracy: SAM 3 substantially better on rare or compositional concepts (&quot;striped red umbrella&quot;). Similar on common single-word concepts.</li>
+<li>Flexibility: Grounded SAM 2 lets you swap detectors (DINO-X, Florence-2, Grounding DINO 1.5); SAM 3 is monolithic.</li>
+</ul>
+<p>Conclusion: SAM 3 is the default for 2026 open-vocab seg. Grounded SAM 2 is still the right answer when you need detector flexibility or different license terms.</p>
+<h2>Use It</h2>
+<p>Production deployment patterns:</p>
+<ul>
+<li><strong>Real-time annotation</strong> — SAM 3 + CVAT's label-as-text-prompt feature. Annotators select a label name; SAM 3 pre-labels every matching instance. Review and correct.</li>
+<li><strong>Video analytics</strong> — SAM 3.1 Object Multiplex for multi-object tracking; feed frames to the memory-based tracker.</li>
+<li><strong>Robotics</strong> — SAM 3 for open-vocab manipulation (&quot;pick up the red cup&quot;); runs as a planning primitive.</li>
+<li><strong>Medical imaging</strong> — SAM 3 fine-tuned on medical concepts; requires access request on HF.</li>
+</ul>
+<p>Ultralytics wraps SAM 3 in its Python package:</p>
+<pre><code class="language-python">from ultralytics import SAM
+
+model = SAM(&quot;sam3.pt&quot;)
+results = model(image_path, prompts=&quot;yellow school bus&quot;)
+</code></pre>
+<p>Same interface as YOLO and SAM 2.</p>
+<h2>Ship It</h2>
+<p>This lesson produces:</p>
+<ul>
+<li><code>outputs/prompt-open-vocab-stack-picker.md</code> — a prompt that picks SAM 3 / Grounded SAM 2 / YOLO-World / SAM-MI based on latency, concept complexity, and licensing.</li>
+<li><code>outputs/skill-concept-prompt-designer.md</code> — a skill that turns user utterances into well-formed SAM 3 concept prompts (splitting, disambiguation, fallbacks).</li>
+</ul>
+<h2>Exercises</h2>
+<ol>
+<li><strong>(Easy)</strong> Run SAM 3 on 10 images with concept prompts you choose. Compare against SAM 2 + Grounding DINO 1.5 on the same images. Report which concepts each model missed.</li>
+<li><strong>(Medium)</strong> Build a &quot;click-to-include / click-to-exclude&quot; UI on top of SAM 3: a text prompt returns candidate instances; user clicks keep which ones count as positive. Output the final concept set as JSON.</li>
+<li><strong>(Hard)</strong> Fine-tune SAM 3 on a custom concept set (e.g. 5 types of electronic components) with 20 labelled images each. Compare to zero-shot SAM 3 on the same test set; measure mask IoU improvement.</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Open-vocabulary segmentation</td>
+<td>&quot;Segment by text&quot;</td>
+<td>Produce masks for objects described in natural language, not a fixed label set</td>
+</tr>
+<tr>
+<td>PCS</td>
+<td>&quot;Promptable Concept Segmentation&quot;</td>
+<td>SAM 3's core task — given a noun-phrase or image exemplar, segment all matching instances</td>
+</tr>
+<tr>
+<td>Concept prompt</td>
+<td>&quot;The text input&quot;</td>
+<td>Short noun phrase or image exemplar; not a full sentence</td>
+</tr>
+<tr>
+<td>Presence head</td>
+<td>&quot;Is it here?&quot;</td>
+<td>SAM 3 module that decides whether the concept exists in the image before localisation</td>
+</tr>
+<tr>
+<td>SA-CO</td>
+<td>&quot;SAM 3 benchmark&quot;</td>
+<td>270K-concept open-vocabulary segmentation benchmark; 50x larger than prior open-vocab benchmarks</td>
+</tr>
+<tr>
+<td>Object Multiplex</td>
+<td>&quot;SAM 3.1 update&quot;</td>
+<td>Shared-memory multi-object tracking; fast joint tracking of many instances</td>
+</tr>
+<tr>
+<td>Grounded SAM 2</td>
+<td>&quot;Modular pipeline&quot;</td>
+<td>Detector + SAM 2 cascade; still relevant when detector swap matters</td>
+</tr>
+<tr>
+<td>SAM-MI</td>
+<td>&quot;Efficient SAM variant&quot;</td>
+<td>Mask Injection for 1.6x speedup over Grounded-SAM</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2511.16719" rel="noreferrer" data-network="true">SAM 3: Segment Anything with Concepts (arXiv 2511.16719) <small>↗ 需要联网</small></a></li>
+<li><a href="https://ai.meta.com/blog/segment-anything-model-3/" rel="noreferrer" data-network="true">SAM 3.1 Object Multiplex (Meta AI, March 2026) <small>↗ 需要联网</small></a></li>
+<li><a href="https://huggingface.co/facebook/sam3" rel="noreferrer" data-network="true">SAM 3 model page on Hugging Face <small>↗ 需要联网</small></a></li>
+<li><a href="https://pyimagesearch.com/2026/01/19/grounded-sam-2-from-open-set-detection-to-segmentation-and-tracking/" rel="noreferrer" data-network="true">Grounded SAM 2 tutorial (PyImageSearch) <small>↗ 需要联网</small></a></li>
+<li><a href="https://docs.ultralytics.com/models/sam-3/" rel="noreferrer" data-network="true">Ultralytics SAM 3 docs <small>↗ 需要联网</small></a></li>
+<li><a href="https://arxiv.org/abs/2512.04585" rel="noreferrer" data-network="true">SAM3-I: Instruction-aware SAM (arXiv 2512.04585) <small>↗ 需要联网</small></a></li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-04-computer-vision--24-sam3-open-vocab-segmentation.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-04-computer-vision--24-sam3-open-vocab-segmentation.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/04-computer-vision/24-sam3-open-vocab-segmentation/code/main.py">phases/04-computer-vision/24-sam3-open-vocab-segmentation/code/main.py</a><details><summary>查看原始文本</summary><pre><code>from abc import ABC, abstractmethod
+from dataclasses import dataclass, asdict
+from typing import List
+import json
+import numpy as np
+
+
+@dataclass
+class ConceptDetection:
+    concept: str
+    instance_id: int
+    box: tuple
+    score: float
+    mask_rle: str
+
+
+def split_concepts(sentence):
+    normalised = sentence
+    for sep in [&quot; and &quot;, &quot; or &quot;, &quot;&amp;&quot;, &quot;;&quot;]:
+        normalised = normalised.replace(sep, &quot;,&quot;)
+    if &quot;,&quot; in normalised:
+        parts = [p.strip() for p in normalised.split(&quot;,&quot;)]
+        return [p for p in parts if p]
+    return [sentence.strip()]
+
+
+def rle_encode(binary_mask):
+    flat = binary_mask.flatten().astype(&quot;uint8&quot;)
+    if flat.size == 0:
+        return &quot;&quot;
+    runs = []
+    prev = int(flat[0])
+    count = 0
+    for v in flat:
+        iv = int(v)
+        if iv == prev:
+            count += 1
+        else:
+            runs.append((prev, count))
+            prev, count = iv, 1
+    runs.append((prev, count))
+    return &quot;;&quot;.join(f&quot;{v}x{c}&quot; for v, c in runs)
+
+
+def rle_decode(rle_str, shape):
+    if not rle_str:
+        return np.zeros(shape, dtype=np.uint8)
+    flat = np.zeros(int(np.prod(shape)), dtype=np.uint8)
+    idx = 0
+    for part in rle_str.split(&quot;;&quot;):
+        v, c = part.split(&quot;x&quot;)
+        v = int(v)
+        c = int(c)
+        flat[idx:idx + c] = v
+        idx += c
+    return flat.reshape(shape)
+
+
+class OpenVocabSeg(ABC):
+    @abstractmethod
+    def detect(self, image: np.ndarray, concept: str) -&gt; List[ConceptDetection]:
+        ...
+
+
+class StubOpenVocabSeg(OpenVocabSeg):
+    &quot;&quot;&quot;Pipeline-testable stand-in for SAM 3 / Grounded SAM 2.&quot;&quot;&quot;
+
+    def detect(self, image, concept):
+        h, w = image.shape[:2]
+        mask_a = np.zeros((h, w), dtype=np.uint8)
+        mask_a[int(h * 0.3):int(h * 0.8), int(w * 0.2):int(w * 0.5)] = 1
+        mask_b = np.zeros((h, w), dtype=np.uint8)
+        mask_b[int(h * 0.25):int(h * 0.75), int(w * 0.55):int(w * 0.85)] = 1
+        return [
+            ConceptDetection(
+                concept=concept,
+                instance_id=0,
+                box=(w * 0.2, h * 0.3, w * 0.5, h * 0.8),
+                score=0.89,
+                mask_rle=rle_encode(mask_a),
+            ),
+            ConceptDetection(
+                concept=concept,
+                instance_id=1,
+                box=(w * 0.55, h * 0.25, w * 0.85, h * 0.75),
+                score=0.74,
+                mask_rle=rle_encode(mask_b),
+            ),
+        ]
+
+
+def run_multi_concept(model: OpenVocabSeg, image: np.ndarray, user_utterance: str):
+    concepts = split_concepts(user_utterance)
+    out = []
+    for c in concepts:
+        out.extend(model.detect(image, c))
+    return out
+
+
+def main():
+    print(&quot;[split_concepts]&quot;)
+    for s in [
+        &quot;cats, dogs and balloons&quot;,
+        &quot;yellow school bus&quot;,
+        &quot;striped red umbrella; green hat&quot;,
+        &quot;one large boat or small boat&quot;,
+    ]:
+        print(f&quot;  {s!r:45s} -&gt; {split_concepts(s)}&quot;)
+
+    print(&quot;\n[rle encode/decode roundtrip]&quot;)
+    mask = (np.random.default_rng(0).random((16, 16)) &gt; 0.5).astype(np.uint8)
+    rle = rle_encode(mask)
+    restored = rle_decode(rle, mask.shape)
+    diff = int(np.abs(mask.astype(int) - restored.astype(int)).sum())
+    print(f&quot;  mask shape {mask.shape}  rle length {len(rle)}  roundtrip diff {diff}&quot;)
+
+    print(&quot;\n[multi-concept detection on stub]&quot;)
+    image = np.zeros((240, 320, 3), dtype=np.uint8)
+    stub = StubOpenVocabSeg()
+    detections = run_multi_concept(stub, image, &quot;oranges, apples&quot;)
+    print(f&quot;  {len(detections)} detections&quot;)
+    for d in detections:
+        summary = {
+            &quot;concept&quot;: d.concept,
+            &quot;id&quot;: d.instance_id,
+            &quot;box&quot;: tuple(round(x, 1) for x in d.box),
+            &quot;score&quot;: round(d.score, 2),
+            &quot;mask_len&quot;: len(d.mask_rle.split(&quot;;&quot;)),
+        }
+        print(f&quot;    {json.dumps(summary)}&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/04-computer-vision/24-sam3-open-vocab-segmentation/outputs/prompt-open-vocab-stack-picker.md">phases/04-computer-vision/24-sam3-open-vocab-segmentation/outputs/prompt-open-vocab-stack-picker.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: prompt-open-vocab-stack-picker
+description: Pick SAM 3 / Grounded SAM 2 / YOLO-World / SAM-MI based on latency, concept complexity, and licensing
+phase: 4
+lesson: 24
+---
+
+You are an open-vocabulary vision stack selector.
+
+## Inputs
+
+- `task_output`: masks | boxes | tracking_over_video
+- `concept_complexity`: single_word | short_phrase | compositional
+- `latency_target_ms`: p95 per frame
+- `license_need`: permissive | commercial_ok | research_ok
+- `deployment`: cloud_gpu | edge | browser
+
+## Decision
+
+Rules fire top-down; first match wins. License constraints act as hard filters — if a rule&#39;s default model violates the caller&#39;s `license_need`, skip to the next rule rather than overriding.
+
+1. `task_output == boxes` and `latency_target_ms &lt;= 50` -&gt; **YOLO-World** (or OV-DINO).
+2. `task_output == masks` and `concept_complexity == compositional` -&gt; **SAM 3** (PCS handles descriptive prompts best).
+3. `task_output == masks` and `license_need == permissive` -&gt; **Grounded SAM 2** with Apache-licensed detector (Florence-2 / Grounding DINO 1.5).
+4. `task_output == tracking_over_video` with many instances -&gt; **SAM 3.1 Object Multiplex**.
+5. `deployment == edge` and `task_output == masks` -&gt; **SAM-MI** or MobileSAM + lightweight open-vocab detector.
+6. `deployment == browser` -&gt; YOLO-World ONNX + MobileSAM or an edge distilled variant.
+
+## Output
+
+```
+[stack]
+  model:       &lt;name&gt;
+  backend:     &lt;transformers / ultralytics / mmseg&gt;
+  precision:   float16 | bfloat16 | int8
+
+[pipeline]
+  1. &lt;preprocess&gt;
+  2. &lt;inference&gt;
+  3. &lt;postprocess (NMS, RLE encode, tracking association)&gt;
+
+[expected latency]
+  p50 / p95 estimates for target hardware
+
+[caveats]
+  - license notes
+  - concept-set limitations
+  - known failure modes
+```
+
+## Rules
+
+- If `concept_complexity == compositional` (&quot;striped red umbrella&quot;, &quot;hand holding a mug&quot;), favour SAM 3 over YOLO-World; open-vocab detectors struggle with descriptive modifiers.
+- If the dataset is domain-specific (medical, satellite, industrial defect), recommend Grounded SAM 2 with a domain-tuned detector; SAM 3 may not have seen the concepts at scale.
+- For production at &lt;100ms p95, require INT8 or FP16; never ship FP32 on edge.
+- For SAM 3, always note the HF access-request gate on the checkpoint.
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/04-computer-vision/24-sam3-open-vocab-segmentation/outputs/skill-concept-prompt-designer.md">phases/04-computer-vision/24-sam3-open-vocab-segmentation/outputs/skill-concept-prompt-designer.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: skill-concept-prompt-designer
+description: Turn user utterances into well-formed SAM 3 concept prompts with splitting, disambiguation, and fallbacks
+version: 1.0.0
+phase: 4
+lesson: 24
+tags: [sam3, open-vocab, prompt-engineering, segmentation]
+---
+
+# Concept Prompt Designer
+
+SAM 3&#39;s accuracy depends heavily on how the concept prompt is phrased. This skill normalises free-form user utterances into prompts that SAM 3 handles well.
+
+## When to use
+
+- Building a UI that accepts natural-language object queries.
+- Exposing SAM 3 through an API where upstream callers send sentences.
+- Debugging poor SAM 3 matches — often the prompt is malformed, not the model.
+
+## Inputs
+
+- `utterance`: raw user string.
+- `context`: optional domain hint (e.g. &quot;surveillance&quot;, &quot;medical&quot;, &quot;retail&quot;).
+- `max_concepts`: maximum concepts to extract per utterance; default 5.
+
+## Rules SAM 3 prefers
+
+- **Short noun phrases, not sentences.** `&quot;cat&quot;` wins over `&quot;there is a cat&quot;`.
+- **Concrete nouns.** `&quot;skateboard&quot;` wins over `&quot;thing to ride on&quot;`.
+- **Modifiers immediately before the noun.** `&quot;red car&quot;` wins over `&quot;car that is red&quot;`.
+- **Lowercase.** SAM 3 is robust but empirically slightly better on lowercase inputs.
+- **Singular or plural.** Both work; plural helps when multiple instances are expected.
+
+## Steps
+
+1. **Tokenise by common separators** — comma, semicolon, &quot;and&quot;, &quot;or&quot;, &quot;&amp;&quot;.
+2. **Drop filler prefixes** — &quot;find&quot;, &quot;show me&quot;, &quot;segment&quot;, &quot;detect&quot;, &quot;locate&quot;, &quot;a&quot;, &quot;an&quot;, &quot;the&quot;.
+3. **Keep prepositional modifiers** only if they are visual — `&quot;striped red umbrella&quot;` yes, `&quot;umbrella from yesterday&quot;` no (the `&quot;from yesterday&quot;` is not in-image).
+4. **Disambiguate collisions** using the optional `context`:
+   - `&quot;window&quot;` in surveillance context -&gt; `&quot;building window&quot;`.
+   - `&quot;window&quot;` in medical context -&gt; often error; suggest user clarify.
+5. **Fallback** to the exact string if splitting yields zero concepts *and* the utterance contains at least one concrete noun. If no concrete noun can be extracted, do not emit a concept — return only warnings and ask the user to clarify (see Rules).
+6. **Cap at `max_concepts`.** If more concepts were extracted than the caller asked for, keep the first `max_concepts` in utterance order and emit the rest under `dropped` with reason `&quot;exceeded max_concepts&quot;`. This keeps latency bounded when a user pastes a long enumeration.
+
+## Output format
+
+```
+[designed prompts]
+  utterance:    &lt;original&gt;
+  concepts:     [&quot;concept_1&quot;, &quot;concept_2&quot;, ...]
+  dropped:      [&quot;filler_1&quot;, ...]
+  warnings:     [&quot;concept too abstract&quot;, &quot;may match many classes&quot;, ...]
+
+[sam3 calls]
+  For each concept run: sam3.detect(image, concept)
+  Merge outputs with distinct concept tags per detection.
+```
+
+## Examples
+
+```
+in:  &quot;can you find me a cat or two dogs?&quot;
+out: [&quot;cat&quot;, &quot;dogs&quot;]
+dropped: [&quot;can you find me&quot;, &quot;a&quot;, &quot;or two&quot;, &quot;?&quot;]
+note: &quot;dogs&quot; kept plural because the utterance says &quot;two dogs&quot; — plural hint preserved.
+
+in:  &quot;segment the big red truck and the blue sedan&quot;
+out: [&quot;big red truck&quot;, &quot;blue sedan&quot;]
+dropped: [&quot;segment&quot;, &quot;the&quot;, &quot;and&quot;]
+
+in:  &quot;thing near the door&quot;
+out: [&quot;door&quot;]
+warnings: [&quot;&#39;thing&#39; is too abstract for SAM 3; fell back to &#39;door&#39;&quot;]
+
+in:  &quot;striped red umbrella, green hat, pink balloon&quot;
+out: [&quot;striped red umbrella&quot;, &quot;green hat&quot;, &quot;pink balloon&quot;]
+```
+
+## Rules
+
+- Never pass sentences longer than 8 words to SAM 3 — accuracy drops above that.
+- When an utterance contains no extractable concrete nouns, do not run SAM 3; return the warnings and ask for clarification.
+- Do not split on punctuation inside quoted strings; preserve `&quot;black and white cat&quot;` as one concept if it is quoted.
+- Always log the original utterance and the derived concepts for production debugging.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. What is Promptable Concept Segmentation (PCS), introduced by SAM 3?</legend><label class="option"><input type="radio" name="q0" value="0"> A multi-step chain of a detector followed by SAM</label><label class="option"><input type="radio" name="q0" value="1"> Segmenting all instances of a concept described by a short noun phrase or image exemplar in a single forward pass, returning masks plus unique instance IDs</label><label class="option"><input type="radio" name="q0" value="2"> A visual prompt (point/box) segmentation like classic SAM</label><label class="option"><input type="radio" name="q0" value="3"> A tracking-only mode</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. Why keep a decoupled detector + SAM 2 pipeline (Grounded SAM 2) in 2026 if SAM 3 already does text-prompted segmentation?</legend><label class="option"><input type="radio" name="q1" value="0"> SAM 3 is only available in the cloud</label><label class="option"><input type="radio" name="q1" value="1"> Grounded SAM 2 is always more accurate</label><label class="option"><input type="radio" name="q1" value="2"> Modularity — you can swap in different open-vocabulary detectors (DINO-X, Florence-2, Grounding DINO 1.5) for different domains, license constraints, or threshold behaviour; SAM 3&#39;s architecture is monolithic</label><label class="option"><input type="radio" name="q1" value="3"> SAM 3 does not support video</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. SAM 3&#39;s presence head produces what?</legend><label class="option"><input type="radio" name="q2" value="0"> A scalar probability that the queried concept exists in the image, decoupled from localisation; lets the model say &#39;not present&#39; cleanly and reduces false positives on absent concepts</label><label class="option"><input type="radio" name="q2" value="1"> The list of candidate bounding boxes</label><label class="option"><input type="radio" name="q2" value="2"> A tracking memory bank</label><label class="option"><input type="radio" name="q2" value="3"> The final mask</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. SAM 3.1 Object Multiplex (March 2026) introduced a shared-memory mechanism for tracking. What does it replace?</legend><label class="option"><input type="radio" name="q3" value="0"> Per-instance separate memory banks; Multiplex collapses them into one shared memory with per-instance queries so tracking N objects runs substantially faster while keeping accuracy</label><label class="option"><input type="radio" name="q3" value="1"> The whole presence head</label><label class="option"><input type="radio" name="q3" value="2"> SAM 2 altogether</label><label class="option"><input type="radio" name="q3" value="3"> The ViT backbone</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. You need real-time open-vocabulary DETECTION (boxes only, no masks) on an edge device. Which 2026 model family is the right choice?</legend><label class="option"><input type="radio" name="q4" value="0"> A custom CLIP + detector chain</label><label class="option"><input type="radio" name="q4" value="1"> SAM 3</label><label class="option"><input type="radio" name="q4" value="2"> Grounded SAM 2</label><label class="option"><input type="radio" name="q4" value="3"> YOLO-World (and related real-time open-vocab detectors); SAM 3 produces masks and is heavier, while YOLO-World is designed specifically for boxes at high fps on edge hardware</label><p data-feedback="4"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/04-computer-vision/23-diffusion-transformers-rectified-flow/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/04-computer-vision/25-vision-language-models/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/04-computer-vision/24-sam3-open-vocab-segmentation/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

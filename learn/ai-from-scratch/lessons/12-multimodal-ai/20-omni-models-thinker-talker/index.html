@@ -1,0 +1,478 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>模:Qwen2.5 - 模和思想家-谈话者分区 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-12-multimodal-ai" data-lesson="12-multimodal-ai/20-omni-models-thinker-talker" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/12-multimodal-ai/">多模态 AI</a> / LESSON 20</p><h1 class="lesson-title">模:Qwen2.5 - 模和思想家-谈话者分区</h1><p>Omni Models: Qwen2.5-Omni and the Thinker-Talker Split</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>模:Qwen2.5 - 模和思想家-谈话者分区</h1>
+<blockquote>
+<p>2024年5月的GPT-4o产品演示不仅因为底层模型而造成破坏,而是由于产品形状语音接口, 开放生态系统在2024年和2025年期间一直在努力达到该产品表面. 文2.5-Omni (2025年3月) 是参考开放设计:一个Thinker (大型发达文字变压器) 加上一个Talker (并行发达语音变压器),通过流媒体语音代币连接. 迷你Omni简化了它,莫希匹配了它的延迟,GLM-4-Voice扩展到中国. 这一课讲述了&quot;思考者-谈话者&quot;架构和延迟预算,</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python (stdlib, streaming pipeline latency simulator + VAD loop)
+<strong>Prerequisites:</strong> Phase 12 · 19 (audio-LLMs), Phase 12 · 16 (any-to-any)
+<strong>Time:</strong> ~180 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>分开推断管道为Thinker (文本推理) 和 Talker (言语合成) 并解释为什么并行流动工作.</li>
+<li>计算对话交互的时间到第一音频字节 (TTFAB) 预算,分别分别分别.</li>
+<li>描述TMRoPE在思考器内视觉,音频和文本中编码的时间一致位置.</li>
+<li>举个实时对话模式:半双,转换,全双.</li>
+</ul>
+<h2>问题</h2>
+<p>实时语音助理必须做很多事情,快速:</p>
+<ol>
+<li>听用户说话,实时语音标记,声活动检测 (VAD) 知道他们什么时候说话.</li>
+<li>选择性地看. 摄像头输入速度为2~4FPS, 流入智能思维器,</li>
+<li>想想,根据谈话历史编写一个答案.</li>
+<li>语音.合成音频代码,解码到波形,流向用户的扬声器.</li>
+</ol>
+<p>每一步都增加了延迟.对话感需要总回路 &lt;500ms 以下,用户停止注意到延迟.GPT-4o声称约250ms.Moshi ~160ms.Qwen2.5-Omni ~350-500ms.</p>
+<p>任何组件都需要流动. 没有什么可以&quot;分组所有然后解码&quot;.</p>
+<h2>概念</h2>
+<h3>思考者和说话者</h3>
+<p>文2.5-Omni的分解:</p>
+<ul>
+<li>思考器:一个7B-80B文本生成变压器. 消耗交织的文本 + 图像 + 音频代码. 输出代表要说什么的文本代码.</li>
+<li>语音器:一个较小的语音生成变压器 (200M-1B).消耗了Thinker的文本输出代币以及最近的语音文本代币.输出了分离式语音代币 (残余VQ指数).</li>
+<li>语音解码器:是一款流浪形解码器 (SNAC,MoVQGAN家族),可实时将语音代码传输到音频样本.</li>
+</ul>
+<p>分离是重要的.思考者必须很大,才能有好推理.说话者可能很小,因为他的工作是当地的.</p>
+<p>运行两者并行:</p>
+<ol>
+<li>思考器发出了文字符号.</li>
+<li>发音者使用t_i (通过流媒体) 并发出语音标志s_i,s_{i+1}, ...,s_{i+k}.</li>
+<li>语音解码器使用语音代码,</li>
+<li>在Tanker在文字代号 t_{i+3}之前,Talker已经播放了 t_0..t_{i+2}.</li>
+</ol>
+<h3>时间对齐的多模态位置</h3>
+<p>思考者需要从对话历史中集成图像框架 (达到,说,4FPS),音频框架 (达到50个框架/秒),以及文本.一个天真的序列顺序 (所有图像,然后所有音频,然后文本) 失去了时间排列.</p>
+<p>TMRoPE将每个代币分配绝对时间标签.视觉代币在t=2.3s.音频代币在t=2.32s.用户的文字代币&quot;停止&quot;在t=2.35s. RoPE按时间标签旋转注意力;模型认为它们是暂时同步的.</p>
+<p>这就是&quot;他挥手问候&quot;的基础设施, 模型可以在同一概念时看到视频框架和音频.</p>
+<h3>流媒体语音合成</h3>
+<p>语音代币必须流动.迷你Omni (Xie &amp; Wu, 2024) 引入了&quot;语音模型可以在流媒体中听到,思考,谈话&quot;:思维输出代币和谈话输出代币在同一序列中交互.思维执行下一个文本代币后,谈话器会发射.没有批量界限.</p>
+<p>莫希 (Défossez等,2024年10月) 是最快的开放实现. 160ms TTFAB在单个A100上.架构:单个7B变压器,在交替位置发出文字和语音代码,具有&quot;内部单独语音&quot;来分离思考流和语音流.这是有效的思考+谈话者与仔细训练融合成一个模型.</p>
+<h3>和转变</h3>
+<p>语音活动检测在输入侧进行.</p>
+<ul>
+<li>半双:用户说话,模型听话.模型说话,用户听话.通过VAD沉默检测 (~200ms) 清晰的传递.</li>
+<li>双重:两者都可以同时说话.模型可以回频道 (&quot;-&quot;) 或打断.更难.莫希支持这一点.</li>
+</ul>
+<p>默认支持半双,通过沉默门进行转换. 完全双需要应用层处理.</p>
+<h3>文3-奥姆尼 (2025年11月)</h3>
+<p>后者:Qwen3-80B Thinker,更大的Talker,改进了TMRoPE-v2. 延迟接近GPT-4o的250ms. 开放重量. 基板上的基准与双子 2.0 Live竞争.</p>
+<h3>生产延迟预算</h3>
+<p>对于典型的流媒体互动:</p>
+<ul>
+<li>电话 -&gt; 音频代码:40-80ms.</li>
+<li>在7B时,100-200ms,在70B时,更多.</li>
+<li>首先,一个思想家的短信代码:40ms.</li>
+<li>谈话器处理第一个文本代币:20ms.</li>
+<li>首次发言代码发行:40ms.</li>
+<li>剩余VQ解码:30ms.</li>
+<li>语音波形解码:50-80ms.</li>
+</ul>
+<p>总TTFAB:7B时320-510ms,70B时600-900ms.边界质量通常意味着70B+;因此边界延迟差距.</p>
+<h3>标记率数学</h3>
+<p>在16kHz语音和50Hz基语音代码时,输出每秒需要50个语音代码.说话者必须发射 ≥50个代码/秒才能跟上.在H100上典型的LLM吞吐量为30-80个代码/秒时,一个小的 (200-300M) 讲话器足够快;一个7B讲话器会落后.</p>
+<p>这就是为什么有小型专用Talker模型,而不是&quot;只使用主模型&quot;.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-5d7d5057fcd1d0beb128.png" alt="l5-thinker-talker 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>用它</h2>
+<p><code>code/main.py</code>其他:</p>
+<ul>
+<li>模拟一个思想家-谈话者管道,</li>
+<li>计算TTFAB用于可配置的模型尺寸和微信样本率.</li>
+<li>显示半双转,与VAD沉默门.</li>
+</ul>
+<h2>运送它</h2>
+<p>这一课产生了<code>outputs/skill-omni-streaming-budget.md</code>鉴于真实时语音产品的目标TTFAB和功能集 (视觉,双语,全双语),选择Qwen2.5-Omni,Qwen3-Omni,Moshi或Mini-Omni,并将Thinker/Speaker进行尺寸.</p>
+<h2>运动</h2>
+<ol>
+<li>
+<p>在7B思考器和300M谈话器上,写出每个组件的延迟.</p>
+</li>
+<li>
+<p>Qwen2.5Omni使用TMRoPE.描述模型在 t=1s 时看到用户开始说话的提示,而相机在 t=1.2s 时捕获手势.</p>
+</li>
+<li>
+<p>支持全双重,模型需要在听话时发射音频. 建议一种教训数据格式来教导这一点.</p>
+</li>
+<li>
+<p>阅读莫希的论文第4节. 描述&quot;内在单词&quot;的分离,以及为什么它避免了思想家和说话者分离.</p>
+</li>
+<li>
+<p>计算吞吐量预算:一个谈话器必须发射代币的速度是多少,以保持16kHz的语音速度在50基层代币/秒?</p>
+</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Thinker</td>
+<td>&quot;Reasoning brain&quot;</td>
+<td>Large text-generating transformer producing what to say</td>
+</tr>
+<tr>
+<td>Talker</td>
+<td>&quot;Speech-generating mouth&quot;</td>
+<td>Small transformer producing discrete speech tokens from Thinker's text</td>
+</tr>
+<tr>
+<td>TTFAB</td>
+<td>&quot;Latency budget&quot;</td>
+<td>Time-to-first-audio-byte: from user speech end to first audio sample out</td>
+</tr>
+<tr>
+<td>TMRoPE</td>
+<td>&quot;Time-aligned RoPE&quot;</td>
+<td>Position encoding using absolute timestamps across vision, audio, text</td>
+</tr>
+<tr>
+<td>Half-duplex</td>
+<td>&quot;Turn-taking&quot;</td>
+<td>User and model alternate; VAD silence detects user-done</td>
+</tr>
+<tr>
+<td>Full-duplex</td>
+<td>&quot;Simultaneous&quot;</td>
+<td>Model can speak and listen at the same time; backchannel capable</td>
+</tr>
+<tr>
+<td>Inner monologue</td>
+<td>&quot;Moshi separation&quot;</td>
+<td>Single-model design where thinking-stream and speaking-stream interleave</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2503.20215" rel="noreferrer" data-network="true">Xu et al. — Qwen2.5-Omni (arXiv:2503.20215) <small>↗ 需要联网</small></a></li>
+<li><a href="https://arxiv.org/html/2509.17765v1" rel="noreferrer" data-network="true">Qwen Team — Qwen3-Omni (arXiv:2509.17765) <small>↗ 需要联网</small></a></li>
+<li><a href="https://arxiv.org/abs/2408.16725" rel="noreferrer" data-network="true">Xie &amp; Wu — Mini-Omni (arXiv:2408.16725) <small>↗ 需要联网</small></a></li>
+<li><a href="https://arxiv.org/abs/2410.00037" rel="noreferrer" data-network="true">Défossez et al. — Moshi (arXiv:2410.00037) <small>↗ 需要联网</small></a></li>
+<li><a href="https://arxiv.org/abs/2412.02612" rel="noreferrer" data-network="true">Zeng et al. — GLM-4-Voice (arXiv:2412.02612) <small>↗ 需要联网</small></a></li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Omni Models: Qwen2.5-Omni and the Thinker-Talker Split</h1>
+<blockquote>
+<p>GPT-4o's product demo in May 2024 was disruptive not because of the underlying model but because of the product shape — a voice interface where you talk, the model sees what the camera sees, and it talks back in under 250ms. The open ecosystem spent the rest of 2024 and 2025 racing to reach that product surface. Qwen2.5-Omni (March 2025) is the reference open design: a Thinker (large text-generating transformer) plus a Talker (parallel speech-generating transformer), linked by streaming speech tokens. Mini-Omni simplified it, Moshi matched its latency, GLM-4-Voice extended it to Chinese. This lesson reads the Thinker-Talker architecture and the latency budget that makes streaming real-time dialogue work.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python (stdlib, streaming pipeline latency simulator + VAD loop)
+<strong>Prerequisites:</strong> Phase 12 · 19 (audio-LLMs), Phase 12 · 16 (any-to-any)
+<strong>Time:</strong> ~180 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Split the inference pipeline into Thinker (text reasoning) and Talker (speech synthesis) and explain why parallel streaming works.</li>
+<li>Compute the time-to-first-audio-byte (TTFAB) budget for a conversational interaction, component by component.</li>
+<li>Describe TMRoPE's time-aligned position encoding across vision, audio, and text within the Thinker.</li>
+<li>Name the three real-time conversational patterns: half-duplex, turn-taking, full-duplex.</li>
+</ul>
+<h2>The Problem</h2>
+<p>A real-time voice assistant has to do a lot, fast:</p>
+<ol>
+<li>Hear the user. Real-time speech tokenization, voice activity detection (VAD) to know when they're done speaking.</li>
+<li>Optionally see. Camera input at 2-4 FPS, streamed into the Thinker alongside audio.</li>
+<li>Think. Compose a response conditioned on the conversation history.</li>
+<li>Speak. Synthesize audio tokens, decode to waveform, stream to the user's speakers.</li>
+</ol>
+<p>Each step adds latency. Conversational-feel requires total round-trip &lt; 500ms — below that, the user stops noticing the lag. GPT-4o claims ~250ms. Moshi ~160ms. Qwen2.5-Omni ~350-500ms.</p>
+<p>Every component needs to stream. Nothing can be &quot;batch everything then decode.&quot;</p>
+<h2>The Concept</h2>
+<h3>Thinker and Talker</h3>
+<p>Qwen2.5-Omni's decomposition:</p>
+<ul>
+<li>Thinker: a 7B-80B text-generating transformer. Consumes interleaved text + image + audio tokens. Outputs text tokens representing what to say.</li>
+<li>Talker: a smaller speech-generating transformer (200M-1B). Consumes Thinker's text output tokens plus recent speech-context tokens. Outputs discrete speech tokens (residual-VQ indices).</li>
+<li>Speech decoder: a streaming waveform decoder (SNAC, MoVQGAN family) that takes speech tokens to audio samples in real time.</li>
+</ul>
+<p>The separation matters. Thinker has to be big for good reasoning. Talker can be small because its job is local — convert text to speech tokens. Bigger Talker is not more expressive; it's slower.</p>
+<p>Running both in parallel:</p>
+<ol>
+<li>Thinker emits text token t_i.</li>
+<li>Talker consumes t_i (via streaming) and emits speech tokens s_i, s_{i+1}, ..., s_{i+k}.</li>
+<li>Speech decoder consumes speech tokens as they come and emits audio samples.</li>
+<li>By the time Thinker is at text token t_{i+3}, Talker has already streamed audio for t_0..t_{i+2}.</li>
+</ol>
+<h3>TMRoPE — time-aligned multimodal positions</h3>
+<p>Thinker needs to integrate image frames (arriving at, say, 4 FPS), audio frames (arriving at 50 frames/second), and text from conversation history. A naive sequence order (all images, then all audio, then text) loses temporal alignment.</p>
+<p>TMRoPE assigns absolute timestamps to every token. Vision token at t=2.3s. Audio token at t=2.32s. Text token from the user &quot;stop&quot; at t=2.35s. RoPE rotates attention by timestamp; the model sees them as temporally concurrent.</p>
+<p>This is the infrastructure for &quot;he waved while saying hello&quot; to work — the model sees the video frame and the audio at the same conceptual moment.</p>
+<h3>Streaming speech synthesis</h3>
+<p>Speech tokens must stream. Mini-Omni (Xie &amp; Wu, 2024) introduced &quot;language models can hear, talk while thinking in streaming&quot;: Thinker output tokens and Talker output tokens interleave in the same sequence. Talker fires as soon as Thinker commits the next text token. No batch boundaries.</p>
+<p>Moshi (Défossez et al., October 2024) is the fastest open implementation. 160ms TTFAB on a single A100. Architecture: a single 7B transformer that emits text and speech tokens on alternating positions, with an &quot;inner monologue&quot; that separates the thinking stream from the speaking stream. This is effectively Thinker + Talker fused into one model with careful training.</p>
+<h3>VAD and turn-taking</h3>
+<p>Voice activity detection runs on the input side. Two patterns:</p>
+<ul>
+<li>Half-duplex: user speaks, model listens. Model speaks, user listens. Clear handoff via VAD silence detection (~200ms).</li>
+<li>Full-duplex: both can speak simultaneously. Model can backchannel (&quot;uh-huh&quot;) or interrupt. Much harder. Moshi supports this.</li>
+</ul>
+<p>Qwen2.5-Omni supports half-duplex by default, with turn-taking via silence threshold. Full-duplex requires application-layer handling.</p>
+<h3>Qwen3-Omni (November 2025)</h3>
+<p>The successor. Qwen3-80B Thinker, larger Talker, improved TMRoPE-v2. Latency close to GPT-4o's 250ms. Open weights. Benchmarks on OmniBench competitive with Gemini 2.0 Live.</p>
+<h3>Production latency budget</h3>
+<p>For a typical streaming interaction:</p>
+<ul>
+<li>Mic -&gt; audio tokens: 40-80ms.</li>
+<li>Prefill (prompt + history): 100-200ms at 7B, much more at 70B.</li>
+<li>First Thinker text token: 40ms.</li>
+<li>Talker processes first text token: 20ms.</li>
+<li>First speech tokens commit: 40ms.</li>
+<li>Residual-VQ decode: 30ms.</li>
+<li>Speech waveform decode: 50-80ms.</li>
+</ul>
+<p>Total TTFAB: 320-510ms at 7B, 600-900ms at 70B. Frontier quality usually means 70B+; hence the frontier latency gap.</p>
+<h3>Token-rate math</h3>
+<p>At 16kHz speech with 50 Hz base speech tokens, you need 50 speech tokens per second of output. Talker must emit ≥50 tok/s to keep up. At a typical LLM throughput of 30-80 tok/s on an H100, a small (200-300M) Talker is fast enough; a 7B Talker would fall behind.</p>
+<p>This is why small dedicated Talker models exist rather than &quot;just use the main model.&quot;</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-5d7d5057fcd1d0beb128.png" alt="l5-thinker-talker 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Use It</h2>
+<p><code>code/main.py</code>:</p>
+<ul>
+<li>Simulates a Thinker-Talker pipeline with mock token-emission rates.</li>
+<li>Computes TTFAB for configurable model sizes and mic sample rates.</li>
+<li>Demonstrates half-duplex turn-taking with VAD silence threshold.</li>
+</ul>
+<h2>Ship It</h2>
+<p>This lesson produces <code>outputs/skill-omni-streaming-budget.md</code>. Given a real-time voice product's target TTFAB and feature set (vision-in, bilingual, full-duplex), picks Qwen2.5-Omni, Qwen3-Omni, Moshi, or Mini-Omni and sizes the Thinker/Talker.</p>
+<h2>Exercises</h2>
+<ol>
+<li>
+<p>Your target TTFAB is 300ms. On a 7B Thinker and 300M Talker, write out every component's latency.</p>
+</li>
+<li>
+<p>Qwen2.5-Omni uses TMRoPE. Describe what the model sees for a prompt where the user starts speaking at t=1s and the camera catches a gesture at t=1.2s.</p>
+</li>
+<li>
+<p>Full-duplex support requires the model to emit audio while listening. Propose a training data format that teaches this.</p>
+</li>
+<li>
+<p>Read Moshi's paper Section 4. Describe the &quot;inner monologue&quot; separation and why it avoids the Thinker-Talker split.</p>
+</li>
+<li>
+<p>Compute the throughput budget: how fast must a Talker emit tokens to keep up with 16kHz speech at 50 base-layer tokens/sec?</p>
+</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Thinker</td>
+<td>&quot;Reasoning brain&quot;</td>
+<td>Large text-generating transformer producing what to say</td>
+</tr>
+<tr>
+<td>Talker</td>
+<td>&quot;Speech-generating mouth&quot;</td>
+<td>Small transformer producing discrete speech tokens from Thinker's text</td>
+</tr>
+<tr>
+<td>TTFAB</td>
+<td>&quot;Latency budget&quot;</td>
+<td>Time-to-first-audio-byte: from user speech end to first audio sample out</td>
+</tr>
+<tr>
+<td>TMRoPE</td>
+<td>&quot;Time-aligned RoPE&quot;</td>
+<td>Position encoding using absolute timestamps across vision, audio, text</td>
+</tr>
+<tr>
+<td>Half-duplex</td>
+<td>&quot;Turn-taking&quot;</td>
+<td>User and model alternate; VAD silence detects user-done</td>
+</tr>
+<tr>
+<td>Full-duplex</td>
+<td>&quot;Simultaneous&quot;</td>
+<td>Model can speak and listen at the same time; backchannel capable</td>
+</tr>
+<tr>
+<td>Inner monologue</td>
+<td>&quot;Moshi separation&quot;</td>
+<td>Single-model design where thinking-stream and speaking-stream interleave</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2503.20215" rel="noreferrer" data-network="true">Xu et al. — Qwen2.5-Omni (arXiv:2503.20215) <small>↗ 需要联网</small></a></li>
+<li><a href="https://arxiv.org/html/2509.17765v1" rel="noreferrer" data-network="true">Qwen Team — Qwen3-Omni (arXiv:2509.17765) <small>↗ 需要联网</small></a></li>
+<li><a href="https://arxiv.org/abs/2408.16725" rel="noreferrer" data-network="true">Xie &amp; Wu — Mini-Omni (arXiv:2408.16725) <small>↗ 需要联网</small></a></li>
+<li><a href="https://arxiv.org/abs/2410.00037" rel="noreferrer" data-network="true">Défossez et al. — Moshi (arXiv:2410.00037) <small>↗ 需要联网</small></a></li>
+<li><a href="https://arxiv.org/abs/2412.02612" rel="noreferrer" data-network="true">Zeng et al. — GLM-4-Voice (arXiv:2412.02612) <small>↗ 需要联网</small></a></li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-12-multimodal-ai--20-omni-models-thinker-talker.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-12-multimodal-ai--20-omni-models-thinker-talker.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/12-multimodal-ai/20-omni-models-thinker-talker/code/main.py">phases/12-multimodal-ai/20-omni-models-thinker-talker/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Thinker-Talker streaming pipeline — TTFAB calculator + VAD turn-taking.
+
+Stdlib. No audio processing; focus on the latency budget and concurrency of
+parallel streaming between Thinker (text) and Talker (speech).
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+@dataclass
+class StreamConfig:
+    thinker_b: int
+    talker_m: int
+    mic_sr: int = 16000
+    include_vision: bool = False
+
+
+@dataclass
+class LatencyComponent:
+    name: str
+    ms: float
+
+
+def ttfab(cfg: StreamConfig) -&gt; list[LatencyComponent]:
+    components = []
+    mic_ms = 40 + (cfg.mic_sr // 8000) * 5
+    components.append(LatencyComponent(&quot;mic -&gt; speech tokens&quot;, mic_ms))
+
+    prefill = 100 * (cfg.thinker_b / 7.0)
+    if cfg.include_vision:
+        prefill += 80
+    components.append(LatencyComponent(&quot;Thinker prefill (prompt + history)&quot;, prefill))
+
+    first_text = 40 * (cfg.thinker_b / 7.0)
+    components.append(LatencyComponent(&quot;Thinker first text token&quot;, first_text))
+
+    talker_first = max(15, 20 * (cfg.talker_m / 300.0))
+    components.append(LatencyComponent(&quot;Talker first speech tokens&quot;, talker_first))
+
+    rvq_decode = 30
+    components.append(LatencyComponent(&quot;residual-VQ decode (8 layers parallel)&quot;, rvq_decode))
+
+    wave_decode = 70
+    components.append(LatencyComponent(&quot;waveform decoder (SNAC-class)&quot;, wave_decode))
+    return components
+
+
+def print_ttfab(cfg: StreamConfig) -&gt; float:
+    print(f&quot;\nCONFIG: Thinker={cfg.thinker_b}B  Talker={cfg.talker_m}M  &quot;
+          f&quot;mic={cfg.mic_sr}Hz  vision={cfg.include_vision}&quot;)
+    print(&quot;-&quot; * 60)
+    total = 0.0
+    for c in ttfab(cfg):
+        total += c.ms
+        print(f&quot;  {c.name:&lt;40}  +{c.ms:&gt;5.0f} ms  ({total:&gt;6.0f})&quot;)
+    print(f&quot;  TTFAB = {total:.0f} ms&quot;, end=&quot; &quot;)
+    if total &lt; 250:
+        print(&quot;  -&gt; GPT-4o class&quot;)
+    elif total &lt; 400:
+        print(&quot;  -&gt; conversational&quot;)
+    elif total &lt; 700:
+        print(&quot;  -&gt; noticeable but usable&quot;)
+    else:
+        print(&quot;  -&gt; sluggish, user drift&quot;)
+    return total
+
+
+@dataclass
+class VADEvent:
+    time_ms: float
+    kind: str
+
+
+def simulate_turn_taking(silence_threshold_ms: int = 200) -&gt; list[VADEvent]:
+    &quot;&quot;&quot;Simulate a user turn ending detected by silence.&quot;&quot;&quot;
+    events = []
+    events.append(VADEvent(0, &quot;user starts speaking&quot;))
+    events.append(VADEvent(450, &quot;user audio tokens streaming&quot;))
+    events.append(VADEvent(3800, &quot;user stops speaking&quot;))
+    events.append(VADEvent(3800 + silence_threshold_ms, &quot;VAD triggers end-of-turn&quot;))
+    events.append(VADEvent(3800 + silence_threshold_ms + 200, &quot;Thinker begins prefill&quot;))
+    events.append(VADEvent(3800 + silence_threshold_ms + 400, &quot;Talker first audio out&quot;))
+    return events
+
+
+def demo_vad() -&gt; None:
+    print(&quot;\nHALF-DUPLEX TURN-TAKING (VAD silence 200ms)&quot;)
+    print(&quot;-&quot; * 60)
+    for e in simulate_turn_taking(200):
+        print(f&quot;  t={e.time_ms:&gt;6.0f} ms  {e.kind}&quot;)
+    print(&quot;  net response lag after user stops: ~400ms&quot;)
+
+
+def duplex_modes() -&gt; None:
+    print(&quot;\nDUPLEX MODES&quot;)
+    print(&quot;-&quot; * 60)
+    modes = [
+        (&quot;half-duplex&quot;,  &quot;user speaks, model listens; swap; clear turns&quot;),
+        (&quot;turn-taking&quot;,  &quot;VAD silence detects end-of-turn (200-400ms)&quot;),
+        (&quot;full-duplex&quot;,  &quot;both can speak; requires training + backchannel data&quot;),
+    ]
+    for mode, note in modes:
+        print(f&quot;  {mode:&lt;14}: {note}&quot;)
+
+
+def main() -&gt; None:
+    print(&quot;=&quot; * 60)
+    print(&quot;OMNI THINKER-TALKER STREAMING (Phase 12, Lesson 20)&quot;)
+    print(&quot;=&quot; * 60)
+
+    configs = [
+        StreamConfig(thinker_b=7,  talker_m=200,  include_vision=False),
+        StreamConfig(thinker_b=7,  talker_m=300,  include_vision=True),
+        StreamConfig(thinker_b=72, talker_m=300,  include_vision=True),
+        StreamConfig(thinker_b=70, talker_m=1000, include_vision=True),
+    ]
+    for c in configs:
+        print_ttfab(c)
+
+    demo_vad()
+    duplex_modes()
+
+    print(&quot;\nOPEN STREAMING DESIGNS&quot;)
+    print(&quot;-&quot; * 60)
+    designs = [
+        (&quot;Mini-Omni (2024)&quot;,  &quot;first open streaming, text+speech interleaved&quot;),
+        (&quot;Moshi (2024)&quot;,      &quot;single transformer inner-monologue, 160ms TTFAB&quot;),
+        (&quot;Qwen2.5-Omni (3/25)&quot;, &quot;Thinker-Talker split + TMRoPE, ~350ms TTFAB&quot;),
+        (&quot;Qwen3-Omni (11/25)&quot;, &quot;scaled Qwen3 base, approaches GPT-4o latency&quot;),
+    ]
+    for name, note in designs:
+        print(f&quot;  {name:&lt;22}: {note}&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/12-multimodal-ai/20-omni-models-thinker-talker/outputs/skill-omni-streaming-budget.md">phases/12-multimodal-ai/20-omni-models-thinker-talker/outputs/skill-omni-streaming-budget.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: omni-streaming-budget
+description: Size a Thinker-Talker streaming voice pipeline (Qwen-Omni / Moshi / Mini-Omni) for a target TTFAB and feature set.
+version: 1.0.0
+phase: 12
+lesson: 20
+tags: [qwen-omni, moshi, mini-omni, streaming, ttfab, thinker-talker]
+---
+
+Given a voice-first product spec (target TTFAB, mic sample rate, vision in yes/no, bilingual, full-duplex) and a compute constraint (GPU class, budget), size the Thinker-Talker pipeline.
+
+Produce:
+
+1. Model family pick. Moshi (best latency), Qwen2.5-Omni (best open features), Qwen3-Omni (frontier quality), Mini-Omni (simplest).
+2. Thinker and Talker sizes. 7B Thinker + 200-300M Talker for &lt;400ms TTFAB. 70B+ Thinker for quality, accept higher TTFAB.
+3. TTFAB breakdown. Component-by-component latency estimate.
+4. Duplex mode. Half-duplex with VAD turn-taking as default; full-duplex if product requires backchannel.
+5. Vision integration. TMRoPE with absolute timestamps for interleaved video frames.
+6. Deployment shape. Single-GPU vs split (Thinker on A, Talker on B) based on throughput needs.
+
+Hard rejects:
+- Proposing 70B Talker. Talker must be small to keep up with speech token rate.
+- Using non-streaming speech decoder. TTFAB explodes.
+- Claiming full-duplex is plug-and-play. It requires specialized training data.
+
+Refusal rules:
+- If target TTFAB &lt;200ms, refuse anything larger than Moshi-class (7B fused) on a single A100.
+- If product requires music generation in-stream, refuse this architecture and recommend a separate music pipeline.
+- If mic sample rate is 48kHz with strict quality, flag the need for stronger speech encoder; don&#39;t downsample blindly.
+
+Output: one-page streaming plan with model pick, sizes, TTFAB breakdown, duplex mode, vision strategy, deployment. End with arXiv 2503.20215 (Qwen2.5-Omni), 2410.00037 (Moshi).
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原课程未提供测验。</p></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/12-multimodal-ai/19-audio-language-whisper-to-af3/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/12-multimodal-ai/21-embodied-vlas-openvla-pi0-groot/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/12-multimodal-ai/20-omni-models-thinker-talker/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

@@ -1,0 +1,764 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>跨编码器重排器 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-19-capstone-projects" data-lesson="19-capstone-projects/66-reranker-cross-encoder" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/19-capstone-projects/">综合项目</a> / LESSON 66</p><h1 class="lesson-title">跨编码器重排器</h1><p>Cross-Encoder Reranker</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>跨编码器重排器</h1>
+<blockquote>
+<p>双码码器独立嵌入查询和文档. 交叉码器连接它们并同时读取它们. 交叉码码器是最聪明的读者和最慢的. 作为双码码器的顶部k的第二阶段,它自行支付.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 11 lesson 06 (RAG), Phase 11 lesson 07 (advanced RAG); Phase 19 Track B foundations (lessons 20-29); Phase 19 lesson 65 (hybrid retrieval feeding this stage)
+<strong>Time:</strong> ~90 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>根据输入形状,参数数数和每次查询成本,区分双码码检索器与跨码码重排器.</li>
+<li>从零开始,将一个小的跨编码器作为一个用包 (查询,文档) 的变压器块,并发出单个相关性尺度.</li>
+<li>通过两阶段的检索再排名管道:通过便宜的检索器检索N顶部,通过交叉编码器重新排名N至顶部K,返回K.</li>
+<li>测量一个小的固定器件体上的延迟与质量交换,并选择给定的延迟预算的正确N.</li>
+</ul>
+<h2>问题</h2>
+<p>双编码器将查询和文档映射到同一向量空间中,并按二数排列.两个编码器从来没有见过彼此.模型必须将有关文档的所有有用信息压缩到单个向量中,盲目对查询.这很快 - 每个文档在索引时间内嵌入一个,每一个查询在查询时间内嵌入一个 - 这也是在体积尺度上排名的唯一方法.</p>
+<p>两个具有相同的总体主题的文件可能具有几乎相同的嵌入式,即使其中一个回答了查询,而另一个没有.双编码器无法区分它们.</p>
+<p>通过阅读查询和文档一起来解决这个问题.<code>[query] [SEP] [document]</code>作为一个单个序列,通过连接进行了全重视,并产生了一个相关性尺度.文件的每个符号可以参加查询的每个符号.模型决定了完整的文本.</p>
+<p>代价是吞吐量. 双码码器嵌入一次并永远查询,交叉码码器运行一次 (查询,文档) 双.对于一个1000万的文档体,这每查询是1000万前进通行.在请求预算中无法运行.</p>
+<p>解决方案是阶段化.使用双码码器检索上层N.使用交叉码器重新排名N至上层K.N小 (50至200),交叉码器的质量升级集中在重要的地方.总延迟保持在请求预算中.总质量是交叉码器的质量,由双码码器在N召回限制.</p>
+<h2>概念</h2>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-f4e0fdf877eed84ec658.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>交叉编码器输入形状</h3>
+<p>标准包装是<code>[CLS] query_tokens [SEP] document_tokens [SEP]</code>某些实现使用平均聚合而不是CLS;差异很小. 问题是,模型每对产生一个数字.</p>
+<p>通过22M参数交叉编码器 (已发布的<code>ms-marco-MiniLM-L-6-v2</code>较小的模型比节省延迟更快地失去质量.较大的模型 (例如:<code>bge-reranker-v2-m3</code>在568M参数) 时,这些参数仅用于非线重新排名或在K小时重新排名第一页.</p>
+<h3>为什么这个课程训练一个小孩子</h3>
+<p>在生产中,你加载一个检查点并运行它. 在这个课程中,目标是向你展示模型的形状和延迟质量曲线的形状,而不是训练一个最先进的排名器.所以我们构建了一个小的<code>nn.Module</code>具有一个变压器块,多头注意力 (默认4头),和一个回归头.它从种子中初始化,因此演示可以在磁盘上重量无需重复.</p>
+<p>玩具模型从固定器件组中学习正确的形状:相关查询文件对比的预测分数比无关的对比更高.端到端管道将双编码器输出量重新排列,重排的顶级k与黄金标签相关.</p>
+<h3>延迟与质量</h3>
+<p>在一个持久的查询集中扫描N从5到100,然后得到曲线.</p>
+<table>
+<thead>
+<tr>
+<th>N</th>
+<th>Recall@1 of stage 2</th>
+<th>Cross-encoder forward passes per query</th>
+<th>Latency</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>5</td>
+<td>0.62</td>
+<td>5</td>
+<td>low</td>
+</tr>
+<tr>
+<td>20</td>
+<td>0.81</td>
+<td>20</td>
+<td>medium</td>
+</tr>
+<tr>
+<td>50</td>
+<td>0.86</td>
+<td>50</td>
+<td>high</td>
+</tr>
+<tr>
+<td>100</td>
+<td>0.86</td>
+<td>100</td>
+<td>very high</td>
+</tr>
+</tbody>
+</table>
+<p>上面的数字说明了形状,而不是从这个装置的测量.形状是真实的.总有一只膝盖在20到50个候选人中,重新排名升降和.</p>
+<p>通过加上延迟预算,选择N从评估曲线中. 交叉编码器不能提高回忆值超过双编码器的回忆值在N,因此低的N限制质量,而不仅仅是延迟.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-5dbb1da35eff40814d61.png" alt="rerank-funnel 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<p><code>code/main.py</code>执行:</p>
+<ul>
+<li><code>CrossEncoder</code>- 一个小的<code>torch.nn.Module</code>:代号嵌入,一个变压器块,多头注意力和反式,平均聚合式头产生一个 skalar.</li>
+<li><code>tokenize_pair(query, document)</code>- 将两个字符串包装成一个单个 id 序列,其中标记着边界,确定性和 stdlib 的类型 id.</li>
+<li><code>train_tiny(pairs)</code>- 一次监督培训,在手动标记的三项列表上 (查询,文档,相关性),因此模型在设备上产生了合理的分数.</li>
+<li><code>rerank(query, candidates, top_k)</code>- 生产界面.</li>
+<li><code>pipeline(query, retriever, top_n, top_k)</code>- 两阶段的流量.</li>
+<li>一个演示<code>main()</code>通过将课程65的模式加载,检索N的顶部,将其排列到K的顶部,印出了两列表,并报告了每个阶段的延迟.</li>
+</ul>
+<p>运行它:</p>
+<pre><code class="language-bash">python3 code/main.py
+</code></pre>
+<p>输出显示双码码器的顶N,交叉码码器的顶K和时间总结.交叉码码器每次通话需要更长时间,但不会在整个体内运行.两个阶段的总数保持在请求预算内,同时选择双码码器排名第二或第三的答案.</p>
+<h2>失败模式的演示将隐藏</h2>
+<p><strong>Cross-encoder is not symmetric.</strong> <code>rerank(q, d)</code>其他<code>rerank(d, q)</code>总是先输入查询. 如果你意外地交换,回忆会崩.</p>
+<p>**N is too low to expose the bug.**如果设置N=K,交叉编码器不能重新排序,它只能重重.升降器看起来是零.选择N至少是K的3倍.</p>
+<p>**Training data leaks into the eval.**如果手动标记的训练对包括评估查询,重新排名看起来很神奇. 严格分开训练和评估,即使在一个固定.</p>
+<p>**Production weights are dense.**在 float32 上,一个22M参数跨码器为88MB. 在承诺 sub-100ms p95之前,计划模型服务器的内存.</p>
+<p>**Batching matters.**实际的交叉编码器将N个候选人运行在一个批量中.<code>_batch_encode</code>通过                                            <code>torch.tensor(...)</code>通过一个前进传输, 跳过批量, 延迟乘以N.</p>
+<h2>用它</h2>
+<p>生产模式:</p>
+<ul>
+<li>关键双码码,交叉码码和N在一起.改变任何一个使评估无效.</li>
+<li>缓存缓存输出 (查询,document_id) 哈希.与稳定体相对的相同查询对相同的顺序进行缓存;缓存击中可以免费减缓延迟.</li>
+<li>记录1级跨编码分数.一个比分高于1级的查询是域外的击中;将其表达给LLM为&quot;我不确定&quot;.</li>
+</ul>
+<h2>运送它</h2>
+<p>第68课评估了这两阶段的管道端到端. 第69课将这种重排器在第65课中的混合回收器后面和答案生成器前面.重排器是端到端系统的第二阶段.</p>
+<h2>运动</h2>
+<ol>
+<li>扫描N从5到50,然后绘制重新排名输出的回忆@1. 在这个装置上找到膝盖.</li>
+<li>训练交叉编码器进行十个时代,而不是一个.</li>
+<li>换一个CLS标记头,并将这种装置的融合进行比较.</li>
+<li>添加一个第二个跨编码头,预测一个二进制&quot;文件中是这个答案&quot;标签. 在推断时使用两个头;一个是排名,一个是门.</li>
+<li>取代确定性模拟双码器用第65课中的一个,链接两个阶段. 测量顶部K与单双码器的变化.</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Bi-encoder</td>
+<td>&quot;Vector retriever&quot;</td>
+<td>Encodes query and doc independently; cosine ranks them</td>
+</tr>
+<tr>
+<td>Cross-encoder</td>
+<td>&quot;Reranker&quot;</td>
+<td>Encodes (query, doc) jointly; outputs one relevance scalar</td>
+</tr>
+<tr>
+<td>Two-stage pipeline</td>
+<td>&quot;Retrieve and rerank&quot;</td>
+<td>Cheap retriever returns N, expensive reranker keeps K</td>
+</tr>
+<tr>
+<td>N (candidate budget)</td>
+<td>&quot;Rerank pool&quot;</td>
+<td>The number of candidates the cross-encoder scores per query</td>
+</tr>
+<tr>
+<td>Mean-pooling head</td>
+<td>&quot;Mean of last hidden&quot;</td>
+<td>Average the encoder's last-layer outputs into one vector</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li>诺格耶拉,乔, &quot;通过BERT重新排名&quot;, 2019 - 经典的跨编码排名论文</li>
+<li>雷默斯,古雷维奇, &quot;Sentence-BERT:使用西安式BERT网络的句子嵌入&quot;, 2019 - 关于双码器与交叉码器</li>
+<li><a href="https://www.sbert.net/examples/applications/cross-encoder/README.html" rel="noreferrer" data-network="true">SentenceTransformers Cross-Encoders documentation <small>↗ 需要联网</small></a></li>
+<li><a href="https://huggingface.co/BAAI/bge-reranker-v2-m3" rel="noreferrer" data-network="true">BGE Reranker v2 model card <small>↗ 需要联网</small></a></li>
+<li>第19阶段课65 - 混合式取器提供了这个重排阶段的食物</li>
+<li>阶段19课68 - 评估测量这一重排的升级</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Cross-Encoder Reranker</h1>
+<blockquote>
+<p>A bi-encoder embeds query and document independently. A cross-encoder concatenates them and reads both at once. The cross-encoder is the smartest reader and the slowest. Used as a second stage on the bi-encoder's top-k, it pays for itself.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 11 lesson 06 (RAG), Phase 11 lesson 07 (advanced RAG); Phase 19 Track B foundations (lessons 20-29); Phase 19 lesson 65 (hybrid retrieval feeding this stage)
+<strong>Time:</strong> ~90 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Distinguish a bi-encoder retriever from a cross-encoder reranker by their input shape, parameter count, and per-query cost.</li>
+<li>Implement a small cross-encoder from scratch as a transformer block that consumes a packed (query, document) sequence and emits a single relevance scalar.</li>
+<li>Wire a two-stage retrieve-then-rerank pipeline: retrieve top-N with a cheap retriever, rerank N to top-K with the cross-encoder, return K.</li>
+<li>Measure the latency-vs-quality trade-off on a small fixture corpus and pick the right N for a given latency budget.</li>
+</ul>
+<h2>The Problem</h2>
+<p>A bi-encoder maps query and document into the same vector space and ranks by cosine. The two encodings never see each other. The model has to compress everything useful about a document into a single vector, blind to the query. This is fast - one embedding per document at index time and one per query at query time - and it is the only way to rank at corpus scale.</p>
+<p>The cost is precision. Two documents that have the same overall topic can have nearly identical embeddings even when one of them answers the query and the other does not. The bi-encoder cannot tell them apart.</p>
+<p>A cross-encoder solves this by reading the query and the document together. The model receives <code>[query] [SEP] [document]</code> as a single sequence, runs full attention across the join, and produces one relevance scalar. Every token of the document can attend to every token of the query. The model decides the score with full context.</p>
+<p>The cost is throughput. Where the bi-encoder embeds once and queries forever, the cross-encoder runs once per (query, document) pair. For a 10-million-document corpus that is 10 million forward passes per query. Unrunnable in a request budget.</p>
+<p>The solution is staging. Use the bi-encoder to retrieve the top-N. Use the cross-encoder to rerank the N to a top-K. N is small (50 to 200) and the cross-encoder's quality lift is concentrated where it matters. The total latency stays in the request budget. The total quality is the cross-encoder's quality, capped by the bi-encoder's recall at N.</p>
+<h2>The Concept</h2>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-f4e0fdf877eed84ec658.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>The cross-encoder's input shape</h3>
+<p>The standard packing is <code>[CLS] query_tokens [SEP] document_tokens [SEP]</code>. The CLS-position output is fed into a single linear head that outputs the relevance scalar. Some implementations use mean-pooling instead of CLS; the difference is small. The point is that the model produces one number per pair.</p>
+<p>A 22M-parameter cross-encoder (the published <code>ms-marco-MiniLM-L-6-v2</code> weight class) is the typical production point. Smaller models lose quality faster than they save latency. Larger models (e.g. <code>bge-reranker-v2-m3</code> at 568M parameters) are reserved for offline reranking or for first-page reranking where K is small.</p>
+<h3>Why this lesson trains a tiny one</h3>
+<p>A real cross-encoder is a finetuned encoder transformer. In production you load a checkpoint and run it. In this lesson the goal is to show you the shape of the model and the shape of the latency-quality curve, not to train a state-of-the-art ranker. So we build a small <code>nn.Module</code> with one transformer block, multi-head attention (4 heads by default), and one regression head. It is initialized deterministically from a seed so the demo is reproducible without weights on disk.</p>
+<p>The toy model learns the right shape from the fixture corpus: relevant query-document pairs have higher predicted scores than irrelevant pairs. The end-to-end pipeline reranks the bi-encoder's output and the rerank's top-k correlates with the gold labels.</p>
+<h3>Latency vs quality</h3>
+<p>The two-stage pipeline has one tunable: N. Sweep N from 5 to 100 on a held-out query set and you get the curve.</p>
+<table>
+<thead>
+<tr>
+<th>N</th>
+<th>Recall@1 of stage 2</th>
+<th>Cross-encoder forward passes per query</th>
+<th>Latency</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>5</td>
+<td>0.62</td>
+<td>5</td>
+<td>low</td>
+</tr>
+<tr>
+<td>20</td>
+<td>0.81</td>
+<td>20</td>
+<td>medium</td>
+</tr>
+<tr>
+<td>50</td>
+<td>0.86</td>
+<td>50</td>
+<td>high</td>
+</tr>
+<tr>
+<td>100</td>
+<td>0.86</td>
+<td>100</td>
+<td>very high</td>
+</tr>
+</tbody>
+</table>
+<p>The numbers above are illustrative of the shape, not measurements from this fixture. The shape is real. There is always a knee around 20 to 50 candidates where the rerank lift saturates. Past the knee you are paying for nothing.</p>
+<p>Pick N from the eval curve plus the latency budget. The cross-encoder cannot raise recall above the bi-encoder's recall at N, so a low N caps quality, not just latency.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-5dbb1da35eff40814d61.png" alt="rerank-funnel 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<p><code>code/main.py</code> implements:</p>
+<ul>
+<li><code>CrossEncoder</code> - a small <code>torch.nn.Module</code>: token embedding, one transformer block with multi-head attention and feedforward, mean-pooled head producing one scalar.</li>
+<li><code>tokenize_pair(query, document)</code> - packs the two strings into a single id sequence with type ids that mark the boundary, deterministic and stdlib.</li>
+<li><code>train_tiny(pairs)</code> - one pass of supervised training on a hand-labeled (query, document, relevance) triple list, so the model produces sensible scores on the fixture.</li>
+<li><code>rerank(query, candidates, top_k)</code> - the production interface.</li>
+<li><code>pipeline(query, retriever, top_n, top_k)</code> - the two-stage flow.</li>
+<li>A demo <code>main()</code> that loads the corpus from lesson 65's pattern, retrieves top-N, reranks to top-K, prints both lists side by side, and reports the latency of each stage.</li>
+</ul>
+<p>Run it:</p>
+<pre><code class="language-bash">python3 code/main.py
+</code></pre>
+<p>The output shows the bi-encoder's top-N, the cross-encoder's top-K, and a timing summary. The cross-encoder takes longer per call but does not run on the full corpus. The two-stage total stays within the request budget while picking the answer that the bi-encoder ranked second or third.</p>
+<h2>Failure modes the demo will hide</h2>
+<p><strong>Cross-encoder is not symmetric.</strong> <code>rerank(q, d)</code> and <code>rerank(d, q)</code> are different scores. Always feed the query first. If you accidentally swap, recall collapses.</p>
+<p><strong>N is too low to expose the bug.</strong> If you set N = K, the cross-encoder cannot reorder; it can only reweight. The lift looks zero. Pick N at least three times K.</p>
+<p><strong>Training data leaks into the eval.</strong> If the hand-labeled training pairs include the eval queries, the rerank looks magical. Strictly separate train and eval, even on a fixture.</p>
+<p><strong>Production weights are dense.</strong> A 22M-parameter cross-encoder is 88MB at float32. Plan the model server's memory before promising sub-100ms p95.</p>
+<p><strong>Batching matters.</strong> A real cross-encoder runs the N candidates in one batch. This lesson does that in <code>_batch_encode</code>, which builds the batched id and type-id tensors with <code>torch.tensor(...)</code> and runs one forward pass. Skip batching and the latency multiplies by N.</p>
+<h2>Use It</h2>
+<p>Production patterns:</p>
+<ul>
+<li>Pin the bi-encoder, cross-encoder, and N together. Changing any one invalidates the eval.</li>
+<li>Cache the reranker's output by (query, document_id) hash. The same query against a stable corpus reranks to the same order; cache hits buy you a free latency cut.</li>
+<li>Log the rank-1 cross-encoder score. A query whose top-1 score is below a corpus-specific threshold is an out-of-domain hit; surface it to the LLM as &quot;I am not confident&quot;.</li>
+</ul>
+<h2>Ship It</h2>
+<p>Lesson 68 evaluates this two-stage pipeline end to end. Lesson 69 wires this reranker behind the hybrid retriever from lesson 65 and in front of the answer generator. The reranker is the second stage of the end-to-end system.</p>
+<h2>Exercises</h2>
+<ol>
+<li>Sweep N from 5 to 50 and plot recall@1 of the reranked output. Find the knee on this fixture.</li>
+<li>Train the cross-encoder for ten epochs instead of one. Measure the score-margin between positive and negative pairs at each epoch.</li>
+<li>Replace mean-pooling with a CLS-token head. Compare convergence on this fixture.</li>
+<li>Add a second cross-encoder head that predicts a binary &quot;is this answer in the document&quot; label. Use both heads at inference; one to rank, one to threshold.</li>
+<li>Replace the deterministic mock bi-encoder with the one from lesson 65 and chain the two stages. Measure the change in top-K versus bi-encoder alone.</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Bi-encoder</td>
+<td>&quot;Vector retriever&quot;</td>
+<td>Encodes query and doc independently; cosine ranks them</td>
+</tr>
+<tr>
+<td>Cross-encoder</td>
+<td>&quot;Reranker&quot;</td>
+<td>Encodes (query, doc) jointly; outputs one relevance scalar</td>
+</tr>
+<tr>
+<td>Two-stage pipeline</td>
+<td>&quot;Retrieve and rerank&quot;</td>
+<td>Cheap retriever returns N, expensive reranker keeps K</td>
+</tr>
+<tr>
+<td>N (candidate budget)</td>
+<td>&quot;Rerank pool&quot;</td>
+<td>The number of candidates the cross-encoder scores per query</td>
+</tr>
+<tr>
+<td>Mean-pooling head</td>
+<td>&quot;Mean of last hidden&quot;</td>
+<td>Average the encoder's last-layer outputs into one vector</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li>Nogueira, Cho, &quot;Passage Re-ranking with BERT&quot;, 2019 - the canonical cross-encoder ranker paper</li>
+<li>Reimers, Gurevych, &quot;Sentence-BERT: Sentence Embeddings using Siamese BERT-Networks&quot;, 2019 - on bi-encoders vs cross-encoders</li>
+<li><a href="https://www.sbert.net/examples/applications/cross-encoder/README.html" rel="noreferrer" data-network="true">SentenceTransformers Cross-Encoders documentation <small>↗ 需要联网</small></a></li>
+<li><a href="https://huggingface.co/BAAI/bge-reranker-v2-m3" rel="noreferrer" data-network="true">BGE Reranker v2 model card <small>↗ 需要联网</small></a></li>
+<li>Phase 19 lesson 65 - the hybrid retriever feeding this rerank stage</li>
+<li>Phase 19 lesson 68 - the eval that measures the lift this rerank delivers</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-19-capstone-projects--66-reranker-cross-encoder.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-19-capstone-projects--66-reranker-cross-encoder.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/66-reranker-cross-encoder/code/main.py">phases/19-capstone-projects/66-reranker-cross-encoder/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Cross-encoder reranker on top of a bi-encoder retriever.
+
+A tiny torch module shows the architectural shape. The two-stage pipeline
+demonstrates the latency-vs-quality trade-off on a fixture corpus.
+
+References:
+- ./docs/en.md
+- Phase 19 lesson 65 (bi-encoder hybrid retriever)
+- Phase 19 lesson 68 (eval harness measuring the rerank lift)
+- Phase 19 lesson 69 (end-to-end system that uses this reranker)
+
+Run: python3 code/main.py
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import math
+import re
+import time
+from dataclasses import dataclass, field
+from typing import Callable
+
+import numpy as np
+import torch
+import torch.nn as nn
+
+
+VOCAB_SIZE = 8192
+PAD_ID = 0
+SEP_ID = 1
+CLS_ID = 2
+SEED = 19660101
+
+
+def _set_seed(seed: int = SEED) -&gt; None:
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+
+def _token_to_id(token: str) -&gt; int:
+    h = 0
+    for ch in token:
+        h = (h * 1315423911) ^ ord(ch)
+        h &amp;= 0xFFFFFFFF
+    return 3 + (h % (VOCAB_SIZE - 3))
+
+
+_WORD = re.compile(r&quot;[a-z0-9]+&quot;)
+
+
+def tokenize_pair(query: str, document: str, max_len: int = 96) -&gt; tuple[list[int], list[int]]:
+    q_tokens = [_token_to_id(t) for t in _WORD.findall(query.lower())]
+    d_tokens = [_token_to_id(t) for t in _WORD.findall(document.lower())]
+    ids = [CLS_ID] + q_tokens + [SEP_ID] + d_tokens + [SEP_ID]
+    type_ids = ([0] * (len(q_tokens) + 2)) + ([1] * (len(d_tokens) + 1))
+    if len(ids) &gt; max_len:
+        ids = ids[:max_len]
+        type_ids = type_ids[:max_len]
+    else:
+        pad = max_len - len(ids)
+        ids = ids + [PAD_ID] * pad
+        type_ids = type_ids + [0] * pad
+    return ids, type_ids
+
+
+# ---------------------------------------------------------------------------
+# the cross-encoder model
+# ---------------------------------------------------------------------------
+
+class CrossEncoder(nn.Module):
+    def __init__(self, d_model: int = 64, n_heads: int = 4, ff_hidden: int = 128,
+                 max_len: int = 96) -&gt; None:
+        super().__init__()
+        _set_seed()
+        self.token_emb = nn.Embedding(VOCAB_SIZE, d_model, padding_idx=PAD_ID)
+        self.type_emb = nn.Embedding(2, d_model)
+        self.pos_emb = nn.Embedding(max_len, d_model)
+        self.attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
+        self.ln1 = nn.LayerNorm(d_model)
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, ff_hidden),
+            nn.GELU(),
+            nn.Linear(ff_hidden, d_model),
+        )
+        self.ln2 = nn.LayerNorm(d_model)
+        self.head = nn.Linear(d_model, 1)
+        self.max_len = max_len
+
+    def forward(self, input_ids: torch.Tensor, type_ids: torch.Tensor) -&gt; torch.Tensor:
+        batch, seq = input_ids.shape
+        pos = torch.arange(seq, device=input_ids.device).unsqueeze(0).expand(batch, seq)
+        x = self.token_emb(input_ids) + self.type_emb(type_ids) + self.pos_emb(pos)
+        mask = (input_ids == PAD_ID)
+        attn_out, _ = self.attn(x, x, x, key_padding_mask=mask)
+        x = self.ln1(x + attn_out)
+        x = self.ln2(x + self.ff(x))
+        # mean-pool over non-pad positions
+        keep = (~mask).unsqueeze(-1).float()
+        pooled = (x * keep).sum(dim=1) / keep.sum(dim=1).clamp(min=1.0)
+        return self.head(pooled).squeeze(-1)
+
+
+# ---------------------------------------------------------------------------
+# training - one supervised pass with hand-labeled triples
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Triple:
+    query: str
+    document: str
+    label: float  # 1.0 relevant, 0.0 irrelevant
+
+
+def _batch_encode(pairs: list[Triple], max_len: int = 96) -&gt; tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    id_lists = []
+    type_lists = []
+    labels = []
+    for p in pairs:
+        ids, tids = tokenize_pair(p.query, p.document, max_len)
+        id_lists.append(ids)
+        type_lists.append(tids)
+        labels.append(p.label)
+    return (
+        torch.tensor(id_lists, dtype=torch.long),
+        torch.tensor(type_lists, dtype=torch.long),
+        torch.tensor(labels, dtype=torch.float),
+    )
+
+
+def train_tiny(model: CrossEncoder, triples: list[Triple], epochs: int = 60, lr: float = 5e-3) -&gt; list[float]:
+    &quot;&quot;&quot;Returns per-epoch loss.&quot;&quot;&quot;
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    loss_fn = nn.MSELoss()
+    losses: list[float] = []
+    ids, tids, labels = _batch_encode(triples, max_len=model.max_len)
+    for _ in range(epochs):
+        opt.zero_grad()
+        pred = model(ids, tids)
+        loss = loss_fn(pred, labels)
+        loss.backward()
+        opt.step()
+        losses.append(loss.item())
+    return losses
+
+
+# ---------------------------------------------------------------------------
+# reranking interface
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Candidate:
+    doc_id: str
+    text: str
+    retriever_score: float = 0.0
+
+
+def rerank(
+    model: CrossEncoder,
+    query: str,
+    candidates: list[Candidate],
+    top_k: int = 5,
+) -&gt; list[tuple[Candidate, float]]:
+    if not candidates:
+        return []
+    model.eval()
+    triples = [Triple(query, c.text, 0.0) for c in candidates]
+    ids, tids, _ = _batch_encode(triples, max_len=model.max_len)
+    with torch.no_grad():
+        scores = model(ids, tids).tolist()
+    out = sorted(zip(candidates, scores), key=lambda x: -x[1])
+    return out[:top_k]
+
+
+# ---------------------------------------------------------------------------
+# bi-encoder retriever (deterministic mock embedding)
+# ---------------------------------------------------------------------------
+
+def mock_embed(text: str, dim: int = 96) -&gt; list[float]:
+    vec = [0.0] * dim
+    for tok in _WORD.findall(text.lower()):
+        h = 0
+        for ch in tok:
+            h = (h * 1315423911) ^ ord(ch)
+            h &amp;= 0xFFFFFFFF
+        vec[h % dim] += 1.0
+        vec[(h &gt;&gt; 7) % dim] += 0.5
+    norm = math.sqrt(sum(v * v for v in vec)) or 1.0
+    return [v / norm for v in vec]
+
+
+def cosine(a: list[float], b: list[float]) -&gt; float:
+    return sum(x * y for x, y in zip(a, b))
+
+
+@dataclass
+class BiEncoder:
+    docs: list[Candidate] = field(default_factory=list)
+    vectors: list[list[float]] = field(default_factory=list)
+
+    def add(self, c: Candidate) -&gt; None:
+        self.docs.append(c)
+        self.vectors.append(mock_embed(c.text))
+
+    def search(self, query: str, top_n: int) -&gt; list[Candidate]:
+        qv = mock_embed(query)
+        scored = [(d, cosine(qv, v)) for d, v in zip(self.docs, self.vectors)]
+        scored.sort(key=lambda x: -x[1])
+        return [Candidate(d.doc_id, d.text, retriever_score=s) for d, s in scored[:top_n]]
+
+
+# ---------------------------------------------------------------------------
+# the full two-stage pipeline
+# ---------------------------------------------------------------------------
+
+def pipeline(
+    query: str,
+    retriever: BiEncoder,
+    reranker: CrossEncoder,
+    top_n: int = 10,
+    top_k: int = 5,
+) -&gt; dict[str, object]:
+    t0 = time.perf_counter()
+    n_candidates = retriever.search(query, top_n)
+    t1 = time.perf_counter()
+    reranked = rerank(reranker, query, n_candidates, top_k)
+    t2 = time.perf_counter()
+    return {
+        &quot;retrieve_top_n&quot;: n_candidates,
+        &quot;reranked_top_k&quot;: reranked,
+        &quot;latency_retrieve_ms&quot;: (t1 - t0) * 1000,
+        &quot;latency_rerank_ms&quot;: (t2 - t1) * 1000,
+    }
+
+
+# ---------------------------------------------------------------------------
+# fixture corpus and training pairs
+# ---------------------------------------------------------------------------
+
+CORPUS = [
+    Candidate(&quot;d1&quot;, &quot;AbortMultipartOnFail aborts an in-flight S3 multipart upload and &quot;
+                    &quot;decrements the per-bucket retry budget when the upload fails.&quot;),
+    Candidate(&quot;d2&quot;, &quot;Uploading large files: the storage service splits a file into parts. &quot;
+                    &quot;The client tracks parts. Cancelled uploads release reserved keys.&quot;),
+    Candidate(&quot;d3&quot;, &quot;Per-bucket budgets: each bucket carries a retry budget that limits &quot;
+                    &quot;how often a failed operation can be retried within a window.&quot;),
+    Candidate(&quot;d4&quot;, &quot;check_permission: authorization is centralized in check_permission &quot;
+                    &quot;which evaluates a policy against principal, resource, and action.&quot;),
+    Candidate(&quot;d5&quot;, &quot;Policy engine: wraps an Open Policy Agent runtime and exposes evaluate. &quot;
+                    &quot;Cached for a configured TTL.&quot;),
+    Candidate(&quot;d6&quot;, &quot;Search ranking: production search combines lexical and semantic &quot;
+                    &quot;retrieval through a rank fusion step.&quot;),
+    Candidate(&quot;d7&quot;, &quot;Index sizing: the vector index sits in memory; plan for 1 KB per &quot;
+                    &quot;vector at 256 dimensions in float32.&quot;),
+    Candidate(&quot;d8&quot;, &quot;Cancelling jobs: long-running jobs accept a cancellation signal that &quot;
+                    &quot;stops the worker and releases the queue slot.&quot;),
+]
+
+
+TRAIN_TRIPLES = [
+    Triple(&quot;how do we abort a multipart upload&quot;, CORPUS[0].text, 1.0),
+    Triple(&quot;how do we abort a multipart upload&quot;, CORPUS[1].text, 0.3),
+    Triple(&quot;how do we abort a multipart upload&quot;, CORPUS[3].text, 0.0),
+    Triple(&quot;retry budget per bucket configuration&quot;, CORPUS[2].text, 1.0),
+    Triple(&quot;retry budget per bucket configuration&quot;, CORPUS[0].text, 0.5),
+    Triple(&quot;retry budget per bucket configuration&quot;, CORPUS[4].text, 0.0),
+    Triple(&quot;centralized authorization check function&quot;, CORPUS[3].text, 1.0),
+    Triple(&quot;centralized authorization check function&quot;, CORPUS[4].text, 0.5),
+    Triple(&quot;centralized authorization check function&quot;, CORPUS[6].text, 0.0),
+    Triple(&quot;how does rank fusion work&quot;, CORPUS[5].text, 1.0),
+    Triple(&quot;how does rank fusion work&quot;, CORPUS[2].text, 0.0),
+    Triple(&quot;how do we cancel a job&quot;, CORPUS[7].text, 1.0),
+    Triple(&quot;how do we cancel a job&quot;, CORPUS[1].text, 0.3),
+    Triple(&quot;how do we cancel a job&quot;, CORPUS[0].text, 0.2),
+]
+
+
+# ---------------------------------------------------------------------------
+# demo
+# ---------------------------------------------------------------------------
+
+def print_list(label: str, items, fmt) -&gt; None:
+    print(f&quot;  {label}:&quot;)
+    for i, item in enumerate(items[:5]):
+        print(f&quot;    {i + 1}. {fmt(item)}&quot;)
+
+
+def main() -&gt; None:
+    _set_seed()
+    retriever = BiEncoder()
+    for c in CORPUS:
+        retriever.add(c)
+
+    reranker = CrossEncoder()
+    losses = train_tiny(reranker, TRAIN_TRIPLES, epochs=60)
+    print(f&quot;trained tiny cross-encoder, loss {losses[0]:.4f} -&gt; {losses[-1]:.4f}\n&quot;)
+
+    queries = [
+        &quot;how do we abort a multipart upload&quot;,
+        &quot;centralized authorization check function&quot;,
+        &quot;how do we cancel a job&quot;,
+    ]
+
+    for q in queries:
+        print(f&quot;query: {q}&quot;)
+        result = pipeline(q, retriever, reranker, top_n=8, top_k=3)
+        print_list(
+            &quot;retrieve top-N&quot;,
+            result[&quot;retrieve_top_n&quot;],
+            lambda c: f&quot;{c.doc_id}  retriever_score={c.retriever_score:.4f}&quot;,
+        )
+        print_list(
+            &quot;reranked top-K&quot;,
+            result[&quot;reranked_top_k&quot;],
+            lambda x: f&quot;{x[0].doc_id}  cross_score={x[1]:.4f}&quot;,
+        )
+        print(f&quot;  latency: retrieve {result[&#39;latency_retrieve_ms&#39;]:.2f}ms, &quot;
+              f&quot;rerank {result[&#39;latency_rerank_ms&#39;]:.2f}ms\n&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/66-reranker-cross-encoder/code/tests/test_reranker.py">phases/19-capstone-projects/66-reranker-cross-encoder/code/tests/test_reranker.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Tests for the cross-encoder reranker and the two-stage pipeline.&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import os
+import sys
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(HERE))
+
+import torch  # noqa: E402
+
+from main import (  # noqa: E402
+    BiEncoder,
+    CORPUS,
+    Candidate,
+    CrossEncoder,
+    TRAIN_TRIPLES,
+    Triple,
+    _set_seed,
+    pipeline,
+    rerank,
+    tokenize_pair,
+    train_tiny,
+)
+
+
+class TestTokenizePair(unittest.TestCase):
+    def test_packs_with_separators(self) -&gt; None:
+        ids, tids = tokenize_pair(&quot;abort upload&quot;, &quot;abort the upload&quot;, max_len=16)
+        self.assertEqual(ids[0], 2)  # CLS
+        self.assertIn(1, ids)  # SEP appears
+        self.assertEqual(len(ids), 16)
+        self.assertEqual(len(tids), 16)
+
+    def test_type_ids_split_query_and_doc(self) -&gt; None:
+        ids, tids = tokenize_pair(&quot;alpha&quot;, &quot;beta gamma&quot;, max_len=12)
+        # type_ids start as zero (query), flip to 1 (doc) after first SEP
+        self.assertEqual(tids[0], 0)
+        ones = [t for t in tids if t == 1]
+        self.assertGreater(len(ones), 0)
+
+    def test_truncates_past_max_len(self) -&gt; None:
+        long_doc = &quot; &quot;.join([&quot;word&quot;] * 200)
+        ids, tids = tokenize_pair(&quot;query&quot;, long_doc, max_len=32)
+        self.assertEqual(len(ids), 32)
+
+
+class TestCrossEncoderForward(unittest.TestCase):
+    def test_forward_returns_scalar_per_batch_row(self) -&gt; None:
+        _set_seed()
+        model = CrossEncoder(d_model=32, n_heads=4, max_len=48)
+        ids = torch.randint(3, 100, (4, 48))
+        tids = torch.zeros((4, 48), dtype=torch.long)
+        out = model(ids, tids)
+        self.assertEqual(tuple(out.shape), (4,))
+
+    def test_deterministic_init(self) -&gt; None:
+        _set_seed()
+        a = CrossEncoder(d_model=32, n_heads=4, max_len=48)
+        _set_seed()
+        b = CrossEncoder(d_model=32, n_heads=4, max_len=48)
+        for pa, pb in zip(a.parameters(), b.parameters()):
+            self.assertTrue(torch.allclose(pa, pb))
+
+
+class TestTrainTiny(unittest.TestCase):
+    def test_loss_decreases(self) -&gt; None:
+        _set_seed()
+        model = CrossEncoder(d_model=32, n_heads=4, max_len=48)
+        losses = train_tiny(model, TRAIN_TRIPLES, epochs=40, lr=5e-3)
+        self.assertLess(losses[-1], losses[0])
+        self.assertLess(losses[-1], 0.1)
+
+    def test_positive_scores_above_negative_after_training(self) -&gt; None:
+        _set_seed()
+        model = CrossEncoder()
+        train_tiny(model, TRAIN_TRIPLES, epochs=60, lr=5e-3)
+        pos_query = &quot;how do we abort a multipart upload&quot;
+        neg = Candidate(&quot;dx&quot;, &quot;fluffy clouds drift across a summer afternoon sky&quot;)
+        pos = Candidate(&quot;dy&quot;, &quot;AbortMultipartOnFail aborts an in-flight S3 multipart upload &quot;
+                              &quot;and decrements the per-bucket retry budget.&quot;)
+        scored = rerank(model, pos_query, [neg, pos], top_k=2)
+        # pos should land at rank 1 after training
+        self.assertEqual(scored[0][0].doc_id, &quot;dy&quot;)
+
+
+class TestRerank(unittest.TestCase):
+    def test_returns_top_k(self) -&gt; None:
+        _set_seed()
+        model = CrossEncoder()
+        cands = [Candidate(f&quot;d{i}&quot;, f&quot;text {i}&quot;) for i in range(5)]
+        scored = rerank(model, &quot;any query&quot;, cands, top_k=3)
+        self.assertEqual(len(scored), 3)
+
+    def test_handles_empty(self) -&gt; None:
+        _set_seed()
+        model = CrossEncoder()
+        self.assertEqual(rerank(model, &quot;q&quot;, [], top_k=3), [])
+
+    def test_top_k_larger_than_input_returns_all(self) -&gt; None:
+        _set_seed()
+        model = CrossEncoder()
+        cands = [Candidate(&quot;a&quot;, &quot;x&quot;), Candidate(&quot;b&quot;, &quot;y&quot;)]
+        scored = rerank(model, &quot;q&quot;, cands, top_k=10)
+        self.assertEqual(len(scored), 2)
+
+
+class TestPipeline(unittest.TestCase):
+    def test_pipeline_reports_two_latencies(self) -&gt; None:
+        _set_seed()
+        retriever = BiEncoder()
+        for c in CORPUS:
+            retriever.add(c)
+        model = CrossEncoder()
+        train_tiny(model, TRAIN_TRIPLES, epochs=40)
+        result = pipeline(&quot;how do we cancel a job&quot;, retriever, model, top_n=6, top_k=3)
+        self.assertIn(&quot;retrieve_top_n&quot;, result)
+        self.assertIn(&quot;reranked_top_k&quot;, result)
+        self.assertGreater(result[&quot;latency_retrieve_ms&quot;], 0.0)
+        self.assertGreater(result[&quot;latency_rerank_ms&quot;], 0.0)
+        self.assertEqual(len(result[&quot;reranked_top_k&quot;]), 3)
+
+    def test_pipeline_reorders_bi_encoder_output(self) -&gt; None:
+        _set_seed()
+        retriever = BiEncoder()
+        for c in CORPUS:
+            retriever.add(c)
+        model = CrossEncoder()
+        train_tiny(model, TRAIN_TRIPLES, epochs=60)
+        result = pipeline(&quot;how do we abort a multipart upload&quot;,
+                          retriever, model, top_n=8, top_k=3)
+        # rerank should keep d1 (the abort doc) somewhere in top-3
+        top_ids = [c.doc_id for c, _ in result[&quot;reranked_top_k&quot;]]
+        self.assertIn(&quot;d1&quot;, top_ids)
+
+
+if __name__ == &quot;__main__&quot;:
+    unittest.main()
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. What is the architectural difference between a bi-encoder and a cross-encoder?</legend><label class="option"><input type="radio" name="q0" value="0"> A bi-encoder embeds query and document independently; a cross-encoder reads the concatenated (query, document) sequence with full attention across both</label><label class="option"><input type="radio" name="q0" value="1"> Bi-encoders are trained; cross-encoders are not</label><label class="option"><input type="radio" name="q0" value="2"> Bi-encoders use cosine; cross-encoders use dot product</label><label class="option"><input type="radio" name="q0" value="3"> Cross-encoders run only on GPUs</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. Why can a cross-encoder not be used as the primary retriever on a 10M-document corpus?</legend><label class="option"><input type="radio" name="q1" value="0"> It cannot embed text</label><label class="option"><input type="radio" name="q1" value="1"> It requires one forward pass per (query, document) pair, which is 10M passes per query</label><label class="option"><input type="radio" name="q1" value="2"> It does not support negative scores</label><label class="option"><input type="radio" name="q1" value="3"> It requires the CLS token at the end of the sequence</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. What is the role of the N parameter in a two-stage retrieve-then-rerank pipeline?</legend><label class="option"><input type="radio" name="q2" value="0"> It is the size of the vocabulary</label><label class="option"><input type="radio" name="q2" value="1"> It is the cross-encoder hidden dimension</label><label class="option"><input type="radio" name="q2" value="2"> It is the number of layers in the cross-encoder</label><label class="option"><input type="radio" name="q2" value="3"> It is the number of candidates returned by the bi-encoder for the cross-encoder to rescore</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. Why must you pick N strictly larger than K (typically 3x or more)?</legend><label class="option"><input type="radio" name="q3" value="0"> BM25 requires it for the IDF computation</label><label class="option"><input type="radio" name="q3" value="1"> Smaller N reduces the embedding dimensionality</label><label class="option"><input type="radio" name="q3" value="2"> The cross-encoder requires N to be a multiple of K</label><label class="option"><input type="radio" name="q3" value="3"> If N equals K the cross-encoder cannot reorder, only reweight; rerank lift collapses to zero</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. What does the cross-encoder&#39;s mean-pooling head do in this lesson?</legend><label class="option"><input type="radio" name="q4" value="0"> Pools over the vocabulary distribution</label><label class="option"><input type="radio" name="q4" value="1"> Computes the softmax over the document positions</label><label class="option"><input type="radio" name="q4" value="2"> Averages the last-layer outputs over non-pad positions and feeds a single linear head to produce one relevance scalar</label><label class="option"><input type="radio" name="q4" value="3"> Sums the embedding indices</label><p data-feedback="4"></p></fieldset><fieldset><legend>6. Which production failure mode does logging the rank-1 cross-encoder score help detect?</legend><label class="option"><input type="radio" name="q5" value="0"> Out-of-domain queries: when the top-1 reranker score is below a corpus-specific threshold, the model is signalling that nothing in the corpus actually answers the query</label><label class="option"><input type="radio" name="q5" value="1"> Network outages</label><label class="option"><input type="radio" name="q5" value="2"> Vocabulary drift in the tokenizer</label><label class="option"><input type="radio" name="q5" value="3"> Index corruption in the bi-encoder</label><p data-feedback="5"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/19-capstone-projects/65-hybrid-retrieval-bm25-dense/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/19-capstone-projects/67-query-rewriting-hyde/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/19-capstone-projects/66-reranker-cross-encoder/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

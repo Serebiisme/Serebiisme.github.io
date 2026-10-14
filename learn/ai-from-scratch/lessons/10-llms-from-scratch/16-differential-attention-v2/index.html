@@ -1,0 +1,788 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>差异性注意力 (V2) · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-10-llms-from-scratch" data-lesson="10-llms-from-scratch/16-differential-attention-v2" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/10-llms-from-scratch/">从零构建大语言模型</a> / LESSON 16</p><h1 class="lesson-title">差异性注意力 (V2)</h1><p>Differential Attention (V2)</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>差异性注意力 (V2)</h1>
+<blockquote>
+<p>软max注意力在每一个不匹配的代币上分散了少量的概率. 超过100万个代币,这些噪音加起来,淹没了信号. 差异变压器 (Ye et al., ICLR 2025) 通过计算注意力为两个软max的差异来解决这一问题,减去共享噪音地面. DIFF V2 (微软,2026年1月) 是生产堆重写:与基线变压器相匹配的解码延迟,没有自定义内核,兼容FlashAttention. 这一课程是V1到V2端到端,用一个工作玩具实现的区别操作你可以运行在Stdlib Python.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python (stdlib)
+<strong>Prerequisites:</strong> Phase 7 · 02 (self-attention), Phase 7 · 15 (attention variants), Phase 10 · 14 (architecture walkthrough)
+<strong>Time:</strong> ~60 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>具体说明为什么软max注意力具有噪音地面,以及为什么随着环境长度而增长.</li>
+<li>推导差异注意力公式,并解释为什么减去在保持信号时取消共享噪音组件.</li>
+<li>走向V1到V2的差异:什么变得更快,什么变得更简单,什么变得更稳定,以及为什么每个变化是生产预训练所必需的.</li>
+<li>在纯Python中从零开始实现差异注意力,并对合成信号加噪声查询进行噪音取消特性经验验证.</li>
+</ul>
+<h2>问题</h2>
+<p>标准软max注意力具有数学特性,它会变成规模上的操作头痛.<code>q</code>关注重量是<code>softmax(qK^T / sqrt(d))</code>软max 永远无法产生精确的零 每一个不匹配的代币都获得了一些正质量.那个残余质量是噪音,它随着背景长度而扩展.在128k代币时,即使每个不匹配的代币只有0.001%的可能性,其中127,999代币总共贡献了总量的12%.模型必须学习绕着环境增长的噪音地面路线.</p>
+<p>经验上,这表现为注意力头部干扰:长文本RAG中的幻觉引用,在100k标记检索任务中失败中失败,在32k以上的针基准上微妙的精度降低. 差异变压器论文 (arXiv:2410.05258,ICLR 2025) 测量了差距:DIFF变压器的困惑程度较低,长文本精度更高,幻觉比相同尺寸的基线更少.</p>
+<p>由于DIFF V1存在三个问题, 它的值缓存必须每次解码步骤加载两次,它需要自定义的CUDA内核,它破坏了FlashAttention兼容性,并且其每头RMSNorm在70B以上规模上破坏了长期训练的稳定性. 微软的云科技博客 (DIFF V2), 这一课程将两个版本都运行,构建区别运算符,并在玩具查询中进行噪音取消.</p>
+<h2>概念</h2>
+<h3>软max的噪音地板</h3>
+<p>为了查询<code>q</code>关键<code>K = [k_1, ..., k_N]</code>注意力重量为:</p>
+<pre><code>w_i = exp(q . k_i / sqrt(d)) / sum_j exp(q . k_j / sqrt(d))
+</code></pre>
+<p>没有.<code>w_i</code>如果<code>k_i</code>完全无关<code>q</code>总结<code>q . k_i</code>不是0 它随着变异而波动在零左右<code>||q||^2 / d</code>软max正常化后,每一个不相关的代币仍然贡献.<code>O(1/N)</code>无关代币的总贡献为<code>O((N-1)/N) = O(1)</code>不是小量.</p>
+<p>模型想要的是硬顶k:匹配的代币的重量很高,其他地方的重量几乎是零.</p>
+<h3>差异性概念</h3>
+<p>分开各头的Q和K投影为两个:Q = (Q_1,Q_2) 和K = (K_1,K_2).计算两个注意力地图:</p>
+<pre><code>A_1 = softmax(Q_1 K_1^T / sqrt(d))
+A_2 = softmax(Q_2 K_2^T / sqrt(d))
+</code></pre>
+<p>输出:</p>
+<pre><code>DiffAttn = (A_1 - lambda * A_2) V
+</code></pre>
+<p>减值取消了两个地图共享的任何噪音分布.如果两个地图在127k不相关的代币上重量大约均 (随机初始化后),则这些都会取消.信号在少数实际相关的代币上最大重量只会取消如果它在两个地图上出现相同的 magnitud,这将不会一旦模型列车.</p>
+<p><code>lambda</code>标记为:<code>lambda = exp(lambda_q1 dot lambda_k1) - exp(lambda_q2 dot lambda_k2) + lambda_init</code>它们可能是负面的.<code>lambda_init</code>默认的数字是小的正数,比如0.8.</p>
+<h3>为什么这匹配的头声取消</h3>
+<p>想象一下两个杂的麦克风录制相同的声音. 两者都接收扬声器加上相关背景噪音. 减去一个和另一个,共享的噪音下降. 声音存活下来,因为两个信号相或幅度相差足以防止完全取消.<code>lambda</code>能学到这种平衡.</p>
+<h3>V1 vs V2:差异</h3>
+<p>V1 保持参数数量与基线变压器等.为了获得每头两个查询,它将头寸减半.这使得头部表达性成本和更痛苦的损失减半了每头的值缓存.解码必须每步两次加载值缓存 (每软max分支一次).结果:除码速度比基线慢,尽管参数数数量相匹配.</p>
+<p>V2 翻倍查询头数量,保持KV头数相同 (借取上映的参数).头寸与基线保持相同.减去后,额外的维度被投影回下来,以匹配基线变压器的O_W投影.三个事情同时发生:</p>
+<ol>
+<li>解码速度与基线匹配 (KV缓存一次加载).</li>
+<li>FlashAttention运行不变 (没有自定义内核).</li>
+<li>在解码时的算术强度增加 (从HBM中加载的每字节的计算量增加).</li>
+</ol>
+<p>V2还删除了V1用来稳定减法的每头RMSNorm.在70B类预训练尺度上,RMSNorm破坏了晚训练的稳定性.V2将其取代为更简单的初始化方案,使训练保持稳定,而无需额外模块.</p>
+<h3>什么时候要达到它</h3>
+<table>
+<thead>
+<tr>
+<th>Workload</th>
+<th>Benefit</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Long-context RAG (64k+)</td>
+<td>Cleaner attention maps, fewer hallucinated citations</td>
+</tr>
+<tr>
+<td>Needle-in-haystack benchmarks</td>
+<td>Substantial accuracy lift past 32k</td>
+</tr>
+<tr>
+<td>Multi-document QA</td>
+<td>Less cross-document interference</td>
+</tr>
+<tr>
+<td>Code completion at 8k</td>
+<td>Marginal, not worth the architecture change</td>
+</tr>
+<tr>
+<td>Short chat (&lt; 4k)</td>
+<td>Essentially indistinguishable from baseline</td>
+</tr>
+</tbody>
+</table>
+<p>随着背景长度的增长,在4k代币时,噪音的地面足够小,以使标准注意力正常.在128k时,它会伤害你.</p>
+<h3>如何与其他2026个子相匹配</h3>
+<table>
+<thead>
+<tr>
+<th>Feature</th>
+<th>Compatible with DIFF V2?</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GQA</td>
+<td>Yes (V2 increases Q heads, not KV heads)</td>
+</tr>
+<tr>
+<td>MLA (DeepSeek)</td>
+<td>Yes in principle, no published paper combining them</td>
+</tr>
+<tr>
+<td>MoE</td>
+<td>Yes (attention is independent of MLP block)</td>
+</tr>
+<tr>
+<td>RoPE</td>
+<td>Yes (unchanged)</td>
+</tr>
+<tr>
+<td>YaRN / long-context scaling</td>
+<td>Yes (exactly where DIFF helps most)</td>
+</tr>
+<tr>
+<td>FlashAttention</td>
+<td>Yes in V2 (was no in V1)</td>
+</tr>
+<tr>
+<td>Speculative decoding</td>
+<td>Yes (attention change is invisible to the spec-decode loop)</td>
+</tr>
+</tbody>
+</table>
+<figure><img src="/learn/ai-from-scratch/figures/figure-c4def90a18b08dcb3abc.png" alt="differential-attention 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<p><code>code/main.py</code>玩具查询,具有已知信号加噪结构,可以直接测量噪音取消比率.</p>
+<h3>步骤1:标准软max注意力</h3>
+<p>分数矩阵操作:列表列表,手动分,软max,数值稳定减小最大.</p>
+<pre><code class="language-python">def softmax(row):
+    m = max(row)
+    exps = [math.exp(x - m) for x in row]
+    s = sum(exps)
+    return [e / s for e in exps]
+</code></pre>
+<h3>步骤2:将Q,K分为两半</h3>
+<p>玩具实施使用V1为教学清晰度 数学相同,只有会计不同.</p>
+<h3>步骤3:两个软max分支 +减小</h3>
+<pre><code class="language-python">A1 = [softmax([dot(q1, k) / scale for k in K1]) for q1 in Q1]
+A2 = [softmax([dot(q2, k) / scale for k in K2]) for q2 in Q2]
+diff_weights = [[a1 - lam * a2 for a1, a2 in zip(r1, r2)] for r1, r2 in zip(A1, A2)]
+out = [[sum(w * v[j] for w, v in zip(row, V)) for j in range(d_v)] for row in diff_weights]
+</code></pre>
+<p>注:输出权重可能是负的. 没关系. 值缓存仍然处理签署的贡献. 随后的V投影吸收标志.</p>
+<h3>步骤4:噪音取消测量</h3>
+<p>构建一个长度1024的合成序列. 放信号标志在已知位置, 填充其余的噪音. 计算 (a) 信号位置的标准软max注意力重量和 (b) 差异注意力重量. 测量每个信号与噪音的比例. 根据两支分支的不同程度,DIFF注意力可靠地产生了3x-10x的信号与噪音比率.</p>
+<h3>步骤 5: V1 vs V2参数会计</h3>
+<p>根据配置 (隐藏=4096,头=32,d_head=128),打印:</p>
+<ul>
+<li>基线变压器:每个尺寸的Q,K,V <code>hidden * hidden</code>隐藏在4*的MLP.</li>
+<li>标准 V1:每尺寸的Q,K <code>hidden * hidden</code> V 尺寸<code>hidden * hidden</code>头部的薄度在内面减半.<code>lambda</code>参数 (O(头 * d_头)).</li>
+<li>型号:<code>2 * hidden * hidden</code>尺寸K<code>hidden * hidden</code> V 尺寸<code>hidden * hidden</code>超薄的投影在O_W之前. 增加相同的<code>lambda</code>参数</li>
+</ul>
+<p>玩具测量了V2的额外参数成本 (大约<code>hidden * hidden</code>按一下,每个注意区块的额外数量)</p>
+<h2>用它</h2>
+<p>截至2026年4月,DIFF V2尚未在每个生产推断服务器中出货,但vLLM和SGLang正在进行集成.</p>
+<ul>
+<li>微软内部长文本生产模型.</li>
+<li>针对256k以上的环境的几个开放模型培训中进行了研究复制.</li>
+<li>混合架构,将DIFF注意力与在替代层上的滑动窗口注意力结合在一起.</li>
+</ul>
+<p>在2026年,你将实现这一点:</p>
+<ul>
+<li>培训一个新的模型从零开始,针对64k+有效的环境.从一开始就增加差异性注意力;后来重新培训是昂贵的.</li>
+<li>调整一个长文本模型,其中中途失败占据了你的评估.</li>
+</ul>
+<p>当你不愿意:</p>
+<ul>
+<li>您正在使用一个预先训练的密集型号,具有稳定的长文本性能.</li>
+<li>你的背景总是低于16K. 噪音的地面是微不足道的.</li>
+</ul>
+<h2>运送它</h2>
+<p>这一课产生了<code>outputs/skill-diff-attention-integrator.md</code>鉴于模型架构,目标背景长度,幻觉形象和培训预算,它产生了一个集成计划,以增加对新预训练运行或LoRA细节调节的差异性注意力.</p>
+<h2>运动</h2>
+<ol>
+<li>
+<p>跑步<code>code/main.py</code>检查对差异注意力报告的信号-噪音比合成查询标准软max注意力高. 变化噪音幅度,显示标准注意力变得无法使用的交叉点.</p>
+</li>
+<li>
+<p>计算从基线到DIFF V1和从基线到DIFF V2的参数数 delta为7B类模型 (隐藏=4096,头=32,d_head=128,32层).显示哪些组件获得参数,哪些保持相同.</p>
+</li>
+<li>
+<p>在DIFF V1论文的第3节 (arXiv:2410.05258) 和DIFF V2 Hugging Face博客的第2节中,用两句话解释为什么每头V1是必要的,以及为什么V2可以在不导致训练分歧的情况下删除它.</p>
+</li>
+<li>
+<p>执行一个减法:计算与 <code>lambda = 0</code>(纯的第一软max) 和<code>lambda = 1</code>测量信号到噪音在扫描中如何变化. 确定<code>lambda</code>通过这种方式,我们可以最大限度地实现信号到噪音.</p>
+</li>
+<li>
+<p>扩展玩具到GQA+DIFF V2. 选择8个KV头和32个Q头. 显示KV缓存尺寸与相同 (8,32) 配置的基线GQA模型相匹配.</p>
+</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Differential attention</td>
+<td>&quot;Two softmaxes minus each other&quot;</td>
+<td>Split Q, K into two halves, compute two softmax maps, subtract the second (scaled by lambda) from the first, then multiply by V</td>
+</tr>
+<tr>
+<td>Noise floor</td>
+<td>&quot;The non-zero tail of softmax&quot;</td>
+<td>The O(1/N) weight softmax puts on every unrelated token, which sums to O(1) across long contexts</td>
+</tr>
+<tr>
+<td>lambda</td>
+<td>&quot;The subtraction scale&quot;</td>
+<td>Per-head learnable scalar parameterized as <code>exp(lq1.lk1) - exp(lq2.lk2) + lambda_init</code>; can be negative</td>
+</tr>
+<tr>
+<td>DIFF V1</td>
+<td>&quot;The ICLR 2025 version&quot;</td>
+<td>Original Differential Transformer; halves head dim to preserve parameter count, needs custom kernel, slower decode</td>
+</tr>
+<tr>
+<td>DIFF V2</td>
+<td>&quot;The January 2026 fix&quot;</td>
+<td>Doubles Q heads keeping KV heads; matches baseline decode speed and works with FlashAttention</td>
+</tr>
+<tr>
+<td>Per-head RMSNorm</td>
+<td>&quot;The V1 stabilizer&quot;</td>
+<td>Extra norm V1 applied after the difference; V2 removed it to prevent late-training instability</td>
+</tr>
+<tr>
+<td>Signal-to-noise ratio</td>
+<td>&quot;How much attention is wasted&quot;</td>
+<td>Ratio of weight on the true signal position to average weight on unrelated positions</td>
+</tr>
+<tr>
+<td>Lost in the middle</td>
+<td>&quot;Long-context failure mode&quot;</td>
+<td>Empirical phenomenon where retrieval accuracy dips for documents in the middle of a long context — DIFF attention reduces this</td>
+</tr>
+<tr>
+<td>Arithmetic intensity</td>
+<td>&quot;FLOPs per byte loaded&quot;</td>
+<td>Ratio V2 increased at decode by doubling queries per KV load; important for memory-bound decode</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2410.05258" rel="noreferrer" data-network="true">Ye et al. — Differential Transformer (arXiv:2410.05258, ICLR 2025) <small>↗ 需要联网</small></a>原始论文,含噪音取消理论和长文本的废除</li>
+<li><a href="https://huggingface.co/blog/microsoft/diff-attn-v2" rel="noreferrer" data-network="true">Microsoft unilm — Differential Transformer V2 (Hugging Face blog, January 2026) <small>↗ 需要联网</small></a>生产堆重写,匹配的基线解码,兼容FlashAttention</li>
+<li><a href="https://arxiv.org/abs/2505.16333" rel="noreferrer" data-network="true">Understanding Differential Transformer Unchains Pretrained Self-Attentions (arXiv:2505.16333) <small>↗ 需要联网</small></a>理论分析减法恢复预训练的注意力结构的原因</li>
+<li><a href="https://arxiv.org/html/2501.17900" rel="noreferrer" data-network="true">Shared DIFF Transformer (arXiv:2501.17900) <small>↗ 需要联网</small></a> 分享参数的变体</li>
+<li><a href="https://arxiv.org/abs/1706.03762" rel="noreferrer" data-network="true">Vaswani et al. — Attention Is All You Need (arXiv:1706.03762) <small>↗ 需要联网</small></a>基线变压器 DIFF从</li>
+<li><a href="https://arxiv.org/abs/2307.03172" rel="noreferrer" data-network="true">Liu et al. — Lost in the Middle (arXiv:2307.03172) <small>↗ 需要联网</small></a>长文本基准指标</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Differential Attention (V2)</h1>
+<blockquote>
+<p>Softmax attention spreads a small amount of probability over every non-matching token. Over 100k tokens that noise adds up and drowns the signal. Differential Transformer (Ye et al., ICLR 2025) fixes it by computing attention as the difference of two softmaxes, subtracting the shared noise floor. DIFF V2 (Microsoft, January 2026) is the production-stack rewrite: matching decode latency to baseline Transformer, no custom kernels, FlashAttention-compatible. This lesson is V1 to V2 end-to-end, with a working toy implementation of the difference operation you can run in stdlib Python.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python (stdlib)
+<strong>Prerequisites:</strong> Phase 7 · 02 (self-attention), Phase 7 · 15 (attention variants), Phase 10 · 14 (architecture walkthrough)
+<strong>Time:</strong> ~60 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>State precisely why softmax attention has a noise floor and why it grows with context length.</li>
+<li>Derive the differential attention formula and explain why the subtraction cancels the shared noise component while preserving signal.</li>
+<li>Walk the V1-to-V2 diff: what got faster, what got simpler, what got more stable, and why each change was necessary for production pre-training.</li>
+<li>Implement differential attention from scratch in pure Python and empirically verify the noise-cancellation property on a synthetic signal-plus-noise query.</li>
+</ul>
+<h2>The Problem</h2>
+<p>Standard softmax attention has a mathematical property that turns into an operational headache at scale. For a query <code>q</code>, the attention weights are <code>softmax(qK^T / sqrt(d))</code>. Softmax can never produce exact zeros — every non-matching token gets some positive mass. That residual mass is noise, and it scales with context length. At 128k tokens, even if each non-matching token gets only 0.001% of the probability, 127,999 of them combined contribute about 12% of the total. The model has to learn to route around a noise floor that grows with context.</p>
+<p>Empirically this shows up as attention-head interference: hallucinated citations in long-context RAG, lost-in-the-middle failures on 100k-token retrieval tasks, and subtle accuracy degradation on needle-in-haystack benchmarks past 32k. The Differential Transformer paper (arXiv:2410.05258, ICLR 2025) measured the gap: DIFF Transformers hit lower perplexity, higher long-context accuracy, and fewer hallucinations than same-size baselines.</p>
+<p>DIFF V1 had three problems that kept it out of frontier pre-training pipelines. Its value cache had to be loaded twice per decode step, it required custom CUDA kernels that broke FlashAttention compatibility, and its per-head RMSNorm destabilized long-run training at 70B-plus scale. DIFF V2 (Microsoft unilm blog, January 20, 2026) fixed all three. This lesson walks both versions, builds the difference operator, and benchmarks noise cancellation on a toy query.</p>
+<h2>The Concept</h2>
+<h3>The noise floor of softmax</h3>
+<p>For a query <code>q</code> and keys <code>K = [k_1, ..., k_N]</code>, attention weights are:</p>
+<pre><code>w_i = exp(q . k_i / sqrt(d)) / sum_j exp(q . k_j / sqrt(d))
+</code></pre>
+<p>No <code>w_i</code> is ever zero. If <code>k_i</code> is completely unrelated to <code>q</code>, the score <code>q . k_i</code> is not 0 — it fluctuates around zero with variance <code>||q||^2 / d</code>. After softmax normalization, each unrelated token still contributes <code>O(1/N)</code> to the weighted sum. The total contribution of unrelated tokens is <code>O((N-1)/N) = O(1)</code> — not a small quantity.</p>
+<p>What the model wants is something like a hard top-k: high weight on matching tokens, near-zero weight everywhere else. Softmax is too smooth to do that directly.</p>
+<h3>The differential idea</h3>
+<p>Split each head's Q and K projections into two: Q = (Q_1, Q_2) and K = (K_1, K_2). Compute two attention maps:</p>
+<pre><code>A_1 = softmax(Q_1 K_1^T / sqrt(d))
+A_2 = softmax(Q_2 K_2^T / sqrt(d))
+</code></pre>
+<p>Output:</p>
+<pre><code>DiffAttn = (A_1 - lambda * A_2) V
+</code></pre>
+<p>The subtraction cancels whatever noise distribution the two maps share. If both maps have roughly uniform weight on the 127k unrelated tokens (which they will, at random initialization), those cancel. The signal — peaked weight on the few actually relevant tokens — only cancels if it appears in both maps at the same magnitude, which it will not once the model trains.</p>
+<p><code>lambda</code> is a learnable scalar per head, parameterized as <code>lambda = exp(lambda_q1 dot lambda_k1) - exp(lambda_q2 dot lambda_k2) + lambda_init</code>. It can be negative. <code>lambda_init</code> defaults to a small positive number like 0.8.</p>
+<h3>Why this matches headed noise-canceling</h3>
+<p>Think of two noisy microphones recording the same voice. Both pick up the speaker plus correlated background noise. Subtract one from the other and the shared noise drops out. The voice survives because the two signals differ in phase or amplitude by enough to prevent full cancellation. The per-head <code>lambda</code> learns exactly this balance.</p>
+<h3>V1 vs V2: the diff</h3>
+<p>V1 kept the parameter count equal to the baseline Transformer. To get two queries per head it halved the head dimension. That cost head expressiveness and — more painfully — halved the value cache per head. Decode had to load the value cache twice per step (once per softmax branch). Result: decode slower than baseline despite matching parameter count.</p>
+<p>V2 doubles the number of query heads and keeps the KV heads the same (borrowing parameters from the up-projection). The head dimension stays the same as baseline. After the subtraction, the extra dimension is projected back down to match baseline Transformer's O_W projection. Three things happen at once:</p>
+<ol>
+<li>Decode speed matches baseline (KV cache is loaded once).</li>
+<li>FlashAttention runs unchanged (no custom kernel).</li>
+<li>Arithmetic intensity at decode goes up (more compute per byte loaded from HBM).</li>
+</ol>
+<p>V2 also removes the per-head RMSNorm that V1 used to stabilize the subtraction. At 70B-class pre-training scales, that RMSNorm destabilized late training. V2 replaces it with a simpler initialization scheme that keeps training stable without the extra module.</p>
+<h3>When to reach for it</h3>
+<table>
+<thead>
+<tr>
+<th>Workload</th>
+<th>Benefit</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Long-context RAG (64k+)</td>
+<td>Cleaner attention maps, fewer hallucinated citations</td>
+</tr>
+<tr>
+<td>Needle-in-haystack benchmarks</td>
+<td>Substantial accuracy lift past 32k</td>
+</tr>
+<tr>
+<td>Multi-document QA</td>
+<td>Less cross-document interference</td>
+</tr>
+<tr>
+<td>Code completion at 8k</td>
+<td>Marginal, not worth the architecture change</td>
+</tr>
+<tr>
+<td>Short chat (&lt; 4k)</td>
+<td>Essentially indistinguishable from baseline</td>
+</tr>
+</tbody>
+</table>
+<p>The value grows with context length. At 4k tokens the noise floor is small enough that standard attention is fine. At 128k it is hurting you.</p>
+<h3>How it stacks with other 2026 knobs</h3>
+<table>
+<thead>
+<tr>
+<th>Feature</th>
+<th>Compatible with DIFF V2?</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GQA</td>
+<td>Yes (V2 increases Q heads, not KV heads)</td>
+</tr>
+<tr>
+<td>MLA (DeepSeek)</td>
+<td>Yes in principle, no published paper combining them</td>
+</tr>
+<tr>
+<td>MoE</td>
+<td>Yes (attention is independent of MLP block)</td>
+</tr>
+<tr>
+<td>RoPE</td>
+<td>Yes (unchanged)</td>
+</tr>
+<tr>
+<td>YaRN / long-context scaling</td>
+<td>Yes (exactly where DIFF helps most)</td>
+</tr>
+<tr>
+<td>FlashAttention</td>
+<td>Yes in V2 (was no in V1)</td>
+</tr>
+<tr>
+<td>Speculative decoding</td>
+<td>Yes (attention change is invisible to the spec-decode loop)</td>
+</tr>
+</tbody>
+</table>
+<figure><img src="/learn/ai-from-scratch/figures/figure-c4def90a18b08dcb3abc.png" alt="differential-attention 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<p><code>code/main.py</code> implements differential attention in pure Python. A toy query with known signal-plus-noise structure lets you measure the noise-cancellation ratio directly.</p>
+<h3>Step 1: standard softmax attention</h3>
+<p>Stdlib matrix ops: lists of lists, manual matmul, softmax with numerical-stability subtraction of the max.</p>
+<pre><code class="language-python">def softmax(row):
+    m = max(row)
+    exps = [math.exp(x - m) for x in row]
+    s = sum(exps)
+    return [e / s for e in exps]
+</code></pre>
+<h3>Step 2: split Q, K into two halves</h3>
+<p>V1 style: halve the head dimension. V2 style: keep the head dimension and double the number of heads. The toy implementation uses V1 for pedagogical clarity — the math is identical, only the bookkeeping differs.</p>
+<h3>Step 3: two softmax branches + subtraction</h3>
+<pre><code class="language-python">A1 = [softmax([dot(q1, k) / scale for k in K1]) for q1 in Q1]
+A2 = [softmax([dot(q2, k) / scale for k in K2]) for q2 in Q2]
+diff_weights = [[a1 - lam * a2 for a1, a2 in zip(r1, r2)] for r1, r2 in zip(A1, A2)]
+out = [[sum(w * v[j] for w, v in zip(row, V)) for j in range(d_v)] for row in diff_weights]
+</code></pre>
+<p>Note: the output weights can be negative. That is fine — the value cache still handles signed contributions. The subsequent V projection absorbs the sign.</p>
+<h3>Step 4: noise cancellation measurement</h3>
+<p>Build a synthetic sequence of length 1024. Place the signal token at a known position, fill the rest with noise. Compute (a) standard softmax attention weight on the signal position and (b) differential attention weight. Measure the ratio of signal-to-noise in each. DIFF attention reliably produces a higher signal-to-noise ratio by a factor of 3x-10x depending on how much the two branches have been trained to differ.</p>
+<h3>Step 5: V1 vs V2 parameter accounting</h3>
+<p>Given a config (hidden=4096, heads=32, d_head=128), print:</p>
+<ul>
+<li>Baseline Transformer: Q, K, V each size <code>hidden * hidden</code>, MLP at 4 * hidden.</li>
+<li>DIFF V1: Q, K each size <code>hidden * hidden</code>, V size <code>hidden * hidden</code> (unchanged), head dim halved internally. Adds per-head <code>lambda</code> parameters (O(heads * d_head)).</li>
+<li>DIFF V2: Q size <code>2 * hidden * hidden</code>, K size <code>hidden * hidden</code>, V size <code>hidden * hidden</code>. Extra dim projected back down before O_W. Adds same <code>lambda</code> parameters.</li>
+</ul>
+<p>The toy measures the extra parameter cost for V2 (roughly <code>hidden * hidden</code> extra per attention block) and prints it.</p>
+<h2>Use It</h2>
+<p>DIFF V2 is not yet shipping in every production inference server as of April 2026, but integration is underway in vLLM and SGLang. Meanwhile the pattern shows up in:</p>
+<ul>
+<li>Microsoft internal long-context production models.</li>
+<li>Research replications in several open model training runs targeting 256k-plus context.</li>
+<li>Hybrid architectures that combine DIFF attention with sliding-window attention on alternate layers.</li>
+</ul>
+<p>When you would reach for this in 2026:</p>
+<ul>
+<li>Training a new model from scratch targeting 64k-plus effective context. Add differential attention from the start; retraining later is expensive.</li>
+<li>Fine-tuning a long-context model where lost-in-the-middle failures dominate your eval. A LoRA on the Q projections can approximate the DIFF structure.</li>
+</ul>
+<p>When you would not:</p>
+<ul>
+<li>You are serving a pre-trained dense model with stable long-context performance. The retraining cost rarely pays back on existing weights.</li>
+<li>Your context is always under 16k. Noise floor is negligible.</li>
+</ul>
+<h2>Ship It</h2>
+<p>This lesson produces <code>outputs/skill-diff-attention-integrator.md</code>. Given a model architecture, target context length, hallucination profile, and training budget, it produces an integration plan for adding differential attention to a new pre-training run or LoRA fine-tune.</p>
+<h2>Exercises</h2>
+<ol>
+<li>
+<p>Run <code>code/main.py</code>. Verify the signal-to-noise ratio reported for differential attention is higher than standard softmax attention on the synthetic query. Vary the noise amplitude and show the crossover point where standard attention becomes unusable.</p>
+</li>
+<li>
+<p>Compute the parameter-count delta from baseline to DIFF V1 and from baseline to DIFF V2 for a 7B-class model (hidden=4096, heads=32, d_head=128, 32 layers). Show which components gained parameters and which stayed the same.</p>
+</li>
+<li>
+<p>Read Section 3 of the DIFF V1 paper (arXiv:2410.05258) and Section 2 of the DIFF V2 Hugging Face blog. In two sentences, explain why the V1 per-head RMSNorm was necessary and why V2 could remove it without causing training divergence.</p>
+</li>
+<li>
+<p>Implement an ablation: compute differential attention with <code>lambda = 0</code> (pure first softmax) and <code>lambda = 1</code> (full subtraction). On the synthetic query, measure how signal-to-noise changes across the sweep. Identify the <code>lambda</code> that maximizes signal-to-noise.</p>
+</li>
+<li>
+<p>Extend the toy to GQA + DIFF V2. Pick 8 KV heads and 32 Q heads. Show that the KV cache size matches a baseline GQA model with the same (8, 32) configuration.</p>
+</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Differential attention</td>
+<td>&quot;Two softmaxes minus each other&quot;</td>
+<td>Split Q, K into two halves, compute two softmax maps, subtract the second (scaled by lambda) from the first, then multiply by V</td>
+</tr>
+<tr>
+<td>Noise floor</td>
+<td>&quot;The non-zero tail of softmax&quot;</td>
+<td>The O(1/N) weight softmax puts on every unrelated token, which sums to O(1) across long contexts</td>
+</tr>
+<tr>
+<td>lambda</td>
+<td>&quot;The subtraction scale&quot;</td>
+<td>Per-head learnable scalar parameterized as <code>exp(lq1.lk1) - exp(lq2.lk2) + lambda_init</code>; can be negative</td>
+</tr>
+<tr>
+<td>DIFF V1</td>
+<td>&quot;The ICLR 2025 version&quot;</td>
+<td>Original Differential Transformer; halves head dim to preserve parameter count, needs custom kernel, slower decode</td>
+</tr>
+<tr>
+<td>DIFF V2</td>
+<td>&quot;The January 2026 fix&quot;</td>
+<td>Doubles Q heads keeping KV heads; matches baseline decode speed and works with FlashAttention</td>
+</tr>
+<tr>
+<td>Per-head RMSNorm</td>
+<td>&quot;The V1 stabilizer&quot;</td>
+<td>Extra norm V1 applied after the difference; V2 removed it to prevent late-training instability</td>
+</tr>
+<tr>
+<td>Signal-to-noise ratio</td>
+<td>&quot;How much attention is wasted&quot;</td>
+<td>Ratio of weight on the true signal position to average weight on unrelated positions</td>
+</tr>
+<tr>
+<td>Lost in the middle</td>
+<td>&quot;Long-context failure mode&quot;</td>
+<td>Empirical phenomenon where retrieval accuracy dips for documents in the middle of a long context — DIFF attention reduces this</td>
+</tr>
+<tr>
+<td>Arithmetic intensity</td>
+<td>&quot;FLOPs per byte loaded&quot;</td>
+<td>Ratio V2 increased at decode by doubling queries per KV load; important for memory-bound decode</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2410.05258" rel="noreferrer" data-network="true">Ye et al. — Differential Transformer (arXiv:2410.05258, ICLR 2025) <small>↗ 需要联网</small></a> — the original paper with noise-cancellation theory and long-context ablations</li>
+<li><a href="https://huggingface.co/blog/microsoft/diff-attn-v2" rel="noreferrer" data-network="true">Microsoft unilm — Differential Transformer V2 (Hugging Face blog, January 2026) <small>↗ 需要联网</small></a> — the production-stack rewrite, matching baseline decode, FlashAttention-compatible</li>
+<li><a href="https://arxiv.org/abs/2505.16333" rel="noreferrer" data-network="true">Understanding Differential Transformer Unchains Pretrained Self-Attentions (arXiv:2505.16333) <small>↗ 需要联网</small></a> — theoretical analysis of why the subtraction recovers pretrained attention structure</li>
+<li><a href="https://arxiv.org/html/2501.17900" rel="noreferrer" data-network="true">Shared DIFF Transformer (arXiv:2501.17900) <small>↗ 需要联网</small></a> — parameter-sharing variant</li>
+<li><a href="https://arxiv.org/abs/1706.03762" rel="noreferrer" data-network="true">Vaswani et al. — Attention Is All You Need (arXiv:1706.03762) <small>↗ 需要联网</small></a> — the baseline Transformer DIFF subtracts from</li>
+<li><a href="https://arxiv.org/abs/2307.03172" rel="noreferrer" data-network="true">Liu et al. — Lost in the Middle (arXiv:2307.03172) <small>↗ 需要联网</small></a> — the long-context benchmark DIFF attention targets</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-10-llms-from-scratch--16-differential-attention-v2.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-10-llms-from-scratch--16-differential-attention-v2.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/10-llms-from-scratch/16-differential-attention-v2/code/main.py">phases/10-llms-from-scratch/16-differential-attention-v2/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Differential attention (Ye et al., ICLR 2025) in stdlib Python.
+
+Builds two softmax maps from split Q, K, subtracts the second from the first
+scaled by a learned lambda, multiplies by V. Measures the signal-to-noise
+ratio of the resulting attention weights on a synthetic long-context query
+and compares to standard softmax attention. Also prints the parameter-count
+diff for DIFF V1 and DIFF V2 against a baseline Transformer.
+
+Pure stdlib. No numpy, no torch.
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import math
+import random
+from dataclasses import dataclass
+from typing import List
+
+
+def dot(a: List[float], b: List[float]) -&gt; float:
+    return sum(ai * bi for ai, bi in zip(a, b))
+
+
+def softmax_row(row: List[float]) -&gt; List[float]:
+    m = max(row)
+    exps = [math.exp(x - m) for x in row]
+    s = sum(exps)
+    return [e / s for e in exps]
+
+
+def standard_attention(Q: List[List[float]], K: List[List[float]],
+                       V: List[List[float]]) -&gt; tuple[List[List[float]], List[List[float]]]:
+    d = len(Q[0])
+    scale = math.sqrt(d)
+    weights = []
+    for q in Q:
+        row = [dot(q, k) / scale for k in K]
+        weights.append(softmax_row(row))
+    out = []
+    d_v = len(V[0])
+    for w in weights:
+        o = [sum(w[j] * V[j][c] for j in range(len(V))) for c in range(d_v)]
+        out.append(o)
+    return weights, out
+
+
+def diff_attention(Q1: List[List[float]], K1: List[List[float]],
+                   Q2: List[List[float]], K2: List[List[float]],
+                   V: List[List[float]],
+                   lam: float) -&gt; tuple[List[List[float]], List[List[float]]]:
+    &quot;&quot;&quot;Differential attention:
+        A1 = softmax(Q1 K1^T / sqrt(d))
+        A2 = softmax(Q2 K2^T / sqrt(d))
+        out = (A1 - lam * A2) V
+    &quot;&quot;&quot;
+    d = len(Q1[0])
+    scale = math.sqrt(d)
+    weights = []
+    for q1, q2 in zip(Q1, Q2):
+        row1 = softmax_row([dot(q1, k) / scale for k in K1])
+        row2 = softmax_row([dot(q2, k) / scale for k in K2])
+        diff = [a - lam * b for a, b in zip(row1, row2)]
+        weights.append(diff)
+    out = []
+    d_v = len(V[0])
+    for w in weights:
+        o = [sum(w[j] * V[j][c] for j in range(len(V))) for c in range(d_v)]
+        out.append(o)
+    return weights, out
+
+
+def random_projection(d_in: int, d_out: int,
+                      rng: random.Random) -&gt; List[List[float]]:
+    &quot;&quot;&quot;d_in x d_out projection matrix with unit-variance columns.&quot;&quot;&quot;
+    return [[rng.gauss(0, 1.0 / math.sqrt(d_in)) for _ in range(d_out)]
+            for _ in range(d_in)]
+
+
+def matmul(X: List[List[float]], W: List[List[float]]) -&gt; List[List[float]]:
+    out = []
+    d_out = len(W[0])
+    for row in X:
+        o = [sum(row[k] * W[k][c] for k in range(len(row))) for c in range(d_out)]
+        out.append(o)
+    return out
+
+
+def build_signal_plus_noise(
+    n_tokens: int, signal_pos: int, d_embed: int, noise_scale: float,
+    rng: random.Random,
+) -&gt; tuple[List[List[float]], List[float]]:
+    &quot;&quot;&quot;Return an input embedding sequence X[n_tokens][d_embed] and a query
+    vector q. Position signal_pos carries a specific pattern; the query is
+    aligned to that pattern. Every other position is Gaussian noise.
+
+    The Q, K projections are applied AFTER this build step so that both
+    differential branches see the same underlying sequence but project it
+    through different matrices — the faithful simulation of DIFF attention.
+    &quot;&quot;&quot;
+    pattern = [rng.gauss(0, 1) for _ in range(d_embed)]
+    norm = math.sqrt(sum(x * x for x in pattern))
+    pattern = [x / norm for x in pattern]
+    X = []
+    for i in range(n_tokens):
+        if i == signal_pos:
+            X.append([p + rng.gauss(0, noise_scale * 0.1) for p in pattern])
+        else:
+            X.append([rng.gauss(0, noise_scale) for _ in range(d_embed)])
+    q = list(pattern)
+    return X, q
+
+
+def snr(weights_row: List[float], signal_pos: int) -&gt; float:
+    sig = abs(weights_row[signal_pos])
+    noise_vals = [abs(w) for i, w in enumerate(weights_row) if i != signal_pos]
+    mean_noise = sum(noise_vals) / len(noise_vals)
+    if mean_noise == 0:
+        return float(&quot;inf&quot;)
+    return sig / mean_noise
+
+
+@dataclass
+class ParamDiff:
+    baseline: int
+    diff_v1: int
+    diff_v2: int
+    extra_v1: int
+    extra_v2: int
+
+
+def attention_params_baseline(hidden: int) -&gt; int:
+    return 4 * hidden * hidden
+
+
+def attention_params_diff_v1(hidden: int, n_heads: int, d_head: int) -&gt; int:
+    q_params = 2 * (hidden * (n_heads * d_head // 2))
+    k_params = 2 * (hidden * (n_heads * d_head // 2))
+    v_params = hidden * hidden
+    o_params = hidden * hidden
+    lam_params = 4 * n_heads * (d_head // 2)
+    return q_params + k_params + v_params + o_params + lam_params
+
+
+def attention_params_diff_v2(hidden: int, n_heads: int, d_head: int,
+                             kv_heads: int) -&gt; int:
+    q_params = hidden * (2 * n_heads * d_head)
+    k_params = hidden * (kv_heads * d_head)
+    v_params = hidden * (kv_heads * d_head)
+    o_params = (2 * n_heads * d_head) * hidden
+    lam_params = 4 * n_heads * d_head
+    return q_params + k_params + v_params + o_params + lam_params
+
+
+def compute_param_diff(hidden: int, n_heads: int, kv_heads: int) -&gt; ParamDiff:
+    d_head = hidden // n_heads
+    base = attention_params_baseline(hidden)
+    v1 = attention_params_diff_v1(hidden, n_heads, d_head)
+    v2 = attention_params_diff_v2(hidden, n_heads, d_head, kv_heads)
+    return ParamDiff(
+        baseline=base,
+        diff_v1=v1,
+        diff_v2=v2,
+        extra_v1=v1 - base,
+        extra_v2=v2 - base,
+    )
+
+
+def fmt_m(n: int) -&gt; str:
+    if n &gt;= 1_000_000:
+        return f&quot;{n / 1e6:.1f}M&quot;
+    if n &gt;= 1_000:
+        return f&quot;{n / 1e3:.1f}K&quot;
+    return f&quot;{n}&quot;
+
+
+def main() -&gt; None:
+    rng = random.Random(17)
+    print(&quot;=&quot; * 70)
+    print(&quot;DIFFERENTIAL ATTENTION V2 (Phase 10, Lesson 16)&quot;)
+    print(&quot;=&quot; * 70)
+    print()
+
+    n_tokens = 1024
+    signal_pos = 500
+
+    print(&quot;-&quot; * 70)
+    print(f&quot;Step 1: direct-logit toy on length {n_tokens}, signal at pos {signal_pos}&quot;)
+    print(&quot;-&quot; * 70)
+    print(&quot;  Both branches compute softmax over q.K logits. Branch 1 is a&quot;)
+    print(&quot;  TRAINED head that correctly amplifies the signal. Branch 2 is&quot;)
+    print(&quot;  an untrained/noise-seeing head. DIFF subtracts the shared&quot;)
+    print(&quot;  noise-floor component.&quot;)
+    print()
+
+    signal_logit = 4.0
+    noise_std = 0.5
+    logits_trained = [rng.gauss(0, noise_std) for _ in range(n_tokens)]
+    logits_trained[signal_pos] = signal_logit
+    logits_untrained = [rng.gauss(0, noise_std) for _ in range(n_tokens)]
+
+    A1 = softmax_row(logits_trained)
+    A2 = softmax_row(logits_untrained)
+
+    std_snr = snr(A1, signal_pos)
+    std_signal = A1[signal_pos]
+    std_noise = sum(abs(w) for i, w in enumerate(A1) if i != signal_pos)
+    print(f&quot;  standard softmax attention (branch 1 only):&quot;)
+    print(f&quot;    weight on signal position  : {std_signal:.6f}&quot;)
+    print(f&quot;    sum of |noise| weights     : {std_noise:.6f}&quot;)
+    print(f&quot;    signal-to-noise ratio      : {std_snr:.2f}&quot;)
+    print()
+
+    for lam in (0.0, 0.3, 0.6, 0.8, 1.0):
+        diff = [a1 - lam * a2 for a1, a2 in zip(A1, A2)]
+        dsnr = snr(diff, signal_pos)
+        d_signal = diff[signal_pos]
+        d_noise = sum(abs(w) for i, w in enumerate(diff) if i != signal_pos)
+        print(f&quot;  differential attention (lambda={lam:.1f}):&quot;)
+        print(f&quot;    weight on signal position  : {d_signal:+.6f}&quot;)
+        print(f&quot;    sum of |noise| weights     : {d_noise:.6f}&quot;)
+        print(f&quot;    signal-to-noise ratio      : {dsnr:.2f}&quot;)
+    print()
+
+    print(&quot;-&quot; * 70)
+    print(&quot;Step 2: noise-amplitude sweep (higher = noisier context)&quot;)
+    print(&quot;-&quot; * 70)
+    print(f&quot;  {&#39;noise_std&#39;:&gt;10}  {&#39;std SNR&#39;:&gt;9}  {&#39;diff SNR (lam=0.8)&#39;:&gt;20}&quot;)
+    for noise_scale in (0.25, 0.50, 1.0, 1.5, 2.0):
+        lrng = random.Random(int(noise_scale * 100))
+        l1 = [lrng.gauss(0, noise_scale) for _ in range(n_tokens)]
+        l1[signal_pos] = signal_logit
+        l2 = [lrng.gauss(0, noise_scale) for _ in range(n_tokens)]
+        A1s = softmax_row(l1)
+        A2s = softmax_row(l2)
+        diff_s = [a - 0.8 * b for a, b in zip(A1s, A2s)]
+        s_snr = snr(A1s, signal_pos)
+        d_snr = snr(diff_s, signal_pos)
+        print(f&quot;  {noise_scale:&gt;10.2f}  {s_snr:&gt;9.2f}  {d_snr:&gt;20.2f}&quot;)
+    print()
+
+    print(&quot;-&quot; * 70)
+    print(&quot;Step 3: parameter-count diff, 7B-class config&quot;)
+    print(&quot;-&quot; * 70)
+    pd = compute_param_diff(hidden=4096, n_heads=32, kv_heads=8)
+    print(f&quot;  baseline attention   : {fmt_m(pd.baseline)}&quot;)
+    print(f&quot;  DIFF V1 attention    : {fmt_m(pd.diff_v1)}  (delta {fmt_m(pd.extra_v1)})&quot;)
+    print(f&quot;  DIFF V2 attention    : {fmt_m(pd.diff_v2)}  (delta {fmt_m(pd.extra_v2)})&quot;)
+    print()
+
+    print(&quot;takeaway: DIFF attention reliably improves signal-to-noise in long-context&quot;)
+    print(&quot;          queries. V2 brings the parameter cost down and matches baseline&quot;)
+    print(&quot;          decode speed by doubling Q heads rather than halving head_dim.&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/10-llms-from-scratch/16-differential-attention-v2/outputs/skill-diff-attention-integrator.md">phases/10-llms-from-scratch/16-differential-attention-v2/outputs/skill-diff-attention-integrator.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: diff-attention-integrator
+description: Integration plan for adding Differential Attention V2 to a new pre-training run or LoRA fine-tune.
+version: 1.0.0
+phase: 10
+lesson: 16
+tags: [differential-attention, diff-transformer, long-context, flash-attention, pre-training, lora]
+---
+
+Given a model architecture (hidden, heads, KV heads, layers, d_head), a target context length, a hallucination or long-context profile (failure modes on your existing evals), and a training budget (tokens available, GPU-hours), produce an integration plan for DIFF V2.
+
+Produce:
+
+1. Integration mode. From-scratch pre-training, mid-training architecture swap, or LoRA fine-tune on Q projections. Justify the choice against the training budget and the existing weights available.
+2. Architecture diff. Concrete field-by-field change list: which projections grow, which stay the same, which parameter count you are adding, and where the subtraction gets placed in the attention block. Include `lambda_init` schedule by layer depth (`0.8 - 0.6 * exp(-0.3 * (depth - 1))` is the paper&#39;s default; adjust per-depth if layerwise telemetry shows instability).
+3. Kernel choice. Confirm FlashAttention 2 or 3 support given V2&#39;s head-count doubling. Reject V1&#39;s custom-kernel path unless the user explicitly needs it for reproducibility.
+4. Memory budget. KV cache stays at baseline (KV heads unchanged). Compute per-token activation memory delta (extra Q heads, extra compute). Report absolute numbers at the target context.
+5. Training stability plan. Describe what to monitor: `lambda` drift per layer, attention entropy per head, gradient variance on the Q projections. Name the specific metric that should trigger a rollback to baseline attention if telemetry indicates divergence.
+
+Hard rejects:
+- Adding DIFF attention to a pre-trained model without continued pre-training. Output distributions drift — not a drop-in fix.
+- DIFF V1 for any new run past April 2026. V2 is strictly better in all measured dimensions.
+- Integrating DIFF without also enabling long-context training data. The benefit only shows past 32k.
+- Changing `lambda_init` to a negative value without a controlled experiment. Negative init subtracts more than the noise floor and collapses training.
+
+Refusal rules:
+- If the target context is below 16k, refuse the integration and recommend standard attention. The added parameter cost is not justified by the noise-floor argument.
+- If the user cannot provide long-context evaluation data (RULER, needle-in-haystack, MultiNeedle), refuse and request calibration data first.
+- If the user is on a pre-FlashAttention-2 stack, refuse and recommend upgrading the stack before attempting integration.
+
+Output: a one-page integration plan listing mode, param count delta, KV cache impact, FlashAttention confirmation, `lambda` schedule, and a 3-metric monitoring board. End with a &quot;success criterion&quot; paragraph naming the specific long-context eval number (percentage point delta on RULER 64k or equivalent) that would justify keeping DIFF V2 in the architecture versus reverting.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原课程未提供测验。</p></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/10-llms-from-scratch/15-speculative-decoding-eagle3/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/10-llms-from-scratch/17-native-sparse-attention/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/10-llms-from-scratch/16-differential-attention-v2/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

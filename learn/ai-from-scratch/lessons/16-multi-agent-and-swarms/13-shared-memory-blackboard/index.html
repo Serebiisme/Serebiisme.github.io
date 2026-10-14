@@ -1,0 +1,604 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>共同记忆和黑板图案 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-16-multi-agent-and-swarms" data-lesson="16-multi-agent-and-swarms/13-shared-memory-blackboard" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/16-multi-agent-and-swarms/">多 Agent 与群体</a> / LESSON 13</p><h1 class="lesson-title">共同记忆和黑板图案</h1><p>Shared Memory and Blackboard Patterns</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>共同记忆和黑板图案</h1>
+<blockquote>
+<p>在2026年多代理系统中,存在两个方法:<strong>message pool</strong>(每个人都能看到每个人的信息,如在AutoGen GroupChat或MetaGPT)<strong>blackboard with subscription</strong>两个是多代理系统的唯一状态部分,这意味着两个都是有趣的错误居住的地方.参考故障模式是<strong>memory poisoning</strong>另一种方法是:一个代理人幻觉化一个&quot;事实&quot;,其他代理人将其视为验证,准确性逐渐衰退,比即时崩更难进行调试.</p>
+</blockquote>
+<p><strong>Type:</strong> Learn + Build
+<strong>Languages:</strong> Python (stdlib, <code>threading</code>)
+<strong>Prerequisites:</strong> Phase 16 · 04 (Primitive Model), Phase 16 · 09 (Parallel Swarm Networks)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>问题</h2>
+<p>多代理系统需要一个代理分享事实的地方.一个字面上的选择是&quot;通过信息&quot;,但这重新发明了共享状态,并增加了复制.另一个是&quot;给每个人都提供全球日志&quot;,但全球日志会无限增长并很容易被毒害.第三个是&quot;每代理的项目&quot;可扩展但重于方案.</p>
+<p>当一个代理人幻觉并写幻觉到共享状态时,每一个读到该状态的下游代理都会把幻觉作为事实.人类注意到的时候,推理链已经深入了五步,根源是有史以来第三个消息.调整多代理精度衰退比调整崩更难.</p>
+<p>这是一种记忆中毒.这是MAST类别中第二大记录的失败家族 (Cemri等人, arXiv:2503.13657) ,它是结构性的:任何没有来源的共享记忆设计和不可编写的验证器最终将显示它.</p>
+<h2>概念</h2>
+<h3>两个主要的拓物</h3>
+<p>**Full message pool.**每个代理都会阅读每一个消息.AutoGen GroupChat和MetaGPT都使用这种方法.简单,透明,可检查,但不会超过10个代理,因为每个代理的文本充满了其他代理的工作.</p>
+<pre><code>agent-A ──write──▶ ┌────────────────┐ ◀──read── agent-D
+                   │ message pool   │
+agent-B ──write──▶ │                │ ◀──read── agent-E
+                   │ (global log)   │
+agent-C ──write──▶ └────────────────┘ ◀──read── agent-F
+</code></pre>
+<p>**Blackboard with subscription.**代理人表示对主题的兴趣;基板路线只传递相关信息.CA-MCP (arXiv:2601.11595) 和矩阵分散框架 (arXiv:2511.21686) 使用此.进一步扩展,但需要先前的方案设计,使订阅有意义.</p>
+<pre><code>                   ┌─ topic: prices ──┐
+agent-A ──pub────▶ │                  │ ──▶ agent-D (subscribed)
+                   ├─ topic: orders ──┤
+agent-B ──pub────▶ │                  │ ──▶ agent-E (subscribed)
+                   ├─ topic: alerts ──┤
+agent-C ──pub────▶ │                  │ ──▶ agent-F (subscribed)
+                   └──────────────────┘
+</code></pre>
+<h3>当每个人都赢得</h3>
+<ul>
+<li><strong>Full pool</strong>只有在代理人少 (&lt;10),不均的情况下,谈话是短视线的.</li>
+<li><strong>Blackboard</strong>通过线路调节节节省代码成本和环境污染.</li>
+</ul>
+<p>生产系统通常混合:顶部有一个小的完整池 (规划层),下面是黑板 (工人层).</p>
+<h3>记忆中毒,在一个场景中</h3>
+<p>现在,我们有三名特工在研究任务上,A特工是检索特工,B特工是总结者,C特工是分析师.</p>
+<ol>
+<li>一个人拿到一个页面,然后写一个信息给共享状态:&quot;研究报告了42%的准确性改善.</li>
+<li>收到的页面实际上说&quot;4.2%的改善&quot;. 一个幻觉了一个十数.</li>
+<li>报告的准确度增加了42% (来源:A).</li>
+<li>,阅读共享状态,写道:&quot;建议采用 42%升高是转型的.</li>
+<li>报告指出,这一数字从未存在过的42%.</li>
+</ol>
+<p>没有任何代理毁,没有任何测试失败,系统&quot;工作了&quot;,幻觉从一个代理的背景到每个下游代理的推理通过共享状态.</p>
+<h3>为什么这是结构性的</h3>
+<p>没有共享状态,A代理的幻觉仍然存在于A的背景下.下游代理会重新搜索或重新推导,可能会发现错误. 通过天真共享状态,A的背景成为每个人的背景,幻觉被洗成事实.</p>
+<p>问题不是一个共享国家本身<strong>without provenance and without an independent verifier</strong>三个减轻措施解决了这一问题:</p>
+<ol>
+<li>**Attribute provenance on every write.**根据什么提示,如果适用,代理引用哪个来源. 下游代理阅读怀疑,关键是来源.</li>
+<li>**Version writes; treat them as append-only.**修改是取代旧的新条目,而不是现场更新.</li>
+<li>**Keep at least one agent that cannot write to shared state.**仅读的验证器检测到输入,重新查找来源,并标记不一致.</li>
+</ol>
+<h3>黑板先例 (海斯-罗思,1985年)</h3>
+<p>黑板模式比法师事务所代理人早了四十年. 哈伊斯-罗思 (1985,&quot;控制的黑板架构&quot;) 描述了观察全球黑板的专业知识来源,贡献部分解决方案,并触发其他来源. 2026年黑板 (CA-MCP,矩阵) 与知识来源和部分解决方案的JSON片一样,具有LLM代理. 旧文献记录了写作争端,机会主义控制和一致性的解决方案,</p>
+<h3>投影与全景</h3>
+<p>纯黑板给每个用户提供相同的投影 (主题范围).<strong>per-agent projection</strong>根据LangGraph的状态减小器是2026年可行的实现.</p>
+<p>没有一个,你在每个代理的提示中重建了临时投影.</p>
+<h3>写内容模式</h3>
+<p>许多代理人同时写作是一个同时问题,而不是仅仅是一个LLM问题.</p>
+<ul>
+<li>**Sequential writer (single producer).**所有的写作都通过一个编辑代理来进行序列化.</li>
+<li>**Optimistic concurrency with versioning.**每个条目都有版本;编写者失败于版本不匹配和重新尝试.</li>
+<li>**Topic partitioning.**不同的代理人拥有不同的主题,没有跨主题争端,需要设计的分区边界.</li>
+</ul>
+<p>由于LLM电话速度足够慢,争端很少,瓶不会伤害.</p>
+<h3>无法写的验证器</h3>
+<p>最有效的减轻是仅可读的验证器.</p>
+<ul>
+<li>验证者与团队分享状态 (阅读黑板或池).</li>
+<li>验证器没有写字柄,只能将状态分享到单独的验证道.</li>
+<li>验证者独立搜索在书中引用的来源.</li>
+<li>验证器的输出被转移到人类或单独的决策代理,</li>
+</ul>
+<p>没有这种分离,验证器的输出将成为池中的新输入,这意味着受毒的池中会毒害验证器,从而毒害其验证.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-6c9cb1e4187a31a396d7.png" alt="swarm-blackboard 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<p><code>code/main.py</code>在Stlib Python中实现了两个拓,加上玩具毒害攻击和三种减轻.</p>
+<ul>
+<li><code>MessagePool</code> 连接单独登录,全读取.</li>
+<li><code>Blackboard</code>主题关键的酒吧/子酒店,每位代理订阅.</li>
+<li><code>ProvenanceEntry</code>每一个写记录 (作者,时间标签, prompt_hash, source_uri).</li>
+<li><code>PoisoningScenario</code>执行一个三位代理的研究任务,其中A位代理幻觉化一个十位数.</li>
+<li><code>Verifier</code>只能读取的代理,重新查找来源并标记不一致. 运行相同的情况,验证器存在.</li>
+</ul>
+<p>运行:</p>
+<pre><code>python3 code/main.py
+</code></pre>
+<p>预期产量:</p>
+<ul>
+<li>运行1 (没有验证器):幻的42%传播到最终报告.</li>
+<li>运行2 (与验证器):验证器标记不一致性,池被标记为&quot;标记&quot;,最终报告包括撤销.</li>
+</ul>
+<h2>用它</h2>
+<p><code>outputs/skill-memory-auditor.md</code>通过多代理系统的共享内存设计来审核原产,版本化和验证器分离. 在生产前运行它在新的多代理架构上.</p>
+<h2>运送它</h2>
+<p>对于任何共享内存设计:</p>
+<ul>
+<li>每次写的记录来源: <code>(writer, timestamp, prompt_hash, tool_calls_cited, source_uri)</code>现在,我们要去.</li>
+<li>修改是指指新录取的录取.</li>
+<li>部署至少一个具有独立源访问的仅读验证器.</li>
+<li>路由验证器输出到单独的频道,而不是返回共享池中.</li>
+<li>记录那些写作的比例是变异 一个增加的比例是幻觉模式的早期证据.</li>
+</ul>
+<h2>运动</h2>
+<ol>
+<li>跑步<code>code/main.py</code>确认第一个运行传播幻觉,第二次运行捕捉.</li>
+<li>另外一个幻觉:B代理发明了一个数据集尺寸.验证器应该捕获两者,而不需要手动调整任何一个.</li>
+<li>转换整个池块为一个有主题分区的黑板 (<code>prices</code>现在<code>summaries</code>现在<code>analyses</code>问题是,在哪些情况下,分区更难解决,</li>
+<li>阅读Hayes-Roth (1985,&quot;控制的黑板架构&quot;). 鉴定2026年系统将受益于本课中未讨论的两个控制模式.</li>
+<li>读取CA-MCP (arXiv:2601.11595). 映射其共享文本存储器到 either MessagePool或黑板类中.<code>code/main.py</code>什么原始的CA-MCP添加到上面?</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Message pool</td>
+<td>&quot;Shared chat history&quot;</td>
+<td>Append-only log that every agent reads. Full transparency, poor scaling.</td>
+</tr>
+<tr>
+<td>Blackboard</td>
+<td>&quot;Shared workspace&quot;</td>
+<td>Topic-keyed pub/sub. Agents subscribe to relevant topics. Scales farther.</td>
+</tr>
+<tr>
+<td>Provenance</td>
+<td>&quot;Who wrote what&quot;</td>
+<td>Metadata on each write: writer, timestamp, prompt, sources.</td>
+</tr>
+<tr>
+<td>Memory poisoning</td>
+<td>&quot;Hallucinations spreading&quot;</td>
+<td>One agent's error enters shared state, downstream agents adopt it as fact.</td>
+</tr>
+<tr>
+<td>Append-only</td>
+<td>&quot;No in-place updates&quot;</td>
+<td>Corrections are new entries that supersede. Preserves audit trail.</td>
+</tr>
+<tr>
+<td>Unwritable verifier</td>
+<td>&quot;Independent auditor&quot;</td>
+<td>Read-only agent that re-fetches sources and flags inconsistencies.</td>
+</tr>
+<tr>
+<td>Projection</td>
+<td>&quot;Scoped view&quot;</td>
+<td>Per-agent view computed from global state. LangGraph reducers are the canonical case.</td>
+</tr>
+<tr>
+<td>Knowledge Source</td>
+<td>&quot;Specialist agent&quot;</td>
+<td>Hayes-Roth's 1985 term for a blackboard participant.</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2503.13657" rel="noreferrer" data-network="true">Cemri et al. — Why Do Multi-Agent LLM Systems Fail? <small>↗ 需要联网</small></a> MAST类别;记忆中毒是一种协调失败子组</li>
+<li><a href="https://arxiv.org/abs/2601.11595" rel="noreferrer" data-network="true">CA-MCP — Context-Aware Multi-Server MCP <small>↗ 需要联网</small></a>共享MCP服务器的语境存储</li>
+<li><a href="https://arxiv.org/abs/2511.21686" rel="noreferrer" data-network="true">Matrix — decentralized multi-agent framework <small>↗ 需要联网</small></a>没有中央管弦乐器的消息队列基于黑板</li>
+<li><a href="https://docs.langchain.com/oss/python/langgraph/workflows-agents" rel="noreferrer" data-network="true">LangGraph state and reducers <small>↗ 需要联网</small></a>生产中每剂投影模式</li>
+<li><a href="https://www.anthropic.com/engineering/multi-agent-research-system" rel="noreferrer" data-network="true">Anthropic — How we built our multi-agent research system <small>↗ 需要联网</small></a>生产部署的来源和验证说明</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Shared Memory and Blackboard Patterns</h1>
+<blockquote>
+<p>Two approaches coexist in 2026 multi-agent systems: the <strong>message pool</strong> (everyone sees everyone's messages, as in AutoGen GroupChat or MetaGPT) and the <strong>blackboard with subscription</strong> (agents subscribe to relevant events, as in Context-Aware MCP or the Matrix framework). Both are the only stateful part of a multi-agent system — which means both are where the interesting bugs live. The reference failure mode is <strong>memory poisoning</strong>: one agent hallucinates a &quot;fact,&quot; other agents treat it as verified, and accuracy decays gradually in a way that is much harder to debug than an immediate crash. This lesson builds both structures from stdlib, injects a poisoning attack, and shows the three mitigations that actually work in production.</p>
+</blockquote>
+<p><strong>Type:</strong> Learn + Build
+<strong>Languages:</strong> Python (stdlib, <code>threading</code>)
+<strong>Prerequisites:</strong> Phase 16 · 04 (Primitive Model), Phase 16 · 09 (Parallel Swarm Networks)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>Problem</h2>
+<p>Multi-agent systems need a place for agents to share facts. A literal option is &quot;pass everything in messages&quot; — but that reinvents shared state with extra copying. Another is &quot;give everyone a global log&quot; — but global logs grow unbounded and poison easily. A third is &quot;project a view per agent&quot; — scalable but schema-heavy.</p>
+<p>When one of the agents hallucinates and writes the hallucination to shared state, every downstream agent that reads that state adopts the hallucination as fact. By the time the human notices, the reasoning chain is five steps deep and the root cause is the third message ever written. Debugging multi-agent accuracy decay is harder than debugging a crash.</p>
+<p>This is memory poisoning. It is the second-most-documented failure family in the MAST taxonomy (Cemri et al., arXiv:2503.13657) and it is structural: any shared-memory design without provenance and an unwritable verifier will exhibit it eventually.</p>
+<h2>Concept</h2>
+<h3>The two main topologies</h3>
+<p><strong>Full message pool.</strong> Every agent reads every message. AutoGen GroupChat and MetaGPT use this. Simple, transparent, inspectable, but does not scale past ~10 agents because each agent's context fills with other agents' work.</p>
+<pre><code>agent-A ──write──▶ ┌────────────────┐ ◀──read── agent-D
+                   │ message pool   │
+agent-B ──write──▶ │                │ ◀──read── agent-E
+                   │ (global log)   │
+agent-C ──write──▶ └────────────────┘ ◀──read── agent-F
+</code></pre>
+<p><strong>Blackboard with subscription.</strong> Agents declare interest in topics; the substrate routes only relevant messages. CA-MCP (arXiv:2601.11595) and the Matrix decentralized framework (arXiv:2511.21686) use this. Scales further, but requires upfront schema design to make subscriptions meaningful.</p>
+<pre><code>                   ┌─ topic: prices ──┐
+agent-A ──pub────▶ │                  │ ──▶ agent-D (subscribed)
+                   ├─ topic: orders ──┤
+agent-B ──pub────▶ │                  │ ──▶ agent-E (subscribed)
+                   ├─ topic: alerts ──┤
+agent-C ──pub────▶ │                  │ ──▶ agent-F (subscribed)
+                   └──────────────────┘
+</code></pre>
+<h3>When each wins</h3>
+<ul>
+<li><strong>Full pool</strong> wins when agents are few (&lt; 10), heterogeneous, and the conversation is short-horizon. Reasoning about who said what is trivial when everyone sees everything.</li>
+<li><strong>Blackboard</strong> wins when agents are many, homogeneous in role but numerous in instance (swarms), and the conversation is long-running. Routing saves token cost and context pollution.</li>
+</ul>
+<p>Production systems often mix: a small full pool at the top (planning layer), blackboards below (worker layer).</p>
+<h3>Memory poisoning, in one scenario</h3>
+<p>Three agents work on a research task. Agent A is a retrieval agent. Agent B is a summarizer. Agent C is an analyst.</p>
+<ol>
+<li>A fetches a page and writes a message to shared state: &quot;The study reports a 42% accuracy improvement.&quot;</li>
+<li>The fetched page actually said &quot;4.2% improvement.&quot; A hallucinated a decimal.</li>
+<li>B, reading shared state, writes: &quot;Large 42% accuracy gain reported (source: A).&quot;</li>
+<li>C, reading shared state, writes: &quot;Recommend adoption — 42% lift is transformative.&quot;</li>
+<li>The final report cites a 42% number that never existed.</li>
+</ol>
+<p>No agent crashed. No test failed. The system &quot;worked.&quot; The hallucination crossed from one agent's context into every downstream agent's reasoning via shared state.</p>
+<h3>Why this is structural</h3>
+<p>Without shared state, agent A's hallucination stays in A's context. Downstream agents would re-fetch or re-derive and might catch the error. With naive shared state, A's context becomes everyone's context, and the hallucination is laundered into fact.</p>
+<p>The problem is not shared state per se — it is shared state <strong>without provenance and without an independent verifier</strong>. Three mitigations address this:</p>
+<ol>
+<li><strong>Attribute provenance on every write.</strong> Every entry in shared state records who wrote it, when, under what prompt, and (if applicable) what source the agent cited. Downstream agents read with skepticism keyed to provenance.</li>
+<li><strong>Version writes; treat them as append-only.</strong> A correction is a new entry that supersedes the old, not an in-place update. The audit trail is preserved.</li>
+<li><strong>Keep at least one agent that cannot write to shared state.</strong> A read-only verifier agent samples entries, re-fetches sources, and flags inconsistencies. Because it cannot write to the pool, it cannot be poisoned by the pool.</li>
+</ol>
+<h3>Blackboard precedent (Hayes-Roth, 1985)</h3>
+<p>The blackboard pattern predates LLM agents by four decades. Hayes-Roth (1985, &quot;A Blackboard Architecture for Control&quot;) described specialist Knowledge Sources that observe a global blackboard, contribute partial solutions, and trigger other sources. The 2026 blackboard (CA-MCP, Matrix) is the same pattern with LLM agents as Knowledge Sources and JSON blobs as partial solutions. The old literature has documented solutions to write contention, opportunistic control, and consistency that modern systems rediscover.</p>
+<h3>Projection vs full view</h3>
+<p>A pure blackboard gives every subscriber the same projection (topic-scoped). A more aggressive design is <strong>per-agent projection</strong>: each agent gets a view customized to its role. LangGraph's state reducers are the canonical 2026 implementation — the reducer function folds global state into a role-specific slice.</p>
+<p>Per-agent projection scales further but needs a schema. Without one, you rebuild ad-hoc projection in every agent's prompt.</p>
+<h3>Write-contention patterns</h3>
+<p>Multiple agents writing simultaneously is a concurrency problem, not just an LLM problem. Three patterns work:</p>
+<ul>
+<li><strong>Sequential writer (single producer).</strong> All writes go through one coordinator agent that serializes. Simple, but a bottleneck.</li>
+<li><strong>Optimistic concurrency with versioning.</strong> Each entry has a version; writers fail on version mismatch and retry. Classic database technique.</li>
+<li><strong>Topic partitioning.</strong> Different agents own different topics. No cross-topic contention. Requires designed partition boundaries.</li>
+</ul>
+<p>Most 2026 frameworks default to sequential writer because LLM calls are slow enough that contention is rare and the bottleneck does not hurt.</p>
+<h3>The unwritable verifier</h3>
+<p>The most load-bearing mitigation is the read-only verifier. Implementation rules:</p>
+<ul>
+<li>Verifier shares state with the team (reads the blackboard or pool).</li>
+<li>Verifier has no write handle to shared state — only to a separate verification channel.</li>
+<li>Verifier independently fetches sources cited in writes. Flags disagreement.</li>
+<li>Verifier's own outputs are routed to a human or a separate decision agent, never fed back into the pool.</li>
+</ul>
+<p>Without this separation, the verifier's outputs become new entries in the pool, which means a poisoned pool poisons the verifier, which poisons its verifications.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-6c9cb1e4187a31a396d7.png" alt="swarm-blackboard 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<p><code>code/main.py</code> implements both topologies in stdlib Python plus a toy poisoning attack and the three mitigations.</p>
+<ul>
+<li><code>MessagePool</code> — thread-safe append-only log with full read-out.</li>
+<li><code>Blackboard</code> — topic-keyed pub/sub with per-agent subscriptions.</li>
+<li><code>ProvenanceEntry</code> — every write records (writer, timestamp, prompt_hash, source_uri).</li>
+<li><code>PoisoningScenario</code> — runs a three-agent research task where agent A hallucinates a decimal. Prints final report.</li>
+<li><code>Verifier</code> — a read-only agent that re-fetches sources and flags inconsistencies. Runs the same scenario with the verifier present.</li>
+</ul>
+<p>Run:</p>
+<pre><code>python3 code/main.py
+</code></pre>
+<p>Expected output:</p>
+<ul>
+<li>Run 1 (no verifier): the hallucinated 42% propagates to the final report.</li>
+<li>Run 2 (with verifier): the verifier flags the inconsistency, the pool is labeled &quot;flagged&quot;, the final report includes a retraction.</li>
+</ul>
+<h2>Use It</h2>
+<p><code>outputs/skill-memory-auditor.md</code> is a skill that audits any multi-agent system's shared-memory design for provenance, versioning, and verifier separation. Run it on new multi-agent architectures before production.</p>
+<h2>Ship It</h2>
+<p>For any shared-memory design:</p>
+<ul>
+<li>Record provenance on every write: <code>(writer, timestamp, prompt_hash, tool_calls_cited, source_uri)</code>.</li>
+<li>Make the log append-only. Corrections are new entries that reference the superseded one.</li>
+<li>Deploy at least one read-only verifier agent with independent source access.</li>
+<li>Route verifier output to a separate channel, not back into the shared pool.</li>
+<li>Log the ratio of writes that are supersessions — a rising ratio is early evidence of hallucination patterns.</li>
+</ul>
+<h2>Exercises</h2>
+<ol>
+<li>Run <code>code/main.py</code>. Confirm run 1 propagates the hallucination and run 2 catches it.</li>
+<li>Add a second hallucination: agent B invents a dataset size. The verifier should catch both without being hand-tuned for either.</li>
+<li>Switch the full pool to a blackboard with topic partitions (<code>prices</code>, <code>summaries</code>, <code>analyses</code>). Which poisoning scenarios does topic partitioning make harder to pull off, and which does it not help with?</li>
+<li>Read Hayes-Roth (1985, &quot;A Blackboard Architecture for Control&quot;). Identify two control patterns from the paper not discussed in this lesson that 2026 systems would benefit from.</li>
+<li>Read CA-MCP (arXiv:2601.11595). Map its Shared Context Store to either the MessagePool or Blackboard class in <code>code/main.py</code>. Which primitives does CA-MCP add on top?</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Message pool</td>
+<td>&quot;Shared chat history&quot;</td>
+<td>Append-only log that every agent reads. Full transparency, poor scaling.</td>
+</tr>
+<tr>
+<td>Blackboard</td>
+<td>&quot;Shared workspace&quot;</td>
+<td>Topic-keyed pub/sub. Agents subscribe to relevant topics. Scales farther.</td>
+</tr>
+<tr>
+<td>Provenance</td>
+<td>&quot;Who wrote what&quot;</td>
+<td>Metadata on each write: writer, timestamp, prompt, sources.</td>
+</tr>
+<tr>
+<td>Memory poisoning</td>
+<td>&quot;Hallucinations spreading&quot;</td>
+<td>One agent's error enters shared state, downstream agents adopt it as fact.</td>
+</tr>
+<tr>
+<td>Append-only</td>
+<td>&quot;No in-place updates&quot;</td>
+<td>Corrections are new entries that supersede. Preserves audit trail.</td>
+</tr>
+<tr>
+<td>Unwritable verifier</td>
+<td>&quot;Independent auditor&quot;</td>
+<td>Read-only agent that re-fetches sources and flags inconsistencies.</td>
+</tr>
+<tr>
+<td>Projection</td>
+<td>&quot;Scoped view&quot;</td>
+<td>Per-agent view computed from global state. LangGraph reducers are the canonical case.</td>
+</tr>
+<tr>
+<td>Knowledge Source</td>
+<td>&quot;Specialist agent&quot;</td>
+<td>Hayes-Roth's 1985 term for a blackboard participant.</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2503.13657" rel="noreferrer" data-network="true">Cemri et al. — Why Do Multi-Agent LLM Systems Fail? <small>↗ 需要联网</small></a> — MAST taxonomy; memory poisoning is a coordination-failure sub-family</li>
+<li><a href="https://arxiv.org/abs/2601.11595" rel="noreferrer" data-network="true">CA-MCP — Context-Aware Multi-Server MCP <small>↗ 需要联网</small></a> — Shared Context Store for coordinated MCP servers</li>
+<li><a href="https://arxiv.org/abs/2511.21686" rel="noreferrer" data-network="true">Matrix — decentralized multi-agent framework <small>↗ 需要联网</small></a> — message-queue-based blackboard without a central orchestrator</li>
+<li><a href="https://docs.langchain.com/oss/python/langgraph/workflows-agents" rel="noreferrer" data-network="true">LangGraph state and reducers <small>↗ 需要联网</small></a> — the per-agent projection pattern in production</li>
+<li><a href="https://www.anthropic.com/engineering/multi-agent-research-system" rel="noreferrer" data-network="true">Anthropic — How we built our multi-agent research system <small>↗ 需要联网</small></a> — provenance and verification notes from a production deployment</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-16-multi-agent-and-swarms--13-shared-memory-blackboard.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-16-multi-agent-and-swarms--13-shared-memory-blackboard.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/16-multi-agent-and-swarms/13-shared-memory-blackboard/code/main.py">phases/16-multi-agent-and-swarms/13-shared-memory-blackboard/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Shared memory patterns: MessagePool, Blackboard, and a poisoning demo.
+
+Runs a three-agent research task twice. The first run has a hallucinated
+decimal that propagates through shared memory into the final report. The
+second run adds a read-only verifier that re-fetches the source and flags
+the inconsistency.
+&quot;&quot;&quot;
+from __future__ import annotations
+
+import hashlib
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import Callable
+
+
+@dataclass
+class ProvenanceEntry:
+    id: int
+    writer: str
+    topic: str
+    content: str
+    timestamp: float
+    prompt_hash: str
+    source_uri: str | None = None
+    supersedes: int | None = None
+    flags: list[str] = field(default_factory=list)
+
+
+class MessagePool:
+    &quot;&quot;&quot;Append-only full-pool shared state.&quot;&quot;&quot;
+
+    def __init__(self) -&gt; None:
+        self.entries: list[ProvenanceEntry] = []
+        self._lock = threading.Lock()
+        self._next_id = 0
+
+    def write(self, writer: str, content: str, prompt: str, source_uri: str | None = None,
+              topic: str = &quot;default&quot;, supersedes: int | None = None) -&gt; int:
+        with self._lock:
+            eid = self._next_id
+            self._next_id += 1
+            e = ProvenanceEntry(
+                id=eid,
+                writer=writer,
+                topic=topic,
+                content=content,
+                timestamp=time.time(),
+                prompt_hash=hashlib.sha256(prompt.encode()).hexdigest()[:10],
+                source_uri=source_uri,
+                supersedes=supersedes,
+            )
+            self.entries.append(e)
+            return eid
+
+    def read_all(self) -&gt; list[ProvenanceEntry]:
+        with self._lock:
+            return list(self.entries)
+
+    def flag(self, entry_id: int, flag: str) -&gt; None:
+        with self._lock:
+            for e in self.entries:
+                if e.id == entry_id:
+                    e.flags.append(flag)
+                    return
+
+
+class Blackboard:
+    &quot;&quot;&quot;Topic-keyed pub/sub blackboard.&quot;&quot;&quot;
+
+    def __init__(self) -&gt; None:
+        self.topics: dict[str, list[ProvenanceEntry]] = {}
+        self.subscribers: dict[str, list[Callable[[ProvenanceEntry], None]]] = {}
+        self._lock = threading.Lock()
+        self._next_id = 0
+
+    def publish(self, writer: str, topic: str, content: str, prompt: str,
+                source_uri: str | None = None) -&gt; int:
+        with self._lock:
+            eid = self._next_id
+            self._next_id += 1
+            e = ProvenanceEntry(
+                id=eid,
+                writer=writer,
+                topic=topic,
+                content=content,
+                timestamp=time.time(),
+                prompt_hash=hashlib.sha256(prompt.encode()).hexdigest()[:10],
+                source_uri=source_uri,
+            )
+            self.topics.setdefault(topic, []).append(e)
+            subs = list(self.subscribers.get(topic, []))
+        for cb in subs:
+            cb(e)
+        return eid
+
+    def subscribe(self, topic: str, cb: Callable[[ProvenanceEntry], None]) -&gt; None:
+        with self._lock:
+            self.subscribers.setdefault(topic, []).append(cb)
+
+    def read_topic(self, topic: str) -&gt; list[ProvenanceEntry]:
+        with self._lock:
+            return list(self.topics.get(topic, []))
+
+
+FAKE_SOURCES = {
+    &quot;https://arxiv.org/paper-1&quot;: &quot;The study reports a 4.2% accuracy improvement over the baseline.&quot;,
+    &quot;https://arxiv.org/paper-2&quot;: &quot;Dataset size was 12,500 examples.&quot;,
+}
+
+
+def retrieval_agent(pool: MessagePool, uri: str, hallucinate: bool) -&gt; int:
+    content = FAKE_SOURCES[uri]
+    if hallucinate and &quot;4.2%&quot; in content:
+        content = content.replace(&quot;4.2%&quot;, &quot;42%&quot;)
+    return pool.write(
+        writer=&quot;retriever&quot;,
+        content=content,
+        prompt=f&quot;Fetch and summarize {uri}&quot;,
+        source_uri=uri,
+    )
+
+
+def summarizer_agent(pool: MessagePool) -&gt; int:
+    retrieved = [e for e in pool.read_all() if e.writer == &quot;retriever&quot;]
+    if not retrieved:
+        return pool.write(&quot;summarizer&quot;, &quot;no source&quot;, &quot;Summarize retrieval&quot;, None)
+    latest = retrieved[-1].content
+    summary = f&quot;Summary: study reports a significant result -- {latest.split(&#39;.&#39;)[0]}.&quot;
+    return pool.write(&quot;summarizer&quot;, summary, &quot;Summarize retrieval&quot;, None)
+
+
+def analyst_agent(pool: MessagePool) -&gt; int:
+    summaries = [e for e in pool.read_all() if e.writer == &quot;summarizer&quot;]
+    if not summaries:
+        return pool.write(&quot;analyst&quot;, &quot;no summary&quot;, &quot;Draw conclusions&quot;, None)
+    latest = summaries[-1].content
+    verdict = &quot;Recommend adoption&quot; if &quot;42%&quot; in latest else &quot;Recommend further review&quot;
+    return pool.write(&quot;analyst&quot;, f&quot;Analyst verdict: {verdict} (based on: {latest})&quot;,
+                      &quot;Draw conclusions&quot;, None)
+
+
+def verifier_agent(pool: MessagePool) -&gt; list[tuple[int, str]]:
+    &quot;&quot;&quot;Read-only agent. Re-fetches cited sources and flags inconsistencies.
+
+    Returns a list of (entry_id, reason) tuples for the caller to act on.
+    The verifier never writes back to the pool -- the caller decides what to do.
+    &quot;&quot;&quot;
+    findings = []
+    for e in pool.read_all():
+        if e.source_uri and e.source_uri in FAKE_SOURCES:
+            truth = FAKE_SOURCES[e.source_uri]
+            if e.content != truth:
+                findings.append((e.id, f&quot;mismatch with {e.source_uri}: fetched text was {truth!r}&quot;))
+    return findings
+
+
+def run_without_verifier() -&gt; None:
+    print(&quot;=&quot; * 72)
+    print(&quot;RUN 1 — no verifier; hallucination propagates&quot;)
+    print(&quot;=&quot; * 72)
+    pool = MessagePool()
+    retrieval_agent(pool, &quot;https://arxiv.org/paper-1&quot;, hallucinate=True)
+    summarizer_agent(pool)
+    analyst_agent(pool)
+    for e in pool.read_all():
+        print(f&quot;  [{e.id}] {e.writer:11s} ({e.prompt_hash}) :: {e.content}&quot;)
+    print(&quot;\nfinal report uses hallucinated 42% figure; no alarm raised.&quot;)
+
+
+def run_with_verifier() -&gt; None:
+    print(&quot;\n&quot; + &quot;=&quot; * 72)
+    print(&quot;RUN 2 — read-only verifier re-fetches sources and flags&quot;)
+    print(&quot;=&quot; * 72)
+    pool = MessagePool()
+    retrieval_agent(pool, &quot;https://arxiv.org/paper-1&quot;, hallucinate=True)
+    summarizer_agent(pool)
+    findings = verifier_agent(pool)
+    for eid, reason in findings:
+        pool.flag(eid, reason)
+    analyst_agent(pool)
+
+    for e in pool.read_all():
+        flag_str = f&quot; [FLAGGED: {&#39;; &#39;.join(e.flags)}]&quot; if e.flags else &quot;&quot;
+        print(f&quot;  [{e.id}] {e.writer:11s} ({e.prompt_hash}) :: {e.content}{flag_str}&quot;)
+    if findings:
+        print(f&quot;\nverifier surfaced {len(findings)} inconsistency. downstream agents can suppress the verdict.&quot;)
+
+
+def demo_blackboard() -&gt; None:
+    print(&quot;\n&quot; + &quot;=&quot; * 72)
+    print(&quot;BLACKBOARD DEMO — topic-keyed pub/sub, not every agent reads everything&quot;)
+    print(&quot;=&quot; * 72)
+    bb = Blackboard()
+    received = {&quot;prices&quot;: [], &quot;alerts&quot;: []}
+
+    def on_prices(e: ProvenanceEntry) -&gt; None:
+        received[&quot;prices&quot;].append(e.id)
+
+    def on_alerts(e: ProvenanceEntry) -&gt; None:
+        received[&quot;alerts&quot;].append(e.id)
+
+    bb.subscribe(&quot;prices&quot;, on_prices)
+    bb.subscribe(&quot;alerts&quot;, on_alerts)
+
+    bb.publish(&quot;scraper-1&quot;, &quot;prices&quot;, &quot;AAPL=192.4&quot;, &quot;poll market&quot;)
+    bb.publish(&quot;scraper-2&quot;, &quot;prices&quot;, &quot;MSFT=401.2&quot;, &quot;poll market&quot;)
+    bb.publish(&quot;risk-engine&quot;, &quot;alerts&quot;, &quot;ALERT: AAPL moved &gt;2% in 60s&quot;, &quot;watch prices&quot;)
+
+    print(f&quot;  price subscribers got ids: {received[&#39;prices&#39;]}&quot;)
+    print(f&quot;  alert subscribers got ids: {received[&#39;alerts&#39;]}&quot;)
+    print(&quot;  (note: price subscribers never saw the alert; that is the point)&quot;)
+
+
+def main() -&gt; None:
+    run_without_verifier()
+    run_with_verifier()
+    demo_blackboard()
+    print(&quot;\nTakeaways:&quot;)
+    print(&quot;  1. shared state without provenance launders hallucinations into downstream reasoning&quot;)
+    print(&quot;  2. a read-only verifier with independent source access catches memory poisoning&quot;)
+    print(&quot;  3. a blackboard scales past a full pool because agents only read what they subscribe to&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/16-multi-agent-and-swarms/13-shared-memory-blackboard/outputs/skill-memory-auditor.md">phases/16-multi-agent-and-swarms/13-shared-memory-blackboard/outputs/skill-memory-auditor.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: memory-auditor
+description: Audit a multi-agent system&#39;s shared-memory design for provenance, versioning, verifier separation, and projection schema. Flag memory-poisoning exposure before production.
+version: 1.0.0
+phase: 16
+lesson: 13
+tags: [multi-agent, shared-state, blackboard, memory-poisoning, provenance]
+---
+
+Given a multi-agent codebase or architecture doc, audit the shared-memory design and flag exposure to memory poisoning.
+
+Produce:
+
+1. **Topology.** Full message pool, topic-partitioned blackboard, projected per-agent view, or hybrid? Name the data structure (list, dict, pandas frame, vector store, SQL table). Count rough upper bound of writers and readers at steady state.
+2. **Provenance fields.** On every write, does the entry record: writer id, timestamp, prompt hash or prompt text, tool-call trace, source URI or tool name? List the fields present and the fields missing.
+3. **Update model.** Is the log append-only, or do writers mutate in place? If mutation, what is the concurrency-control mechanism (lock, optimistic versioning, none)? Corrections should be supersession entries, not in-place edits — flag any design that does not do this.
+4. **Verifier separation.** Is there a read-only agent with independent source access? Can it write to the main pool (it should not)? Where does its output go?
+5. **Projection schema.** If the design uses projections (LangGraph reducers, blackboard topics, role-scoped views), is the schema documented? How do new agents declare the projection they consume?
+6. **Poisoning risk score.** Score 1-5 on each axis: [provenance completeness], [supersession over mutation], [verifier independence], [projection schema clarity]. A system that scores below 3 on any axis is flagged.
+
+Hard rejects:
+
+- Any audit that does not flag a missing verifier. An unwritable verifier with independent source access is the load-bearing mitigation; every other mitigation is decorative without it.
+- Audits that recommend &quot;add more tests.&quot; Tests do not catch memory poisoning because poisoning produces plausible outputs that pass tests.
+- Audits that recommend hashing the content as the sole provenance. A hash tells you *what* was written, not *who* or *from where*.
+
+Refusal rules:
+
+- If the codebase hides shared state in an external service (Redis, Postgres, vector DB) with no inspection tools, state that the audit cannot complete without production read access.
+- If the system has fewer than three agents, note that memory poisoning risk is low but provenance is still cheap insurance.
+- If the system uses a framework with built-in state management (LangGraph checkpointer, AutoGen pool), audit the framework&#39;s guarantees rather than re-deriving them.
+
+Output: a two-page report. Start with a one-sentence summary (&quot;Shared state is a full message pool with no provenance and no verifier — high poisoning risk.&quot;), then the six sections above. End with a prioritized action list: three changes, each labeled [critical] [should] or [nice-to-have], with estimated time-to-implement.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原课程未提供测验。</p></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/16-multi-agent-and-swarms/12-a2a-protocol/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/16-multi-agent-and-swarms/14-consensus-and-bft/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/16-multi-agent-and-swarms/13-shared-memory-blackboard/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

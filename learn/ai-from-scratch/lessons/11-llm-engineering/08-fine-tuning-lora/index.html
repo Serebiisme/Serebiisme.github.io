@@ -1,0 +1,1852 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>精细调节与LoRA和QLoRA · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-11-llm-engineering" data-lesson="11-llm-engineering/08-fine-tuning-lora" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/11-llm-engineering/">大语言模型工程</a> / LESSON 08</p><h1 class="lesson-title">精细调节与LoRA和QLoRA</h1><p>Fine-Tuning with LoRA &amp; QLoRA</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>精细调节与LoRA和QLoRA</h1>
+<blockquote>
+<p>完全调整7B模型需要56GB的VRAM.你没有.大多数公司也不会.LoRA允许你通过训练不到1%的参数来调整6GB的模型.这不是妥协 - - 它与大多数任务的完整调整质量相匹配.整个开源调整生态系统都运行在这个技巧上.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 10, Lesson 06 (Instruction Tuning / SFT)
+<strong>Time:</strong> ~75 minutes
+**Related:**第十阶段将从零开始涵盖SFT/DPO循环. 本课程将这些循环连接到2026年PEFT工具包中 (PEFT,TRL,Unsloth,Axolotl,LLaMA-Factory).</p>
+<h2>学习目标</h2>
+<ul>
+<li>通过注入低级适配器矩阵 (A和B) 进入预训练模型的注意力层来实现LoRA</li>
+<li>计算LoRA对完全微调的参数节省:r级别与d_模型尺寸列车2<em>r</em>d参数而不是d2</li>
+<li>使用QLoRA (4位量化基 + LoRA适配器) 调整模型,以适应消费者GPU内存</li>
+<li>将LoRA重量重新融入部署的基模型,并将推断速度与无适配器进行比较</li>
+</ul>
+<h2>问题</h2>
+<p>你有一个基本模型,Llama3 8B. 你希望它能用公司的声音回答客户支持票.SFT是答案.但SFT有成本问题.</p>
+<p>完全细调更新模型中的每个参数.Llama 3 8B 有800亿参数.在fp16中,每个参数需要2字节.这仅仅是16GB来加载重量.在训练期间,你还需要梯度 (16GB),优化状态为Adam (32GB为动力 +变量),以及激活.总数:大约56GB的VRAM为单个8B模型.</p>
+<p>一个A10080GB几乎不能容纳这两款A100的价格.<span class="katex"><span class="katex-mathml"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>3</mn><mo>−</mo><mn>4</mn><mi mathvariant="normal">/</mi><mi>h</mi><mi>o</mi><mi>u</mi><mi>r</mi><mi>o</mi><mi>n</mi><mi>c</mi><mi>l</mi><mi>o</mi><mi>u</mi><mi>d</mi><mi>p</mi><mi>r</mi><mi>o</mi><mi>v</mi><mi>i</mi><mi>d</mi><mi>e</mi><mi>r</mi><mi>s</mi><mi mathvariant="normal">.</mi><mi>T</mi><mi>r</mi><mi>a</mi><mi>i</mi><mi>n</mi><mi>i</mi><mi>n</mi><mi>g</mi><mi>f</mi><mi>o</mi><mi>r</mi><mn>3</mn><mi>e</mi><mi>p</mi><mi>o</mi><mi>c</mi><mi>h</mi><mi>s</mi><mi>o</mi><mi>n</mi><mn>50</mn><mo separator="true">,</mo><mn>000</mn><mi>e</mi><mi>x</mi><mi>a</mi><mi>m</mi><mi>p</mi><mi>l</mi><mi>e</mi><mi>s</mi><mi>t</mi><mi>a</mi><mi>k</mi><mi>e</mi><mi>s</mi><mn>6</mn><mo>−</mo><mn>10</mn><mi>h</mi><mi>o</mi><mi>u</mi><mi>r</mi><mi>s</mi><mi mathvariant="normal">.</mi><mi>T</mi><mi>h</mi><mi>a</mi><msup><mi>t</mi><mo mathvariant="normal" lspace="0em" rspace="0em">′</mo></msup><mi>s</mi></mrow><annotation encoding="application/x-tex">3-4/hour on cloud providers. Training for 3 epochs on 50,000 examples takes 6-10 hours. That&#x27;s </annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="katex-base"><span class="katex-strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">3</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="katex-base"><span class="katex-strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">4/</span><span class="mord mathnormal">h</span><span class="mord mathnormal">o</span><span class="mord mathnormal">u</span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="mord mathnormal">o</span><span class="mord mathnormal">n</span><span class="mord mathnormal">c</span><span class="mord mathnormal" style="margin-right:0.0197em;">l</span><span class="mord mathnormal">o</span><span class="mord mathnormal">u</span><span class="mord mathnormal">d</span><span class="mord mathnormal">p</span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="mord mathnormal">o</span><span class="mord mathnormal" style="margin-right:0.0359em;">v</span><span class="mord mathnormal">i</span><span class="mord mathnormal">d</span><span class="mord mathnormal" style="margin-right:0.0278em;">er</span><span class="mord mathnormal">s</span><span class="mord">.</span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="mord mathnormal">ainin</span><span class="mord mathnormal" style="margin-right:0.0359em;">g</span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="mord mathnormal" style="margin-right:0.0278em;">or</span><span class="mord">3</span><span class="mord mathnormal">e</span><span class="mord mathnormal">p</span><span class="mord mathnormal">oc</span><span class="mord mathnormal">h</span><span class="mord mathnormal">so</span><span class="mord mathnormal">n</span><span class="mord">50</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">000</span><span class="mord mathnormal">e</span><span class="mord mathnormal">x</span><span class="mord mathnormal">am</span><span class="mord mathnormal" style="margin-right:0.0197em;">pl</span><span class="mord mathnormal">es</span><span class="mord mathnormal">t</span><span class="mord mathnormal" style="margin-right:0.0315em;">ak</span><span class="mord mathnormal">es</span><span class="mord">6</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="katex-base"><span class="katex-strut" style="height:0.7519em;"></span><span class="mord">10</span><span class="mord mathnormal">h</span><span class="mord mathnormal">o</span><span class="mord mathnormal">u</span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="mord mathnormal">s</span><span class="mord">.</span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="mord mathnormal">ha</span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.7519em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="katex-sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">′</span></span></span></span></span></span></span></span></span><span class="mord mathnormal">s</span></span></span></span>试验每次30-40次,试验10次,以获得超参数的正确性,</p>
+<p>只有重量,需要一个集群,每次实验100美元以上.</p>
+<p>现在,我们需要一个更深层次的问题. 完整的细节调整改变了模型的每一个重量. 如果你细节调整了客户支持数据,你可能会降低模型的一般能力. 这被称为灾难性忘记. 模型在你的任务上变得更好,而其他事情上变得更糟.</p>
+<p>你需要一种训练少参数,使用少记忆,</p>
+<h2>概念</h2>
+<h3>低级调整</h3>
+<p>微软的爱德华·胡和同事于2021年6月发布了LoRA.论文的见解是:细调过程中的权重更新具有低内在等级.你不需要更新4096x4096权重矩阵中的所有1670万参数.更新中的有用信息可以通过16或32等级的矩阵捕获.</p>
+<p>标准线性层计算:</p>
+<pre><code>y = Wx
+</code></pre>
+<p>在 W 是 d_out x d_in 矩阵.为4096x4096的注意力投影,这是16777,216参数.</p>
+<p>洛拉结W并添加低级分解:</p>
+<pre><code>y = Wx + BAx
+</code></pre>
+<p>在B是 (d_out x r) 和A是 (r x d_in) 的位置 r 比d小得多 - 通常是8,16或32</p>
+<p>对于4096x4096层的 r=16:</p>
+<ul>
+<li>基本参数:4096 x 4096 = 16,777,216</li>
+<li>低温率参数: (4096 x 16) + (16 x 4096) = 65,536 + 65,536 = 131,072</li>
+<li>减少:131,072 / 16,777,216 = 0.78%</li>
+</ul>
+<p>你训练0.78%的参数,得到95%-100%的质量.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-016f890f80957f53f713.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>A是随机高斯人初始化. B是初始化到零.这意味着LoRA贡献从零开始 - - 模型从原始行为开始训练,并逐渐学习适应.</p>
+<h3>规模因素:阿尔法</h3>
+<p>洛拉引入了扩展因子alpha,它控制了低级更新对输出的影响:</p>
+<pre><code>y = Wx + (alpha / r) * BAx
+</code></pre>
+<p>当alpha=r时,规模为1x.当alpha=2r (常见默认) 时,规模为2x.这个超参数独立于基础学习率控制了LoRA路径的学习速度.</p>
+<p>实际指导:</p>
+<ul>
+<li>位是一个常见的社区公约 (原始使用的论文是位在大多数实验中)</li>
+<li>率为1x的规模,保守但稳定</li>
+<li>高级alpha意味着每步的更新更大,这可以加速化或导致不稳定性</li>
+</ul>
+<h3>适用Lora的地点</h3>
+<p>变压器有很多线性层,你不需要把LoRA添加到它们所有.原始的纸质测试了不同的组合:</p>
+<table>
+<thead>
+<tr>
+<th>Target Layers</th>
+<th>Trainable Params (7B)</th>
+<th>Quality</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>q_proj only</td>
+<td>4.7M</td>
+<td>Good</td>
+</tr>
+<tr>
+<td>q_proj + v_proj</td>
+<td>9.4M</td>
+<td>Better</td>
+</tr>
+<tr>
+<td>q_proj + k_proj + v_proj + o_proj</td>
+<td>18.9M</td>
+<td>Best for attention</td>
+</tr>
+<tr>
+<td>All linear (attention + MLP)</td>
+<td>37.7M</td>
+<td>Marginal gain, 2x params</td>
+</tr>
+</tbody>
+</table>
+<p>对于大多数任务的甜点点:q_proj + v_proj. 这针对查询和值预测,以自我注意,这些预测控制模型所关注的内容和它提取的信息.添加MLP层有助于复杂的任务,如代码生成,但对更简单的任务减少回报的参数数量增加了一倍.</p>
+<h3>排名选择</h3>
+<p>级r控制了适应的表达性:</p>
+<table>
+<thead>
+<tr>
+<th>Rank</th>
+<th>Trainable Params (per layer)</th>
+<th>Best For</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>4</td>
+<td>32,768</td>
+<td>Simple classification, sentiment</td>
+</tr>
+<tr>
+<td>8</td>
+<td>65,536</td>
+<td>Single-domain Q&amp;A, summarization</td>
+</tr>
+<tr>
+<td>16</td>
+<td>131,072</td>
+<td>Multi-domain tasks, instruction following</td>
+</tr>
+<tr>
+<td>32</td>
+<td>262,144</td>
+<td>Complex reasoning, code generation</td>
+</tr>
+<tr>
+<td>64</td>
+<td>524,288</td>
+<td>Diminishing returns for most tasks</td>
+</tr>
+<tr>
+<td>128</td>
+<td>1,048,576</td>
+<td>Rarely justified</td>
+</tr>
+</tbody>
+</table>
+<p>胡等人表明,r=4已经捕获了对简单任务的适应大部分.r=8和r=16是实践中最常见的选择.超越r=64很少改善质量,并开始失去LoRA的记忆优势.</p>
+<h3>定量:4位量化+LORA</h3>
+<p>蒂姆·德特默斯和华盛顿大学的同事在2023年5月发表了QLoRA. 想法是:将冷基模型量化到4位精度,然后将LoRA适配器附在fp16上方.</p>
+<p>这会显著改变记忆方程:</p>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Weight Memory (7B)</th>
+<th>Training Memory (7B)</th>
+<th>GPU Required</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Full fine-tune (fp16)</td>
+<td>14GB</td>
+<td>~56GB</td>
+<td>1x A100 80GB</td>
+</tr>
+<tr>
+<td>LoRA (fp16 base)</td>
+<td>14GB</td>
+<td>~18GB</td>
+<td>1x A100 40GB</td>
+</tr>
+<tr>
+<td>QLoRA (4-bit base)</td>
+<td>3.5GB</td>
+<td>~6GB</td>
+<td>1x RTX 3090 24GB</td>
+</tr>
+</tbody>
+</table>
+<p>洛拉提供了三个技术贡献:</p>
+<p>**NF4 (Normal Float 4-bit)**网络重量遵循基本正常分布.NF4将其16个量化水平定位在标准正常分布的量化值.这是通常分布的数据的信息理论上最佳.它损失的信息比统一的4位量化 (INT4) 或标准 Float4少.</p>
+<p><strong>Double quantization</strong>量子定位本身需要记忆.每块64重量需要fp32尺度因子 (4字节).对于7B模型,这是额外的0.4GB.双量子定位将这些定位量化为fp8,降低上空成本到0.1GB.小但它加起来.</p>
+<p><strong>Paged optimizers</strong>训练期间,优化器状态 (亚当的动力和变异) 在长序列上可以超过GPU内存.页面优化器使用NVIDIA的统一内存,在GPU内存耗尽时自动将优化器状态转到CPU RAM上,并在需要时将它们转页.这以免OOM失败以牺牲一些吞吐量.</p>
+<h3>质量问题</h3>
+<p>减少参数或量化基数是否会损害质量?</p>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>MMLU (5-shot)</th>
+<th>MT-Bench</th>
+<th>HumanEval</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Full fine-tune (Llama 2 7B)</td>
+<td>48.3</td>
+<td>6.72</td>
+<td>14.6</td>
+</tr>
+<tr>
+<td>LoRA r=16</td>
+<td>47.9</td>
+<td>6.68</td>
+<td>14.0</td>
+</tr>
+<tr>
+<td>QLoRA r=16 (NF4)</td>
+<td>47.5</td>
+<td>6.61</td>
+<td>13.4</td>
+</tr>
+<tr>
+<td>QLoRA r=64 (NF4)</td>
+<td>48.1</td>
+<td>6.70</td>
+<td>14.2</td>
+</tr>
+</tbody>
+</table>
+<p>在大多数基准值上,R=16的LoRA在1%内.R=16的QLoRA损失了另一个百分比.R=64的QLoRA基本上与完全的细调匹配,同时使用90%的内存.</p>
+<h3>实际成本</h3>
+<p>精细调节Llama 3 8B50000个样本 (3个时代):</p>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>GPU</th>
+<th>Time</th>
+<th>Cost</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Full fine-tune</td>
+<td>2x A100 80GB</td>
+<td>8 hours</td>
+<td>~$32</td>
+</tr>
+<tr>
+<td>LoRA r=16</td>
+<td>1x A100 40GB</td>
+<td>4 hours</td>
+<td>~$8</td>
+</tr>
+<tr>
+<td>QLoRA r=16</td>
+<td>1x RTX 4090 24GB</td>
+<td>6 hours</td>
+<td>~$5</td>
+</tr>
+<tr>
+<td>QLoRA r=16 (Unsloth)</td>
+<td>1x RTX 4090 24GB</td>
+<td>2.5 hours</td>
+<td>~$2</td>
+</tr>
+<tr>
+<td>QLoRA r=16</td>
+<td>1x T4 16GB</td>
+<td>12 hours</td>
+<td>~$4</td>
+</tr>
+</tbody>
+</table>
+<p>单个消费者GPU上的QLoRA成本低于午餐.这就是为什么开放权重细调社区在2023年爆炸,以及为什么每一个低于QLoRA的培训框架都会在2026年默认地将QLoRA发送.</p>
+<h3>根据&quot;2026年&quot;的标准,</h3>
+<table>
+<thead>
+<tr>
+<th>Framework</th>
+<th>What it is</th>
+<th>Pick when</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Hugging Face PEFT</strong></td>
+<td>The canonical LoRA/QLoRA/DoRA/IA3 library</td>
+<td>You want raw control and your training loop is already on <code>transformers.Trainer</code></td>
+</tr>
+<tr>
+<td><strong>TRL</strong></td>
+<td>HF's reinforcement-from-feedback trainers (SFT, DPO, GRPO, PPO, ORPO)</td>
+<td>You need DPO/GRPO after SFT; built on top of PEFT</td>
+</tr>
+<tr>
+<td><strong>Unsloth</strong></td>
+<td>Triton-kernel rewrite of the forward/backward pass</td>
+<td>You want 2-5x speedup + half the VRAM with no accuracy loss; Llama/Mistral/Qwen family</td>
+</tr>
+<tr>
+<td><strong>Axolotl</strong></td>
+<td>YAML-config wrapper over PEFT + TRL + DeepSpeed + Unsloth</td>
+<td>You want reproducible, version-controlled training runs</td>
+</tr>
+<tr>
+<td><strong>LLaMA-Factory</strong></td>
+<td>GUI/CLI/API over PEFT + TRL</td>
+<td>You want zero-code fine-tuning; 100+ model families supported</td>
+</tr>
+<tr>
+<td><strong>torchtune</strong></td>
+<td>Native PyTorch recipes, no <code>transformers</code> dep</td>
+<td>You want minimal deps and your org already standardizes on PyTorch</td>
+</tr>
+</tbody>
+</table>
+<p>基本规则:研究使用或一次性实验 → PEFT.可重复生产管道 → 无核启用的Axolotl.抛弃原型 → LLaMA-工厂.</p>
+<h3>融合适配器</h3>
+<p>训练后,你有两个东西:结的基模型和一个小的LoRA适配器 (通常是10-100MB).</p>
+<ol>
+<li>
+<p><strong>Keep them separate</strong>根据本模型的定义,您可以使用一个模型的多个细调变体.</p>
+</li>
+<li>
+<p><strong>Merge them permanently</strong>计算W' =W + (alpha/r) *BA,并将结果保存为新的完整模型. 合并模型与原始相同的尺寸. 没有推断费用. 没有适配器可管理.</p>
+</li>
+</ol>
+<p>为了完成多项任务 (客户支持适配器,代码适配器,翻译适配器),将它们分开.</p>
+<p>复合多个适配器的先进合并技术:</p>
+<ul>
+<li><strong>TIES-Merging</strong>达夫及其他2023年: 切除小幅参数,解决信号冲突,然后合并.减少适配器之间的干扰.</li>
+<li><strong>DARE</strong>和其他2023年:在合并之前随机降低适配器参数,然后重新扩展其余.</li>
+<li><strong>Task arithmetic</strong>简单地添加或减去适配器重量.添加&quot;代码&quot;适配器和&quot;数学&quot;适配器通常会产生一个模型在两者都很好.</li>
+</ul>
+<h3>什么时候不调整</h3>
+<p>调整是第三种选择,不是第一个.</p>
+<p>**First: prompt engineering.**写一个更好的系统提示,添加几个拍摄的例子,使用链接思考. 这不花费什么,需要几分钟. 如果提示让你达到80%的路径,你可能不需要调整.</p>
+<p>**Second: RAG.**如果模型需要了解您的具体数据 (文件,知识库,产品目录),则检索比成权重更便宜,更可维护.</p>
+<p>**Third: fine-tuning.**需要模型采用特定的风格,格式或推理模式,但不能通过提示实现.需要一致的结构化输出.需要将更大的模型化为更小的模型. 延迟重要,并且您无法承担一些投篮提示的额外代币.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-f50f535ac9477f0a866d.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><figure><img src="/learn/ai-from-scratch/figures/figure-3111887106acc6e8ebd7.png" alt="lora-params 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<p>我们将LoRA从零开始运用纯PyTorch,没有图书馆,没有魔法. 你将构建LoRA层,注入模型中,训练它,并将重量重新合并.</p>
+<h3>第一个步骤:洛拉层</h3>
+<pre><code class="language-python">import torch
+import torch.nn as nn
+import math
+
+class LoRALayer(nn.Module):
+    def __init__(self, in_features, out_features, rank=8, alpha=16):
+        super().__init__()
+        self.rank = rank
+        self.alpha = alpha
+        self.scaling = alpha / rank
+
+        self.A = nn.Parameter(torch.randn(in_features, rank) * (1 / math.sqrt(rank)))
+        self.B = nn.Parameter(torch.zeros(rank, out_features))
+
+    def forward(self, x):
+        return (x @ self.A @ self.B) * self.scaling
+</code></pre>
+<p>产品BA从零开始,所以模型从其原始行为开始.</p>
+<h3>步骤2:LoRA绕线性层</h3>
+<pre><code class="language-python">class LinearWithLoRA(nn.Module):
+    def __init__(self, linear, rank=8, alpha=16):
+        super().__init__()
+        self.linear = linear
+        self.lora = LoRALayer(
+            linear.in_features, linear.out_features, rank, alpha
+        )
+
+        for param in self.linear.parameters():
+            param.requires_grad = False
+
+    def forward(self, x):
+        return self.linear(x) + self.lora(x)
+</code></pre>
+<p>只有LoRA参数 (A和B) 才能进行训练.</p>
+<h3>步骤3:将LoRA注入模型中</h3>
+<pre><code class="language-python">def inject_lora(model, target_modules, rank=8, alpha=16):
+    for param in model.parameters():
+        param.requires_grad = False
+
+    lora_layers = {}
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear):
+            if any(t in name for t in target_modules):
+                parent_name = &quot;.&quot;.join(name.split(&quot;.&quot;)[:-1])
+                child_name = name.split(&quot;.&quot;)[-1]
+                parent = dict(model.named_modules())[parent_name]
+                lora_linear = LinearWithLoRA(module, rank, alpha)
+                setattr(parent, child_name, lora_linear)
+                lora_layers[name] = lora_linear
+    return lora_layers
+</code></pre>
+<p>首先,结模型中的每个参数.然后走在模型树上,找到符合目标名称的线性层,并用LoRA包装版本取代它们.LoRA A和B矩阵是整个模型中的唯一可训练的参数.</p>
+<h3>步骤 4: 计算参数</h3>
+<pre><code class="language-python">def count_parameters(model):
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    frozen = total - trainable
+    return {
+        &quot;total&quot;: total,
+        &quot;trainable&quot;: trainable,
+        &quot;frozen&quot;: frozen,
+        &quot;trainable_pct&quot;: 100 * trainable / total if total &gt; 0 else 0
+    }
+</code></pre>
+<h3>步骤5:重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量重量</h3>
+<pre><code class="language-python">def merge_lora_weights(model):
+    for name, module in model.named_modules():
+        if isinstance(module, LinearWithLoRA):
+            with torch.no_grad():
+                merged = (
+                    module.lora.A @ module.lora.B
+                ) * module.lora.scaling
+                module.linear.weight.data += merged.T
+            parent_name = &quot;.&quot;.join(name.split(&quot;.&quot;)[:-1])
+            child_name = name.split(&quot;.&quot;)[-1]
+            if parent_name:
+                parent = dict(model.named_modules())[parent_name]
+            else:
+                parent = model
+            setattr(parent, child_name, module.linear)
+</code></pre>
+<p>合并后,LoRA层消失了.模型与原始尺寸相同,适应量被烤成重量.</p>
+<h3>步骤 6:模拟QLoRA量化</h3>
+<pre><code class="language-python">def quantize_to_nf4(tensor, block_size=64):
+    blocks = tensor.reshape(-1, block_size)
+    scales = blocks.abs().max(dim=1, keepdim=True).values / 7.0
+    scales = torch.clamp(scales, min=1e-8)
+    quantized = torch.round(blocks / scales).clamp(-8, 7).to(torch.int8)
+    return quantized, scales
+
+def dequantize_from_nf4(quantized, scales, original_shape):
+    dequantized = quantized.float() * scales
+    return dequantized.reshape(original_shape)
+</code></pre>
+<p>这通过在64个块内映射权重为16个分离层次进行4位量化.</p>
+<h3>七步:训练循环</h3>
+<pre><code class="language-python">def train_lora(model, data, epochs=5, lr=1e-3, batch_size=4):
+    optimizer = torch.optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad], lr=lr
+    )
+    criterion = nn.MSELoss()
+
+    losses = []
+    for epoch in range(epochs):
+        epoch_loss = 0.0
+        n_batches = 0
+        indices = torch.randperm(len(data[&quot;inputs&quot;]))
+
+        for i in range(0, len(indices), batch_size):
+            batch_idx = indices[i:i + batch_size]
+            x = data[&quot;inputs&quot;][batch_idx]
+            y = data[&quot;targets&quot;][batch_idx]
+
+            output = model(x)
+            loss = criterion(output, y)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            epoch_loss += loss.item()
+            n_batches += 1
+
+        avg_loss = epoch_loss / n_batches
+        losses.append(avg_loss)
+
+    return losses
+</code></pre>
+<h3>步骤8:完整的演示</h3>
+<pre><code class="language-python">def demo():
+    torch.manual_seed(42)
+    d_model = 256
+    n_classes = 10
+
+    model = nn.Sequential(
+        nn.Linear(d_model, 512),
+        nn.ReLU(),
+        nn.Linear(512, 512),
+        nn.ReLU(),
+        nn.Linear(512, n_classes),
+    )
+
+    n_samples = 500
+    x = torch.randn(n_samples, d_model)
+    y = torch.randint(0, n_classes, (n_samples,))
+    y_onehot = torch.zeros(n_samples, n_classes).scatter_(1, y.unsqueeze(1), 1.0)
+
+    data = {&quot;inputs&quot;: x, &quot;targets&quot;: y_onehot}
+
+    params_before = count_parameters(model)
+
+    lora_layers = inject_lora(
+        model, target_modules=[&quot;0&quot;, &quot;2&quot;], rank=8, alpha=16
+    )
+
+    params_after = count_parameters(model)
+
+    losses = train_lora(model, data, epochs=20, lr=1e-3)
+
+    merge_lora_weights(model)
+    params_merged = count_parameters(model)
+
+    return {
+        &quot;params_before&quot;: params_before,
+        &quot;params_after&quot;: params_after,
+        &quot;params_merged&quot;: params_merged,
+        &quot;losses&quot;: losses,
+    }
+</code></pre>
+<p>演示程序创建了一个小模型,将LoRA注入两个层,训练它,并将重量重新合并.参数数数从完全可训练到LoRA训练期间可训练的 ~ 1%,然后在合并后返回原始架构.</p>
+<h2>用它</h2>
+<p>通过拥抱面孔生态系统, LoRA在一个真正的模型上需要大约20条线:</p>
+<pre><code class="language-python">from transformers import AutoModelForCausalLM, AutoTokenizer
+from peft import LoraConfig, get_peft_model, TaskType
+
+model = AutoModelForCausalLM.from_pretrained(&quot;meta-llama/Llama-3.1-8B&quot;)
+tokenizer = AutoTokenizer.from_pretrained(&quot;meta-llama/Llama-3.1-8B&quot;)
+
+lora_config = LoraConfig(
+    task_type=TaskType.CAUSAL_LM,
+    r=16,
+    lora_alpha=32,
+    lora_dropout=0.05,
+    target_modules=[&quot;q_proj&quot;, &quot;v_proj&quot;],
+)
+
+model = get_peft_model(model, lora_config)
+model.print_trainable_parameters()
+</code></pre>
+<p>对于QLoRA,添加位和字节量化:</p>
+<pre><code class="language-python">from transformers import BitsAndBytesConfig
+
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type=&quot;nf4&quot;,
+    bnb_4bit_compute_dtype=torch.bfloat16,
+    bnb_4bit_use_double_quant=True,
+)
+
+model = AutoModelForCausalLM.from_pretrained(
+    &quot;meta-llama/Llama-3.1-8B&quot;,
+    quantization_config=bnb_config,
+    device_map=&quot;auto&quot;,
+)
+
+model = get_peft_model(model, lora_config)
+</code></pre>
+<p>基本模型现在是4位,LoRA适配器是Fp16的,整个东西都适合6GB.</p>
+<p>为了接受接受面部训练:</p>
+<pre><code class="language-python">from transformers import TrainingArguments, Trainer
+from datasets import load_dataset
+
+dataset = load_dataset(&quot;tatsu-lab/alpaca&quot;, split=&quot;train[:5000]&quot;)
+
+training_args = TrainingArguments(
+    output_dir=&quot;./lora-llama&quot;,
+    num_train_epochs=3,
+    per_device_train_batch_size=4,
+    gradient_accumulation_steps=4,
+    learning_rate=2e-4,
+    fp16=True,
+    logging_steps=10,
+    save_strategy=&quot;epoch&quot;,
+    optim=&quot;paged_adamw_8bit&quot;,
+)
+
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=dataset,
+)
+
+trainer.train()
+
+model.save_pretrained(&quot;./lora-adapter&quot;)
+</code></pre>
+<p>保存的适配器为10-100MB. 基模型保持不变. 在拥抱面孔中心可以分享适配器,而不需要重新分配完整的模型.</p>
+<h2>运送它</h2>
+<p>这一课产生了:</p>
+<ul>
+<li><code>outputs/prompt-lora-advisor.md</code>-- 提示帮助您决定您的特定任务的 LoRA 排名,目标模块和超参数</li>
+<li><code>outputs/skill-fine-tuning-guide.md</code>能教导代理人如何做出决定,</li>
+</ul>
+<h2>运动</h2>
+<ol>
+<li>
+<p>**Rank ablation study.**运行排名 2, 4, 8, 16, 32, 和 64 的演示. 绘制最终损失与排名. 找到减少回报的点,在排名的翻倍不再减半损失.对于256维特征的简单分类任务,这应该是约r=8-16.</p>
+</li>
+<li>
+<p>**Target module comparison.**修改Inject_lora以仅针对层 &quot;0&quot;,仅针对层 &quot;2&quot;,仅针对层 &quot;4&quot;,以及所有三个.训练每个变体20个时代.比较缩速度和最终损失.这反映了针对 q_proj vs v_proj vs 所有线性层的真实决定.</p>
+</li>
+<li>
+<p>**Quantization error analysis.**计算中方误差,最大绝对误差,以及原始和重复的关系.使用 block_size值的 32, 64, 128 和 256 进行实验.</p>
+</li>
+<li>
+<p>**Multi-adapter serving.**训练两个LoRA适配器在不同的数据子集 (即使是指数与奇数指数).保存两个适配器.一次加载基模型,然后交换适配器,并验证每个输出都在同一输入上产生不同的输出. 这就是生产系统从一个基点服务多个细调模型的方式.</p>
+</li>
+<li>
+<p>**Merge vs. unmerged inference.**根据 LoRA 模型的输出,在同一100个输入中,并列_lora_weights之前和之后的输出量进行比较. 检查输出量相同 (在浮点容忍度为1e-5) 然后对两个 - 合并的推断速度应该略快,因为它是单个矩阵乘以而不是两个.</p>
+</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>LoRA</td>
+<td>&quot;Efficient fine-tuning&quot;</td>
+<td>Low-Rank Adaptation: freeze base weights, train two small matrices A and B whose product approximates the full weight update</td>
+</tr>
+<tr>
+<td>QLoRA</td>
+<td>&quot;Fine-tune on a laptop&quot;</td>
+<td>Quantized LoRA: load the base model in 4-bit NF4, train LoRA adapters in fp16 on top, enabling 7B fine-tuning in 6GB VRAM</td>
+</tr>
+<tr>
+<td>Rank (r)</td>
+<td>&quot;How much the model can learn&quot;</td>
+<td>The inner dimension of the A and B matrices; controls expressiveness vs. parameter count</td>
+</tr>
+<tr>
+<td>Alpha</td>
+<td>&quot;LoRA learning rate&quot;</td>
+<td>Scaling factor applied to the LoRA output; alpha/r scales the adaptation's contribution to the final output</td>
+</tr>
+<tr>
+<td>NF4</td>
+<td>&quot;4-bit quantization&quot;</td>
+<td>Normal Float 4: a 4-bit data type with quantization levels at normal distribution quantiles, optimal for neural network weights</td>
+</tr>
+<tr>
+<td>Adapter</td>
+<td>&quot;The small trained part&quot;</td>
+<td>The LoRA A and B matrices saved as a separate file (10-100MB), loadable on top of any copy of the base model</td>
+</tr>
+<tr>
+<td>Target modules</td>
+<td>&quot;Which layers to LoRA&quot;</td>
+<td>The specific linear layers (q_proj, v_proj, etc.) where LoRA adapters are injected</td>
+</tr>
+<tr>
+<td>Merging</td>
+<td>&quot;Bake it in&quot;</td>
+<td>Computing W + (alpha/r) * BA and replacing the original weight, eliminating the adapter overhead at inference</td>
+</tr>
+<tr>
+<td>Paged optimizers</td>
+<td>&quot;Don't OOM during training&quot;</td>
+<td>Offloading optimizer states (Adam momentum, variance) to CPU when GPU memory is exhausted</td>
+</tr>
+<tr>
+<td>Catastrophic forgetting</td>
+<td>&quot;Fine-tuning broke everything else&quot;</td>
+<td>When updating all weights causes the model to lose previously learned capabilities</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li>胡等人&quot;,LoRA:大语言模型的低级适应 (2021) &quot;--原稿介绍了低级分解方法,在GPT-3 175B上测试,级别低于4</li>
+<li>德特默斯等人&quot;,QLoRA:量化语言模型的有效细节调整&quot; (2023) -- 引入了NF4,双量化和页面优化器,使在单个48GB的GPU上能够进行65B细节调整</li>
+<li>接面的环境环境 (Huggingface.co/docs/peft) - - 接面生态系统中LoRA,QLoRA和其他参数效率高的标准库</li>
+<li>亚达夫等人&quot;,TIES-Merging: Solving Interference When Merging Models&quot; (2023) -- 技术用于在质量下降的情况下结合多个LoRA适配器</li>
+<li><a href="https://arxiv.org/abs/2305.18290" rel="noreferrer" data-network="true">Rafailov et al., &quot;Direct Preference Optimization: Your Language Model is Secretly a Reward Model&quot; (NeurIPS 2023) <small>↗ 需要联网</small></a>根据SFT的定义,没有奖励模型.</li>
+<li><a href="https://huggingface.co/docs/trl/" rel="noreferrer" data-network="true">TRL documentation <small>↗ 需要联网</small></a>-- 官方参考<code>SFTTrainer</code>现在<code>DPOTrainer</code>现在<code>KTOTrainer</code>并且与PEFT/bitsandbytes/Unsloth的集成表面.</li>
+<li><a href="https://docs.unsloth.ai/" rel="noreferrer" data-network="true">Unsloth documentation <small>↗ 需要联网</small></a>-- 融合的核能,可双倍调整吞吐量,减半内存; TRL 下的性能层.</li>
+<li><a href="https://axolotl-ai-cloud.github.io/axolotl/" rel="noreferrer" data-network="true">Axolotl documentation <small>↗ 需要联网</small></a>设置为YAML配置的多GPUSFT/DPO/QLoRA训练器;为手写脚本提供配置为代码的替代方案.</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Fine-Tuning with LoRA &amp; QLoRA</h1>
+<blockquote>
+<p>Full fine-tuning a 7B model requires 56GB of VRAM. You don't have that. Neither do most companies. LoRA lets you fine-tune the same model in 6GB by training less than 1% of the parameters. This isn't a compromise -- it matches full fine-tuning quality on most tasks. The entire open-source fine-tuning ecosystem runs on this one trick.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 10, Lesson 06 (Instruction Tuning / SFT)
+<strong>Time:</strong> ~75 minutes
+<strong>Related:</strong> Phase 10 covers the SFT/DPO loops from scratch. This lesson plugs those into the 2026 PEFT toolkits (PEFT, TRL, Unsloth, Axolotl, LLaMA-Factory).</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Implement LoRA by injecting low-rank adapter matrices (A and B) into a pretrained model's attention layers</li>
+<li>Calculate the parameter savings of LoRA vs full fine-tuning: rank r with d_model dimensions trains 2<em>r</em>d parameters instead of d^2</li>
+<li>Fine-tune a model using QLoRA (4-bit quantized base + LoRA adapters) to fit within consumer GPU memory</li>
+<li>Merge LoRA weights back into the base model for deployment and compare inference speed with and without adapters</li>
+</ul>
+<h2>The Problem</h2>
+<p>You have a base model. Llama 3 8B. You want it to answer customer support tickets in your company's voice. SFT is the answer. But SFT has a cost problem.</p>
+<p>Full fine-tuning updates every parameter in the model. Llama 3 8B has 8 billion parameters. In fp16, each parameter takes 2 bytes. That's 16GB just to load the weights. During training, you also need gradients (16GB), optimizer states for Adam (32GB for momentum + variance), and activations. Total: roughly 56GB of VRAM for a single 8B model.</p>
+<p>An A100 80GB can barely fit this. Two A100s cost <span class="katex"><span class="katex-mathml"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>3</mn><mo>−</mo><mn>4</mn><mi mathvariant="normal">/</mi><mi>h</mi><mi>o</mi><mi>u</mi><mi>r</mi><mi>o</mi><mi>n</mi><mi>c</mi><mi>l</mi><mi>o</mi><mi>u</mi><mi>d</mi><mi>p</mi><mi>r</mi><mi>o</mi><mi>v</mi><mi>i</mi><mi>d</mi><mi>e</mi><mi>r</mi><mi>s</mi><mi mathvariant="normal">.</mi><mi>T</mi><mi>r</mi><mi>a</mi><mi>i</mi><mi>n</mi><mi>i</mi><mi>n</mi><mi>g</mi><mi>f</mi><mi>o</mi><mi>r</mi><mn>3</mn><mi>e</mi><mi>p</mi><mi>o</mi><mi>c</mi><mi>h</mi><mi>s</mi><mi>o</mi><mi>n</mi><mn>50</mn><mo separator="true">,</mo><mn>000</mn><mi>e</mi><mi>x</mi><mi>a</mi><mi>m</mi><mi>p</mi><mi>l</mi><mi>e</mi><mi>s</mi><mi>t</mi><mi>a</mi><mi>k</mi><mi>e</mi><mi>s</mi><mn>6</mn><mo>−</mo><mn>10</mn><mi>h</mi><mi>o</mi><mi>u</mi><mi>r</mi><mi>s</mi><mi mathvariant="normal">.</mi><mi>T</mi><mi>h</mi><mi>a</mi><msup><mi>t</mi><mo mathvariant="normal" lspace="0em" rspace="0em">′</mo></msup><mi>s</mi></mrow><annotation encoding="application/x-tex">3-4/hour on cloud providers. Training for 3 epochs on 50,000 examples takes 6-10 hours. That&#x27;s </annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="katex-base"><span class="katex-strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">3</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="katex-base"><span class="katex-strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">4/</span><span class="mord mathnormal">h</span><span class="mord mathnormal">o</span><span class="mord mathnormal">u</span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="mord mathnormal">o</span><span class="mord mathnormal">n</span><span class="mord mathnormal">c</span><span class="mord mathnormal" style="margin-right:0.0197em;">l</span><span class="mord mathnormal">o</span><span class="mord mathnormal">u</span><span class="mord mathnormal">d</span><span class="mord mathnormal">p</span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="mord mathnormal">o</span><span class="mord mathnormal" style="margin-right:0.0359em;">v</span><span class="mord mathnormal">i</span><span class="mord mathnormal">d</span><span class="mord mathnormal" style="margin-right:0.0278em;">er</span><span class="mord mathnormal">s</span><span class="mord">.</span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="mord mathnormal">ainin</span><span class="mord mathnormal" style="margin-right:0.0359em;">g</span><span class="mord mathnormal" style="margin-right:0.1076em;">f</span><span class="mord mathnormal" style="margin-right:0.0278em;">or</span><span class="mord">3</span><span class="mord mathnormal">e</span><span class="mord mathnormal">p</span><span class="mord mathnormal">oc</span><span class="mord mathnormal">h</span><span class="mord mathnormal">so</span><span class="mord mathnormal">n</span><span class="mord">50</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">000</span><span class="mord mathnormal">e</span><span class="mord mathnormal">x</span><span class="mord mathnormal">am</span><span class="mord mathnormal" style="margin-right:0.0197em;">pl</span><span class="mord mathnormal">es</span><span class="mord mathnormal">t</span><span class="mord mathnormal" style="margin-right:0.0315em;">ak</span><span class="mord mathnormal">es</span><span class="mord">6</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="katex-base"><span class="katex-strut" style="height:0.7519em;"></span><span class="mord">10</span><span class="mord mathnormal">h</span><span class="mord mathnormal">o</span><span class="mord mathnormal">u</span><span class="mord mathnormal" style="margin-right:0.0278em;">r</span><span class="mord mathnormal">s</span><span class="mord">.</span><span class="mord mathnormal" style="margin-right:0.1389em;">T</span><span class="mord mathnormal">ha</span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.7519em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="katex-sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">′</span></span></span></span></span></span></span></span></span><span class="mord mathnormal">s</span></span></span></span>30-40 per experiment. Run 10 experiments to get the hyperparameters right and you've spent $400 before deploying anything.</p>
+<p>Scale this to Llama 3 70B and the numbers get absurd. 140GB for weights alone. You need a cluster. $100+ per experiment.</p>
+<p>There's a deeper problem too. Full fine-tuning modifies every weight in the model. If you fine-tune on customer support data, you might degrade the model's general capabilities. It's called catastrophic forgetting. The model gets better at your task and worse at everything else.</p>
+<p>You need a method that trains fewer parameters, uses less memory, and doesn't destroy the model's existing knowledge.</p>
+<h2>The Concept</h2>
+<h3>LoRA: Low-Rank Adaptation</h3>
+<p>Edward Hu and colleagues at Microsoft published LoRA in June 2021. The paper's insight: the weight updates during fine-tuning have low intrinsic rank. You don't need to update all 16.7 million parameters in a 4096x4096 weight matrix. The useful information in the update can be captured by a matrix of rank 16 or 32.</p>
+<p>Here's the math. A standard linear layer computes:</p>
+<pre><code>y = Wx
+</code></pre>
+<p>Where W is a d_out x d_in matrix. For a 4096x4096 attention projection, that's 16,777,216 parameters.</p>
+<p>LoRA freezes W and adds a low-rank decomposition:</p>
+<pre><code>y = Wx + BAx
+</code></pre>
+<p>Where B is (d_out x r) and A is (r x d_in). The rank r is much smaller than d -- typically 8, 16, or 32.</p>
+<p>For r=16 on a 4096x4096 layer:</p>
+<ul>
+<li>Original parameters: 4096 x 4096 = 16,777,216</li>
+<li>LoRA parameters: (4096 x 16) + (16 x 4096) = 65,536 + 65,536 = 131,072</li>
+<li>Reduction: 131,072 / 16,777,216 = 0.78%</li>
+</ul>
+<p>You're training 0.78% of the parameters and getting 95-100% of the quality.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-016f890f80957f53f713.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>A is initialized with a random Gaussian. B is initialized to zero. This means the LoRA contribution starts at zero -- the model begins training from its original behavior and gradually learns the adaptation.</p>
+<h3>The Scaling Factor: Alpha</h3>
+<p>LoRA introduces a scaling factor alpha that controls how much the low-rank update affects the output:</p>
+<pre><code>y = Wx + (alpha / r) * BAx
+</code></pre>
+<p>When alpha = r, the scaling is 1x. When alpha = 2r (the common default), the scaling is 2x. This hyperparameter controls the learning rate of the LoRA path independently of the base learning rate.</p>
+<p>Practical guidance:</p>
+<ul>
+<li>alpha = 2 * rank is a common community convention (the original paper used alpha = rank in most experiments)</li>
+<li>alpha = rank gives 1x scaling, conservative but stable</li>
+<li>Higher alpha means larger updates per step, which can speed convergence or cause instability</li>
+</ul>
+<h3>Where to Apply LoRA</h3>
+<p>A transformer has many linear layers. You don't need to add LoRA to all of them. The original paper tested different combinations:</p>
+<table>
+<thead>
+<tr>
+<th>Target Layers</th>
+<th>Trainable Params (7B)</th>
+<th>Quality</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>q_proj only</td>
+<td>4.7M</td>
+<td>Good</td>
+</tr>
+<tr>
+<td>q_proj + v_proj</td>
+<td>9.4M</td>
+<td>Better</td>
+</tr>
+<tr>
+<td>q_proj + k_proj + v_proj + o_proj</td>
+<td>18.9M</td>
+<td>Best for attention</td>
+</tr>
+<tr>
+<td>All linear (attention + MLP)</td>
+<td>37.7M</td>
+<td>Marginal gain, 2x params</td>
+</tr>
+</tbody>
+</table>
+<p>The sweet spot for most tasks: q_proj + v_proj. This targets the query and value projections in self-attention, which control what the model attends to and what information it extracts. Adding MLP layers helps for complex tasks like code generation but doubles the parameter count for diminishing returns on simpler tasks.</p>
+<h3>Rank Selection</h3>
+<p>The rank r controls the expressiveness of the adaptation:</p>
+<table>
+<thead>
+<tr>
+<th>Rank</th>
+<th>Trainable Params (per layer)</th>
+<th>Best For</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>4</td>
+<td>32,768</td>
+<td>Simple classification, sentiment</td>
+</tr>
+<tr>
+<td>8</td>
+<td>65,536</td>
+<td>Single-domain Q&amp;A, summarization</td>
+</tr>
+<tr>
+<td>16</td>
+<td>131,072</td>
+<td>Multi-domain tasks, instruction following</td>
+</tr>
+<tr>
+<td>32</td>
+<td>262,144</td>
+<td>Complex reasoning, code generation</td>
+</tr>
+<tr>
+<td>64</td>
+<td>524,288</td>
+<td>Diminishing returns for most tasks</td>
+</tr>
+<tr>
+<td>128</td>
+<td>1,048,576</td>
+<td>Rarely justified</td>
+</tr>
+</tbody>
+</table>
+<p>Hu et al. showed that r=4 already captures most of the adaptation for simple tasks. r=8 and r=16 are the most common choices in practice. Going beyond r=64 rarely improves quality and starts to lose LoRA's memory advantage.</p>
+<h3>QLoRA: 4-Bit Quantization + LoRA</h3>
+<p>Tim Dettmers and colleagues at the University of Washington published QLoRA in May 2023. The idea: quantize the frozen base model to 4-bit precision, then attach LoRA adapters in fp16 on top.</p>
+<p>This changes the memory equation dramatically:</p>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Weight Memory (7B)</th>
+<th>Training Memory (7B)</th>
+<th>GPU Required</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Full fine-tune (fp16)</td>
+<td>14GB</td>
+<td>~56GB</td>
+<td>1x A100 80GB</td>
+</tr>
+<tr>
+<td>LoRA (fp16 base)</td>
+<td>14GB</td>
+<td>~18GB</td>
+<td>1x A100 40GB</td>
+</tr>
+<tr>
+<td>QLoRA (4-bit base)</td>
+<td>3.5GB</td>
+<td>~6GB</td>
+<td>1x RTX 3090 24GB</td>
+</tr>
+</tbody>
+</table>
+<p>QLoRA makes three technical contributions:</p>
+<p><strong>NF4 (Normal Float 4-bit)</strong>: A new data type designed specifically for neural network weights. Neural network weights follow a roughly normal distribution. NF4 places its 16 quantization levels at the quantiles of a standard normal distribution. This is information-theoretically optimal for normally distributed data. It loses less information than uniform 4-bit quantization (INT4) or standard Float4.</p>
+<p><strong>Double quantization</strong>: The quantization constants themselves take memory. Each block of 64 weights needs a fp32 scale factor (4 bytes). For a 7B model, that's an extra 0.4GB. Double quantization quantizes these constants to fp8, reducing the overhead to 0.1GB. Small but it adds up.</p>
+<p><strong>Paged optimizers</strong>: During training, optimizer states (Adam's momentum and variance) can exceed GPU memory on long sequences. Paged optimizers use NVIDIA's unified memory to automatically page optimizer states to CPU RAM when GPU memory is exhausted, and page them back when needed. This prevents OOM crashes at the cost of some throughput.</p>
+<h3>The Quality Question</h3>
+<p>Does reducing parameters or quantizing the base hurt quality? The results from multiple papers:</p>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>MMLU (5-shot)</th>
+<th>MT-Bench</th>
+<th>HumanEval</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Full fine-tune (Llama 2 7B)</td>
+<td>48.3</td>
+<td>6.72</td>
+<td>14.6</td>
+</tr>
+<tr>
+<td>LoRA r=16</td>
+<td>47.9</td>
+<td>6.68</td>
+<td>14.0</td>
+</tr>
+<tr>
+<td>QLoRA r=16 (NF4)</td>
+<td>47.5</td>
+<td>6.61</td>
+<td>13.4</td>
+</tr>
+<tr>
+<td>QLoRA r=64 (NF4)</td>
+<td>48.1</td>
+<td>6.70</td>
+<td>14.2</td>
+</tr>
+</tbody>
+</table>
+<p>LoRA at r=16 is within 1% of full fine-tuning on most benchmarks. QLoRA at r=16 loses another fraction of a percent. QLoRA at r=64 essentially matches full fine-tuning while using 90% less memory.</p>
+<h3>Real-World Costs</h3>
+<p>Fine-tuning Llama 3 8B on 50,000 examples (3 epochs):</p>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>GPU</th>
+<th>Time</th>
+<th>Cost</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Full fine-tune</td>
+<td>2x A100 80GB</td>
+<td>8 hours</td>
+<td>~$32</td>
+</tr>
+<tr>
+<td>LoRA r=16</td>
+<td>1x A100 40GB</td>
+<td>4 hours</td>
+<td>~$8</td>
+</tr>
+<tr>
+<td>QLoRA r=16</td>
+<td>1x RTX 4090 24GB</td>
+<td>6 hours</td>
+<td>~$5</td>
+</tr>
+<tr>
+<td>QLoRA r=16 (Unsloth)</td>
+<td>1x RTX 4090 24GB</td>
+<td>2.5 hours</td>
+<td>~$2</td>
+</tr>
+<tr>
+<td>QLoRA r=16</td>
+<td>1x T4 16GB</td>
+<td>12 hours</td>
+<td>~$4</td>
+</tr>
+</tbody>
+</table>
+<p>QLoRA on a single consumer GPU costs less than a lunch. This is why the open-weight fine-tuning community exploded in 2023 and why every training framework below ships QLoRA by default in 2026.</p>
+<h3>The 2026 PEFT stack</h3>
+<table>
+<thead>
+<tr>
+<th>Framework</th>
+<th>What it is</th>
+<th>Pick when</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Hugging Face PEFT</strong></td>
+<td>The canonical LoRA/QLoRA/DoRA/IA3 library</td>
+<td>You want raw control and your training loop is already on <code>transformers.Trainer</code></td>
+</tr>
+<tr>
+<td><strong>TRL</strong></td>
+<td>HF's reinforcement-from-feedback trainers (SFT, DPO, GRPO, PPO, ORPO)</td>
+<td>You need DPO/GRPO after SFT; built on top of PEFT</td>
+</tr>
+<tr>
+<td><strong>Unsloth</strong></td>
+<td>Triton-kernel rewrite of the forward/backward pass</td>
+<td>You want 2-5x speedup + half the VRAM with no accuracy loss; Llama/Mistral/Qwen family</td>
+</tr>
+<tr>
+<td><strong>Axolotl</strong></td>
+<td>YAML-config wrapper over PEFT + TRL + DeepSpeed + Unsloth</td>
+<td>You want reproducible, version-controlled training runs</td>
+</tr>
+<tr>
+<td><strong>LLaMA-Factory</strong></td>
+<td>GUI/CLI/API over PEFT + TRL</td>
+<td>You want zero-code fine-tuning; 100+ model families supported</td>
+</tr>
+<tr>
+<td><strong>torchtune</strong></td>
+<td>Native PyTorch recipes, no <code>transformers</code> dep</td>
+<td>You want minimal deps and your org already standardizes on PyTorch</td>
+</tr>
+</tbody>
+</table>
+<p>Rule of thumb: research use or one-off experiment → PEFT. Repeatable production pipeline → Axolotl with Unsloth kernels enabled. Throwaway prototyping → LLaMA-Factory.</p>
+<h3>Merging Adapters</h3>
+<p>After training, you have two things: the frozen base model and a small LoRA adapter (typically 10-100MB). You can either:</p>
+<ol>
+<li>
+<p><strong>Keep them separate</strong>: Load the base model, load the adapter on top. Swap adapters for different tasks. This is how you serve multiple fine-tuned variants from one base model.</p>
+</li>
+<li>
+<p><strong>Merge them permanently</strong>: Compute W' = W + (alpha/r) * BA and save the result as a new full model. The merged model is the same size as the original. No inference overhead. No adapter to manage.</p>
+</li>
+</ol>
+<p>For serving multiple tasks (customer support adapter, code adapter, translation adapter), keep them separate. For deploying a single specialized model, merge.</p>
+<p>Advanced merging techniques for combining multiple adapters:</p>
+<ul>
+<li><strong>TIES-Merging</strong> (Yadav et al. 2023): Trims small-magnitude parameters, resolves sign conflicts, then merges. Reduces interference between adapters.</li>
+<li><strong>DARE</strong> (Yu et al. 2023): Randomly drops adapter parameters before merging and rescales the rest. Surprisingly effective at combining capabilities.</li>
+<li><strong>Task arithmetic</strong>: Simply add or subtract adapter weights. Adding a &quot;code&quot; adapter and a &quot;math&quot; adapter often produces a model good at both.</li>
+</ul>
+<h3>When NOT to Fine-Tune</h3>
+<p>Fine-tuning is the third option, not the first.</p>
+<p><strong>First: prompt engineering.</strong> Write a better system prompt. Add few-shot examples. Use chain-of-thought. This costs nothing and takes minutes. If prompting gets you 80% of the way there, you probably don't need to fine-tune.</p>
+<p><strong>Second: RAG.</strong> If the model needs to know about your specific data (documents, knowledge base, product catalog), retrieval is cheaper and more maintainable than baking it into weights. See Lesson 06.</p>
+<p><strong>Third: fine-tuning.</strong> Use this when you need the model to adopt a specific style, format, or reasoning pattern that cannot be achieved through prompting. When you need consistent structured output. When you need to distill a larger model into a smaller one. When latency matters and you can't afford the extra tokens from few-shot prompting.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-f50f535ac9477f0a866d.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><figure><img src="/learn/ai-from-scratch/figures/figure-3111887106acc6e8ebd7.png" alt="lora-params 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<p>We implement LoRA from scratch in pure PyTorch. No libraries. No magic. You'll build the LoRA layer, inject it into a model, train it, and merge the weights back.</p>
+<h3>Step 1: The LoRA Layer</h3>
+<pre><code class="language-python">import torch
+import torch.nn as nn
+import math
+
+class LoRALayer(nn.Module):
+    def __init__(self, in_features, out_features, rank=8, alpha=16):
+        super().__init__()
+        self.rank = rank
+        self.alpha = alpha
+        self.scaling = alpha / rank
+
+        self.A = nn.Parameter(torch.randn(in_features, rank) * (1 / math.sqrt(rank)))
+        self.B = nn.Parameter(torch.zeros(rank, out_features))
+
+    def forward(self, x):
+        return (x @ self.A @ self.B) * self.scaling
+</code></pre>
+<p>A is initialized with scaled random values. B is initialized to zero. The product BA starts at zero, so the model begins with its original behavior.</p>
+<h3>Step 2: LoRA-Wrapped Linear Layer</h3>
+<pre><code class="language-python">class LinearWithLoRA(nn.Module):
+    def __init__(self, linear, rank=8, alpha=16):
+        super().__init__()
+        self.linear = linear
+        self.lora = LoRALayer(
+            linear.in_features, linear.out_features, rank, alpha
+        )
+
+        for param in self.linear.parameters():
+            param.requires_grad = False
+
+    def forward(self, x):
+        return self.linear(x) + self.lora(x)
+</code></pre>
+<p>The original linear layer is frozen. Only the LoRA parameters (A and B) are trainable.</p>
+<h3>Step 3: Inject LoRA into a Model</h3>
+<pre><code class="language-python">def inject_lora(model, target_modules, rank=8, alpha=16):
+    for param in model.parameters():
+        param.requires_grad = False
+
+    lora_layers = {}
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear):
+            if any(t in name for t in target_modules):
+                parent_name = &quot;.&quot;.join(name.split(&quot;.&quot;)[:-1])
+                child_name = name.split(&quot;.&quot;)[-1]
+                parent = dict(model.named_modules())[parent_name]
+                lora_linear = LinearWithLoRA(module, rank, alpha)
+                setattr(parent, child_name, lora_linear)
+                lora_layers[name] = lora_linear
+    return lora_layers
+</code></pre>
+<p>First, freeze every parameter in the model. Then walk the model tree, find linear layers matching your target names, and replace them with LoRA-wrapped versions. The LoRA A and B matrices are the only trainable parameters in the entire model.</p>
+<h3>Step 4: Count Parameters</h3>
+<pre><code class="language-python">def count_parameters(model):
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    frozen = total - trainable
+    return {
+        &quot;total&quot;: total,
+        &quot;trainable&quot;: trainable,
+        &quot;frozen&quot;: frozen,
+        &quot;trainable_pct&quot;: 100 * trainable / total if total &gt; 0 else 0
+    }
+</code></pre>
+<h3>Step 5: Merge Weights Back</h3>
+<pre><code class="language-python">def merge_lora_weights(model):
+    for name, module in model.named_modules():
+        if isinstance(module, LinearWithLoRA):
+            with torch.no_grad():
+                merged = (
+                    module.lora.A @ module.lora.B
+                ) * module.lora.scaling
+                module.linear.weight.data += merged.T
+            parent_name = &quot;.&quot;.join(name.split(&quot;.&quot;)[:-1])
+            child_name = name.split(&quot;.&quot;)[-1]
+            if parent_name:
+                parent = dict(model.named_modules())[parent_name]
+            else:
+                parent = model
+            setattr(parent, child_name, module.linear)
+</code></pre>
+<p>After merging, the LoRA layers are gone. The model is the same size as the original with the adaptation baked into the weights. No inference overhead.</p>
+<h3>Step 6: Simulated QLoRA Quantization</h3>
+<pre><code class="language-python">def quantize_to_nf4(tensor, block_size=64):
+    blocks = tensor.reshape(-1, block_size)
+    scales = blocks.abs().max(dim=1, keepdim=True).values / 7.0
+    scales = torch.clamp(scales, min=1e-8)
+    quantized = torch.round(blocks / scales).clamp(-8, 7).to(torch.int8)
+    return quantized, scales
+
+def dequantize_from_nf4(quantized, scales, original_shape):
+    dequantized = quantized.float() * scales
+    return dequantized.reshape(original_shape)
+</code></pre>
+<p>This simulates 4-bit quantization by mapping weights into 16 discrete levels within blocks of 64. Production QLoRA uses the bitsandbytes library for true NF4 on GPU.</p>
+<h3>Step 7: Training Loop</h3>
+<pre><code class="language-python">def train_lora(model, data, epochs=5, lr=1e-3, batch_size=4):
+    optimizer = torch.optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad], lr=lr
+    )
+    criterion = nn.MSELoss()
+
+    losses = []
+    for epoch in range(epochs):
+        epoch_loss = 0.0
+        n_batches = 0
+        indices = torch.randperm(len(data[&quot;inputs&quot;]))
+
+        for i in range(0, len(indices), batch_size):
+            batch_idx = indices[i:i + batch_size]
+            x = data[&quot;inputs&quot;][batch_idx]
+            y = data[&quot;targets&quot;][batch_idx]
+
+            output = model(x)
+            loss = criterion(output, y)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            epoch_loss += loss.item()
+            n_batches += 1
+
+        avg_loss = epoch_loss / n_batches
+        losses.append(avg_loss)
+
+    return losses
+</code></pre>
+<h3>Step 8: Full Demo</h3>
+<pre><code class="language-python">def demo():
+    torch.manual_seed(42)
+    d_model = 256
+    n_classes = 10
+
+    model = nn.Sequential(
+        nn.Linear(d_model, 512),
+        nn.ReLU(),
+        nn.Linear(512, 512),
+        nn.ReLU(),
+        nn.Linear(512, n_classes),
+    )
+
+    n_samples = 500
+    x = torch.randn(n_samples, d_model)
+    y = torch.randint(0, n_classes, (n_samples,))
+    y_onehot = torch.zeros(n_samples, n_classes).scatter_(1, y.unsqueeze(1), 1.0)
+
+    data = {&quot;inputs&quot;: x, &quot;targets&quot;: y_onehot}
+
+    params_before = count_parameters(model)
+
+    lora_layers = inject_lora(
+        model, target_modules=[&quot;0&quot;, &quot;2&quot;], rank=8, alpha=16
+    )
+
+    params_after = count_parameters(model)
+
+    losses = train_lora(model, data, epochs=20, lr=1e-3)
+
+    merge_lora_weights(model)
+    params_merged = count_parameters(model)
+
+    return {
+        &quot;params_before&quot;: params_before,
+        &quot;params_after&quot;: params_after,
+        &quot;params_merged&quot;: params_merged,
+        &quot;losses&quot;: losses,
+    }
+</code></pre>
+<p>The demo creates a small model, injects LoRA into two layers, trains it, and merges the weights back. The parameter count drops from full trainable to ~1% trainable during LoRA training, then returns to the original architecture after merging.</p>
+<h2>Use It</h2>
+<p>With the Hugging Face ecosystem, LoRA on a real model takes about 20 lines:</p>
+<pre><code class="language-python">from transformers import AutoModelForCausalLM, AutoTokenizer
+from peft import LoraConfig, get_peft_model, TaskType
+
+model = AutoModelForCausalLM.from_pretrained(&quot;meta-llama/Llama-3.1-8B&quot;)
+tokenizer = AutoTokenizer.from_pretrained(&quot;meta-llama/Llama-3.1-8B&quot;)
+
+lora_config = LoraConfig(
+    task_type=TaskType.CAUSAL_LM,
+    r=16,
+    lora_alpha=32,
+    lora_dropout=0.05,
+    target_modules=[&quot;q_proj&quot;, &quot;v_proj&quot;],
+)
+
+model = get_peft_model(model, lora_config)
+model.print_trainable_parameters()
+</code></pre>
+<p>For QLoRA, add bitsandbytes quantization:</p>
+<pre><code class="language-python">from transformers import BitsAndBytesConfig
+
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type=&quot;nf4&quot;,
+    bnb_4bit_compute_dtype=torch.bfloat16,
+    bnb_4bit_use_double_quant=True,
+)
+
+model = AutoModelForCausalLM.from_pretrained(
+    &quot;meta-llama/Llama-3.1-8B&quot;,
+    quantization_config=bnb_config,
+    device_map=&quot;auto&quot;,
+)
+
+model = get_peft_model(model, lora_config)
+</code></pre>
+<p>That's it. Same training loop. Same data pipeline. The base model now lives in 4-bit, LoRA adapters train in fp16, and the whole thing fits in 6GB.</p>
+<p>For training with the Hugging Face Trainer:</p>
+<pre><code class="language-python">from transformers import TrainingArguments, Trainer
+from datasets import load_dataset
+
+dataset = load_dataset(&quot;tatsu-lab/alpaca&quot;, split=&quot;train[:5000]&quot;)
+
+training_args = TrainingArguments(
+    output_dir=&quot;./lora-llama&quot;,
+    num_train_epochs=3,
+    per_device_train_batch_size=4,
+    gradient_accumulation_steps=4,
+    learning_rate=2e-4,
+    fp16=True,
+    logging_steps=10,
+    save_strategy=&quot;epoch&quot;,
+    optim=&quot;paged_adamw_8bit&quot;,
+)
+
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=dataset,
+)
+
+trainer.train()
+
+model.save_pretrained(&quot;./lora-adapter&quot;)
+</code></pre>
+<p>The saved adapter is 10-100MB. The base model stays untouched. You can share adapters on the Hugging Face Hub without redistributing the full model.</p>
+<h2>Ship It</h2>
+<p>This lesson produces:</p>
+<ul>
+<li><code>outputs/prompt-lora-advisor.md</code> -- a prompt that helps you decide LoRA rank, target modules, and hyperparameters for your specific task</li>
+<li><code>outputs/skill-fine-tuning-guide.md</code> -- a skill that teaches agents the decision tree for when and how to fine-tune</li>
+</ul>
+<h2>Exercises</h2>
+<ol>
+<li>
+<p><strong>Rank ablation study.</strong> Run the demo with ranks 2, 4, 8, 16, 32, and 64. Plot final loss vs. rank. Find the point of diminishing returns where doubling the rank no longer halves the loss. For a simple classification task on 256-dim features, this should be around r=8-16.</p>
+</li>
+<li>
+<p><strong>Target module comparison.</strong> Modify inject_lora to target only layer &quot;0&quot;, only layer &quot;2&quot;, only layer &quot;4&quot;, and all three. Train each variant for 20 epochs. Compare convergence speed and final loss. This mirrors the real decision of targeting q_proj vs v_proj vs all linear layers.</p>
+</li>
+<li>
+<p><strong>Quantization error analysis.</strong> Take the trained model's weight matrices before and after quantize_to_nf4 / dequantize_from_nf4. Compute the mean squared error, max absolute error, and the correlation between original and reconstructed weights. Experiment with block_size values of 32, 64, 128, and 256.</p>
+</li>
+<li>
+<p><strong>Multi-adapter serving.</strong> Train two LoRA adapters on different subsets of the data (even indices vs odd indices). Save both adapters. Load the base model once, then swap adapters and verify that each produces different outputs on the same input. This is how production systems serve multiple fine-tuned models from one base.</p>
+</li>
+<li>
+<p><strong>Merge vs. unmerged inference.</strong> Compare the output of the LoRA model before and after merge_lora_weights on the same 100 inputs. Verify the outputs are identical (within floating-point tolerance of 1e-5). Then benchmark inference speed for both -- merged should be slightly faster since it's a single matrix multiply instead of two.</p>
+</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>LoRA</td>
+<td>&quot;Efficient fine-tuning&quot;</td>
+<td>Low-Rank Adaptation: freeze base weights, train two small matrices A and B whose product approximates the full weight update</td>
+</tr>
+<tr>
+<td>QLoRA</td>
+<td>&quot;Fine-tune on a laptop&quot;</td>
+<td>Quantized LoRA: load the base model in 4-bit NF4, train LoRA adapters in fp16 on top, enabling 7B fine-tuning in 6GB VRAM</td>
+</tr>
+<tr>
+<td>Rank (r)</td>
+<td>&quot;How much the model can learn&quot;</td>
+<td>The inner dimension of the A and B matrices; controls expressiveness vs. parameter count</td>
+</tr>
+<tr>
+<td>Alpha</td>
+<td>&quot;LoRA learning rate&quot;</td>
+<td>Scaling factor applied to the LoRA output; alpha/r scales the adaptation's contribution to the final output</td>
+</tr>
+<tr>
+<td>NF4</td>
+<td>&quot;4-bit quantization&quot;</td>
+<td>Normal Float 4: a 4-bit data type with quantization levels at normal distribution quantiles, optimal for neural network weights</td>
+</tr>
+<tr>
+<td>Adapter</td>
+<td>&quot;The small trained part&quot;</td>
+<td>The LoRA A and B matrices saved as a separate file (10-100MB), loadable on top of any copy of the base model</td>
+</tr>
+<tr>
+<td>Target modules</td>
+<td>&quot;Which layers to LoRA&quot;</td>
+<td>The specific linear layers (q_proj, v_proj, etc.) where LoRA adapters are injected</td>
+</tr>
+<tr>
+<td>Merging</td>
+<td>&quot;Bake it in&quot;</td>
+<td>Computing W + (alpha/r) * BA and replacing the original weight, eliminating the adapter overhead at inference</td>
+</tr>
+<tr>
+<td>Paged optimizers</td>
+<td>&quot;Don't OOM during training&quot;</td>
+<td>Offloading optimizer states (Adam momentum, variance) to CPU when GPU memory is exhausted</td>
+</tr>
+<tr>
+<td>Catastrophic forgetting</td>
+<td>&quot;Fine-tuning broke everything else&quot;</td>
+<td>When updating all weights causes the model to lose previously learned capabilities</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li>Hu et al., &quot;LoRA: Low-Rank Adaptation of Large Language Models&quot; (2021) -- the original paper introducing the low-rank decomposition method, tested on GPT-3 175B with rank as low as 4</li>
+<li>Dettmers et al., &quot;QLoRA: Efficient Finetuning of Quantized Language Models&quot; (2023) -- introduces NF4, double quantization, and paged optimizers, enabling 65B fine-tuning on a single 48GB GPU</li>
+<li>PEFT library documentation (huggingface.co/docs/peft) -- the standard library for LoRA, QLoRA, and other parameter-efficient methods in the Hugging Face ecosystem</li>
+<li>Yadav et al., &quot;TIES-Merging: Resolving Interference When Merging Models&quot; (2023) -- techniques for combining multiple LoRA adapters without quality degradation</li>
+<li><a href="https://arxiv.org/abs/2305.18290" rel="noreferrer" data-network="true">Rafailov et al., &quot;Direct Preference Optimization: Your Language Model is Secretly a Reward Model&quot; (NeurIPS 2023) <small>↗ 需要联网</small></a> -- DPO derivation; the preference-tuning stage that comes after SFT, no reward model needed.</li>
+<li><a href="https://huggingface.co/docs/trl/" rel="noreferrer" data-network="true">TRL documentation <small>↗ 需要联网</small></a> -- official reference for <code>SFTTrainer</code>, <code>DPOTrainer</code>, <code>KTOTrainer</code>, and the integration surface with PEFT/bitsandbytes/Unsloth.</li>
+<li><a href="https://docs.unsloth.ai/" rel="noreferrer" data-network="true">Unsloth documentation <small>↗ 需要联网</small></a> -- fused kernels that double fine-tuning throughput and halve memory; the performance layer under TRL.</li>
+<li><a href="https://axolotl-ai-cloud.github.io/axolotl/" rel="noreferrer" data-network="true">Axolotl documentation <small>↗ 需要联网</small></a> -- YAML-configured multi-GPU SFT/DPO/QLoRA trainer; the config-as-code alternative to hand-written scripts.</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-11-llm-engineering--08-fine-tuning-lora.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-11-llm-engineering--08-fine-tuning-lora.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/11-llm-engineering/08-fine-tuning-lora/code/lora.py">phases/11-llm-engineering/08-fine-tuning-lora/code/lora.py</a><details><summary>查看原始文本</summary><pre><code>import torch
+import torch.nn as nn
+import math
+
+
+class LoRALayer(nn.Module):
+    def __init__(self, in_features, out_features, rank=8, alpha=16):
+        super().__init__()
+        self.rank = rank
+        self.alpha = alpha
+        self.scaling = alpha / rank
+
+        self.A = nn.Parameter(torch.randn(in_features, rank) * (1 / math.sqrt(rank)))
+        self.B = nn.Parameter(torch.zeros(rank, out_features))
+
+    def forward(self, x):
+        return (x @ self.A @ self.B) * self.scaling
+
+
+class LinearWithLoRA(nn.Module):
+    def __init__(self, linear, rank=8, alpha=16):
+        super().__init__()
+        self.linear = linear
+        self.lora = LoRALayer(
+            linear.in_features, linear.out_features, rank, alpha
+        )
+
+        for param in self.linear.parameters():
+            param.requires_grad = False
+
+    def forward(self, x):
+        return self.linear(x) + self.lora(x)
+
+
+def inject_lora(model, target_modules, rank=8, alpha=16):
+    for param in model.parameters():
+        param.requires_grad = False
+
+    lora_layers = {}
+    for name, module in list(model.named_modules()):
+        if isinstance(module, nn.Linear):
+            if any(t in name for t in target_modules):
+                parent_name = &quot;.&quot;.join(name.split(&quot;.&quot;)[:-1])
+                child_name = name.split(&quot;.&quot;)[-1]
+                if parent_name:
+                    parent = dict(model.named_modules())[parent_name]
+                else:
+                    parent = model
+                lora_linear = LinearWithLoRA(module, rank, alpha)
+                setattr(parent, child_name, lora_linear)
+                lora_layers[name] = lora_linear
+    return lora_layers
+
+
+def count_parameters(model):
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    frozen = total - trainable
+    return {
+        &quot;total&quot;: total,
+        &quot;trainable&quot;: trainable,
+        &quot;frozen&quot;: frozen,
+        &quot;trainable_pct&quot;: 100 * trainable / total if total &gt; 0 else 0,
+    }
+
+
+def merge_lora_weights(model):
+    for name, module in list(model.named_modules()):
+        if isinstance(module, LinearWithLoRA):
+            with torch.no_grad():
+                merged = (module.lora.A @ module.lora.B) * module.lora.scaling
+                module.linear.weight.data += merged.T
+
+            parent_name = &quot;.&quot;.join(name.split(&quot;.&quot;)[:-1])
+            child_name = name.split(&quot;.&quot;)[-1]
+            if parent_name:
+                parent = dict(model.named_modules())[parent_name]
+            else:
+                parent = model
+            setattr(parent, child_name, module.linear)
+
+
+def quantize_to_nf4(tensor, block_size=64):
+    original_shape = tensor.shape
+    flat = tensor.reshape(-1)
+
+    pad_size = (block_size - flat.shape[0] % block_size) % block_size
+    if pad_size &gt; 0:
+        flat = torch.cat([flat, torch.zeros(pad_size)])
+
+    blocks = flat.reshape(-1, block_size)
+    scales = blocks.abs().max(dim=1, keepdim=True).values / 7.0
+    scales = torch.clamp(scales, min=1e-8)
+    quantized = torch.round(blocks / scales).clamp(-8, 7).to(torch.int8)
+
+    return quantized, scales, original_shape, pad_size
+
+
+def dequantize_from_nf4(quantized, scales, original_shape, pad_size):
+    dequantized = quantized.float() * scales
+    flat = dequantized.reshape(-1)
+    if pad_size &gt; 0:
+        flat = flat[:-pad_size]
+    return flat.reshape(original_shape)
+
+
+def quantize_model(model):
+    quantized_state = {}
+    for name, param in model.named_parameters():
+        if not param.requires_grad and param.dim() &gt;= 2:
+            q, scales, shape, pad = quantize_to_nf4(param.data)
+            quantized_state[name] = {
+                &quot;quantized&quot;: q,
+                &quot;scales&quot;: scales,
+                &quot;shape&quot;: shape,
+                &quot;pad_size&quot;: pad,
+            }
+            param.data = dequantize_from_nf4(q, scales, shape, pad)
+    return quantized_state
+
+
+def train_lora(model, data, epochs=5, lr=1e-3, batch_size=4):
+    optimizer = torch.optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad], lr=lr
+    )
+    criterion = nn.MSELoss()
+
+    losses = []
+    for epoch in range(epochs):
+        epoch_loss = 0.0
+        n_batches = 0
+        indices = torch.randperm(len(data[&quot;inputs&quot;]))
+
+        for i in range(0, len(indices), batch_size):
+            batch_idx = indices[i : i + batch_size]
+            x = data[&quot;inputs&quot;][batch_idx]
+            y = data[&quot;targets&quot;][batch_idx]
+
+            output = model(x)
+            loss = criterion(output, y)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            epoch_loss += loss.item()
+            n_batches += 1
+
+        avg_loss = epoch_loss / max(n_batches, 1)
+        losses.append(avg_loss)
+
+    return losses
+
+
+def save_lora_adapter(model, path):
+    adapter_state = {}
+    for name, module in model.named_modules():
+        if isinstance(module, LoRALayer):
+            adapter_state[f&quot;{name}.A&quot;] = module.A.data.clone()
+            adapter_state[f&quot;{name}.B&quot;] = module.B.data.clone()
+            adapter_state[f&quot;{name}.rank&quot;] = module.rank
+            adapter_state[f&quot;{name}.alpha&quot;] = module.alpha
+    torch.save(adapter_state, path)
+    return len(adapter_state) // 4
+
+
+def load_lora_adapter(model, path):
+    adapter_state = torch.load(path, weights_only=False)
+    for name, module in model.named_modules():
+        if isinstance(module, LoRALayer):
+            a_key = f&quot;{name}.A&quot;
+            b_key = f&quot;{name}.B&quot;
+            if a_key in adapter_state:
+                module.A.data = adapter_state[a_key]
+                module.B.data = adapter_state[b_key]
+
+
+def create_demo_model(d_model=256, hidden=512, n_classes=10):
+    return nn.Sequential(
+        nn.Linear(d_model, hidden),
+        nn.ReLU(),
+        nn.Linear(hidden, hidden),
+        nn.ReLU(),
+        nn.Linear(hidden, n_classes),
+    )
+
+
+def create_demo_data(n_samples=500, d_model=256, n_classes=10):
+    x = torch.randn(n_samples, d_model)
+    y = torch.randint(0, n_classes, (n_samples,))
+    y_onehot = torch.zeros(n_samples, n_classes).scatter_(1, y.unsqueeze(1), 1.0)
+    return {&quot;inputs&quot;: x, &quot;targets&quot;: y_onehot}
+
+
+if __name__ == &quot;__main__&quot;:
+    torch.manual_seed(42)
+
+    print(&quot;=&quot; * 60)
+    print(&quot;STEP 1: Create Base Model&quot;)
+    print(&quot;=&quot; * 60)
+
+    model = create_demo_model()
+    params = count_parameters(model)
+    print(f&quot;  Architecture: Linear(256-&gt;512) -&gt; ReLU -&gt; Linear(512-&gt;512) -&gt; ReLU -&gt; Linear(512-&gt;10)&quot;)
+    print(f&quot;  Total parameters: {params[&#39;total&#39;]:,}&quot;)
+    print(f&quot;  Trainable: {params[&#39;trainable&#39;]:,} ({params[&#39;trainable_pct&#39;]:.1f}%)&quot;)
+
+    print(&quot;\n&quot; + &quot;=&quot; * 60)
+    print(&quot;STEP 2: Inject LoRA (rank=8, alpha=16)&quot;)
+    print(&quot;=&quot; * 60)
+
+    lora_layers = inject_lora(model, target_modules=[&quot;0&quot;, &quot;2&quot;], rank=8, alpha=16)
+    params = count_parameters(model)
+    print(f&quot;  LoRA injected into: {list(lora_layers.keys())}&quot;)
+    print(f&quot;  Total parameters: {params[&#39;total&#39;]:,}&quot;)
+    print(f&quot;  Trainable (LoRA only): {params[&#39;trainable&#39;]:,} ({params[&#39;trainable_pct&#39;]:.2f}%)&quot;)
+    print(f&quot;  Frozen (base model): {params[&#39;frozen&#39;]:,}&quot;)
+
+    print(&quot;\n&quot; + &quot;=&quot; * 60)
+    print(&quot;STEP 3: Rank Comparison&quot;)
+    print(&quot;=&quot; * 60)
+
+    data = create_demo_data()
+
+    for rank in [2, 4, 8, 16, 32]:
+        m = create_demo_model()
+        inject_lora(m, target_modules=[&quot;0&quot;, &quot;2&quot;], rank=rank, alpha=rank * 2)
+        p = count_parameters(m)
+        losses = train_lora(m, data, epochs=10, lr=1e-3)
+        print(
+            f&quot;  rank={rank:&gt;2d}: trainable={p[&#39;trainable&#39;]:&gt;6,} ({p[&#39;trainable_pct&#39;]:.2f}%)  &quot;
+            f&quot;loss: {losses[0]:.4f} -&gt; {losses[-1]:.4f}&quot;
+        )
+
+    print(&quot;\n&quot; + &quot;=&quot; * 60)
+    print(&quot;STEP 4: Simulated QLoRA (4-bit quantization)&quot;)
+    print(&quot;=&quot; * 60)
+
+    model_q = create_demo_model()
+    inject_lora(model_q, target_modules=[&quot;0&quot;, &quot;2&quot;], rank=8, alpha=16)
+
+    weight_before = model_q[0].linear.weight.data.clone()
+    q_state = quantize_model(model_q)
+    weight_after = model_q[0].linear.weight.data
+
+    mse = ((weight_before - weight_after) ** 2).mean().item()
+    max_err = (weight_before - weight_after).abs().max().item()
+    corr = torch.corrcoef(torch.stack([weight_before.flatten(), weight_after.flatten()]))[0, 1].item()
+
+    print(f&quot;  Quantized layers: {len(q_state)}&quot;)
+    print(f&quot;  Quantization error (layer 0):&quot;)
+    print(f&quot;    MSE: {mse:.6f}&quot;)
+    print(f&quot;    Max absolute error: {max_err:.6f}&quot;)
+    print(f&quot;    Correlation: {corr:.6f}&quot;)
+
+    original_bytes = sum(p.numel() * 4 for p in model_q.parameters())
+    quantized_bytes = sum(
+        v[&quot;quantized&quot;].numel() * 1 + v[&quot;scales&quot;].numel() * 4
+        for v in q_state.values()
+    )
+    lora_bytes = sum(
+        p.numel() * 4 for p in model_q.parameters() if p.requires_grad
+    )
+
+    print(f&quot;\n  Memory comparison:&quot;)
+    print(f&quot;    Full model (fp32): {original_bytes / 1024:.1f} KB&quot;)
+    print(f&quot;    Quantized base (simulated NF4): {quantized_bytes / 1024:.1f} KB&quot;)
+    print(f&quot;    LoRA adapters (fp32): {lora_bytes / 1024:.1f} KB&quot;)
+    print(f&quot;    QLoRA total: {(quantized_bytes + lora_bytes) / 1024:.1f} KB&quot;)
+
+    print(&quot;\n&quot; + &quot;=&quot; * 60)
+    print(&quot;STEP 5: Train with QLoRA&quot;)
+    print(&quot;=&quot; * 60)
+
+    losses = train_lora(model_q, data, epochs=20, lr=1e-3)
+    print(f&quot;  Training loss: {losses[0]:.4f} -&gt; {losses[-1]:.4f}&quot;)
+    print(f&quot;  Epoch losses: &quot;, end=&quot;&quot;)
+    for i in range(0, 20, 5):
+        print(f&quot;  e{i}={losses[i]:.4f}&quot;, end=&quot;&quot;)
+    print()
+
+    print(&quot;\n&quot; + &quot;=&quot; * 60)
+    print(&quot;STEP 6: Merge and Verify&quot;)
+    print(&quot;=&quot; * 60)
+
+    test_input = torch.randn(10, 256)
+    output_before_merge = model_q(test_input).detach()
+
+    merge_lora_weights(model_q)
+    params_merged = count_parameters(model_q)
+
+    output_after_merge = model_q(test_input).detach()
+    merge_diff = (output_before_merge - output_after_merge).abs().max().item()
+
+    print(f&quot;  Parameters after merge: {params_merged[&#39;total&#39;]:,}&quot;)
+    print(f&quot;  LoRA layers remaining: {sum(1 for _, m in model_q.named_modules() if isinstance(m, LinearWithLoRA))}&quot;)
+    print(f&quot;  Max output difference (should be ~0): {merge_diff:.8f}&quot;)
+
+    print(&quot;\n&quot; + &quot;=&quot; * 60)
+    print(&quot;STEP 7: Save and Load Adapter&quot;)
+    print(&quot;=&quot; * 60)
+
+    base_weights = create_demo_model().state_dict()
+
+    model_a = create_demo_model()
+    model_a.load_state_dict(base_weights)
+    inject_lora(model_a, target_modules=[&quot;0&quot;, &quot;2&quot;], rank=8, alpha=16)
+    train_lora(model_a, data, epochs=10, lr=1e-3)
+
+    import tempfile
+    import os
+
+    with tempfile.NamedTemporaryFile(suffix=&quot;.pt&quot;, delete=False) as f:
+        adapter_path = f.name
+
+    n_saved = save_lora_adapter(model_a, adapter_path)
+    adapter_size = os.path.getsize(adapter_path)
+
+    model_b = create_demo_model()
+    model_b.load_state_dict(base_weights)
+    inject_lora(model_b, target_modules=[&quot;0&quot;, &quot;2&quot;], rank=8, alpha=16)
+    load_lora_adapter(model_b, adapter_path)
+
+    test_in = torch.randn(5, 256)
+    out_a = model_a(test_in).detach()
+    out_b = model_b(test_in).detach()
+    load_diff = (out_a - out_b).abs().max().item()
+
+    print(f&quot;  Adapter layers saved: {n_saved}&quot;)
+    print(f&quot;  Adapter file size: {adapter_size / 1024:.1f} KB&quot;)
+    print(f&quot;  Base model size: {sum(p.numel() * 4 for p in model_b.parameters()) / 1024:.1f} KB&quot;)
+    print(f&quot;  Adapter is {adapter_size / sum(p.numel() * 4 for p in model_b.parameters()) * 100:.1f}% of base model&quot;)
+    print(f&quot;  Output match after load (max diff): {load_diff:.8f}&quot;)
+
+    os.unlink(adapter_path)
+
+    print(&quot;\n&quot; + &quot;=&quot; * 60)
+    print(&quot;STEP 8: Multi-Adapter Serving&quot;)
+    print(&quot;=&quot; * 60)
+
+    base = create_demo_model()
+
+    data_even = {
+        &quot;inputs&quot;: data[&quot;inputs&quot;][::2],
+        &quot;targets&quot;: data[&quot;targets&quot;][::2],
+    }
+    data_odd = {
+        &quot;inputs&quot;: data[&quot;inputs&quot;][1::2],
+        &quot;targets&quot;: data[&quot;targets&quot;][1::2],
+    }
+
+    model_even = create_demo_model()
+    model_even.load_state_dict(base.state_dict())
+    inject_lora(model_even, target_modules=[&quot;0&quot;, &quot;2&quot;], rank=8, alpha=16)
+    train_lora(model_even, data_even, epochs=15, lr=1e-3)
+
+    model_odd = create_demo_model()
+    model_odd.load_state_dict(base.state_dict())
+    inject_lora(model_odd, target_modules=[&quot;0&quot;, &quot;2&quot;], rank=8, alpha=16)
+    train_lora(model_odd, data_odd, epochs=15, lr=1e-3)
+
+    test_in = torch.randn(5, 256)
+    out_even = model_even(test_in).detach()
+    out_odd = model_odd(test_in).detach()
+    adapter_diff = (out_even - out_odd).abs().mean().item()
+
+    print(f&quot;  Adapter A trained on {len(data_even[&#39;inputs&#39;])} even-indexed samples&quot;)
+    print(f&quot;  Adapter B trained on {len(data_odd[&#39;inputs&#39;])} odd-indexed samples&quot;)
+    print(f&quot;  Mean output difference between adapters: {adapter_diff:.4f}&quot;)
+    print(f&quot;  (Different adapters produce different outputs from the same base model)&quot;)
+
+    print(&quot;\n&quot; + &quot;=&quot; * 60)
+    print(&quot;SUMMARY&quot;)
+    print(&quot;=&quot; * 60)
+    print(&quot;  LoRA: freeze base weights, train low-rank A and B matrices&quot;)
+    print(&quot;  QLoRA: quantize base to 4-bit, LoRA adapters in fp16&quot;)
+    print(&quot;  Typical trainable parameters: 0.5-2% of the base model&quot;)
+    print(&quot;  Adapters are small (10-100MB) and swappable&quot;)
+    print(&quot;  Merged model = original size, no inference overhead&quot;)
+    print(&quot;  Quality: within 1% of full fine-tuning on most benchmarks&quot;)
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/11-llm-engineering/08-fine-tuning-lora/outputs/prompt-lora-advisor.md">phases/11-llm-engineering/08-fine-tuning-lora/outputs/prompt-lora-advisor.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: prompt-lora-advisor
+description: Decide LoRA rank, target modules, and hyperparameters for a specific fine-tuning task
+phase: 11
+lesson: 8
+---
+
+You are a LoRA fine-tuning advisor. Given a task description, recommend the exact configuration for parameter-efficient fine-tuning.
+
+Gather these inputs before recommending:
+
+1. **Base model**: Which model? (Llama 3 8B, Mistral 7B, Qwen 2.5 72B, etc.)
+2. **Task type**: Classification, Q&amp;A, summarization, code generation, style transfer, instruction following?
+3. **Dataset size**: How many training examples?
+4. **GPU available**: What GPU and VRAM? (RTX 3090 24GB, A100 40GB, T4 16GB, etc.)
+5. **Quality bar**: How close to full fine-tuning quality do you need?
+6. **Serving plan**: Single task or multiple adapters from one base?
+
+Decision framework:
+
+**Method selection:**
+- VRAM &gt;= 2x model size in fp16 -&gt; Full fine-tuning (if dataset &gt; 100K and budget allows)
+- VRAM &gt;= model size in fp16 -&gt; LoRA with fp16 base
+- VRAM &gt;= model size / 4 -&gt; QLoRA (4-bit base + fp16 adapters)
+- VRAM &lt; model size / 4 -&gt; Use a smaller base model or offload to CPU
+
+**Rank selection:**
+- r=4: binary classification, sentiment, simple extraction
+- r=8: single-domain Q&amp;A, summarization, translation
+- r=16: multi-domain tasks, instruction following, chat
+- r=32: code generation, complex reasoning, math
+- r=64: only when r=32 is measurably insufficient (run an ablation first)
+
+**Alpha selection:**
+- alpha = 2 * rank: default starting point (e.g., r=16, alpha=32)
+- alpha = rank: conservative, use when training is unstable
+- alpha = 4 * rank: aggressive, use when convergence is too slow
+
+**Target modules:**
+- Minimum viable: q_proj, v_proj (attention query and value)
+- Standard: q_proj, k_proj, v_proj, o_proj (all attention projections)
+- Maximum: all linear layers (attention + MLP: gate_proj, up_proj, down_proj)
+- Start with q_proj + v_proj. Add more only if quality is insufficient.
+
+**Learning rate:**
+- QLoRA: 1e-4 to 3e-4 (higher than full fine-tuning because fewer params)
+- LoRA fp16: 5e-5 to 2e-4
+- Full fine-tuning: 1e-5 to 5e-5
+
+**Batch size and gradient accumulation:**
+- Effective batch size of 16-64 for most tasks
+- If VRAM is tight, use per_device_batch_size=1 with gradient_accumulation_steps=16
+- Larger effective batch sizes stabilize training but slow convergence per step
+
+**Dropout:**
+- lora_dropout=0.05: default for most tasks
+- lora_dropout=0.1: small datasets (&lt; 5K examples) to prevent overfitting
+- lora_dropout=0.0: large datasets (&gt; 100K examples) where regularization is unnecessary
+
+For each recommendation, provide:
+- Exact PEFT/bitsandbytes config snippet
+- Estimated VRAM usage during training
+- Estimated training time
+- Expected quality vs. full fine-tuning (as a percentage)
+- Top 3 things to monitor during training (loss curve shape, gradient norms, eval metrics)
+- Recommended evaluation: run the base model, LoRA model, and full fine-tuned model on the same 200-example eval set
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/11-llm-engineering/08-fine-tuning-lora/outputs/skill-fine-tuning-guide.md">phases/11-llm-engineering/08-fine-tuning-lora/outputs/skill-fine-tuning-guide.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: skill-fine-tuning-guide
+description: Decision tree for when and how to fine-tune LLMs with LoRA and QLoRA
+version: 1.0.0
+phase: 11
+lesson: 8
+tags: [fine-tuning, lora, qlora, peft, llm-engineering]
+---
+
+# Fine-Tuning Decision Guide
+
+Before fine-tuning, try these in order:
+
+```
+1. Prompt engineering (minutes, $0)
+2. Few-shot examples in prompt (minutes, $0)
+3. RAG for knowledge retrieval (days, $10-100/month)
+4. Fine-tuning with LoRA/QLoRA (days, $5-50 per experiment)
+5. Full fine-tuning (weeks, $100-10,000 per run)
+```
+
+Only move to the next step if the previous one is measurably insufficient.
+
+## When to fine-tune
+
+- Model needs a consistent output style or format that prompting cannot achieve
+- You&#39;re distilling a larger model (GPT-4 quality from an 8B model)
+- Latency matters and few-shot examples add too many tokens
+- You need the model to reliably follow a complex reasoning pattern
+- You have 1,000+ high-quality examples of the desired input-output behavior
+
+## When NOT to fine-tune
+
+- The model already does what you want with the right prompt
+- You need the model to know facts (use RAG instead)
+- You have fewer than 500 training examples (likely to overfit)
+- The task changes frequently (retraining is expensive)
+- You need to audit which data influenced a specific output (fine-tuning is a black box)
+
+## Method selection
+
+| GPU VRAM | 7B model | 13B model | 70B model |
+|----------|----------|-----------|-----------|
+| 16GB (T4) | QLoRA | Not feasible | Not feasible |
+| 24GB (3090/4090) | QLoRA or LoRA | QLoRA | Not feasible |
+| 40GB (A100) | LoRA or Full | QLoRA or LoRA | QLoRA |
+| 80GB (A100/H100) | Full | LoRA or Full | QLoRA or LoRA |
+
+## LoRA configuration checklist
+
+1. Start with r=16, alpha=32 (safe default for most tasks)
+2. Target q_proj and v_proj first (minimum viable LoRA)
+3. Use learning rate 2e-4 for QLoRA, 5e-5 for LoRA fp16
+4. Set lora_dropout=0.05
+5. Train for 1-3 epochs (more risks overfitting)
+6. Evaluate every 100 steps on a held-out set
+7. Save checkpoints and pick the best by eval loss
+
+## Common mistakes
+
+- Training for too many epochs (overfitting after epoch 2-3 on small datasets)
+- Using the same learning rate as full fine-tuning (LoRA needs higher LR)
+- Forgetting to set the pad token (causes NaN losses with Llama models)
+- Not freezing the base model (defeats the purpose of LoRA)
+- Evaluating only on training data (always hold out 10-20% for eval)
+- Skipping the prompt engineering baseline (fine-tuning a problem that prompting already solves)
+
+## Quality verification
+
+After training, compare on 200+ held-out examples:
+1. Base model with best prompt (baseline)
+2. Base model with LoRA adapter (your fine-tuned model)
+3. GPT-4 or Claude with same prompt (ceiling)
+
+If the LoRA model does not beat the prompted baseline, your training data or configuration needs work, not more compute.
+
+## Adapter management
+
+- Keep adapters separate for multi-task serving (swap adapters per request)
+- Merge adapters into base weights for single-task deployment
+- Store adapters on Hugging Face Hub (10-100MB, easy to version and share)
+- Test merged model outputs match unmerged outputs before deploying
+- Use TIES-Merging or DARE to combine multiple adapters into one
+
+## Debugging training
+
+If loss does not decrease:
+1. Check learning rate (too low for LoRA, try 2e-4)
+2. Verify LoRA layers are actually receiving gradients
+3. Confirm base model weights are frozen
+4. Check data formatting (tokenizer must match model&#39;s expected format)
+
+If loss decreases but eval quality is bad:
+1. Training data quality issue (garbage in, garbage out)
+2. Overfitting (reduce epochs, increase dropout, add more data)
+3. Wrong target modules (add MLP layers for complex tasks)
+4. Rank too low (try r=32 or r=64)
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. What is the core insight behind LoRA (Low-Rank Adaptation)?</legend><label class="option"><input type="radio" name="q0" value="0"> Smaller models are always better</label><label class="option"><input type="radio" name="q0" value="1"> Weight updates during fine-tuning have low intrinsic rank, so they can be approximated by two small matrices instead of updating the full weight matrix</label><label class="option"><input type="radio" name="q0" value="2"> Most weights don&#39;t matter</label><label class="option"><input type="radio" name="q0" value="3"> Fine-tuning only needs the last layer</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. How much memory does LoRA save compared to full fine-tuning of an 8B model?</legend><label class="option"><input type="radio" name="q1" value="0"> Only saves disk space</label><label class="option"><input type="radio" name="q1" value="1"> No savings</label><label class="option"><input type="radio" name="q1" value="2"> From ~56GB down to ~6GB by training &lt;1% of parameters while keeping base weights frozen</label><label class="option"><input type="radio" name="q1" value="3"> 50% reduction</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. What is QLoRA?</legend><label class="option"><input type="radio" name="q2" value="0"> A different fine-tuning algorithm</label><label class="option"><input type="radio" name="q2" value="1"> LoRA applied to quantized activations</label><label class="option"><input type="radio" name="q2" value="2"> Quantized LoRA: the base model is loaded in 4-bit precision while LoRA adapters train in 16-bit, combining memory savings from both techniques</label><label class="option"><input type="radio" name="q2" value="3"> A faster version of LoRA</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. What does the &#39;rank&#39; parameter (r) in LoRA control?</legend><label class="option"><input type="radio" name="q3" value="0"> The learning rate</label><label class="option"><input type="radio" name="q3" value="1"> The number of training epochs</label><label class="option"><input type="radio" name="q3" value="2"> The capacity of the adapter: higher rank captures more complex adaptations but uses more parameters and memory</label><label class="option"><input type="radio" name="q3" value="3"> The number of layers to fine-tune</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. What happens when you merge LoRA weights back into the base model?</legend><label class="option"><input type="radio" name="q4" value="0"> Merging is not possible</label><label class="option"><input type="radio" name="q4" value="1"> The model becomes larger</label><label class="option"><input type="radio" name="q4" value="2"> The model needs to be retrained</label><label class="option"><input type="radio" name="q4" value="3"> The adapter matrices are added to the base weights (W_merged = W_base + B*A), producing a standard model with no inference overhead</label><p data-feedback="4"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/11-llm-engineering/07-advanced-rag/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/11-llm-engineering/09-function-calling/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/11-llm-engineering/08-fine-tuning-lora/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

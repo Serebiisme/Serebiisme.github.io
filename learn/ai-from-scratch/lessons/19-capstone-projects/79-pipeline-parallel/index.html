@@ -1,0 +1,434 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>管道平行和泡分析 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-19-capstone-projects" data-lesson="19-capstone-projects/79-pipeline-parallel" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/19-capstone-projects/">综合项目</a> / LESSON 79</p><h1 class="lesson-title">管道平行和泡分析</h1><p>Pipeline Parallel and Bubble Analysis</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>管道平行和泡分析</h1>
+<blockquote>
+<p>数平行式分开矩阵乘以各行.管道平行式分开模型跨行,每个行各分别分开一个阶段.微分组通过管道流动.开始和结束的空时间是泡;最小化它是整个工艺.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 19 Track C lessons 42-49
+<strong>Time:</strong> ~90 min</p>
+<h2>学习目标</h2>
+<ul>
+<li>分开一个连续模型成N阶段,并模拟N行间的前进管道.</li>
+<li>使用GPipe时间表 (仅前面填充,然后倒退) 通过管道进行M微洗,并计算泡分数.</li>
+<li>根据Megatron-LM和PipeDream所使用的1F1B时间表进行泡比较.</li>
+<li>防御阶段分配:每阶段的等式计算比每阶段的等式参数数数更重要.</li>
+</ul>
+<h2>问题</h2>
+<p>只有在fp16中的70B参数模型需要140GB的参数. 没有消费者GPU可以控制它. 泽罗-3在各层中分断参数,但仍然需要每个层来收集每一步的全部层次,每层支付 log ((N) 跳. 管道平行采用不同的路径:将模型切成N阶段,并将每个阶段设置为一个阶段. 阶段1的前进在0级完成,并将激活子交给1级;阶段1运行2级,手交给2级等等. 倒流向后,倒流向后. 记忆线性下降,因为每个级别只包含一个阶段;计算是序列的,这是泡问题.</p>
+<p>泡是管道开始时的置时间 (等待第一批微洗到最后阶段),以及最后 (等待最后一批微洗回流). 对于M微洗和N阶段,每个阶段的泡分数为 (N-1)/(M+N-1). 在M=8,N=4是27%. 在M=64时,N=4是4.5%. 泡会缩小,当你每步都有很多微型洗器,这意味着每微型洗器的批量量很小,</p>
+<h2>概念</h2>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-b365918f61b124d34512.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>轮时间表</h3>
+<p>在向后开始之前,将M微洗手机填充到前方,然后向后排水. 任何微型的激活必须保持到它向后,所以记忆以线性方式增长与M. 前进需要M+N-1周期,后退需要另一个M+N-1周期. 每阶段有用的工作为2M周期;每阶段泡为2 ((N-1) 周期. 泡分数是 (N-1)/(M+N-1) 每个向前和向后都需要一个时间单位. 选择M比N大得多,就隐藏了泡.</p>
+<h3>时间表1F1B</h3>
+<p>间歇:一旦微型的前行达到最后阶段,就开始向后流,然后让它回流. 每个阶段,时间表交换一次向前,一次向后. 泡仍然是N-1,但激活记忆由管道深度限制,而不是微量. 生产管道使用1F1B (Megatron, PipeDream). 课程首先将GPipe执行,因为它更简单,</p>
+<h3>为什么每个阶段的等式计算是重要的</h3>
+<p>如果阶段0需要50ms,阶段1需要100ms,每个周期都被关在阶段1.其他阶段每周期停滞50ms等待阶段1释放.等等参数数数量是错误的轴:变压器的计算由注意力加上每层MLP主导,嵌入层具有许多参数,但计算很少.阶段分配应该等同于每个阶段的FLOP,而不是每个阶段的重量.</p>
+<h3>微分批量对批量</h3>
+<p>管道运行B尺寸M微.有效批量大小为M<em>B.管道步骤结束时的梯度是结合M</em>B示例的梯度.泡分数取决于M;优化器看到M*B.调整M意味着交易泡 (低于M高) 与每微存储器 (GPipe的高于M高的更高的激活存储).</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-3c72273724d3c9260c0d.png" alt="cd-pipeline-bubble 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<p><code>code/main.py</code>执行:</p>
+<ul>
+<li><code>PipelineStage</code>子<code>nn.Module</code>具有一个阶段的参数和暴露<code>forward(activation)</code>现在,我们要去.</li>
+<li><code>Pipeline(stages, num_microbatches)</code>通过模拟每阶段的墙钟,调整GPipe的时间表.</li>
+<li><code>bubble_fraction(num_stages, num_microbatches)</code>:封闭式 (N-1) /(M+N-1).</li>
+<li>通过4个阶段的演示, 打印每微分量的痕迹和测量的泡分数.</li>
+</ul>
+<p>运行它:</p>
+<pre><code class="language-bash">python3 code/main.py
+</code></pre>
+<p>输出:一个阶段按微批次的甘特图表和与封闭形式预测相比的泡百分比.</p>
+<h2>野生生产模式</h2>
+<p>两种模式使管道硬化,</p>
+<p>**Activation checkpointing pairs with pipeline.**通过GPipe飞行中的M微分钟,激活内存为M乘以1微分钟.激活检查点重新计算前进时间,对内存进行交易.</p>
+<p>**Stage balance is measured, not assumed.**制作团队运行一个配置文件通过,测量目标硬件的实际每层计算 (FLOP和墙钟),然后按此测量进行分区.<code>--num-layers-per-stage</code>标志接受列表,以便在各阶段的成本不同时允许不均的层计数.</p>
+<p>**Send-recv schedule must avoid deadlock.**管道,每个阶段都在收到电线上的门之前发送.标准的修正是交互:平排阶段先发送,然后回复,奇排阶段先回复,然后发送.课程时间表明确排列,所以模式可见.</p>
+<h2>用它</h2>
+<p>生产模式:</p>
+<ul>
+<li>**Megatron-LM.**参考管道平行尺度. 使用1F1B,支持子+管道+数据平行组合.</li>
+<li>**DeepSpeed Pipeline.**与 ZeRO 集成; ZeRO-1 + 管道是最大的开放模型的常见组合.</li>
+<li>**PyTorch Pipe.**管道包装, 基于<code>torch.distributed.pipeline.sync.Pipe</code>现在,我们要去.</li>
+</ul>
+<h2>运送它</h2>
+<p>第80课节将每个阶段参数的分片存储在分片检查点. 第81课节将DDP + ZeRO +管道组合到端到端演示中 (精神上;演示保持管道模拟运行时间).</p>
+<h2>运动</h2>
+<ol>
+<li>执行1F1B,验证泡分数与GPipe相匹配,但激活内存是有限的.</li>
+<li>在更深层次的模型上,按测量的墙钟进行分析,并重新平衡阶段的实时阶段.</li>
+<li>通过管道微分组加上梯度积累,检查梯度等于相当的全批次向前梯度.</li>
+<li>通过激活检查点对配管道进行测量,测量内存下降与计算成本.</li>
+<li>结合管道与DDP (每个管道排名在数据平行组中复制) 并通过2D时间表进行推理.</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Pipeline</td>
+<td>&quot;Model parallel along depth&quot;</td>
+<td>One stage per rank, activations flow stage to stage</td>
+</tr>
+<tr>
+<td>Bubble</td>
+<td>&quot;Pipeline idle time&quot;</td>
+<td>(N-1) steps at start + end where some stages have no work</td>
+</tr>
+<tr>
+<td>Microbatch</td>
+<td>&quot;Slice of the batch&quot;</td>
+<td>One forward/backward unit; bubble shrinks as M grows</td>
+</tr>
+<tr>
+<td>GPipe</td>
+<td>&quot;Fill then drain&quot;</td>
+<td>All M forwards before any backward; high activation memory</td>
+</tr>
+<tr>
+<td>1F1B</td>
+<td>&quot;Interleaved schedule&quot;</td>
+<td>One forward one backward per stage; bounded activation memory</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/1811.06965" rel="noreferrer" data-network="true">Huang et al, GPipe: Efficient Training of Giant Neural Networks <small>↗ 需要联网</small></a></li>
+<li><a href="https://arxiv.org/abs/1806.03377" rel="noreferrer" data-network="true">Narayanan et al, PipeDream: Generalized Pipeline Parallelism for DNN Training <small>↗ 需要联网</small></a></li>
+<li><a href="https://github.com/NVIDIA/Megatron-LM" rel="noreferrer" data-network="true">Megatron-LM pipeline parallel docs <small>↗ 需要联网</small></a></li>
+<li>第19阶段 第76课 - 时间表使用的发送/回收原始函数</li>
+<li>阶段19课程78 - ZeRO与管道直角,通常是结合的</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Pipeline Parallel and Bubble Analysis</h1>
+<blockquote>
+<p>Tensor parallelism splits the matrix multiply across ranks. Pipeline parallelism splits the model across ranks, one stage per rank. Microbatches flow through the pipeline. The empty time at the start and end is the bubble; minimising it is the whole craft.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 19 Track C lessons 42-49
+<strong>Time:</strong> ~90 min</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Split a sequential model into N stages and simulate a forward pipeline across N ranks.</li>
+<li>Schedule M microbatches through the pipeline using the GPipe schedule (forward-only fill, then backward) and compute the bubble fraction.</li>
+<li>Compare bubble against the interleaved 1F1B schedule used in Megatron-LM and PipeDream.</li>
+<li>Defend stage assignment: equal compute per stage matters more than equal parameter count per stage.</li>
+</ul>
+<h2>The Problem</h2>
+<p>A 70B-parameter model in fp16 needs 140 GB of parameters alone. No consumer GPU holds it. ZeRO-3 shards parameters across ranks but still needs every rank to allgather the full layer for each forward step, paying log(N) hops per layer. Pipeline parallel takes a different route: cut the model into N stages and put one stage on each rank. Forward of layer 1 finishes on rank 0 and hands the activation tensor to rank 1; rank 1 runs layer 2 and hands to rank 2; and so on. Backward flows in reverse. Memory drops linearly because each rank only holds one stage; compute is sequential, which is the bubble problem.</p>
+<p>The bubble is the idle time at the start of the pipeline (waiting for the first microbatch to reach the last stage) and at the end (waiting for the last microbatch to drain back through). With M microbatches and N stages the per-stage bubble fraction is (N-1)/(M+N-1). At M=8, N=4 that is 27%. At M=64, N=4 it is 4.5%. The bubble shrinks when you have many microbatches per step, which means small per-microbatch batch sizes, which is the constraint that drives microbatch design.</p>
+<h2>The Concept</h2>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-b365918f61b124d34512.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>GPipe schedule</h3>
+<p>Fill the pipeline forward with all M microbatches before starting any backward; then drain backward in reverse. Activations from every microbatch must be held until its backward, so memory grows linearly with M. Forward takes M+N-1 cycles, backward takes another M+N-1 cycles. Per-stage useful work is 2M cycles; per-stage bubble is 2(N-1) cycles. Bubble fraction is (N-1)/(M+N-1) when each forward and backward takes one unit of time. Picking M much greater than N hides the bubble.</p>
+<h3>1F1B schedule</h3>
+<p>Interleave: as soon as a microbatch's forward reaches the last stage, start its backward and let it stream back. The schedule alternates one forward and one backward per stage. Bubble is still N-1 but activation memory is bounded by the pipeline depth, not the microbatch count. Production pipelines use 1F1B (Megatron, PipeDream). The lesson implements GPipe first because it is simpler, and 1F1B as an exercise.</p>
+<h3>Why equal compute per stage matters</h3>
+<p>If stage 0 takes 50 ms and stage 1 takes 100 ms, every cycle is gated on stage 1. The other stages idle 50 ms per cycle waiting for stage 1 to release. Equal parameter count is the wrong axis: a transformer's compute is dominated by attention plus MLP per layer, and embedding layers have many parameters but little compute. Stage assignment should equalise FLOPs per stage, not weights per stage.</p>
+<h3>Microbatch versus batch</h3>
+<p>A pipeline runs M microbatches of size B each. The effective batch size is M<em>B. The gradient at the end of a pipeline step is the gradient on the combined M</em>B examples. Bubble fraction depends on M; the optimiser sees M*B. Tuning M means trading bubble (lower with high M) against per-microbatch memory (higher activation memory with high M for GPipe).</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-3c72273724d3c9260c0d.png" alt="cd-pipeline-bubble 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<p><code>code/main.py</code> implements:</p>
+<ul>
+<li><code>PipelineStage</code>: a small <code>nn.Module</code> that holds one stage's parameters and exposes <code>forward(activation)</code>.</li>
+<li><code>Pipeline(stages, num_microbatches)</code>: orchestrates the GPipe schedule on simulated stages using simulated wall-clock per stage.</li>
+<li><code>bubble_fraction(num_stages, num_microbatches)</code>: closed-form (N-1)/(M+N-1).</li>
+<li>A 4-stage demo that prints the per-microbatch trace and the measured bubble fraction.</li>
+</ul>
+<p>Run it:</p>
+<pre><code class="language-bash">python3 code/main.py
+</code></pre>
+<p>Output: a stage-by-microbatch Gantt chart and the bubble percentage against the closed-form prediction.</p>
+<h2>Production patterns in the wild</h2>
+<p>Three patterns harden pipeline parallel enough to ship.</p>
+<p><strong>Activation checkpointing pairs with pipeline.</strong> With M microbatches in flight on GPipe, activation memory is M times one microbatch. Activation checkpointing recomputes the forward at backward time, trading compute for memory; the combination is what makes pipeline tractable for long sequences.</p>
+<p><strong>Stage balance is measured, not assumed.</strong> Production teams run a profiling pass that measures actual per-layer compute (FLOPs and wall-clock) on the target hardware, then partition by that measurement. The Megatron-LM <code>--num-layers-per-stage</code> flag accepts a list to allow uneven layer counts when stages have different per-layer cost.</p>
+<p><strong>Send-recv schedule must avoid deadlock.</strong> A pipeline that has every stage send before receive deadlocks on the wire. The standard fix is to interleave: even-rank stages send first then recv, odd-rank stages recv first then send. The lesson schedules ranks explicitly so the pattern is visible.</p>
+<h2>Use It</h2>
+<p>Production patterns:</p>
+<ul>
+<li><strong>Megatron-LM.</strong> The reference for pipeline parallel at scale. Uses 1F1B and supports tensor + pipeline + data parallel combined.</li>
+<li><strong>DeepSpeed Pipeline.</strong> Integrates with ZeRO; ZeRO-1 + pipeline is a common combo for the largest open models.</li>
+<li><strong>PyTorch Pipe.</strong> The PyTorch-native pipeline wrapper, built on <code>torch.distributed.pipeline.sync.Pipe</code>.</li>
+</ul>
+<h2>Ship It</h2>
+<p>Lesson 80 stores the per-stage parameter shards in the sharded checkpoint. Lesson 81 composes DDP + ZeRO + pipeline on the end-to-end demo (in spirit; the demo keeps the pipeline simulated for runtime).</p>
+<h2>Exercises</h2>
+<ol>
+<li>Implement 1F1B and verify the bubble fraction matches GPipe but activation memory is bounded.</li>
+<li>Profile real per-stage time on a deeper model and rebalance stages by measured wall-clock.</li>
+<li>Add gradient accumulation across pipeline microbatches and check the gradient equals the gradient of the equivalent full-batch forward.</li>
+<li>Pair the pipeline with activation checkpointing and measure the memory drop versus compute cost.</li>
+<li>Combine pipeline with DDP (each pipeline rank is replicated across a data-parallel group) and reason through the 2D schedule.</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Pipeline</td>
+<td>&quot;Model parallel along depth&quot;</td>
+<td>One stage per rank, activations flow stage to stage</td>
+</tr>
+<tr>
+<td>Bubble</td>
+<td>&quot;Pipeline idle time&quot;</td>
+<td>(N-1) steps at start + end where some stages have no work</td>
+</tr>
+<tr>
+<td>Microbatch</td>
+<td>&quot;Slice of the batch&quot;</td>
+<td>One forward/backward unit; bubble shrinks as M grows</td>
+</tr>
+<tr>
+<td>GPipe</td>
+<td>&quot;Fill then drain&quot;</td>
+<td>All M forwards before any backward; high activation memory</td>
+</tr>
+<tr>
+<td>1F1B</td>
+<td>&quot;Interleaved schedule&quot;</td>
+<td>One forward one backward per stage; bounded activation memory</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/1811.06965" rel="noreferrer" data-network="true">Huang et al, GPipe: Efficient Training of Giant Neural Networks <small>↗ 需要联网</small></a></li>
+<li><a href="https://arxiv.org/abs/1806.03377" rel="noreferrer" data-network="true">Narayanan et al, PipeDream: Generalized Pipeline Parallelism for DNN Training <small>↗ 需要联网</small></a></li>
+<li><a href="https://github.com/NVIDIA/Megatron-LM" rel="noreferrer" data-network="true">Megatron-LM pipeline parallel docs <small>↗ 需要联网</small></a></li>
+<li>Phase 19 Lesson 76 - the send/recv primitives the schedule uses</li>
+<li>Phase 19 Lesson 78 - ZeRO is orthogonal to pipeline and often combined</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-19-capstone-projects--79-pipeline-parallel.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-19-capstone-projects--79-pipeline-parallel.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/79-pipeline-parallel/code/main.py">phases/19-capstone-projects/79-pipeline-parallel/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Pipeline parallel with GPipe schedule and bubble analysis.
+
+Splits a sequential MLP into N stages. The schedule simulates wall-clock for
+each stage&#39;s forward and backward, then prints a Gantt chart and computes the
+bubble fraction against the closed-form (N-1)/(M+N-1) prediction.
+
+A second demo wires a 2-stage real pipeline over torch.distributed gloo:
+rank 0 owns stage 0, rank 1 owns stage 1, activations flow over send/recv,
+and the schedule trains a small MLP for a few steps to prove the wire works.
+
+Run: python3 code/main.py
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import multiprocessing as mp
+import os
+import sys
+import tempfile
+
+import torch
+import torch.distributed as dist
+import torch.nn as nn
+
+
+SEED = 23
+NUM_STAGES = 4
+NUM_MICROBATCHES = 8
+FORWARD_UNITS = 1
+BACKWARD_UNITS = 2
+
+
+def _loopback_iface() -&gt; str:
+    return &quot;lo0&quot; if sys.platform == &quot;darwin&quot; else &quot;lo&quot;
+
+
+def bubble_fraction(num_stages: int, num_microbatches: int) -&gt; float:
+    &quot;&quot;&quot;Closed-form bubble fraction per stage for GPipe.
+
+    Forward takes M + N - 1 cycles per stage (M useful + N - 1 idle warmup).
+    Backward takes M + N - 1 cycles per stage (M useful + N - 1 idle drain).
+    Total cycles = 2(M + N - 1); useful per stage = 2M.
+    Bubble fraction = 2(N - 1) / 2(M + N - 1) = (N - 1) / (M + N - 1).
+    &quot;&quot;&quot;
+    n = num_stages
+    m = num_microbatches
+    return (n - 1) / (m + n - 1)
+
+
+def gpipe_schedule(num_stages: int, num_microbatches: int) -&gt; list:
+    &quot;&quot;&quot;Return the GPipe schedule as a list of (cycle, stage, microbatch, phase).
+
+    Phase is &#39;F&#39; for forward, &#39;B&#39; for backward, &#39;.&#39; for idle. Cycle is the
+    integer time slot. Microbatch is the microbatch index.
+    &quot;&quot;&quot;
+    n = num_stages
+    m = num_microbatches
+    schedule = []
+    # forward pass: microbatch i enters stage 0 at cycle i, stage k at cycle i+k
+    for mb in range(m):
+        for stage in range(n):
+            cycle = mb + stage
+            schedule.append((cycle, stage, mb, &quot;F&quot;))
+    # backward pass: microbatch i finishes forward at stage n-1 cycle i+n-1
+    # then backward starts at stage n-1 at cycle m+n-1+i and rolls to stage 0
+    forward_end = m + n - 1
+    for mb in range(m):
+        for stage in reversed(range(n)):
+            cycle = forward_end + (m - 1 - mb) + (n - 1 - stage)
+            schedule.append((cycle, stage, mb, &quot;B&quot;))
+    return schedule
+
+
+def render_gantt(schedule: list, num_stages: int, num_microbatches: int) -&gt; str:
+    &quot;&quot;&quot;Render the schedule as a stage-by-cycle text Gantt chart.&quot;&quot;&quot;
+    n = num_stages
+    m = num_microbatches
+    max_cycle = max(c for c, _, _, _ in schedule)
+    grid = [[&quot;.&quot; for _ in range(max_cycle + 1)] for _ in range(n)]
+    for cycle, stage, mb, phase in schedule:
+        grid[stage][cycle] = f&quot;{phase}{mb}&quot; if phase != &quot;.&quot; else &quot;.&quot;
+    lines = []
+    header = &quot;stage \\ cycle  &quot; + &quot; &quot;.join(f&quot;{c:&gt;2}&quot; for c in range(max_cycle + 1))
+    lines.append(header)
+    for s, row in enumerate(grid):
+        lines.append(f&quot;stage {s}         &quot; + &quot; &quot;.join(f&quot;{cell:&gt;2}&quot; for cell in row))
+    return &quot;\n&quot;.join(lines)
+
+
+def measure_bubble(num_stages: int, num_microbatches: int) -&gt; float:
+    &quot;&quot;&quot;Empirical bubble: count idle slots in the rendered schedule.&quot;&quot;&quot;
+    schedule = gpipe_schedule(num_stages, num_microbatches)
+    max_cycle = max(c for c, _, _, _ in schedule)
+    total_slots = num_stages * (max_cycle + 1)
+    used = len(schedule)
+    return (total_slots - used) / total_slots
+
+
+class StageMLP(nn.Module):
+    &quot;&quot;&quot;One stage of a sequential MLP.&quot;&quot;&quot;
+
+    def __init__(self, in_dim: int, hid_dim: int, out_dim: int):
+        super().__init__()
+        self.fc1 = nn.Linear(in_dim, hid_dim)
+        self.fc2 = nn.Linear(hid_dim, out_dim)
+
+    def forward(self, x: torch.Tensor) -&gt; torch.Tensor:
+        return torch.relu(self.fc2(torch.relu(self.fc1(x))))
+
+
+def _pipe_worker(rank: int, world_size: int, init_file: str, iface: str,
+                 steps: int, batch: int, microbatches: int, out_queue) -&gt; None:
+    &quot;&quot;&quot;Two-rank pipeline: rank 0 owns stage 0, rank 1 owns stage 1.
+
+    Forward: rank 0 runs stage 0 on microbatch, sends activation to rank 1.
+    Rank 1 runs stage 1, computes loss, runs backward, sends grad back to rank 0.
+    Rank 0 finishes backward on stage 0. Repeats per microbatch.
+    &quot;&quot;&quot;
+    os.environ[&quot;GLOO_SOCKET_IFNAME&quot;] = iface
+    dist.init_process_group(
+        backend=&quot;gloo&quot;, init_method=f&quot;file://{init_file}&quot;,
+        rank=rank, world_size=world_size,
+    )
+    torch.manual_seed(SEED + rank)
+    in_dim, hid_dim, mid_dim, out_dim = 16, 32, 16, 4
+    if rank == 0:
+        stage = StageMLP(in_dim, hid_dim, mid_dim)
+    else:
+        stage = StageMLP(mid_dim, hid_dim, out_dim)
+    optim = torch.optim.SGD(stage.parameters(), lr=0.05)
+    loss_fn = nn.MSELoss()
+    g = torch.Generator().manual_seed(SEED + 99)
+    losses = []
+    for step in range(steps):
+        optim.zero_grad(set_to_none=True)
+        for _ in range(microbatches):
+            if rank == 0:
+                x = torch.randn(batch, in_dim, generator=g)
+                act = stage(x)
+                dist.send(act.detach(), dst=1)
+                grad = torch.zeros_like(act)
+                dist.recv(grad, src=1)
+                act.backward(grad)
+            else:
+                act = torch.zeros(batch, mid_dim, requires_grad=True)
+                buf = torch.zeros(batch, mid_dim)
+                dist.recv(buf, src=0)
+                act = buf.detach().requires_grad_(True)
+                pred = stage(act)
+                y = torch.zeros(batch, out_dim)
+                loss = loss_fn(pred, y)
+                loss.backward()
+                dist.send(act.grad.detach(), dst=0)
+                losses.append(loss.item())
+        optim.step()
+    norm = sum(p.detach().pow(2).sum().item() for p in stage.parameters()) ** 0.5
+    out_queue.put((rank, losses, norm))
+    out_queue.close()
+    out_queue.join_thread()
+    os._exit(0)
+
+
+def run_pipeline(steps: int = 5, batch: int = 8, microbatches: int = 4) -&gt; dict:
+    &quot;&quot;&quot;Spawn a 2-rank pipeline; return per-rank losses (only rank 1 reports) and norms.&quot;&quot;&quot;
+    ctx = mp.get_context(&quot;spawn&quot;)
+    out_queue = ctx.Queue()
+    init_dir = tempfile.mkdtemp(prefix=&quot;aie_pipe_&quot;)
+    init_file = os.path.join(init_dir, &quot;rendezvous&quot;)
+    iface = _loopback_iface()
+    world_size = 2
+    procs = []
+    try:
+        for r in range(world_size):
+            p = ctx.Process(
+                target=_pipe_worker,
+                args=(r, world_size, init_file, iface, steps, batch, microbatches, out_queue),
+            )
+            p.start()
+            procs.append(p)
+        results = {}
+        for _ in range(world_size):
+            rank, losses, norm = out_queue.get(timeout=120)
+            results[rank] = (losses, norm)
+        return results
+    finally:
+        for p in procs:
+            p.join(timeout=5)
+            if p.is_alive():
+                p.terminate()
+                p.join(timeout=2)
+        try:
+            os.remove(init_file)
+        except FileNotFoundError:
+            pass
+        try:
+            os.rmdir(init_dir)
+        except OSError:
+            pass
+
+
+def main() -&gt; int:
+    print(f&quot;GPipe schedule analysis: stages={NUM_STAGES}, microbatches={NUM_MICROBATCHES}&quot;)
+    schedule = gpipe_schedule(NUM_STAGES, NUM_MICROBATCHES)
+    print(render_gantt(schedule, NUM_STAGES, NUM_MICROBATCHES))
+    closed = bubble_fraction(NUM_STAGES, NUM_MICROBATCHES)
+    measured = measure_bubble(NUM_STAGES, NUM_MICROBATCHES)
+    print(f&quot;\nclosed-form bubble fraction: {closed * 100:.2f}%&quot;)
+    print(f&quot;measured bubble fraction:    {measured * 100:.2f}%&quot;)
+    print(&quot;\nbubble vs microbatch count (N=4):&quot;)
+    print(f&quot;{&#39;M&#39;:&lt;6}{&#39;bubble %&#39;:&lt;10}&quot;)
+    for m in (1, 2, 4, 8, 16, 32, 64):
+        print(f&quot;{m:&lt;6}{bubble_fraction(4, m)*100:&lt;10.2f}&quot;)
+    print(&quot;\nrunning 2-stage real pipeline over gloo...&quot;)
+    results = run_pipeline(steps=3, batch=8, microbatches=4)
+    rank1_losses = results[1][0]
+    print(f&quot;rank 1 saw {len(rank1_losses)} microbatch losses; final norm rank 0 = {results[0][1]:.4f}, rank 1 = {results[1][1]:.4f}&quot;)
+    return 0
+
+
+if __name__ == &quot;__main__&quot;:
+    raise SystemExit(main())
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. What is the pipeline bubble?</legend><label class="option"><input type="radio" name="q0" value="0"> A network packet</label><label class="option"><input type="radio" name="q0" value="1"> A bug in NCCL</label><label class="option"><input type="radio" name="q0" value="2"> Idle time at start and end of the pipeline: stages with no work until the first microbatch reaches them, and after the last microbatch leaves</label><label class="option"><input type="radio" name="q0" value="3"> Memory leak</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. Why is GPipe&#39;s activation memory proportional to M?</legend><label class="option"><input type="radio" name="q1" value="0"> Hardware limit</label><label class="option"><input type="radio" name="q1" value="1"> Compiler limit</label><label class="option"><input type="radio" name="q1" value="2"> Bug</label><label class="option"><input type="radio" name="q1" value="3"> All M microbatches&#39; activations must be held until the matching backward; nothing frees until the drain begins</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. How does 1F1B improve over GPipe?</legend><label class="option"><input type="radio" name="q2" value="0"> Higher throughput</label><label class="option"><input type="radio" name="q2" value="1"> Same bubble but bounded activation memory; once mb 0&#39;s forward reaches the last stage, its backward begins and activations free</label><label class="option"><input type="radio" name="q2" value="2"> Smaller model</label><label class="option"><input type="radio" name="q2" value="3"> Lower bubble</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. Why is equal compute per stage more important than equal parameter count?</legend><label class="option"><input type="radio" name="q3" value="0"> Memory aligned</label><label class="option"><input type="radio" name="q3" value="1"> Aesthetic</label><label class="option"><input type="radio" name="q3" value="2"> The slowest stage gates every cycle; other stages idle waiting for it. Embedding layers have many parameters but little compute, so partitioning by parameter count misbalances the pipeline</label><label class="option"><input type="radio" name="q3" value="3"> Easier to code</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. What goes wrong if every stage calls send before recv?</legend><label class="option"><input type="radio" name="q4" value="0"> Higher bubble</label><label class="option"><input type="radio" name="q4" value="1"> Slow</label><label class="option"><input type="radio" name="q4" value="2"> Deadlock on the wire; standard fix is to interleave even-rank send-first and odd-rank recv-first</label><label class="option"><input type="radio" name="q4" value="3"> Memory leak</label><p data-feedback="4"></p></fieldset><fieldset><legend>6. Pipeline plus ZeRO-1 combines what two memory wins?</legend><label class="option"><input type="radio" name="q5" value="0"> Activation only</label><label class="option"><input type="radio" name="q5" value="1"> Nothing</label><label class="option"><input type="radio" name="q5" value="2"> Per-stage parameter sharding (each rank only holds one stage of layers) plus per-rank optimiser sharding (each rank only holds 1/N of optimiser state for its stage)</label><label class="option"><input type="radio" name="q5" value="3"> Compression and quantisation</label><p data-feedback="5"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/19-capstone-projects/78-zero-parameter-sharding/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/19-capstone-projects/80-checkpoint-sharded-resume/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/19-capstone-projects/79-pipeline-parallel/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

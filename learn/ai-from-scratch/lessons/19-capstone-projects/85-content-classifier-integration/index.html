@@ -1,0 +1,915 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>内容分类器集成 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-19-capstone-projects" data-lesson="19-capstone-projects/85-content-classifier-integration" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/19-capstone-projects/">综合项目</a> / LESSON 85</p><h1 class="lesson-title">内容分类器集成</h1><p>Capstone 85 — Content Classifier Integration</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>内容分类器集成</h1>
+<blockquote>
+<p>输出侧的分类器回答了不同的问题,而不是输入侧的规则.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 18 safety lessons, Phase 19 Track A lessons 25-29
+<strong>Time:</strong> ~90 min</p>
+<h2>问题</h2>
+<p>输入并不是唯一的攻击表面. 一个通过了每次输入检查的模型仍然可以产生泄漏PII的输出,重复其训练分布的谤,或回响系统提示回给用户以响应一个聪明的问题. 输出侧分类器看到模型的实际反应,而不是用户的提示,</p>
+<p>团队经常跳过输出分类,因为输入分类感觉足够,并且输出分类器引入额外的延迟. 两种论点都失败了. 跳过输出分类给攻击者一个单次绕过:输入管道不覆盖的任何新的攻击家族都会落地于用户身上. 延迟是真实的,但可以解决:分类器可以与代币流动并行运行,门将最后的部分缓冲,并在冲光之前应用分类器判决.</p>
+<p>这块顶石将三个独立的输出侧分类器连接到单个政策路由器. 毒性 (基于规则的和骚扰检测). 信息信息 (电子邮件,电话号码,SSN形字符串,信用卡形字符串,IP地址). 指示泄漏 (系统提示回声的统计,通过三重图重叠来将输出与已知系统提示进行比较). 路由器收集分类器的判决,选择严格度,并执行行动政策:<code>block</code>现在<code>redact</code>现在<code>warn</code>其他<code>log</code>现在,我们要去.</p>
+<h2>概念</h2>
+<p>每个分类器都是一个返回一个可调用的<code>ClassifierVerdict</code>随着<code>name</code>现在<code>score in [0,1]</code>现在<code>severity</code>(<code>none</code>现在<code>low</code>现在<code>medium</code>现在<code>high</code>),以及<code>findings</code>路由器将判决列表进行,并应用规则表:</p>
+<table>
+<thead>
+<tr>
+<th>Severity</th>
+<th>Action</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>high</td>
+<td>block (drop output, return policy refusal)</td>
+</tr>
+<tr>
+<td>medium</td>
+<td>redact (apply per-classifier redactor to the output)</td>
+</tr>
+<tr>
+<td>low</td>
+<td>warn (log and append a soft notice to the response)</td>
+</tr>
+<tr>
+<td>none</td>
+<td>log (record verdict in the trace, ship as-is)</td>
+</tr>
+</tbody>
+</table>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-f973942754e1a1f85752.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>路由器在分类器中采取最大的严重程度并执行相应的操作. 阻塞获胜. 编辑+警告变成编辑. 记录+警告变成警告. 路由器发出一个<code>Action</code>具有的对象<code>verb</code>现在<code>output</code>现在<code>severity</code>现在<code>verdicts</code>其他<code>metadata</code>后游,课87中的安全门将元数据记录在一个跟踪中,将删除的输出发送,将原始输出发送,或将输出取代,以政策拒绝.</p>
+<p>每个分类器都有自己的编辑器.<code>name@example.com</code>随着<code>[redacted-email]</code>信用卡形状的数字<code>[redacted-card]</code>指示泄漏分类器删除类似系统提示标题的线条.毒性分类器取代匹配的语器使用<code>[redacted-language]</code>编辑是独立的,因此毒性和PII输出通过两个编辑器流动.</p>
+<p>毒性分类器基于规则的目的:一个精选的骚扰关键词清单,白色空间限制的匹配和一个小的否定窗口检查,所以&quot;你不是&quot;不会颠覆规则.列表是故意短的 (课程是关于管道,而不是词典构建).PII分类器使用标准的调解符来对普通形状进行调整.指示泄漏分类器接受一个<code>system_prompt</code>构建时的参数,并将三重图重叠与输出进行比较;高重叠是泄漏信号.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-8a69fcd6b8c1980d5653.png" alt="cd-output-router 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<p><code>code/classifiers.py</code>它们的分类是:<code>classify(text) -&gt; ClassifierVerdict</code>方法和一个<code>redact(text) -&gt; str</code>如何使用<code>code/main.py</code>定义了<code>Router</code>课程<code>decide(text, verdicts) -&gt; Action</code>其他<code>run(text) -&gt; Action</code>演示器将三个分类器连接到一个路由器后面,并运行一个小组的制作输出,</p>
+<h2>用它</h2>
+<p>跑步<code>python3 main.py</code>演示程序将每次测试输出的动词打印出来,写道<code>outputs/classifier_report.json</code>延迟是人工零的,因为所有分类器都是基于规则的;对于一个具有神经分类器的真实模型,每分类器延迟增加后,同样的管道应用.</p>
+<h2>运送它</h2>
+<p><code>outputs/skill-content-classifier-integration.md</code>文件记录了判决和行动结构,</p>
+<h2>运动</h2>
+<ol>
+<li>添加代码注射的第四个分类器 (输出含有 <code>&lt;script&gt;</code>现在<code>eval(</code>决定其严格政策并将其整合.</li>
+<li>让路由器按每个分类器的重量量,使 PII 比毒性更重要.</li>
+<li>增加一个信任门,以使得低分的判决降低1级重度.</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>Common usage</th>
+<th>Precise meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>output classifier</td>
+<td>a model that detects bad outputs</td>
+<td>a callable returning a structured verdict with severity, score, and findings, plus a redactor</td>
+</tr>
+<tr>
+<td>severity</td>
+<td>how bad it is</td>
+<td>one of none, low, medium, high</td>
+</tr>
+<tr>
+<td>router</td>
+<td>a switch</td>
+<td>a function from verdict list to action (block, redact, warn, log)</td>
+</tr>
+<tr>
+<td>redact</td>
+<td>hide the bad parts</td>
+<td>per-classifier replacement of matched spans with a tag like [redacted-pii]</td>
+</tr>
+<tr>
+<td>instruction leakage</td>
+<td>the model leaks the system prompt</td>
+<td>a heuristic comparing model output to a known system prompt by trigram overlap</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<p>第86课增加了对不自然有分类器形状的约束的声明规则引擎. 第87课组合了输入侧检测器.</p>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Capstone 85 — Content Classifier Integration</h1>
+<blockquote>
+<p>Classifiers on the output side answer a different question than rules on the input side. Both need a policy router.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 18 safety lessons, Phase 19 Track A lessons 25-29
+<strong>Time:</strong> ~90 min</p>
+<h2>Problem</h2>
+<p>Inputs are not the only attack surface. A model that passed every input check can still produce an output that leaks PII, repeats slurs from its training distribution, or echoes the system prompt back to the user in response to a clever question. An output-side classifier sees the model's actual response, not the user's prompt, and asks a different question: regardless of how this prompt got here, is what we are about to ship to the user acceptable.</p>
+<p>Teams often skip output classification because input classification feels sufficient and because output classifiers introduce extra latency. Both arguments lose. Skipping output classification gives an attacker a one-shot bypass: any new attack family that the input pipeline does not cover will land on the user. Latency is real but addressable: classifiers can run in parallel with token streaming, with the gate buffering the final chunk and applying the classifier verdict before flush.</p>
+<p>This capstone wires three independent output-side classifiers behind a single policy router. Toxicity (rule-based slur and harassment detection). PII (regex for emails, phone numbers, SSN-shaped strings, credit-card-shaped strings, IP addresses). Instruction leakage (a heuristic for system prompt echo, comparing the output to a known system prompt by trigram overlap). The router collects classifier verdicts, picks a severity, and applies an action policy: <code>block</code>, <code>redact</code>, <code>warn</code>, or <code>log</code>.</p>
+<h2>Concept</h2>
+<p>Each classifier is a callable returning a <code>ClassifierVerdict</code> with <code>name</code>, <code>score in [0,1]</code>, <code>severity</code> (<code>none</code>, <code>low</code>, <code>medium</code>, <code>high</code>), and <code>findings</code> (a list of strings describing what it flagged). The router takes a list of verdicts and applies a rule table:</p>
+<table>
+<thead>
+<tr>
+<th>Severity</th>
+<th>Action</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>high</td>
+<td>block (drop output, return policy refusal)</td>
+</tr>
+<tr>
+<td>medium</td>
+<td>redact (apply per-classifier redactor to the output)</td>
+</tr>
+<tr>
+<td>low</td>
+<td>warn (log and append a soft notice to the response)</td>
+</tr>
+<tr>
+<td>none</td>
+<td>log (record verdict in the trace, ship as-is)</td>
+</tr>
+</tbody>
+</table>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-f973942754e1a1f85752.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>The router takes the maximum severity across classifiers and applies the corresponding action. Block wins. A redact + warn becomes redact. A log + warn becomes warn. The router emits an <code>Action</code> object with <code>verb</code>, <code>output</code>, <code>severity</code>, <code>verdicts</code>, and <code>metadata</code>. Downstream, the safety gate in lesson 87 logs the metadata into a trace and either ships the redacted output, ships the original with a warning, or replaces the output with a policy refusal.</p>
+<p>Each classifier has its own redactor. The PII classifier replaces <code>name@example.com</code> with <code>[redacted-email]</code> and the credit-card-shaped digits with <code>[redacted-card]</code>. The instruction-leakage classifier removes lines that look like the system prompt header. The toxicity classifier replaces matched slurs with <code>[redacted-language]</code>. Redaction is independent so a toxicity-and-PII output flows through both redactors.</p>
+<p>The toxicity classifier is rule-based on purpose: a curated list of harassment keywords with whitespace-bounded matching and a small negation-window check so &quot;you are not a slur&quot; does not trip the rule. The list is deliberately short (the lesson is about plumbing, not lexicon-building). The PII classifier uses standard regexes for the common shapes. The instruction-leakage classifier accepts a <code>system_prompt</code> parameter at construction and compares trigram overlap with the output; a high overlap is the leakage signal.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-8a69fcd6b8c1980d5653.png" alt="cd-output-router 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<p><code>code/classifiers.py</code> defines all three classifiers. Each has a <code>classify(text) -&gt; ClassifierVerdict</code> method and a <code>redact(text) -&gt; str</code> method. <code>code/main.py</code> defines the <code>Router</code> class with <code>decide(text, verdicts) -&gt; Action</code> and a <code>run(text) -&gt; Action</code> shortcut. The demo wires the three classifiers behind one router and runs a small corpus of crafted outputs that exercise each severity.</p>
+<h2>Use It</h2>
+<p>Run <code>python3 main.py</code>. The demo prints the action verb for each test output, writes <code>outputs/classifier_report.json</code>, and confirms that block, redact, warn, and log each fire on at least one fixture. Latency is artificially zero because all classifiers are rule-based; for a real model with neural classifiers, the same plumbing applies after the per-classifier latency goes up.</p>
+<h2>Ship It</h2>
+<p><code>outputs/skill-content-classifier-integration.md</code> documents the verdict and action structures so the gate in lesson 87 can consume them.</p>
+<h2>Exercises</h2>
+<ol>
+<li>Add a fourth classifier for code injection (output contains <code>&lt;script&gt;</code>, <code>eval(</code>, etc). Decide its severity policy and integrate it.</li>
+<li>Make the router apply a per-classifier severity weight so PII counts more than toxicity. Demonstrate the change on the same fixtures.</li>
+<li>Add a confidence threshold so low-score verdicts downgrade by one severity level. Sweep the threshold and report how block rate changes.</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>Common usage</th>
+<th>Precise meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>output classifier</td>
+<td>a model that detects bad outputs</td>
+<td>a callable returning a structured verdict with severity, score, and findings, plus a redactor</td>
+</tr>
+<tr>
+<td>severity</td>
+<td>how bad it is</td>
+<td>one of none, low, medium, high</td>
+</tr>
+<tr>
+<td>router</td>
+<td>a switch</td>
+<td>a function from verdict list to action (block, redact, warn, log)</td>
+</tr>
+<tr>
+<td>redact</td>
+<td>hide the bad parts</td>
+<td>per-classifier replacement of matched spans with a tag like [redacted-pii]</td>
+</tr>
+<tr>
+<td>instruction leakage</td>
+<td>the model leaks the system prompt</td>
+<td>a heuristic comparing model output to a known system prompt by trigram overlap</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<p>Lesson 86 adds a declarative rules engine for constraints not naturally classifier-shaped. Lesson 87 composes both with the input-side detector.</p>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-19-capstone-projects--85-content-classifier-integration.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-19-capstone-projects--85-content-classifier-integration.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/85-content-classifier-integration/code/classifiers.py">phases/19-capstone-projects/85-content-classifier-integration/code/classifiers.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Three output-side classifiers and their redactors.
+
+Each classifier exposes classify(text) -&gt; ClassifierVerdict and
+redact(text) -&gt; str. Severity is one of none, low, medium, high. All are
+rule-based so latency is zero and tests are deterministic.
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import math
+import re
+from collections import Counter
+from dataclasses import dataclass, field
+from typing import Iterable
+
+SEVERITY_ORDER = (&quot;none&quot;, &quot;low&quot;, &quot;medium&quot;, &quot;high&quot;)
+
+
+@dataclass
+class ClassifierVerdict:
+    name: str
+    severity: str = &quot;none&quot;
+    score: float = 0.0
+    findings: list[str] = field(default_factory=list)
+
+
+def _max_severity(a: str, b: str) -&gt; str:
+    return a if SEVERITY_ORDER.index(a) &gt;= SEVERITY_ORDER.index(b) else b
+
+
+HARASSMENT_TERMS = [
+    &quot;moron&quot;,
+    &quot;idiot&quot;,
+    &quot;stupid&quot;,
+    &quot;worthless&quot;,
+    &quot;trash human&quot;,
+    &quot;kill yourself&quot;,
+    &quot;lowlife&quot;,
+    &quot;scumbag&quot;,
+    &quot;useless person&quot;,
+    &quot;good for nothing&quot;,
+]
+
+
+_NEGATION_WINDOW = 20
+
+
+class ToxicityClassifier:
+    name = &quot;toxicity&quot;
+
+    def __init__(self, terms: Iterable[str] | None = None) -&gt; None:
+        self._terms = [t.lower() for t in (terms if terms is not None else HARASSMENT_TERMS)]
+        joined = &quot;|&quot;.join(re.escape(t) for t in self._terms)
+        self._needle = re.compile(rf&quot;\b({joined})\b&quot;, re.IGNORECASE)
+
+    def _negated_at(self, text: str, start: int) -&gt; bool:
+        window = text[max(0, start - _NEGATION_WINDOW) : start].lower()
+        return bool(re.search(r&quot;\b(not|never|no)\b&quot;, window))
+
+    def classify(self, text: str) -&gt; ClassifierVerdict:
+        findings: list[str] = []
+        hits = 0
+        for m in self._needle.finditer(text):
+            if self._negated_at(text, m.start()):
+                continue
+            findings.append(f&quot;matched &#39;{m.group(0)}&#39;&quot;)
+            hits += 1
+        if not findings:
+            return ClassifierVerdict(name=self.name)
+        score = min(1.0, 0.4 + 0.2 * hits)
+        if hits &gt;= 3:
+            sev = &quot;high&quot;
+        elif hits == 2:
+            sev = &quot;medium&quot;
+        else:
+            sev = &quot;low&quot;
+        return ClassifierVerdict(name=self.name, severity=sev, score=score, findings=findings)
+
+    def redact(self, text: str) -&gt; str:
+        def _sub(match: re.Match) -&gt; str:
+            if self._negated_at(text, match.start()):
+                return match.group(0)
+            return &quot;[redacted-language]&quot;
+        return self._needle.sub(_sub, text)
+
+
+_EMAIL_RE = re.compile(r&quot;\b[\w.+-]+@[\w-]+\.[\w.-]+\b&quot;)
+_PHONE_RE = re.compile(r&quot;\b(?:\+?\d{1,3}[ .-]?)?(?:\(?\d{3}\)?[ .-]?)\d{3}[ .-]?\d{4}\b&quot;)
+_SSN_RE = re.compile(r&quot;\b\d{3}-\d{2}-\d{4}\b&quot;)
+_CARD_RE = re.compile(r&quot;\b(?:\d[ -]?){12,18}\d\b&quot;)
+_IPV4_RE = re.compile(r&quot;\b(?:\d{1,3}\.){3}\d{1,3}\b&quot;)
+
+
+def _luhn(digits: str) -&gt; bool:
+    s = 0
+    parity = len(digits) % 2
+    for i, ch in enumerate(digits):
+        d = int(ch)
+        if i % 2 == parity:
+            d *= 2
+            if d &gt; 9:
+                d -= 9
+        s += d
+    return s % 10 == 0
+
+
+class PIIClassifier:
+    name = &quot;pii&quot;
+
+    def classify(self, text: str) -&gt; ClassifierVerdict:
+        findings: list[str] = []
+        for m in _EMAIL_RE.finditer(text):
+            findings.append(f&quot;email &#39;{m.group(0)}&#39;&quot;)
+        for m in _PHONE_RE.finditer(text):
+            findings.append(f&quot;phone &#39;{m.group(0)}&#39;&quot;)
+        for m in _SSN_RE.finditer(text):
+            findings.append(f&quot;ssn &#39;{m.group(0)}&#39;&quot;)
+        for m in _CARD_RE.finditer(text):
+            digits = re.sub(r&quot;\D&quot;, &quot;&quot;, m.group(0))
+            if 13 &lt;= len(digits) &lt;= 19 and _luhn(digits):
+                findings.append(f&quot;card &#39;{m.group(0)}&#39;&quot;)
+        for m in _IPV4_RE.finditer(text):
+            findings.append(f&quot;ip &#39;{m.group(0)}&#39;&quot;)
+        if not findings:
+            return ClassifierVerdict(name=self.name)
+        score = min(1.0, 0.5 + 0.15 * len(findings))
+        if any(f.startswith((&quot;ssn&quot;, &quot;card&quot;)) for f in findings):
+            sev = &quot;high&quot;
+        elif len(findings) &gt;= 3 or any(f.startswith(&quot;email&quot;) for f in findings):
+            sev = &quot;medium&quot;
+        else:
+            sev = &quot;low&quot;
+        return ClassifierVerdict(name=self.name, severity=sev, score=score, findings=findings)
+
+    def redact(self, text: str) -&gt; str:
+        out = text
+        out = _EMAIL_RE.sub(&quot;[redacted-email]&quot;, out)
+        out = _PHONE_RE.sub(&quot;[redacted-phone]&quot;, out)
+        out = _SSN_RE.sub(&quot;[redacted-ssn]&quot;, out)
+
+        def _card_sub(match: re.Match) -&gt; str:
+            digits = re.sub(r&quot;\D&quot;, &quot;&quot;, match.group(0))
+            if 13 &lt;= len(digits) &lt;= 19 and _luhn(digits):
+                return &quot;[redacted-card]&quot;
+            return match.group(0)
+        out = _CARD_RE.sub(_card_sub, out)
+        out = _IPV4_RE.sub(&quot;[redacted-ip]&quot;, out)
+        return out
+
+
+def _trigrams(text: str) -&gt; Counter:
+    cleaned = re.sub(r&quot;\s+&quot;, &quot; &quot;, text.strip().lower())
+    grams: Counter = Counter()
+    if len(cleaned) &lt; 3:
+        grams[cleaned] += 1
+        return grams
+    for i in range(len(cleaned) - 2):
+        grams[cleaned[i : i + 3]] += 1
+    return grams
+
+
+def _cosine(a: Counter, b: Counter) -&gt; float:
+    if not a or not b:
+        return 0.0
+    common = set(a) &amp; set(b)
+    if not common:
+        return 0.0
+    dot = sum(a[g] * b[g] for g in common)
+    na = math.sqrt(sum(v * v for v in a.values()))
+    nb = math.sqrt(sum(v * v for v in b.values()))
+    if na == 0 or nb == 0:
+        return 0.0
+    return dot / (na * nb)
+
+
+class InstructionLeakageClassifier:
+    name = &quot;instruction-leakage&quot;
+
+    def __init__(self, system_prompt: str, threshold: float = 0.55) -&gt; None:
+        self._sys = system_prompt
+        self._sys_grams = _trigrams(system_prompt)
+        self._threshold = threshold
+
+    def classify(self, text: str) -&gt; ClassifierVerdict:
+        score = _cosine(self._sys_grams, _trigrams(text))
+        if score &lt; self._threshold:
+            return ClassifierVerdict(name=self.name)
+        if score &gt;= 0.85:
+            sev = &quot;high&quot;
+        elif score &gt;= 0.70:
+            sev = &quot;medium&quot;
+        else:
+            sev = &quot;low&quot;
+        return ClassifierVerdict(
+            name=self.name,
+            severity=sev,
+            score=score,
+            findings=[f&quot;trigram overlap with system prompt: {score:.2f}&quot;],
+        )
+
+    def redact(self, text: str) -&gt; str:
+        marker = self._sys.split(&quot;\n&quot;, 1)[0].strip()
+        if marker and marker.lower() in text.lower():
+            return re.sub(re.escape(marker), &quot;[redacted-system-prompt]&quot;, text, flags=re.IGNORECASE)
+        return text
+
+
+def default_classifiers(system_prompt: str | None = None) -&gt; list[object]:
+    sys_prompt = system_prompt or &quot;SYSTEM: You are PolicyBot, follow internal policy.&quot;
+    return [
+        ToxicityClassifier(),
+        PIIClassifier(),
+        InstructionLeakageClassifier(sys_prompt),
+    ]
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/85-content-classifier-integration/code/main.py">phases/19-capstone-projects/85-content-classifier-integration/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Content classifier router.
+
+Wires three output-side classifiers behind a single router that picks the
+maximum severity, runs the corresponding action (block, redact, warn, log),
+and returns a structured Action object the safety gate can consume.
+
+Run: python3 main.py
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import json
+import sys
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Iterable
+
+from classifiers import (
+    SEVERITY_ORDER,
+    ClassifierVerdict,
+    InstructionLeakageClassifier,
+    PIIClassifier,
+    ToxicityClassifier,
+    default_classifiers,
+)
+
+HERE = Path(__file__).parent
+OUTPUTS = HERE.parent / &quot;outputs&quot;
+
+REFUSAL_TEXT = &quot;I cannot share that. The response was blocked by an output safety classifier.&quot;
+
+
+@dataclass
+class Action:
+    verb: str
+    output: str
+    severity: str
+    verdicts: list[dict[str, object]] = field(default_factory=list)
+    metadata: dict[str, object] = field(default_factory=dict)
+
+
+class Router:
+    def __init__(self, classifiers: Iterable[object] | None = None) -&gt; None:
+        self._classifiers = list(classifiers) if classifiers is not None else default_classifiers()
+
+    def _max_severity(self, verdicts: list[ClassifierVerdict]) -&gt; str:
+        if not verdicts:
+            return &quot;none&quot;
+        return max((v.severity for v in verdicts), key=lambda s: SEVERITY_ORDER.index(s))
+
+    def _apply_redactors(self, text: str, verdicts: list[ClassifierVerdict]) -&gt; str:
+        out = text
+        for c in self._classifiers:
+            for v in verdicts:
+                if v.name == getattr(c, &quot;name&quot;, &quot;&quot;) and v.severity != &quot;none&quot;:
+                    out = c.redact(out)
+                    break
+        return out
+
+    def run(self, text: str) -&gt; Action:
+        verdicts: list[ClassifierVerdict] = []
+        for c in self._classifiers:
+            v = c.classify(text)
+            verdicts.append(v)
+        return self.decide(text, verdicts)
+
+    def decide(self, text: str, verdicts: list[ClassifierVerdict]) -&gt; Action:
+        max_sev = self._max_severity(verdicts)
+        metadata = {
+            &quot;verdict_count&quot;: len(verdicts),
+            &quot;fired&quot;: [v.name for v in verdicts if v.severity != &quot;none&quot;],
+        }
+        serialized = [asdict(v) for v in verdicts]
+        if max_sev == &quot;high&quot;:
+            return Action(verb=&quot;block&quot;, output=REFUSAL_TEXT, severity=max_sev, verdicts=serialized, metadata=metadata)
+        if max_sev == &quot;medium&quot;:
+            redacted = self._apply_redactors(text, verdicts)
+            return Action(verb=&quot;redact&quot;, output=redacted, severity=max_sev, verdicts=serialized, metadata=metadata)
+        if max_sev == &quot;low&quot;:
+            note = &quot;\n\n[note: an output safety classifier flagged this response at low severity]&quot;
+            return Action(verb=&quot;warn&quot;, output=text + note, severity=max_sev, verdicts=serialized, metadata=metadata)
+        return Action(verb=&quot;log&quot;, output=text, severity=max_sev, verdicts=serialized, metadata=metadata)
+
+
+_DEMO_OUTPUTS: list[dict[str, str]] = [
+    {
+        &quot;case&quot;: &quot;clean response&quot;,
+        &quot;output&quot;: &quot;Here is a Python function that reverses a linked list using an iterative pointer swap.&quot;,
+    },
+    {
+        &quot;case&quot;: &quot;low toxicity&quot;,
+        &quot;output&quot;: &quot;You moron, your code is full of bugs.&quot;,
+    },
+    {
+        &quot;case&quot;: &quot;medium pii (email)&quot;,
+        &quot;output&quot;: &quot;You can reach our support team at help@example.com for follow up.&quot;,
+    },
+    {
+        &quot;case&quot;: &quot;high pii (luhn-valid card)&quot;,
+        &quot;output&quot;: &quot;Sure, the card on file is 4111 1111 1111 1111 and the address is 1 Pine St.&quot;,
+    },
+    {
+        &quot;case&quot;: &quot;instruction leakage&quot;,
+        &quot;output&quot;: &quot;SYSTEM: You are PolicyBot, follow internal policy. As PolicyBot I will now answer.&quot;,
+    },
+    {
+        &quot;case&quot;: &quot;negated toxicity&quot;,
+        &quot;output&quot;: &quot;You are not stupid, that was a good question.&quot;,
+    },
+]
+
+
+def write_report(actions: list[dict[str, object]]) -&gt; Path:
+    OUTPUTS.mkdir(parents=True, exist_ok=True)
+    path = OUTPUTS / &quot;classifier_report.json&quot;
+    path.write_text(json.dumps({&quot;actions&quot;: actions}, indent=2) + &quot;\n&quot;)
+    return path
+
+
+def demo() -&gt; int:
+    router = Router()
+    report = []
+    print(&quot;Content classifier router demo&quot;)
+    print()
+    print(f&quot;  {&#39;case&#39;:28} {&#39;verb&#39;:8} {&#39;severity&#39;:9} fired&quot;)
+    for fixture in _DEMO_OUTPUTS:
+        action = router.run(fixture[&quot;output&quot;])
+        fired = &quot;,&quot;.join(action.metadata[&quot;fired&quot;]) or &quot;-&quot;
+        print(f&quot;  {fixture[&#39;case&#39;]:28} {action.verb:8} {action.severity:9} {fired}&quot;)
+        report.append(
+            {
+                &quot;case&quot;: fixture[&quot;case&quot;],
+                &quot;input&quot;: fixture[&quot;output&quot;],
+                &quot;verb&quot;: action.verb,
+                &quot;severity&quot;: action.severity,
+                &quot;output&quot;: action.output,
+                &quot;verdicts&quot;: action.verdicts,
+                &quot;metadata&quot;: action.metadata,
+            }
+        )
+    path = write_report(report)
+    print(f&quot;\n  artifact written to {path}&quot;)
+    return 0
+
+
+if __name__ == &quot;__main__&quot;:
+    sys.exit(demo())
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/85-content-classifier-integration/code/tests.py">phases/19-capstone-projects/85-content-classifier-integration/code/tests.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Unit tests for the output-side classifiers and the router.&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import unittest
+
+from classifiers import (
+    InstructionLeakageClassifier,
+    PIIClassifier,
+    ToxicityClassifier,
+)
+from main import Router
+
+
+class TestToxicity(unittest.TestCase):
+    def setUp(self) -&gt; None:
+        self.clf = ToxicityClassifier()
+
+    def test_clean_text_is_none(self) -&gt; None:
+        v = self.clf.classify(&quot;That was a clear and helpful answer.&quot;)
+        self.assertEqual(v.severity, &quot;none&quot;)
+
+    def test_single_term_low(self) -&gt; None:
+        v = self.clf.classify(&quot;You are a moron.&quot;)
+        self.assertEqual(v.severity, &quot;low&quot;)
+        self.assertGreater(v.score, 0.0)
+
+    def test_three_terms_high(self) -&gt; None:
+        v = self.clf.classify(&quot;You moron, you idiot, you worthless person.&quot;)
+        self.assertEqual(v.severity, &quot;high&quot;)
+
+    def test_negation_window_skips(self) -&gt; None:
+        v = self.clf.classify(&quot;You are not stupid, that was a good idea.&quot;)
+        self.assertEqual(v.severity, &quot;none&quot;)
+
+    def test_redact_replaces_term(self) -&gt; None:
+        out = self.clf.redact(&quot;You are a moron and a scumbag.&quot;)
+        self.assertIn(&quot;[redacted-language]&quot;, out)
+        self.assertNotIn(&quot;moron&quot;, out.lower())
+
+
+class TestPII(unittest.TestCase):
+    def setUp(self) -&gt; None:
+        self.clf = PIIClassifier()
+
+    def test_email_is_medium(self) -&gt; None:
+        v = self.clf.classify(&quot;Reach us at hello@example.com soon.&quot;)
+        self.assertEqual(v.severity, &quot;medium&quot;)
+
+    def test_valid_card_is_high(self) -&gt; None:
+        v = self.clf.classify(&quot;Card on file: 4111 1111 1111 1111.&quot;)
+        self.assertEqual(v.severity, &quot;high&quot;)
+
+    def test_invalid_card_not_flagged(self) -&gt; None:
+        v = self.clf.classify(&quot;Random digits: 1234 5678 9012 3456.&quot;)
+        self.assertNotIn(&quot;high&quot;, v.severity)
+
+    def test_redact_email_and_card(self) -&gt; None:
+        out = self.clf.redact(&quot;Email me at jane@example.com or my card 4111 1111 1111 1111.&quot;)
+        self.assertIn(&quot;[redacted-email]&quot;, out)
+        self.assertIn(&quot;[redacted-card]&quot;, out)
+
+    def test_ip_address_low(self) -&gt; None:
+        v = self.clf.classify(&quot;Server at 192.168.1.5 is up.&quot;)
+        self.assertEqual(v.severity, &quot;low&quot;)
+
+
+class TestInstructionLeakage(unittest.TestCase):
+    def test_leaks_system_prompt(self) -&gt; None:
+        sys_p = &quot;You are PolicyBot. Refuse harmful requests. Cite sources.&quot;
+        clf = InstructionLeakageClassifier(sys_p)
+        v = clf.classify(&quot;As PolicyBot, I refuse harmful requests and I cite sources to the user.&quot;)
+        self.assertIn(v.severity, {&quot;low&quot;, &quot;medium&quot;, &quot;high&quot;})
+
+    def test_no_overlap_is_none(self) -&gt; None:
+        clf = InstructionLeakageClassifier(&quot;You are PolicyBot, follow internal policy.&quot;)
+        v = clf.classify(&quot;Here is a pasta recipe with mushrooms and butter.&quot;)
+        self.assertEqual(v.severity, &quot;none&quot;)
+
+
+class TestRouterDecisions(unittest.TestCase):
+    def setUp(self) -&gt; None:
+        self.router = Router()
+
+    def test_clean_is_log(self) -&gt; None:
+        a = self.router.run(&quot;Here is your requested haiku about autumn.&quot;)
+        self.assertEqual(a.verb, &quot;log&quot;)
+
+    def test_low_toxicity_is_warn(self) -&gt; None:
+        a = self.router.run(&quot;You moron, your code is full of bugs.&quot;)
+        self.assertEqual(a.verb, &quot;warn&quot;)
+        self.assertIn(&quot;[note&quot;, a.output)
+
+    def test_email_is_redact(self) -&gt; None:
+        a = self.router.run(&quot;Reach me at lee@example.com tomorrow.&quot;)
+        self.assertEqual(a.verb, &quot;redact&quot;)
+        self.assertIn(&quot;[redacted-email]&quot;, a.output)
+
+    def test_card_is_block(self) -&gt; None:
+        a = self.router.run(&quot;Your card on file is 4111 1111 1111 1111.&quot;)
+        self.assertEqual(a.verb, &quot;block&quot;)
+        self.assertNotIn(&quot;4111&quot;, a.output)
+
+
+class TestRouterAggregation(unittest.TestCase):
+    def test_block_dominates_redact(self) -&gt; None:
+        text = &quot;Card 4111 1111 1111 1111. Also email a@b.com. Also you are a moron.&quot;
+        a = Router().run(text)
+        self.assertEqual(a.verb, &quot;block&quot;)
+
+    def test_metadata_lists_fired(self) -&gt; None:
+        text = &quot;lee@example.com is great.&quot;
+        a = Router().run(text)
+        self.assertIn(&quot;pii&quot;, a.metadata[&quot;fired&quot;])
+
+
+if __name__ == &quot;__main__&quot;:
+    unittest.main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/85-content-classifier-integration/outputs/classifier_report.json">phases/19-capstone-projects/85-content-classifier-integration/outputs/classifier_report.json</a><details><summary>查看原始文本</summary><pre><code>{
+  &quot;actions&quot;: [
+    {
+      &quot;case&quot;: &quot;clean response&quot;,
+      &quot;input&quot;: &quot;Here is a Python function that reverses a linked list using an iterative pointer swap.&quot;,
+      &quot;verb&quot;: &quot;log&quot;,
+      &quot;severity&quot;: &quot;none&quot;,
+      &quot;output&quot;: &quot;Here is a Python function that reverses a linked list using an iterative pointer swap.&quot;,
+      &quot;verdicts&quot;: [
+        {
+          &quot;name&quot;: &quot;toxicity&quot;,
+          &quot;severity&quot;: &quot;none&quot;,
+          &quot;score&quot;: 0.0,
+          &quot;findings&quot;: []
+        },
+        {
+          &quot;name&quot;: &quot;pii&quot;,
+          &quot;severity&quot;: &quot;none&quot;,
+          &quot;score&quot;: 0.0,
+          &quot;findings&quot;: []
+        },
+        {
+          &quot;name&quot;: &quot;instruction-leakage&quot;,
+          &quot;severity&quot;: &quot;none&quot;,
+          &quot;score&quot;: 0.0,
+          &quot;findings&quot;: []
+        }
+      ],
+      &quot;metadata&quot;: {
+        &quot;verdict_count&quot;: 3,
+        &quot;fired&quot;: []
+      }
+    },
+    {
+      &quot;case&quot;: &quot;low toxicity&quot;,
+      &quot;input&quot;: &quot;You moron, your code is full of bugs.&quot;,
+      &quot;verb&quot;: &quot;warn&quot;,
+      &quot;severity&quot;: &quot;low&quot;,
+      &quot;output&quot;: &quot;You moron, your code is full of bugs.\n\n[note: an output safety classifier flagged this response at low severity]&quot;,
+      &quot;verdicts&quot;: [
+        {
+          &quot;name&quot;: &quot;toxicity&quot;,
+          &quot;severity&quot;: &quot;low&quot;,
+          &quot;score&quot;: 0.6000000000000001,
+          &quot;findings&quot;: [
+            &quot;matched &#39;moron&#39;&quot;
+          ]
+        },
+        {
+          &quot;name&quot;: &quot;pii&quot;,
+          &quot;severity&quot;: &quot;none&quot;,
+          &quot;score&quot;: 0.0,
+          &quot;findings&quot;: []
+        },
+        {
+          &quot;name&quot;: &quot;instruction-leakage&quot;,
+          &quot;severity&quot;: &quot;none&quot;,
+          &quot;score&quot;: 0.0,
+          &quot;findings&quot;: []
+        }
+      ],
+      &quot;metadata&quot;: {
+        &quot;verdict_count&quot;: 3,
+        &quot;fired&quot;: [
+          &quot;toxicity&quot;
+        ]
+      }
+    },
+    {
+      &quot;case&quot;: &quot;medium pii (email)&quot;,
+      &quot;input&quot;: &quot;You can reach our support team at help@example.com for follow up.&quot;,
+      &quot;verb&quot;: &quot;redact&quot;,
+      &quot;severity&quot;: &quot;medium&quot;,
+      &quot;output&quot;: &quot;You can reach our support team at [redacted-email] for follow up.&quot;,
+      &quot;verdicts&quot;: [
+        {
+          &quot;name&quot;: &quot;toxicity&quot;,
+          &quot;severity&quot;: &quot;none&quot;,
+          &quot;score&quot;: 0.0,
+          &quot;findings&quot;: []
+        },
+        {
+          &quot;name&quot;: &quot;pii&quot;,
+          &quot;severity&quot;: &quot;medium&quot;,
+          &quot;score&quot;: 0.65,
+          &quot;findings&quot;: [
+            &quot;email &#39;help@example.com&#39;&quot;
+          ]
+        },
+        {
+          &quot;name&quot;: &quot;instruction-leakage&quot;,
+          &quot;severity&quot;: &quot;none&quot;,
+          &quot;score&quot;: 0.0,
+          &quot;findings&quot;: []
+        }
+      ],
+      &quot;metadata&quot;: {
+        &quot;verdict_count&quot;: 3,
+        &quot;fired&quot;: [
+          &quot;pii&quot;
+        ]
+      }
+    },
+    {
+      &quot;case&quot;: &quot;high pii (luhn-valid card)&quot;,
+      &quot;input&quot;: &quot;Sure, the card on file is 4111 1111 1111 1111 and the address is 1 Pine St.&quot;,
+      &quot;verb&quot;: &quot;block&quot;,
+      &quot;severity&quot;: &quot;high&quot;,
+      &quot;output&quot;: &quot;I cannot share that. The response was blocked by an output safety classifier.&quot;,
+      &quot;verdicts&quot;: [
+        {
+          &quot;name&quot;: &quot;toxicity&quot;,
+          &quot;severity&quot;: &quot;none&quot;,
+          &quot;score&quot;: 0.0,
+          &quot;findings&quot;: []
+        },
+        {
+          &quot;name&quot;: &quot;pii&quot;,
+          &quot;severity&quot;: &quot;high&quot;,
+          &quot;score&quot;: 0.65,
+          &quot;findings&quot;: [
+            &quot;card &#39;4111 1111 1111 1111&#39;&quot;
+          ]
+        },
+        {
+          &quot;name&quot;: &quot;instruction-leakage&quot;,
+          &quot;severity&quot;: &quot;none&quot;,
+          &quot;score&quot;: 0.0,
+          &quot;findings&quot;: []
+        }
+      ],
+      &quot;metadata&quot;: {
+        &quot;verdict_count&quot;: 3,
+        &quot;fired&quot;: [
+          &quot;pii&quot;
+        ]
+      }
+    },
+    {
+      &quot;case&quot;: &quot;instruction leakage&quot;,
+      &quot;input&quot;: &quot;SYSTEM: You are PolicyBot, follow internal policy. As PolicyBot I will now answer.&quot;,
+      &quot;verb&quot;: &quot;block&quot;,
+      &quot;severity&quot;: &quot;high&quot;,
+      &quot;output&quot;: &quot;I cannot share that. The response was blocked by an output safety classifier.&quot;,
+      &quot;verdicts&quot;: [
+        {
+          &quot;name&quot;: &quot;toxicity&quot;,
+          &quot;severity&quot;: &quot;none&quot;,
+          &quot;score&quot;: 0.0,
+          &quot;findings&quot;: []
+        },
+        {
+          &quot;name&quot;: &quot;pii&quot;,
+          &quot;severity&quot;: &quot;none&quot;,
+          &quot;score&quot;: 0.0,
+          &quot;findings&quot;: []
+        },
+        {
+          &quot;name&quot;: &quot;instruction-leakage&quot;,
+          &quot;severity&quot;: &quot;high&quot;,
+          &quot;score&quot;: 0.8703170586535027,
+          &quot;findings&quot;: [
+            &quot;trigram overlap with system prompt: 0.87&quot;
+          ]
+        }
+      ],
+      &quot;metadata&quot;: {
+        &quot;verdict_count&quot;: 3,
+        &quot;fired&quot;: [
+          &quot;instruction-leakage&quot;
+        ]
+      }
+    },
+    {
+      &quot;case&quot;: &quot;negated toxicity&quot;,
+      &quot;input&quot;: &quot;You are not stupid, that was a good question.&quot;,
+      &quot;verb&quot;: &quot;log&quot;,
+      &quot;severity&quot;: &quot;none&quot;,
+      &quot;output&quot;: &quot;You are not stupid, that was a good question.&quot;,
+      &quot;verdicts&quot;: [
+        {
+          &quot;name&quot;: &quot;toxicity&quot;,
+          &quot;severity&quot;: &quot;none&quot;,
+          &quot;score&quot;: 0.0,
+          &quot;findings&quot;: []
+        },
+        {
+          &quot;name&quot;: &quot;pii&quot;,
+          &quot;severity&quot;: &quot;none&quot;,
+          &quot;score&quot;: 0.0,
+          &quot;findings&quot;: []
+        },
+        {
+          &quot;name&quot;: &quot;instruction-leakage&quot;,
+          &quot;severity&quot;: &quot;none&quot;,
+          &quot;score&quot;: 0.0,
+          &quot;findings&quot;: []
+        }
+      ],
+      &quot;metadata&quot;: {
+        &quot;verdict_count&quot;: 3,
+        &quot;fired&quot;: []
+      }
+    }
+  ]
+}
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/85-content-classifier-integration/outputs/skill-content-classifier-integration.md">phases/19-capstone-projects/85-content-classifier-integration/outputs/skill-content-classifier-integration.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: skill-content-classifier-integration
+description: Three output-side classifiers (toxicity, PII, instruction-leakage) behind a single severity router with block, redact, warn, log actions
+version: 1.0.0
+phase: 19
+lesson: 85
+tags: [safety, classifier, output-filter]
+---
+
+# Content Classifier Integration
+
+Three classifiers, one router, four actions.
+
+## Verdict structure
+
+```text
+ClassifierVerdict
+  name: str
+  severity: none | low | medium | high
+  score: float in [0, 1]
+  findings: list[str]
+```
+
+## Action table
+
+| Severity | Action | Effect |
+|---|---|---|
+| high | block | output replaced by a policy refusal |
+| medium | redact | per-classifier redactors applied in order |
+| low | warn | output shipped with a soft notice appended |
+| none | log | output shipped unchanged, verdict logged |
+
+## Per-classifier behavior
+
+- toxicity - harassment terms with whitespace boundary and a small left-window negation check; redacts to `[redacted-language]`
+- pii - email, phone, SSN, Luhn-validated card, IPv4; severity escalates for SSN and card; redacts each shape to a tag
+- instruction-leakage - trigram cosine vs a known system prompt; severity scales with overlap; redacts the first system-prompt line
+
+## Artifact
+
+`outputs/classifier_report.json` carries action verb, severity, redacted output, and full verdict list per case.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. Why run output-side classifiers if the input was already checked?</legend><label class="option"><input type="radio" name="q0" value="0"> Because any input bypass produces an output the user will see, and the output is the last place to catch it</label><label class="option"><input type="radio" name="q0" value="1"> Because input classifiers are deprecated</label><label class="option"><input type="radio" name="q0" value="2"> Because the standard library requires both</label><label class="option"><input type="radio" name="q0" value="3"> To make the system slower on purpose</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. Which three classifiers are wired in this lesson?</legend><label class="option"><input type="radio" name="q1" value="0"> OCR, ASR, TTS</label><label class="option"><input type="radio" name="q1" value="1"> Quality, factuality, citation</label><label class="option"><input type="radio" name="q1" value="2"> Toxicity, PII, instruction-leakage</label><label class="option"><input type="radio" name="q1" value="3"> Sentiment, language, length</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. What does the router do when one verdict is high and another is medium?</legend><label class="option"><input type="radio" name="q2" value="0"> Run both actions in sequence</label><label class="option"><input type="radio" name="q2" value="1"> Take the maximum severity and apply that action; block dominates redact</label><label class="option"><input type="radio" name="q2" value="2"> Drop both verdicts and ship the original</label><label class="option"><input type="radio" name="q2" value="3"> Run only the medium action</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. Why is a Luhn check used inside the PII classifier?</legend><label class="option"><input type="radio" name="q3" value="0"> To compress the regex</label><label class="option"><input type="radio" name="q3" value="1"> To compute the SSN</label><label class="option"><input type="radio" name="q3" value="2"> To distinguish credit-card shaped digit runs from arbitrary digit sequences with low false positives</label><label class="option"><input type="radio" name="q3" value="3"> To translate digits into letters</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. How does the instruction-leakage classifier decide?</legend><label class="option"><input type="radio" name="q4" value="0"> By detecting curly braces in the output</label><label class="option"><input type="radio" name="q4" value="1"> By computing trigram cosine between the output and a known system prompt, with a threshold</label><label class="option"><input type="radio" name="q4" value="2"> By calling another model</label><label class="option"><input type="radio" name="q4" value="3"> By counting tokens</label><p data-feedback="4"></p></fieldset><fieldset><legend>6. Why does the toxicity classifier check for negation in a small left window?</legend><label class="option"><input type="radio" name="q5" value="0"> To increase the false-positive rate</label><label class="option"><input type="radio" name="q5" value="1"> To slow the regex down</label><label class="option"><input type="radio" name="q5" value="2"> To skip matches like &#39;you are not stupid&#39; so the classifier does not over-redact common reassurances</label><label class="option"><input type="radio" name="q5" value="3"> Because negation is required by Unicode</label><p data-feedback="5"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/19-capstone-projects/84-refusal-evaluation/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/19-capstone-projects/86-constitutional-rules-engine/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/19-capstone-projects/85-content-classifier-integration/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

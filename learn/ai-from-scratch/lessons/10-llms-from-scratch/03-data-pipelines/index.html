@@ -1,0 +1,1387 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>预训练数据管道 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-10-llms-from-scratch" data-lesson="10-llms-from-scratch/03-data-pipelines" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/10-llms-from-scratch/">从零构建大语言模型</a> / LESSON 03</p><h1 class="lesson-title">预训练数据管道</h1><p>Data Pipelines for Pre-Training</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>预训练数据管道</h1>
+<blockquote>
+<p>模型是镜子,它反映出你给它提供的数据,它给它垃圾,它反映垃圾,完全流利.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 10, Lessons 01-02 (Tokenizers, Building a Tokenizer)
+<strong>Time:</strong> ~90 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>建立一个流媒体数据管道,将图标,块,混动和批量图拉字节的文本,而不需要将其全部加载到内存中</li>
+<li>实施在实际预训管道中使用的数据质量过器 (脱复,语言检测,内容过)</li>
+<li>建立固定长度训练序列,使用适当的注意力面具和文件边界处理</li>
+<li>为了确保数据加载器跟上GPU训练速度</li>
+</ul>
+<h2>问题</h2>
+<p>你有代币,现在你需要数据.</p>
+<p>没有数据集,没有CSV文件. 文字的太字节 - - 清理,减倍,过质量,将其代币化成固定长度的序列,</p>
+<p>大多数人认为,培训LLM是关于模型架构.不是.Llama 3使用了15.6万亿代币.GPT-3使用了300亿代币.DeepSeek-V2使用了8.1万亿代币.三者的架构大致相同:堆叠的变压器块,有注意力和反层.输出质量差异主要来自数据.</p>
+<p>深思维的辛奇拉论文确切地说明了这一点. 对于给定的计算预算,模型参数与训练令牌的最佳比例. 奇拉表明,大多数2022年的模型都很少训练, 训练用14万亿代币 (Chinchilla-optimal) 的70B参数模型超过了训练用300亿代币 (Gopher) 的280B模型.</p>
+<p>您的数据管道决定您的模型是否学习语言或学习噪音.</p>
+<h2>概念</h2>
+<h3>数据来源于哪里</h3>
+<p>每个大型语言模型都基于各种来源进行训练.</p>
+<table>
+<thead>
+<tr>
+<th>Source</th>
+<th>Size</th>
+<th>Quality</th>
+<th>Used By</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Common Crawl</td>
+<td>~250 TB raw</td>
+<td>Low (needs heavy filtering)</td>
+<td>GPT-3, Llama, most open models</td>
+</tr>
+<tr>
+<td>Wikipedia</td>
+<td>~20 GB</td>
+<td>High</td>
+<td>Every major LLM</td>
+</tr>
+<tr>
+<td>GitHub code</td>
+<td>~1 TB+</td>
+<td>Medium (lots of duplicates, dead code)</td>
+<td>StarCoder, CodeLlama, DeepSeek-Coder</td>
+</tr>
+<tr>
+<td>Books (BookCorpus, Pile)</td>
+<td>~100 GB</td>
+<td>High</td>
+<td>GPT-2, GPT-3, early models</td>
+</tr>
+<tr>
+<td>Academic papers (arXiv, S2ORC)</td>
+<td>~100 GB</td>
+<td>High for STEM</td>
+<td>Llama, Galactica</td>
+</tr>
+<tr>
+<td>StackOverflow, Reddit</td>
+<td>~100 GB</td>
+<td>Medium</td>
+<td>Llama, Falcon</td>
+</tr>
+<tr>
+<td>Curated web (C4, RefinedWeb)</td>
+<td>~5 TB</td>
+<td>Medium-High (pre-filtered)</td>
+<td>T5, Falcon</td>
+</tr>
+</tbody>
+</table>
+<p>拉马3公布了其数据组合:大约50%的网页数据,25%的代码,13%的书籍和学术论文,8%的数学数据,4%的多语言网页数据.总共来自超过5TB原始文本的15.6万亿代币.</p>
+<p>比例与总规模一样重要.太多的网络数据,模型变成了Reddit.太少代码,它无法编程.太少数学,它无法推理.</p>
+<h3>数据清理</h3>
+<p>常见的爬垃圾包含:</p>
+<ul>
+<li>HTML标签和JavaScript</li>
+<li>炉板头,脚,导航菜单</li>
+<li>复制页面 (准确和接近复制)</li>
+<li>机器生成的垃圾邮件</li>
+<li>个人身份信息 (PII)</li>
+<li>低质量的文本 (关键词列表,SEO垃圾邮件)</li>
+<li>编码为文本的非文本内容</li>
+</ul>
+<p>清理不是可选的.这是生成一致段落的模型和输出与产品列表混合的HTML标签之间的区别.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-b93a3f14278a9ae4da87.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>每一步都消除了一类噪音:</p>
+<p>**HTML stripping:**删除所有标记,只保留可见的文本内容.<code>trafilatura</code>或<code>readability</code>提取文章内容,同时丢弃导航,广告和板.</p>
+<p>**Language detection:**使用快Text的语言识别模型 (lid.176.bin) 来分类每个文档. 过到您的目标语言.一个以0.8以下的信心分类为英语的文档可能不是清洁的英语.</p>
+<p>**Quality filtering:**这就是有趣的地方. 精炼Web (猎背后的数据集) 使用基于困难的过器:训练维基百科中的一个小语言模型,然后分分每份文档. 很高的困难意味着文档与维基百科不同 - 可能是垃圾邮件,关键词列表或机器生成的内容.</p>
+<p>**Deduplication:**简单的清洁步骤.普通爬行包含大量的复制页面 - - 法律豁免, Cookie通知,服务条款.</p>
+<p>**PII removal:**基于Regex的检测,用于结构化 PII,NER模型,用于名字的背景.</p>
+<h3>除使用 MinHash</h3>
+<p>精确的排版很容易:哈希每个文件,删除重复.但近重复是真正的问题.两个副本的相同新闻文章,周围有略有不同的广告是近重复.内容是95%相同的,但它们的字节对字节不同.</p>
+<p>微软+本地敏感密码 (LSH) 能有效地解决这一问题.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-e2345e6e39918749a062.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>他们的想法:</p>
+<ol>
+<li>
+<p>**Shingling:**转换每份文件成 n 克的集合 (例如, 5 克的词或字符). &quot;快棕狐&quot;与 3 字的带成为 {&quot;快棕狐&quot;&quot;,快棕狐&quot;}.</p>
+</li>
+<li>
+<p>**MinHash:**对于每个文件的纹集合,计算k哈希值.每个哈希值是在不同哈希函数下所有纹中最小的哈希值. 这会产生一个固定尺寸的&quot;签名&quot;,它接近任何两个文件之间的Jaccard相似性.</p>
+</li>
+<li>
+<p>**LSH:**根据他们MinHash签名的带,将文件组成桶.同一桶中的文件是候选人近重复. 这避免了每对的比较 - - 你只比较候选人.</p>
+</li>
+<li>
+<p>**Verify:**对于每个候选对,计算出精确的Jaccard相似性. 如果相似性超过门值 (通常是0.8),则删除一本.</p>
+</li>
+</ol>
+<p>拉马团队报告说,通过排版删除了约38%的网络数据.这并不小数.超过三分之一的通用爬虫是重复或接近重复的内容.</p>
+<h3>序列包装</h3>
+<p>您的模型预计的输入序列是固定的长度.您的文件是变长度.有些是50个代币.有些是50,000个代币.</p>
+<p>简单的方法:将每个文件填充到最大的序列长度. 这就会浪费大量的计算,</p>
+<p>较好的方法:将多份文件捆绑在一个单一的序列中,由序列结束代币分开. 2048代币的序列可能包含三个短文档,它们之间有 [EOS]代币.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-0fc24c81f3f41277d59d.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>注意力面具必须正确设置.文件 A 的代币不应在同一包装序列内与文件 B 的代币相处.这需要一个区块斜角的注意力面具.</p>
+<p>长文档在序列边界被缩小或分成块. 分断点是重要的:分断句子中部迫使模型看到不完整的想法.有些管道将分断与段落或句子边界进行排列,如果可能的话.</p>
+<h3>奇拉尺度定律</h3>
+<p>对于固定计算预算C (以FLOP计量),最佳模型大小N和数据集大小D是:</p>
+<pre><code>N_opt ~ C^0.5
+D_opt ~ C^0.5
+</code></pre>
+<p>实际上,这意味着你应该大约同样扩展模型大小和数据集大小.一个具有10倍以上参数的模型需要大约10倍更多的训练令牌才能达到相同的损失.</p>
+<table>
+<thead>
+<tr>
+<th>Model</th>
+<th>Parameters</th>
+<th>Training Tokens</th>
+<th>Chinchilla-Optimal?</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GPT-3</td>
+<td>175B</td>
+<td>300B</td>
+<td>No (undertrained 3-4x)</td>
+</tr>
+<tr>
+<td>Chinchilla</td>
+<td>70B</td>
+<td>1.4T</td>
+<td>Yes (by design)</td>
+</tr>
+<tr>
+<td>Llama 2</td>
+<td>70B</td>
+<td>2T</td>
+<td>Overtrained (intentionally)</td>
+</tr>
+<tr>
+<td>Llama 3</td>
+<td>70B</td>
+<td>15T</td>
+<td>Heavily overtrained</td>
+</tr>
+</tbody>
+</table>
+<p>拉马3故意违反了辛奇拉法.Meta发现,在更多数据上进行过度训练 - - 远远超出计算-最佳比率 - - - 产生了更好的推理模型.额外的训练成本是一次支付的,但较小的模型更便宜永远服务.这有时被称为&quot;推理-最佳&quot;规模化方法,并成为2024年以来的行业标准.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-dde337af601a25dded44.png" alt="l5-data-pipeline 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<h3>第一个步骤:清洁文字</h3>
+<p>删除非文本内容,将公共领域文本 (Gutenberg项目) 作为我们的小体.</p>
+<pre><code class="language-python">import re
+
+def clean_text(text):
+    text = re.sub(r&quot;&lt;[^&gt;]+&gt;&quot;, &quot;&quot;, text)
+    text = re.sub(r&quot;http\S+&quot;, &quot;&quot;, text)
+    text = re.sub(r&quot;[^\x20-\x7E\n]&quot;, &quot;&quot;, text)
+    text = re.sub(r&quot;\n{3,}&quot;, &quot;\n\n&quot;, text)
+    text = re.sub(r&quot; {2,}&quot;, &quot; &quot;, text)
+    return text.strip()
+
+def quality_filter(text, min_words=50, max_ratio_caps=0.3, max_ratio_special=0.1):
+    words = text.split()
+    if len(words) &lt; min_words:
+        return False
+    caps_ratio = sum(1 for w in words if w.isupper()) / len(words)
+    if caps_ratio &gt; max_ratio_caps:
+        return False
+    special_chars = sum(1 for c in text if not c.isalnum() and not c.isspace())
+    if special_chars / max(len(text), 1) &gt; max_ratio_special:
+        return False
+    return True
+</code></pre>
+<p>质量过器捕获SEO垃圾邮件 (ALL CAPS),机器生成的噪音 (特殊字符比例高),以及页 (太短).仅仅这些三个检查可以从网页爬行中清除惊人的垃圾量.</p>
+<h3>步骤2: 微量化</h3>
+<p>没有需要外部图书馆,只是<code>hashlib</code>现在,我们要去.</p>
+<pre><code class="language-python">import hashlib
+from collections import defaultdict
+
+def get_shingles(text, k=5):
+    words = text.lower().split()
+    if len(words) &lt; k:
+        return set()
+    return {&quot; &quot;.join(words[i:i+k]) for i in range(len(words) - k + 1)}
+
+def minhash_signature(shingles, num_hashes=128):
+    signature = []
+    for i in range(num_hashes):
+        min_hash = float(&quot;inf&quot;)
+        for shingle in shingles:
+            h = int(hashlib.sha256(f&quot;{i}:{shingle}&quot;.encode()).hexdigest(), 16)
+            min_hash = min(min_hash, h)
+        signature.append(min_hash)
+    return signature
+
+def lsh_buckets(signature, bands=16):
+    rows_per_band = len(signature) // bands
+    buckets = []
+    for b in range(bands):
+        start = b * rows_per_band
+        band_data = tuple(signature[start:start + rows_per_band])
+        bucket_hash = hashlib.md5(str(band_data).encode()).hexdigest()
+        buckets.append((b, bucket_hash))
+    return buckets
+
+def deduplicate(documents, threshold=0.8, num_hashes=128, bands=16):
+    signatures = []
+    shingle_sets = []
+    for doc in documents:
+        shingles = get_shingles(doc)
+        shingle_sets.append(shingles)
+        signatures.append(minhash_signature(shingles, num_hashes))
+
+    bucket_map = defaultdict(list)
+    for doc_idx, sig in enumerate(signatures):
+        for band_id, bucket_hash in lsh_buckets(sig, bands):
+            bucket_map[(band_id, bucket_hash)].append(doc_idx)
+
+    duplicate_pairs = set()
+    for bucket_docs in bucket_map.values():
+        if len(bucket_docs) &lt; 2:
+            continue
+        for i in range(len(bucket_docs)):
+            for j in range(i + 1, len(bucket_docs)):
+                duplicate_pairs.add((bucket_docs[i], bucket_docs[j]))
+
+    removed = set()
+    for i, j in duplicate_pairs:
+        if i in removed or j in removed:
+            continue
+        s1, s2 = shingle_sets[i], shingle_sets[j]
+        if not s1 or not s2:
+            continue
+        jaccard = len(s1 &amp; s2) / len(s1 | s2)
+        if jaccard &gt;= threshold:
+            removed.add(j)
+
+    return [doc for idx, doc in enumerate(documents) if idx not in removed], len(removed)
+</code></pre>
+<p>其他<code>num_hashes=128</code>其他<code>bands=16</code>更多的哈希提供更准确的相似性估计.更多的频段以更大的假正值来增加回忆 (捕获更多重复).这些值对典型的网页文本工作很好.</p>
+<h3>步骤3:标记并将序列包装</h3>
+<p>清洁的,复制的文本,将其标记成标记,然后将其包装成固定长度的序列,</p>
+<pre><code class="language-python">def tokenize_corpus(documents, tokenizer):
+    all_tokens = []
+    for doc in documents:
+        tokens = tokenizer.encode(doc)
+        all_tokens.extend(tokens)
+        all_tokens.append(tokenizer.eos_id)
+    return all_tokens
+
+def pack_sequences(token_ids, seq_length, pad_id=0):
+    sequences = []
+    attention_masks = []
+    for i in range(0, len(token_ids), seq_length):
+        seq = token_ids[i:i + seq_length]
+        mask = [1] * len(seq)
+        if len(seq) &lt; seq_length:
+            pad_count = seq_length - len(seq)
+            seq = seq + [pad_id] * pad_count
+            mask = mask + [0] * pad_count
+        sequences.append(seq)
+        attention_masks.append(mask)
+    return sequences, attention_masks
+</code></pre>
+<h3>步骤4:培训数据载体</h3>
+<p>随机组装序列的结果. 这就是训练循环所消耗的.</p>
+<pre><code class="language-python">import random
+
+class PreTrainingDataLoader:
+    def __init__(self, sequences, attention_masks, batch_size, shuffle=True):
+        self.sequences = sequences
+        self.attention_masks = attention_masks
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+
+    def __len__(self):
+        return (len(self.sequences) + self.batch_size - 1) // self.batch_size
+
+    def __iter__(self):
+        indices = list(range(len(self.sequences)))
+        if self.shuffle:
+            random.shuffle(indices)
+        for start in range(0, len(indices), self.batch_size):
+            batch_idx = indices[start:start + self.batch_size]
+            batch_seqs = [self.sequences[i] for i in batch_idx]
+            batch_masks = [self.attention_masks[i] for i in batch_idx]
+            yield batch_seqs, batch_masks
+</code></pre>
+<h3>步骤5:数据集统计</h3>
+<p>计算重要数字:总代币,独特代币,压缩比,文件长度分布.</p>
+<pre><code class="language-python">from collections import Counter
+
+def compute_statistics(documents, token_ids, sequences, tokenizer_vocab_size):
+    total_chars = sum(len(d) for d in documents)
+    total_tokens = len(token_ids)
+    unique_tokens = len(set(token_ids))
+    compression_ratio = total_chars / total_tokens
+
+    doc_lengths = [len(d.split()) for d in documents]
+    avg_doc_length = sum(doc_lengths) / max(len(doc_lengths), 1)
+    max_doc_length = max(doc_lengths) if doc_lengths else 0
+    min_doc_length = min(doc_lengths) if doc_lengths else 0
+
+    token_counts = Counter(token_ids)
+    top_tokens = token_counts.most_common(10)
+
+    non_pad_tokens = sum(sum(1 for t in seq if t != 0) for seq in sequences)
+    total_positions = sum(len(seq) for seq in sequences)
+    utilization = non_pad_tokens / max(total_positions, 1)
+
+    stats = {
+        &quot;total_documents&quot;: len(documents),
+        &quot;total_characters&quot;: total_chars,
+        &quot;total_tokens&quot;: total_tokens,
+        &quot;unique_tokens&quot;: unique_tokens,
+        &quot;vocab_utilization&quot;: unique_tokens / tokenizer_vocab_size,
+        &quot;compression_ratio&quot;: compression_ratio,
+        &quot;avg_doc_length_words&quot;: avg_doc_length,
+        &quot;max_doc_length_words&quot;: max_doc_length,
+        &quot;min_doc_length_words&quot;: min_doc_length,
+        &quot;num_sequences&quot;: len(sequences),
+        &quot;sequence_utilization&quot;: utilization,
+        &quot;top_10_tokens&quot;: top_tokens,
+    }
+    return stats
+</code></pre>
+<p>压缩比率告诉你代币器在这个体积上是多么高效.英语文本通常压缩到每代币约3-4个字符.如果你看到每代币1.5个字符,你的代币器会被分化过于激进.如果你看到8+,它已经学会了非常特定的域的合并.</p>
+<p>序列利用告诉你你的包装序列中的多少是真实数据与填充.90%以下意味着你的包装是不高效的 - - 你正在浪费计算在填充代币.</p>
+<h2>用它</h2>
+<h3>与&quot;抱抱脸&quot;数据集进行比较</h3>
+<p>通过 HuggingFace 的数据库中加载相同的数据库,并比较管道速度.</p>
+<pre><code class="language-python">from datasets import load_dataset
+from transformers import AutoTokenizer
+
+ds = load_dataset(&quot;wikitext&quot;, &quot;wikitext-2-raw-v1&quot;, split=&quot;train&quot;)
+tokenizer = AutoTokenizer.from_pretrained(&quot;meta-llama/Meta-Llama-3-8B&quot;)
+
+import time
+
+start = time.time()
+tokenized = ds.map(
+    lambda x: tokenizer(x[&quot;text&quot;], truncation=True, max_length=2048),
+    batched=True,
+    num_proc=4,
+)
+hf_time = time.time() - start
+total_tokens = sum(len(t) for t in tokenized[&quot;input_ids&quot;])
+print(f&quot;HuggingFace: {total_tokens:,} tokens in {hf_time:.2f}s ({total_tokens/hf_time:,.0f} tokens/sec)&quot;)
+</code></pre>
+<p>脸管道使用罩下的Rust代币,并行处理在4个核心.你的纯 Python 管道将会10-50倍慢.这差距是为什么生产团队使用编译代币.算法是一样的.实现语言是差异.</p>
+<h2>运送它</h2>
+<p>本课程提供了验证和调试LLM培训管道数据质量的提示.<code>outputs/prompt-data-quality-checker.md</code>现在,我们要去.</p>
+<h2>运动</h2>
+<ol>
+<li>**Easy:**通过简单的学 (字符集分析) 添加语言检测到清洁管道. 仅仅将英语文档过,并测量取消的文档数量.</li>
+<li>**Medium:**通过使用 SHA-256 哈希和 MinHash 接近排版一起实现精确排版. 通过每个方法在网页剪辑的体积上捕获的排版数量进行比较.</li>
+<li>**Hard:**建立一个基于杂性的质量过器. 在维基百科文本上训练一个小的大图语言模型,根据杂性评分每个文档,然后删除下面的20%.在训练过数据和未过数据时,比较模型输出质量.</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Common Crawl</td>
+<td>&quot;The internet&quot;</td>
+<td>A non-profit that crawls the web monthly -- ~250TB raw, the starting point for most LLM training data</td>
+</tr>
+<tr>
+<td>MinHash</td>
+<td>&quot;Some hashing trick&quot;</td>
+<td>A technique to estimate Jaccard similarity between sets using fixed-size signatures -- enables near-duplicate detection at scale</td>
+</tr>
+<tr>
+<td>LSH</td>
+<td>&quot;Locality-Sensitive Hashing&quot;</td>
+<td>A method to group similar items into the same bucket -- reduces pairwise comparisons from O(n^2) to near-linear</td>
+</tr>
+<tr>
+<td>Sequence packing</td>
+<td>&quot;Concatenating documents&quot;</td>
+<td>Fitting multiple documents into fixed-length sequences with proper attention masks -- eliminates padding waste</td>
+</tr>
+<tr>
+<td>Chinchilla scaling</td>
+<td>&quot;Train on more data&quot;</td>
+<td>For a fixed compute budget, optimal performance requires scaling model size and training tokens roughly equally</td>
+</tr>
+<tr>
+<td>Fertility</td>
+<td>&quot;Tokens per word&quot;</td>
+<td>Average number of tokens per word -- 1.3 for English in GPT-4, higher for non-Latin scripts</td>
+</tr>
+<tr>
+<td>Data mixing</td>
+<td>&quot;Choosing training data&quot;</td>
+<td>The ratio of code vs text vs math vs multilingual data -- no formula, requires experimentation</td>
+</tr>
+<tr>
+<td>Perplexity filter</td>
+<td>&quot;Quality scoring&quot;</td>
+<td>Use a small language model to score documents -- high perplexity means the text is unlike clean reference data</td>
+</tr>
+<tr>
+<td>Deduplication</td>
+<td>&quot;Removing copies&quot;</td>
+<td>Eliminating exact and near-duplicate documents -- typically removes 30-40% of raw web data</td>
+</tr>
+<tr>
+<td>Attention mask</td>
+<td>&quot;Which tokens to look at&quot;</td>
+<td>A binary mask that prevents attention across document boundaries in packed sequences</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2203.15556" rel="noreferrer" data-network="true">Hoffmann et al., 2022 -- Training Compute-Optimal Large Language Models (Chinchilla) <small>↗ 需要联网</small></a>改变了我们对数据规模的看法.</li>
+<li><a href="https://arxiv.org/abs/2306.01116" rel="noreferrer" data-network="true">Penedo et al., 2023 -- The RefinedWeb Dataset for Falcon LLM <small>↗ 需要联网</small></a>--如何过普通爬虫到高质量</li>
+<li><a href="https://arxiv.org/abs/2307.09288" rel="noreferrer" data-network="true">Touvron et al., 2023 -- Llama 2: Open Foundation and Fine-Tuned Chat Models <small>↗ 需要联网</small></a>-- 关于Llama 2的数据管道详情</li>
+<li><a href="https://arxiv.org/abs/2107.06499" rel="noreferrer" data-network="true">Lee et al., 2022 -- Deduplicating Training Data Makes Language Models Better <small>↗ 需要联网</small></a>-- 为什么减倍比你想象的更重要</li>
+<li><a href="https://ieeexplore.ieee.org/document/666900" rel="noreferrer" data-network="true">Broder, 1997 -- On the Resemblance and Containment of Documents <small>↗ 需要联网</small></a>-- 简单的MINHASH纸</li>
+<li><a href="https://arxiv.org/abs/2407.21783" rel="noreferrer" data-network="true">Meta, 2024 -- Llama 3 Technical Report <small>↗ 需要联网</small></a>-- 15.6T代币,数据混合比率,过管道</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Data Pipelines for Pre-Training</h1>
+<blockquote>
+<p>The model is a mirror. It reflects whatever data you feed it. Feed it garbage, it reflects garbage with perfect fluency.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 10, Lessons 01-02 (Tokenizers, Building a Tokenizer)
+<strong>Time:</strong> ~90 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Build a streaming data pipeline that tokenizes, chunks, shuffles, and batches terabytes of text without loading it all into memory</li>
+<li>Implement data quality filters (deduplication, language detection, content filtering) used in real pre-training pipelines</li>
+<li>Create fixed-length training sequences with proper attention masks and document boundary handling</li>
+<li>Profile pipeline throughput to ensure the dataloader keeps up with GPU training speed</li>
+</ul>
+<h2>The Problem</h2>
+<p>You have a tokenizer. Now you need data.</p>
+<p>Not a dataset. Not a CSV file. Terabytes of text -- cleaned, deduplicated, filtered for quality, tokenized into fixed-length sequences, and served in randomized batches fast enough that your 8-GPU cluster never waits for the next batch.</p>
+<p>Most people think training an LLM is about the model architecture. It is not. Llama 3 used 15.6 trillion tokens. GPT-3 used 300 billion. DeepSeek-V2 used 8.1 trillion. The architecture across all three is roughly the same: stacked transformer blocks with attention and feedforward layers. The difference in output quality comes overwhelmingly from the data.</p>
+<p>The Chinchilla paper from DeepMind made this precise. For a given compute budget, there is an optimal ratio of model parameters to training tokens. Chinchilla showed that most models in 2022 were dramatically undertrained -- they had too many parameters for the amount of data they saw. A 70B parameter model trained on 1.4 trillion tokens (Chinchilla-optimal) outperformed a 280B model trained on 300 billion tokens (Gopher).</p>
+<p>Your data pipeline determines whether your model learns language or learns noise.</p>
+<h2>The Concept</h2>
+<h3>Where the Data Comes From</h3>
+<p>Every large language model is trained on a mix of sources. The exact composition is a closely guarded secret for most labs, but we know enough to understand the categories.</p>
+<table>
+<thead>
+<tr>
+<th>Source</th>
+<th>Size</th>
+<th>Quality</th>
+<th>Used By</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Common Crawl</td>
+<td>~250 TB raw</td>
+<td>Low (needs heavy filtering)</td>
+<td>GPT-3, Llama, most open models</td>
+</tr>
+<tr>
+<td>Wikipedia</td>
+<td>~20 GB</td>
+<td>High</td>
+<td>Every major LLM</td>
+</tr>
+<tr>
+<td>GitHub code</td>
+<td>~1 TB+</td>
+<td>Medium (lots of duplicates, dead code)</td>
+<td>StarCoder, CodeLlama, DeepSeek-Coder</td>
+</tr>
+<tr>
+<td>Books (BookCorpus, Pile)</td>
+<td>~100 GB</td>
+<td>High</td>
+<td>GPT-2, GPT-3, early models</td>
+</tr>
+<tr>
+<td>Academic papers (arXiv, S2ORC)</td>
+<td>~100 GB</td>
+<td>High for STEM</td>
+<td>Llama, Galactica</td>
+</tr>
+<tr>
+<td>StackOverflow, Reddit</td>
+<td>~100 GB</td>
+<td>Medium</td>
+<td>Llama, Falcon</td>
+</tr>
+<tr>
+<td>Curated web (C4, RefinedWeb)</td>
+<td>~5 TB</td>
+<td>Medium-High (pre-filtered)</td>
+<td>T5, Falcon</td>
+</tr>
+</tbody>
+</table>
+<p>Llama 3 disclosed its data mix: roughly 50% web data, 25% code, 13% books and academic papers, 8% math data, and 4% multilingual web data. The total was 15.6 trillion tokens from sources exceeding 5 TB of raw text.</p>
+<p>The ratio matters as much as the total size. Too much web data and the model becomes a Reddit parrot. Too little code and it cannot program. Too little math and it fails at reasoning. Getting this mix right is one of the hardest parts of training an LLM, and there is no formula -- it requires experimentation and evaluation.</p>
+<h3>Data Cleaning</h3>
+<p>Raw web data is filthy. A typical Common Crawl dump contains:</p>
+<ul>
+<li>HTML tags and JavaScript</li>
+<li>Boilerplate headers, footers, navigation menus</li>
+<li>Duplicate pages (exact and near-duplicate)</li>
+<li>Machine-generated spam</li>
+<li>Personally identifiable information (PII)</li>
+<li>Low-quality text (lists of keywords, SEO spam)</li>
+<li>Non-text content encoded as text</li>
+</ul>
+<p>Cleaning this is not optional. It is the difference between a model that generates coherent paragraphs and one that outputs HTML tags mixed with product listings.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-b93a3f14278a9ae4da87.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>Each step eliminates a category of noise:</p>
+<p><strong>HTML stripping:</strong> Remove all markup. Keep only the visible text content. Libraries like <code>trafilatura</code> or <code>readability</code> extract article content while discarding navigation, ads, and boilerplate.</p>
+<p><strong>Language detection:</strong> Use fastText's language identification model (lid.176.bin) to classify each document. Filter to your target languages. A document classified as English with less than 0.8 confidence probably is not clean English.</p>
+<p><strong>Quality filtering:</strong> This is where it gets interesting. RefinedWeb (the dataset behind Falcon) uses a perplexity-based filter: train a small language model on Wikipedia, then score each document. High perplexity means the document is unlike Wikipedia -- likely spam, keyword lists, or machine-generated content. Documents with perplexity above a threshold get removed.</p>
+<p><strong>Deduplication:</strong> The single most impactful cleaning step. Common Crawl contains enormous numbers of duplicated pages -- legal disclaimers, cookie notices, terms of service. Training on duplicates wastes compute and can cause the model to memorize and regurgitate specific passages verbatim.</p>
+<p><strong>PII removal:</strong> Names, email addresses, phone numbers, social security numbers. Regex-based detection for structured PII, NER models for names in context.</p>
+<h3>Deduplication with MinHash</h3>
+<p>Exact deduplication is easy: hash each document, remove duplicates. But near-duplicates are the real problem. Two copies of the same news article with slightly different ads around it are near-duplicates. The content is 95% identical, but byte-for-byte they differ.</p>
+<p>MinHash + Locality-Sensitive Hashing (LSH) solves this efficiently.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-e2345e6e39918749a062.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>The idea:</p>
+<ol>
+<li>
+<p><strong>Shingling:</strong> Convert each document into a set of n-grams (e.g., 5-grams of words or characters). &quot;the quick brown fox&quot; with 3-word shingles becomes {&quot;the quick brown&quot;, &quot;quick brown fox&quot;}.</p>
+</li>
+<li>
+<p><strong>MinHash:</strong> For each document's shingle set, compute k hash values. Each hash value is the minimum hash across all shingles under a different hash function. This creates a fixed-size &quot;signature&quot; that approximates the Jaccard similarity between any two documents.</p>
+</li>
+<li>
+<p><strong>LSH:</strong> Group documents into buckets based on bands of their MinHash signature. Documents in the same bucket are candidate near-duplicates. This avoids comparing every pair -- you only compare candidates.</p>
+</li>
+<li>
+<p><strong>Verify:</strong> For each candidate pair, compute exact Jaccard similarity. Remove one copy if similarity exceeds a threshold (typically 0.8).</p>
+</li>
+</ol>
+<p>The Llama team reported removing approximately 38% of their web data through deduplication. That is not a small number. More than a third of Common Crawl is duplicate or near-duplicate content.</p>
+<h3>Sequence Packing</h3>
+<p>Your model expects fixed-length input sequences. Your documents are variable length. Some are 50 tokens. Some are 50,000 tokens.</p>
+<p>Naive approach: pad every document to the maximum sequence length. This wastes enormous compute on padding tokens that contribute nothing to learning.</p>
+<p>Better approach: pack multiple documents into a single sequence, separated by end-of-sequence tokens. A 2048-token sequence might contain three short documents concatenated with [EOS] tokens between them.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-0fc24c81f3f41277d59d.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>The attention mask must be set correctly. Tokens from Document A should not attend to tokens from Document B within the same packed sequence. This requires a block-diagonal attention mask.</p>
+<p>Long documents get truncated or split into chunks at sequence boundaries. The split point matters: splitting mid-sentence forces the model to see incomplete thoughts. Some pipelines align splits to paragraph or sentence boundaries when possible.</p>
+<h3>The Chinchilla Scaling Law</h3>
+<p>For a fixed compute budget C (measured in FLOPs), the optimal model size N and dataset size D follow:</p>
+<pre><code>N_opt ~ C^0.5
+D_opt ~ C^0.5
+</code></pre>
+<p>In practice, this means you should scale model size and dataset size roughly equally. A model with 10x more parameters needs roughly 10x more training tokens to reach the same loss.</p>
+<table>
+<thead>
+<tr>
+<th>Model</th>
+<th>Parameters</th>
+<th>Training Tokens</th>
+<th>Chinchilla-Optimal?</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GPT-3</td>
+<td>175B</td>
+<td>300B</td>
+<td>No (undertrained 3-4x)</td>
+</tr>
+<tr>
+<td>Chinchilla</td>
+<td>70B</td>
+<td>1.4T</td>
+<td>Yes (by design)</td>
+</tr>
+<tr>
+<td>Llama 2</td>
+<td>70B</td>
+<td>2T</td>
+<td>Overtrained (intentionally)</td>
+</tr>
+<tr>
+<td>Llama 3</td>
+<td>70B</td>
+<td>15T</td>
+<td>Heavily overtrained</td>
+</tr>
+</tbody>
+</table>
+<p>Llama 3 deliberately violates the Chinchilla law. Meta found that overtraining on more data -- far beyond the compute-optimal ratio -- produces better models for inference. The extra training cost is paid once, but the smaller model is cheaper to serve forever. This is sometimes called the &quot;inference-optimal&quot; scaling approach, and it has become the industry standard since 2024.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-dde337af601a25dded44.png" alt="l5-data-pipeline 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<h3>Step 1: Text Cleaning</h3>
+<p>Strip HTML, normalize whitespace, remove non-text content. We will use a public domain text (Project Gutenberg) as our small corpus.</p>
+<pre><code class="language-python">import re
+
+def clean_text(text):
+    text = re.sub(r&quot;&lt;[^&gt;]+&gt;&quot;, &quot;&quot;, text)
+    text = re.sub(r&quot;http\S+&quot;, &quot;&quot;, text)
+    text = re.sub(r&quot;[^\x20-\x7E\n]&quot;, &quot;&quot;, text)
+    text = re.sub(r&quot;\n{3,}&quot;, &quot;\n\n&quot;, text)
+    text = re.sub(r&quot; {2,}&quot;, &quot; &quot;, text)
+    return text.strip()
+
+def quality_filter(text, min_words=50, max_ratio_caps=0.3, max_ratio_special=0.1):
+    words = text.split()
+    if len(words) &lt; min_words:
+        return False
+    caps_ratio = sum(1 for w in words if w.isupper()) / len(words)
+    if caps_ratio &gt; max_ratio_caps:
+        return False
+    special_chars = sum(1 for c in text if not c.isalnum() and not c.isspace())
+    if special_chars / max(len(text), 1) &gt; max_ratio_special:
+        return False
+    return True
+</code></pre>
+<p>The quality filter catches SEO spam (ALL CAPS), machine-generated noise (high special character ratio), and stub pages (too short). These three checks alone remove a surprising amount of garbage from web crawls.</p>
+<h3>Step 2: MinHash Deduplication</h3>
+<p>Implement MinHash from scratch. No external libraries required -- just <code>hashlib</code>.</p>
+<pre><code class="language-python">import hashlib
+from collections import defaultdict
+
+def get_shingles(text, k=5):
+    words = text.lower().split()
+    if len(words) &lt; k:
+        return set()
+    return {&quot; &quot;.join(words[i:i+k]) for i in range(len(words) - k + 1)}
+
+def minhash_signature(shingles, num_hashes=128):
+    signature = []
+    for i in range(num_hashes):
+        min_hash = float(&quot;inf&quot;)
+        for shingle in shingles:
+            h = int(hashlib.sha256(f&quot;{i}:{shingle}&quot;.encode()).hexdigest(), 16)
+            min_hash = min(min_hash, h)
+        signature.append(min_hash)
+    return signature
+
+def lsh_buckets(signature, bands=16):
+    rows_per_band = len(signature) // bands
+    buckets = []
+    for b in range(bands):
+        start = b * rows_per_band
+        band_data = tuple(signature[start:start + rows_per_band])
+        bucket_hash = hashlib.md5(str(band_data).encode()).hexdigest()
+        buckets.append((b, bucket_hash))
+    return buckets
+
+def deduplicate(documents, threshold=0.8, num_hashes=128, bands=16):
+    signatures = []
+    shingle_sets = []
+    for doc in documents:
+        shingles = get_shingles(doc)
+        shingle_sets.append(shingles)
+        signatures.append(minhash_signature(shingles, num_hashes))
+
+    bucket_map = defaultdict(list)
+    for doc_idx, sig in enumerate(signatures):
+        for band_id, bucket_hash in lsh_buckets(sig, bands):
+            bucket_map[(band_id, bucket_hash)].append(doc_idx)
+
+    duplicate_pairs = set()
+    for bucket_docs in bucket_map.values():
+        if len(bucket_docs) &lt; 2:
+            continue
+        for i in range(len(bucket_docs)):
+            for j in range(i + 1, len(bucket_docs)):
+                duplicate_pairs.add((bucket_docs[i], bucket_docs[j]))
+
+    removed = set()
+    for i, j in duplicate_pairs:
+        if i in removed or j in removed:
+            continue
+        s1, s2 = shingle_sets[i], shingle_sets[j]
+        if not s1 or not s2:
+            continue
+        jaccard = len(s1 &amp; s2) / len(s1 | s2)
+        if jaccard &gt;= threshold:
+            removed.add(j)
+
+    return [doc for idx, doc in enumerate(documents) if idx not in removed], len(removed)
+</code></pre>
+<p>The <code>num_hashes=128</code> and <code>bands=16</code> parameters control the precision-recall tradeoff. More hashes give more accurate similarity estimates. More bands increase recall (catch more duplicates) at the cost of more false positives. These values work well for typical web text.</p>
+<h3>Step 3: Tokenize and Pack Sequences</h3>
+<p>Take the clean, deduplicated text, tokenize it, and pack into fixed-length sequences for training.</p>
+<pre><code class="language-python">def tokenize_corpus(documents, tokenizer):
+    all_tokens = []
+    for doc in documents:
+        tokens = tokenizer.encode(doc)
+        all_tokens.extend(tokens)
+        all_tokens.append(tokenizer.eos_id)
+    return all_tokens
+
+def pack_sequences(token_ids, seq_length, pad_id=0):
+    sequences = []
+    attention_masks = []
+    for i in range(0, len(token_ids), seq_length):
+        seq = token_ids[i:i + seq_length]
+        mask = [1] * len(seq)
+        if len(seq) &lt; seq_length:
+            pad_count = seq_length - len(seq)
+            seq = seq + [pad_id] * pad_count
+            mask = mask + [0] * pad_count
+        sequences.append(seq)
+        attention_masks.append(mask)
+    return sequences, attention_masks
+</code></pre>
+<h3>Step 4: DataLoader for Training</h3>
+<p>Yield randomized batches of packed sequences. This is what the training loop consumes.</p>
+<pre><code class="language-python">import random
+
+class PreTrainingDataLoader:
+    def __init__(self, sequences, attention_masks, batch_size, shuffle=True):
+        self.sequences = sequences
+        self.attention_masks = attention_masks
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+
+    def __len__(self):
+        return (len(self.sequences) + self.batch_size - 1) // self.batch_size
+
+    def __iter__(self):
+        indices = list(range(len(self.sequences)))
+        if self.shuffle:
+            random.shuffle(indices)
+        for start in range(0, len(indices), self.batch_size):
+            batch_idx = indices[start:start + self.batch_size]
+            batch_seqs = [self.sequences[i] for i in batch_idx]
+            batch_masks = [self.attention_masks[i] for i in batch_idx]
+            yield batch_seqs, batch_masks
+</code></pre>
+<h3>Step 5: Dataset Statistics</h3>
+<p>Compute the numbers that matter: total tokens, unique tokens, compression ratio, document length distribution.</p>
+<pre><code class="language-python">from collections import Counter
+
+def compute_statistics(documents, token_ids, sequences, tokenizer_vocab_size):
+    total_chars = sum(len(d) for d in documents)
+    total_tokens = len(token_ids)
+    unique_tokens = len(set(token_ids))
+    compression_ratio = total_chars / total_tokens
+
+    doc_lengths = [len(d.split()) for d in documents]
+    avg_doc_length = sum(doc_lengths) / max(len(doc_lengths), 1)
+    max_doc_length = max(doc_lengths) if doc_lengths else 0
+    min_doc_length = min(doc_lengths) if doc_lengths else 0
+
+    token_counts = Counter(token_ids)
+    top_tokens = token_counts.most_common(10)
+
+    non_pad_tokens = sum(sum(1 for t in seq if t != 0) for seq in sequences)
+    total_positions = sum(len(seq) for seq in sequences)
+    utilization = non_pad_tokens / max(total_positions, 1)
+
+    stats = {
+        &quot;total_documents&quot;: len(documents),
+        &quot;total_characters&quot;: total_chars,
+        &quot;total_tokens&quot;: total_tokens,
+        &quot;unique_tokens&quot;: unique_tokens,
+        &quot;vocab_utilization&quot;: unique_tokens / tokenizer_vocab_size,
+        &quot;compression_ratio&quot;: compression_ratio,
+        &quot;avg_doc_length_words&quot;: avg_doc_length,
+        &quot;max_doc_length_words&quot;: max_doc_length,
+        &quot;min_doc_length_words&quot;: min_doc_length,
+        &quot;num_sequences&quot;: len(sequences),
+        &quot;sequence_utilization&quot;: utilization,
+        &quot;top_10_tokens&quot;: top_tokens,
+    }
+    return stats
+</code></pre>
+<p>Compression ratio tells you how efficient the tokenizer is on this corpus. English text typically compresses to about 3-4 characters per token. If you see 1.5 characters per token, your tokenizer is splitting too aggressively. If you see 8+, it has learned very domain-specific merges.</p>
+<p>Sequence utilization tells you how much of your packed sequences is real data versus padding. Below 90% means your packing is inefficient -- you are wasting compute on padding tokens.</p>
+<h2>Use It</h2>
+<h3>Compare With HuggingFace Datasets</h3>
+<p>Load the same corpus through HuggingFace's datasets library and compare the pipeline speed.</p>
+<pre><code class="language-python">from datasets import load_dataset
+from transformers import AutoTokenizer
+
+ds = load_dataset(&quot;wikitext&quot;, &quot;wikitext-2-raw-v1&quot;, split=&quot;train&quot;)
+tokenizer = AutoTokenizer.from_pretrained(&quot;meta-llama/Meta-Llama-3-8B&quot;)
+
+import time
+
+start = time.time()
+tokenized = ds.map(
+    lambda x: tokenizer(x[&quot;text&quot;], truncation=True, max_length=2048),
+    batched=True,
+    num_proc=4,
+)
+hf_time = time.time() - start
+total_tokens = sum(len(t) for t in tokenized[&quot;input_ids&quot;])
+print(f&quot;HuggingFace: {total_tokens:,} tokens in {hf_time:.2f}s ({total_tokens/hf_time:,.0f} tokens/sec)&quot;)
+</code></pre>
+<p>The HuggingFace pipeline uses Rust tokenizers under the hood and parallel processing across 4 cores. Your pure Python pipeline will be 10-50x slower. That gap is why production teams use compiled tokenizers. The algorithm is the same. The implementation language is the difference.</p>
+<h2>Ship It</h2>
+<p>This lesson produces a prompt for validating and debugging data quality in LLM training pipelines. See <code>outputs/prompt-data-quality-checker.md</code>.</p>
+<h2>Exercises</h2>
+<ol>
+<li><strong>Easy:</strong> Add language detection to the cleaning pipeline using a simple heuristic (character set analysis). Filter to only English documents and measure how many documents get removed.</li>
+<li><strong>Medium:</strong> Implement exact deduplication using SHA-256 hashes alongside the MinHash near-deduplication. Compare the number of duplicates caught by each method on a web-scraped corpus.</li>
+<li><strong>Hard:</strong> Build a perplexity-based quality filter. Train a small bigram language model on Wikipedia text, score each document by perplexity, and remove the bottom 20%. Compare model output quality when training on filtered vs unfiltered data.</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Common Crawl</td>
+<td>&quot;The internet&quot;</td>
+<td>A non-profit that crawls the web monthly -- ~250TB raw, the starting point for most LLM training data</td>
+</tr>
+<tr>
+<td>MinHash</td>
+<td>&quot;Some hashing trick&quot;</td>
+<td>A technique to estimate Jaccard similarity between sets using fixed-size signatures -- enables near-duplicate detection at scale</td>
+</tr>
+<tr>
+<td>LSH</td>
+<td>&quot;Locality-Sensitive Hashing&quot;</td>
+<td>A method to group similar items into the same bucket -- reduces pairwise comparisons from O(n^2) to near-linear</td>
+</tr>
+<tr>
+<td>Sequence packing</td>
+<td>&quot;Concatenating documents&quot;</td>
+<td>Fitting multiple documents into fixed-length sequences with proper attention masks -- eliminates padding waste</td>
+</tr>
+<tr>
+<td>Chinchilla scaling</td>
+<td>&quot;Train on more data&quot;</td>
+<td>For a fixed compute budget, optimal performance requires scaling model size and training tokens roughly equally</td>
+</tr>
+<tr>
+<td>Fertility</td>
+<td>&quot;Tokens per word&quot;</td>
+<td>Average number of tokens per word -- 1.3 for English in GPT-4, higher for non-Latin scripts</td>
+</tr>
+<tr>
+<td>Data mixing</td>
+<td>&quot;Choosing training data&quot;</td>
+<td>The ratio of code vs text vs math vs multilingual data -- no formula, requires experimentation</td>
+</tr>
+<tr>
+<td>Perplexity filter</td>
+<td>&quot;Quality scoring&quot;</td>
+<td>Use a small language model to score documents -- high perplexity means the text is unlike clean reference data</td>
+</tr>
+<tr>
+<td>Deduplication</td>
+<td>&quot;Removing copies&quot;</td>
+<td>Eliminating exact and near-duplicate documents -- typically removes 30-40% of raw web data</td>
+</tr>
+<tr>
+<td>Attention mask</td>
+<td>&quot;Which tokens to look at&quot;</td>
+<td>A binary mask that prevents attention across document boundaries in packed sequences</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2203.15556" rel="noreferrer" data-network="true">Hoffmann et al., 2022 -- Training Compute-Optimal Large Language Models (Chinchilla) <small>↗ 需要联网</small></a> -- the paper that changed how we think about data scale</li>
+<li><a href="https://arxiv.org/abs/2306.01116" rel="noreferrer" data-network="true">Penedo et al., 2023 -- The RefinedWeb Dataset for Falcon LLM <small>↗ 需要联网</small></a> -- how to filter Common Crawl to high quality</li>
+<li><a href="https://arxiv.org/abs/2307.09288" rel="noreferrer" data-network="true">Touvron et al., 2023 -- Llama 2: Open Foundation and Fine-Tuned Chat Models <small>↗ 需要联网</small></a> -- data pipeline details for Llama 2</li>
+<li><a href="https://arxiv.org/abs/2107.06499" rel="noreferrer" data-network="true">Lee et al., 2022 -- Deduplicating Training Data Makes Language Models Better <small>↗ 需要联网</small></a> -- why deduplication matters more than you think</li>
+<li><a href="https://ieeexplore.ieee.org/document/666900" rel="noreferrer" data-network="true">Broder, 1997 -- On the Resemblance and Containment of Documents <small>↗ 需要联网</small></a> -- the original MinHash paper</li>
+<li><a href="https://arxiv.org/abs/2407.21783" rel="noreferrer" data-network="true">Meta, 2024 -- Llama 3 Technical Report <small>↗ 需要联网</small></a> -- 15.6T tokens, data mixing ratios, filtering pipeline</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-10-llms-from-scratch--03-data-pipelines.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-10-llms-from-scratch--03-data-pipelines.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/10-llms-from-scratch/03-data-pipelines/code/main.py">phases/10-llms-from-scratch/03-data-pipelines/code/main.py</a><details><summary>查看原始文本</summary><pre><code>import re
+import hashlib
+import random
+import time
+from collections import Counter, defaultdict
+
+
+def clean_text(text):
+    text = re.sub(r&quot;&lt;[^&gt;]+&gt;&quot;, &quot;&quot;, text)
+    text = re.sub(r&quot;http\S+&quot;, &quot;&quot;, text)
+    text = re.sub(r&quot;[^\x20-\x7E\n]&quot;, &quot;&quot;, text)
+    text = re.sub(r&quot;\n{3,}&quot;, &quot;\n\n&quot;, text)
+    text = re.sub(r&quot; {2,}&quot;, &quot; &quot;, text)
+    return text.strip()
+
+
+def quality_filter(text, min_words=50, max_ratio_caps=0.3, max_ratio_special=0.1):
+    words = text.split()
+    if len(words) &lt; min_words:
+        return False
+    caps_ratio = sum(1 for w in words if w.isupper()) / len(words)
+    if caps_ratio &gt; max_ratio_caps:
+        return False
+    special_chars = sum(1 for c in text if not c.isalnum() and not c.isspace())
+    if special_chars / max(len(text), 1) &gt; max_ratio_special:
+        return False
+    return True
+
+
+def get_shingles(text, k=5):
+    words = text.lower().split()
+    if len(words) &lt; k:
+        return set()
+    return {&quot; &quot;.join(words[i:i + k]) for i in range(len(words) - k + 1)}
+
+
+def minhash_signature(shingles, num_hashes=128):
+    signature = []
+    for i in range(num_hashes):
+        min_hash = float(&quot;inf&quot;)
+        for shingle in shingles:
+            h = int(hashlib.sha256(f&quot;{i}:{shingle}&quot;.encode()).hexdigest(), 16)
+            min_hash = min(min_hash, h)
+        if min_hash == float(&quot;inf&quot;):
+            min_hash = 0
+        signature.append(min_hash)
+    return signature
+
+
+def lsh_buckets(signature, bands=16):
+    rows_per_band = len(signature) // bands
+    buckets = []
+    for b in range(bands):
+        start = b * rows_per_band
+        band_data = tuple(signature[start:start + rows_per_band])
+        bucket_hash = hashlib.md5(str(band_data).encode()).hexdigest()
+        buckets.append((b, bucket_hash))
+    return buckets
+
+
+def deduplicate(documents, threshold=0.8, num_hashes=128, bands=16):
+    signatures = []
+    shingle_sets = []
+    for doc in documents:
+        shingles = get_shingles(doc)
+        shingle_sets.append(shingles)
+        signatures.append(minhash_signature(shingles, num_hashes))
+
+    bucket_map = defaultdict(list)
+    for doc_idx, sig in enumerate(signatures):
+        for band_id, bucket_hash in lsh_buckets(sig, bands):
+            bucket_map[(band_id, bucket_hash)].append(doc_idx)
+
+    duplicate_pairs = set()
+    for bucket_docs in bucket_map.values():
+        if len(bucket_docs) &lt; 2:
+            continue
+        for i in range(len(bucket_docs)):
+            for j in range(i + 1, len(bucket_docs)):
+                duplicate_pairs.add((bucket_docs[i], bucket_docs[j]))
+
+    removed = set()
+    for i, j in duplicate_pairs:
+        if i in removed or j in removed:
+            continue
+        s1, s2 = shingle_sets[i], shingle_sets[j]
+        if not s1 or not s2:
+            continue
+        jaccard = len(s1 &amp; s2) / len(s1 | s2)
+        if jaccard &gt;= threshold:
+            removed.add(j)
+
+    return [doc for idx, doc in enumerate(documents) if idx not in removed], len(removed)
+
+
+class SimpleTokenizer:
+    def __init__(self, vocab_size=256):
+        self.vocab = {i: bytes([i]) for i in range(256)}
+        self.merges = {}
+        self.next_id = 256
+        self.eos_id = None
+        self.pad_id = 0
+
+    def train_bpe(self, text, num_merges):
+        tokens = list(text.encode(&quot;utf-8&quot;))
+        for i in range(num_merges):
+            pairs = Counter()
+            for j in range(len(tokens) - 1):
+                pairs[(tokens[j], tokens[j + 1])] += 1
+            if not pairs:
+                break
+            best = max(pairs, key=pairs.get)
+            new_id = self.next_id
+            self.next_id += 1
+            self.merges[best] = new_id
+            self.vocab[new_id] = self.vocab[best[0]] + self.vocab[best[1]]
+            merged = []
+            j = 0
+            while j &lt; len(tokens):
+                if j &lt; len(tokens) - 1 and tokens[j] == best[0] and tokens[j + 1] == best[1]:
+                    merged.append(new_id)
+                    j += 2
+                else:
+                    merged.append(tokens[j])
+                    j += 1
+            tokens = merged
+
+        self.eos_id = self.next_id
+        self.vocab[self.eos_id] = b&quot;&lt;EOS&gt;&quot;
+        self.next_id += 1
+
+    def encode(self, text):
+        tokens = list(text.encode(&quot;utf-8&quot;))
+        for pair, new_id in self.merges.items():
+            merged = []
+            j = 0
+            while j &lt; len(tokens):
+                if j &lt; len(tokens) - 1 and tokens[j] == pair[0] and tokens[j + 1] == pair[1]:
+                    merged.append(new_id)
+                    j += 2
+                else:
+                    merged.append(tokens[j])
+                    j += 1
+            tokens = merged
+        return tokens
+
+    def decode(self, ids):
+        byte_parts = []
+        for token_id in ids:
+            if token_id in self.vocab and token_id != self.eos_id:
+                byte_parts.append(self.vocab[token_id])
+        return b&quot;&quot;.join(byte_parts).decode(&quot;utf-8&quot;, errors=&quot;replace&quot;)
+
+    def vocab_size(self):
+        return len(self.vocab)
+
+
+def tokenize_corpus(documents, tokenizer):
+    all_tokens = []
+    for doc in documents:
+        tokens = tokenizer.encode(doc)
+        all_tokens.extend(tokens)
+        all_tokens.append(tokenizer.eos_id)
+    return all_tokens
+
+
+def pack_sequences(token_ids, seq_length, pad_id=0):
+    sequences = []
+    attention_masks = []
+    for i in range(0, len(token_ids), seq_length):
+        seq = token_ids[i:i + seq_length]
+        mask = [1] * len(seq)
+        if len(seq) &lt; seq_length:
+            pad_count = seq_length - len(seq)
+            seq = seq + [pad_id] * pad_count
+            mask = mask + [0] * pad_count
+        sequences.append(seq)
+        attention_masks.append(mask)
+    return sequences, attention_masks
+
+
+class PreTrainingDataLoader:
+    def __init__(self, sequences, attention_masks, batch_size, shuffle=True):
+        self.sequences = sequences
+        self.attention_masks = attention_masks
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+
+    def __len__(self):
+        return (len(self.sequences) + self.batch_size - 1) // self.batch_size
+
+    def __iter__(self):
+        indices = list(range(len(self.sequences)))
+        if self.shuffle:
+            random.shuffle(indices)
+        for start in range(0, len(indices), self.batch_size):
+            batch_idx = indices[start:start + self.batch_size]
+            batch_seqs = [self.sequences[i] for i in batch_idx]
+            batch_masks = [self.attention_masks[i] for i in batch_idx]
+            yield batch_seqs, batch_masks
+
+
+def compute_statistics(documents, token_ids, sequences, tokenizer_vocab_size):
+    total_chars = sum(len(d) for d in documents)
+    total_tokens = len(token_ids)
+    unique_tokens = len(set(token_ids))
+    compression_ratio = total_chars / max(total_tokens, 1)
+
+    doc_lengths = [len(d.split()) for d in documents]
+    avg_doc_length = sum(doc_lengths) / max(len(doc_lengths), 1)
+    max_doc_length = max(doc_lengths) if doc_lengths else 0
+    min_doc_length = min(doc_lengths) if doc_lengths else 0
+
+    token_counts = Counter(token_ids)
+    top_tokens = token_counts.most_common(10)
+
+    non_pad_tokens = sum(sum(1 for t in seq if t != 0) for seq in sequences)
+    total_positions = sum(len(seq) for seq in sequences)
+    utilization = non_pad_tokens / max(total_positions, 1)
+
+    return {
+        &quot;total_documents&quot;: len(documents),
+        &quot;total_characters&quot;: total_chars,
+        &quot;total_tokens&quot;: total_tokens,
+        &quot;unique_tokens&quot;: unique_tokens,
+        &quot;vocab_utilization&quot;: unique_tokens / max(tokenizer_vocab_size, 1),
+        &quot;compression_ratio&quot;: compression_ratio,
+        &quot;avg_doc_length_words&quot;: avg_doc_length,
+        &quot;max_doc_length_words&quot;: max_doc_length,
+        &quot;min_doc_length_words&quot;: min_doc_length,
+        &quot;num_sequences&quot;: len(sequences),
+        &quot;sequence_utilization&quot;: utilization,
+        &quot;top_10_tokens&quot;: top_tokens,
+    }
+
+
+def generate_sample_corpus():
+    base_docs = [
+        &quot;Machine learning is a subset of artificial intelligence that provides systems the ability &quot;
+        &quot;to automatically learn and improve from experience without being explicitly programmed. &quot;
+        &quot;Machine learning focuses on the development of computer programs that can access data and &quot;
+        &quot;use it to learn for themselves. The process of learning begins with observations or data, &quot;
+        &quot;such as examples, direct experience, or instruction, in order to look for patterns in data &quot;
+        &quot;and make better decisions in the future based on the examples that we provide.&quot;,
+
+        &quot;Deep learning is part of a broader family of machine learning methods based on artificial &quot;
+        &quot;neural networks with representation learning. Learning can be supervised, semi-supervised &quot;
+        &quot;or unsupervised. Deep learning architectures such as deep neural networks, recurrent neural &quot;
+        &quot;networks, convolutional neural networks and transformers have been applied to fields &quot;
+        &quot;including natural language processing, speech recognition, computer vision, and many other tasks.&quot;,
+
+        &quot;Natural language processing is a subfield of linguistics, computer science, and artificial &quot;
+        &quot;intelligence concerned with the interactions between computers and human language, in &quot;
+        &quot;particular how to program computers to process and analyze large amounts of natural language &quot;
+        &quot;data. The result is a computer capable of understanding the contents of documents, including &quot;
+        &quot;the contextual nuances of the language within them.&quot;,
+
+        &quot;Transformers are a type of neural network architecture that has become the dominant approach &quot;
+        &quot;for natural language processing tasks. The key innovation is the self-attention mechanism, &quot;
+        &quot;which allows the model to weigh the importance of different parts of the input when producing &quot;
+        &quot;each part of the output. This enables transformers to capture long-range dependencies in text &quot;
+        &quot;much more effectively than previous recurrent approaches.&quot;,
+
+        &quot;The attention mechanism in neural networks allows the model to focus on relevant parts of &quot;
+        &quot;the input sequence when generating each element of the output. In the transformer architecture, &quot;
+        &quot;multi-head attention computes attention in parallel across multiple representation subspaces, &quot;
+        &quot;enabling the model to jointly attend to information from different representation subspaces &quot;
+        &quot;at different positions in the sequence.&quot;,
+
+        &quot;Reinforcement learning is an area of machine learning concerned with how intelligent agents &quot;
+        &quot;ought to take actions in an environment in order to maximize the notion of cumulative reward. &quot;
+        &quot;Reinforcement learning is one of three basic machine learning paradigms, alongside supervised &quot;
+        &quot;learning and unsupervised learning. It differs from supervised learning in that correct input &quot;
+        &quot;and output pairs need not be presented.&quot;,
+
+        &quot;Computer vision is an interdisciplinary scientific field that deals with how computers can &quot;
+        &quot;gain high-level understanding from digital images or videos. From the perspective of &quot;
+        &quot;engineering, it seeks to understand and automate tasks that the human visual system can do. &quot;
+        &quot;Computer vision tasks include methods for acquiring, processing, analyzing and understanding &quot;
+        &quot;digital images, and extraction of high-dimensional data from the real world.&quot;,
+
+        &quot;Convolutional neural networks are a class of deep learning architecture commonly applied to &quot;
+        &quot;analyze visual imagery. They use a variation of multilayer perceptrons designed to require &quot;
+        &quot;minimal preprocessing. They are also known as shift invariant or space invariant artificial &quot;
+        &quot;neural networks based on their shared-weights architecture and translation invariance &quot;
+        &quot;characteristics. Convolutional networks were inspired by biological processes.&quot;,
+
+        &quot;Generative adversarial networks consist of two neural networks that contest with each other &quot;
+        &quot;in the form of a zero-sum game, where one agent gain is another agent loss. Given a training &quot;
+        &quot;set, this technique learns to generate new data with the same statistics as the training set. &quot;
+        &quot;For example, a generative adversarial network trained on photographs can generate new &quot;
+        &quot;photographs that look authentic to human observers.&quot;,
+
+        &quot;Transfer learning is a machine learning method where a model developed for a task is reused &quot;
+        &quot;as the starting point for a model on a second task. It is a popular approach in deep learning &quot;
+        &quot;where pre-trained models are used as the starting point on computer vision and natural language &quot;
+        &quot;processing tasks given the vast compute and time resources required to develop neural network &quot;
+        &quot;models on these problems and the large improvements they provide.&quot;,
+    ]
+
+    near_dup_1 = (
+        &quot;Machine learning is a subset of artificial intelligence that provides systems the ability &quot;
+        &quot;to automatically learn and improve from experience. Machine learning focuses on developing &quot;
+        &quot;computer programs that can access data and use it to learn for themselves. The learning &quot;
+        &quot;process begins with observations or data, such as examples or direct experience, in order &quot;
+        &quot;to look for patterns and make better decisions based on the examples provided.&quot;
+    )
+
+    near_dup_2 = (
+        &quot;Deep learning is part of a broader family of machine learning methods based on artificial &quot;
+        &quot;neural networks with representation learning. Learning can be supervised, semi-supervised &quot;
+        &quot;or unsupervised. Deep learning architectures such as deep neural networks, recurrent neural &quot;
+        &quot;networks, convolutional neural networks and transformers have been applied to fields &quot;
+        &quot;including natural language processing, speech recognition, computer vision, and many other tasks.&quot;
+    )
+
+    short_doc = &quot;This is too short to be useful.&quot;
+
+    html_doc = (
+        &quot;&lt;html&gt;&lt;body&gt;&lt;h1&gt;Title&lt;/h1&gt;&lt;p&gt;Machine learning is transforming how we build software. &quot;
+        &quot;Deep neural networks can learn complex patterns from data. The transformer architecture &quot;
+        &quot;has become the dominant approach for language tasks. Self-attention allows models to capture &quot;
+        &quot;long-range dependencies. Pre-training on large corpora produces strong foundation models. &quot;
+        &quot;Fine-tuning adapts these models to specific tasks with minimal additional data.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;&quot;
+    )
+
+    spam_doc = &quot;BUY NOW CLICK HERE FREE MONEY GUARANTEED RESULTS &quot; * 20
+
+    docs = base_docs + [near_dup_1, near_dup_2, short_doc, html_doc, spam_doc]
+    return docs
+
+
+def run_pipeline():
+    print(&quot;=&quot; * 60)
+    print(&quot;Data Pipeline for Pre-Training&quot;)
+    print(&quot;=&quot; * 60)
+
+    raw_docs = generate_sample_corpus()
+    print(f&quot;\nRaw documents: {len(raw_docs)}&quot;)
+
+    print(&quot;\n--- Stage 1: Cleaning ---&quot;)
+    cleaned_docs = [clean_text(doc) for doc in raw_docs]
+    print(f&quot;After HTML stripping: {len(cleaned_docs)} documents&quot;)
+
+    print(&quot;\n--- Stage 2: Quality Filtering ---&quot;)
+    filtered_docs = [doc for doc in cleaned_docs if quality_filter(doc)]
+    removed_quality = len(cleaned_docs) - len(filtered_docs)
+    print(f&quot;Removed {removed_quality} low-quality documents&quot;)
+    print(f&quot;Remaining: {len(filtered_docs)} documents&quot;)
+
+    print(&quot;\n--- Stage 3: Deduplication (MinHash + LSH) ---&quot;)
+    start = time.time()
+    deduped_docs, num_removed = deduplicate(filtered_docs, threshold=0.8)
+    dedup_time = time.time() - start
+    print(f&quot;Removed {num_removed} near-duplicates in {dedup_time:.2f}s&quot;)
+    print(f&quot;Remaining: {len(deduped_docs)} documents&quot;)
+
+    print(&quot;\n--- Stage 4: Tokenization ---&quot;)
+    all_text = &quot; &quot;.join(deduped_docs)
+    tokenizer = SimpleTokenizer()
+    start = time.time()
+    tokenizer.train_bpe(all_text, num_merges=100)
+    train_time = time.time() - start
+    print(f&quot;Trained tokenizer with {tokenizer.vocab_size()} tokens in {train_time:.2f}s&quot;)
+
+    start = time.time()
+    token_ids = tokenize_corpus(deduped_docs, tokenizer)
+    tok_time = time.time() - start
+    print(f&quot;Tokenized {len(token_ids):,} tokens in {tok_time:.2f}s ({len(token_ids)/max(tok_time, 0.001):,.0f} tokens/sec)&quot;)
+
+    print(&quot;\n--- Stage 5: Sequence Packing ---&quot;)
+    seq_length = 128
+    sequences, masks = pack_sequences(token_ids, seq_length, pad_id=0)
+    print(f&quot;Packed into {len(sequences)} sequences of length {seq_length}&quot;)
+
+    print(&quot;\n--- Stage 6: DataLoader ---&quot;)
+    batch_size = 4
+    loader = PreTrainingDataLoader(sequences, masks, batch_size)
+    print(f&quot;DataLoader: {len(loader)} batches of size {batch_size}&quot;)
+
+    batch_count = 0
+    total_tokens_served = 0
+    for batch_seqs, batch_masks in loader:
+        batch_count += 1
+        total_tokens_served += sum(sum(m) for m in batch_masks)
+        if batch_count &lt;= 2:
+            print(f&quot;\n  Batch {batch_count}:&quot;)
+            print(f&quot;    Sequences: {len(batch_seqs)}&quot;)
+            print(f&quot;    First seq (first 20 tokens): {batch_seqs[0][:20]}...&quot;)
+            print(f&quot;    First mask (first 20): {batch_masks[0][:20]}...&quot;)
+    print(f&quot;\n  Total batches served: {batch_count}&quot;)
+    print(f&quot;  Total non-padding tokens served: {total_tokens_served:,}&quot;)
+
+    print(&quot;\n--- Dataset Statistics ---&quot;)
+    stats = compute_statistics(deduped_docs, token_ids, sequences, tokenizer.vocab_size())
+    print(f&quot;  Documents:          {stats[&#39;total_documents&#39;]}&quot;)
+    print(f&quot;  Total characters:   {stats[&#39;total_characters&#39;]:,}&quot;)
+    print(f&quot;  Total tokens:       {stats[&#39;total_tokens&#39;]:,}&quot;)
+    print(f&quot;  Unique tokens:      {stats[&#39;unique_tokens&#39;]}&quot;)
+    print(f&quot;  Vocab utilization:  {stats[&#39;vocab_utilization&#39;]:.1%}&quot;)
+    print(f&quot;  Compression ratio:  {stats[&#39;compression_ratio&#39;]:.2f} chars/token&quot;)
+    print(f&quot;  Avg doc length:     {stats[&#39;avg_doc_length_words&#39;]:.0f} words&quot;)
+    print(f&quot;  Num sequences:      {stats[&#39;num_sequences&#39;]}&quot;)
+    print(f&quot;  Seq utilization:    {stats[&#39;sequence_utilization&#39;]:.1%}&quot;)
+
+    print(&quot;\n--- Pipeline Summary ---&quot;)
+    print(f&quot;  Raw documents:       {len(raw_docs)}&quot;)
+    print(f&quot;  After cleaning:      {len(cleaned_docs)}&quot;)
+    print(f&quot;  After quality filter: {len(filtered_docs)} (-{removed_quality})&quot;)
+    print(f&quot;  After dedup:         {len(deduped_docs)} (-{num_removed})&quot;)
+    print(f&quot;  Final tokens:        {len(token_ids):,}&quot;)
+    print(f&quot;  Training sequences:  {len(sequences)}&quot;)
+    print(f&quot;  Training batches:    {len(loader)}&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    run_pipeline()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/10-llms-from-scratch/03-data-pipelines/outputs/prompt-data-quality-checker.md">phases/10-llms-from-scratch/03-data-pipelines/outputs/prompt-data-quality-checker.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: prompt-data-quality-checker
+description: Validate and debug data quality in LLM pre-training pipelines
+version: 1.0.0
+phase: 10
+lesson: 3
+tags: [data-pipeline, deduplication, quality-filter, pre-training, llm, data-cleaning]
+---
+
+# Data Quality Checker for LLM Pre-Training
+
+When building or auditing a data pipeline for LLM pre-training, use this framework to catch problems before they reach the model.
+
+## Red Flags in Pipeline Output
+
+**Deduplication removed less than 20% of web data.** Common Crawl typically contains 30-40% duplicates. If your dedup step removes less than 20%, your MinHash parameters are too conservative or your threshold is too high. Check: shingle size k, number of hash functions, number of LSH bands, Jaccard threshold.
+
+**Compression ratio below 2.0 chars/token.** This means your tokenizer is splitting too aggressively. Either retrain with more merges, increase vocabulary size, or check that pre-tokenization is not fragmenting text unnecessarily.
+
+**Compression ratio above 6.0 chars/token.** Your tokenizer has learned very domain-specific merges that may not generalize. This is fine for a domain-specific model but a warning sign for general-purpose models.
+
+**Sequence utilization below 90%.** Too much padding. Either your documents are very short (filter them or increase minimum document length) or your sequence packing is inefficient (switch from naive padding to multi-document packing).
+
+**Vocab utilization below 50%.** More than half your vocabulary is unused on this corpus. Either the vocabulary is too large for your domain or the tokenizer was trained on very different data.
+
+## Quality Filter Calibration
+
+Run these checks on a random sample of 1,000 documents at each pipeline stage:
+
+1. **Read 20 random documents after cleaning.** Do they contain residual HTML, JavaScript, navigation text, or boilerplate? If yes, your HTML stripping is incomplete.
+
+2. **Read 20 random documents that PASSED the quality filter.** Are any of them spam, keyword lists, or machine-generated? If yes, tighten the filter thresholds.
+
+3. **Read 20 random documents that FAILED the quality filter.** Are any of them genuinely good content? If yes, your filter is too aggressive. Relax thresholds or add exceptions for specific patterns.
+
+4. **Read 20 random near-duplicate pairs from dedup.** Are they actually similar? If not, lower the Jaccard threshold or increase the number of hash functions.
+
+## Data Mixing Ratios
+
+There is no universal formula. Start with these baselines and adjust based on evaluation:
+
+| Category | Llama 3 Ratio | Starting Point |
+|----------|--------------|----------------|
+| Web text | 50% | 50% |
+| Code | 25% | 15-25% |
+| Books/academic | 13% | 10-15% |
+| Math | 8% | 5-10% |
+| Multilingual web | 4% | 5-10% |
+
+Increase code ratio if the model should be strong at programming. Increase math ratio if reasoning matters. Decrease web ratio if you need less noise. Always evaluate on benchmarks after changing ratios.
+
+## Scaling Estimates
+
+For a given target token count:
+
+- 1T tokens from web: expect ~3-5TB raw text, ~1.5-2TB after cleaning and dedup
+- Tokenization speed (Rust): ~100M tokens/second per core
+- Tokenization speed (Python): ~1-10M tokens/second per core
+- MinHash dedup at 128 hashes, 16 bands: ~10K documents/second per core
+- Sequence packing: I/O bound, use memory-mapped files for corpora above 10GB
+
+For 15T tokens (Llama 3 scale), plan for ~30-50TB of raw input data, 1-2 weeks of preprocessing on a 64-core machine, and 100TB+ of disk for intermediate files.
+
+## Checklist Before Training
+
+1. Total token count matches your compute budget (use Chinchilla scaling or the Llama 3 overtrain ratio as a guide)
+2. Dedup removed 30-40% of web data
+3. Quality filter removed 10-20% of remaining data
+4. Compression ratio is 3-5 chars/token for English
+5. Sequence utilization is above 95%
+6. Random spot-checks show clean, coherent text at every pipeline stage
+7. Data mix ratios have been validated on a small-scale training run
+8. PII removal has been verified on a sample
+9. All binary formats (packed sequences, token ID arrays) pass round-trip encoding/decoding tests
+10. Pipeline is reproducible: same input produces identical output with fixed random seeds
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. Why can&#39;t you simply load all pre-training data into memory?</legend><label class="option"><input type="radio" name="q0" value="0"> Pre-training corpora are terabytes in size, far exceeding available RAM, requiring streaming pipelines</label><label class="option"><input type="radio" name="q0" value="1"> Loading data into memory is slower</label><label class="option"><input type="radio" name="q0" value="2"> Memory is only needed for model weights</label><label class="option"><input type="radio" name="q0" value="3"> Python doesn&#39;t support large arrays</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. Why is data deduplication important for pre-training?</legend><label class="option"><input type="radio" name="q1" value="0"> It saves disk space</label><label class="option"><input type="radio" name="q1" value="1"> Duplicate documents cause the model to memorize specific text verbatim and waste training compute on repeated content</label><label class="option"><input type="radio" name="q1" value="2"> It reduces the vocabulary size</label><label class="option"><input type="radio" name="q1" value="3"> It speeds up tokenization</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. What is the purpose of creating fixed-length training sequences from variable-length documents?</legend><label class="option"><input type="radio" name="q2" value="0"> It reduces the total number of tokens</label><label class="option"><input type="radio" name="q2" value="1"> It makes the text easier to read</label><label class="option"><input type="radio" name="q2" value="2"> GPU training requires uniform tensor shapes, so documents must be packed or padded into fixed-length sequences</label><label class="option"><input type="radio" name="q2" value="3"> Fixed-length sequences are more accurate</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. What happens if the data pipeline is slower than GPU training speed?</legend><label class="option"><input type="radio" name="q3" value="0"> Nothing -- the pipeline runs asynchronously</label><label class="option"><input type="radio" name="q3" value="1"> Training automatically slows down to match</label><label class="option"><input type="radio" name="q3" value="2"> The model trains on the same batch repeatedly</label><label class="option"><input type="radio" name="q3" value="3"> The GPU sits idle waiting for batches, wasting expensive compute time</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. Why is data quality filtering (language detection, content filtering) applied before tokenization?</legend><label class="option"><input type="radio" name="q4" value="0"> It reduces tokenization time</label><label class="option"><input type="radio" name="q4" value="1"> Low-quality data (spam, boilerplate, toxic content) degrades model capabilities proportional to its share of training data</label><label class="option"><input type="radio" name="q4" value="2"> Filtering after tokenization is impossible</label><label class="option"><input type="radio" name="q4" value="3"> Tokenizers can&#39;t handle low-quality text</label><p data-feedback="4"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/10-llms-from-scratch/02-building-a-tokenizer/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/10-llms-from-scratch/04-pre-training-mini-gpt/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/10-llms-from-scratch/03-data-pipelines/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

@@ -1,0 +1,2552 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>函数调用和工具使用 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-11-llm-engineering" data-lesson="11-llm-engineering/09-function-calling" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/11-llm-engineering/">大语言模型工程</a> / LESSON 09</p><h1 class="lesson-title">函数调用和工具使用</h1><p>Function Calling &amp; Tool Use</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>函数调用和工具使用</h1>
+<blockquote>
+<p>法律法师什么都不能做. 他们生成了短信. 这就是全部能力. 他们无法检查天气,查询数据库,发送电子邮件,运行代码或阅读文件. 你见过的每一个&quot;AI代理&quot;都是一个LLM生成JSON的, 模型是大脑. 工具是手. 功能调用是神经系统连接它们.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 11 Lesson 03 (Structured Outputs)
+<strong>Time:</strong> ~75 minutes
+**Related:**11 · 14阶段 (模式语境协议) 当工具被共享到主机之间时,从线性函数调用到MCP服务器.本课涵盖线性案例;MCP涵盖协议案例.</p>
+<h2>学习目标</h2>
+<ul>
+<li>实现函数调用循环:定义工具方案,分析模型的工具调用JSON,执行函数,返回结果</li>
+<li>设计工具方案,具有明确的描述和输入参数,模型可可靠地使用</li>
+<li>构建一个多转机代理循环,链接多个函数调用来回答复杂的查询</li>
+<li>处理函数调用边缘情况:并行工具调用,错误传播,防止无限工具循环</li>
+</ul>
+<h2>问题</h2>
+<p>你建立了一个聊天机器人. 一个用户问:&quot;现在东京的天气是什么?&quot;</p>
+<p>根据季节,东京的气温可能是15摄氏度...</p>
+<p>模型不知道天气,永远不会.天气每小时都会变化.模型的训练数据已经有几个月了.</p>
+<p>答案是:需要调用OpenWeatherMap API,获取当前温度,返回真数.模型不能调用API.你的代码可以.缺少的部分:一个结构化的协议,让模型说&quot;我需要用这些参数调用天气API&quot;,并让你的代码执行它并返回结果.</p>
+<p>模型输出结构化的JSON描述哪个函数需要使用哪些参数.你的应用程序执行该函数.结果返回对话中.模型使用结果来生成最终答案.</p>
+<p>没有职能调用,LLM是百科全书.</p>
+<h2>概念</h2>
+<h3>调用循环的功能</h3>
+<p>每个工具使用互动都遵循相同的5步循环.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-a78051f16f293ec5194a.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>步骤1:用户发送信息. 步骤2:模型收到信息,并附工具定义 (描述可用的函数的JSON方案). 步骤3:模型不用文字回复,而是输出一个工具调用--一个结构化的JSON对象, 步骤4:你的代码执行函数并捕获结果. 步骤5:结果回到模型,现在有实际数据来产生最终答案.</p>
+<p>模型从来没有执行任何东西,它只决定什么叫什么和什么参数.你的代码是执行器.</p>
+<h3>工具定义:JSON方案合同</h3>
+<p>每个工具都由一个JSON方案定义,该模型告诉该函数做什么,它需要哪些参数,以及这些参数必须是什么类型.</p>
+<pre><code class="language-json">{
+  &quot;type&quot;: &quot;function&quot;,
+  &quot;function&quot;: {
+    &quot;name&quot;: &quot;get_weather&quot;,
+    &quot;description&quot;: &quot;Get current weather for a city. Returns temperature in Celsius and conditions.&quot;,
+    &quot;parameters&quot;: {
+      &quot;type&quot;: &quot;object&quot;,
+      &quot;properties&quot;: {
+        &quot;city&quot;: {
+          &quot;type&quot;: &quot;string&quot;,
+          &quot;description&quot;: &quot;City name, e.g. 'Tokyo' or 'San Francisco'&quot;
+        },
+        &quot;units&quot;: {
+          &quot;type&quot;: &quot;string&quot;,
+          &quot;enum&quot;: [&quot;celsius&quot;, &quot;fahrenheit&quot;],
+          &quot;description&quot;: &quot;Temperature units&quot;
+        }
+      },
+      &quot;required&quot;: [&quot;city&quot;]
+    }
+  }
+}
+</code></pre>
+<p>其他<code>description</code>模型读取它们,以决定使用工具的时间和方法. &quot;气候变化&quot;这样的模糊描述会产生更糟糕的工具选择,而不是&quot;为城市获得当前的气候.返回温度在摄氏度和条件&quot;.</p>
+<h3>提供商的比较</h3>
+<p>每个主要供应商都支持函数调用,但API表面不同.</p>
+<table>
+<thead>
+<tr>
+<th>Provider</th>
+<th>API Parameter</th>
+<th>Tool Call Format</th>
+<th>Parallel Calls</th>
+<th>Forced Calling</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>OpenAI (GPT-5, o4)</td>
+<td><code>tools</code></td>
+<td><code>tool_calls[].function</code></td>
+<td>Yes (multiple per turn)</td>
+<td><code>tool_choice=&quot;required&quot;</code></td>
+</tr>
+<tr>
+<td>Anthropic (Claude 4.6/4.7)</td>
+<td><code>tools</code></td>
+<td><code>content[].type=&quot;tool_use&quot;</code></td>
+<td>Yes (multiple blocks)</td>
+<td><code>tool_choice={&quot;type&quot;:&quot;any&quot;}</code></td>
+</tr>
+<tr>
+<td>Google (Gemini 3)</td>
+<td><code>function_declarations</code></td>
+<td><code>functionCall</code></td>
+<td>Yes</td>
+<td><code>function_calling_config</code></td>
+</tr>
+<tr>
+<td>Open-weight (Llama 4, Qwen3, DeepSeek-V3)</td>
+<td>Native <code>tools</code> on Llama 4; Hermes or ChatML on others</td>
+<td>Mixed</td>
+<td>Model-dependent</td>
+<td>Prompt-based or <code>tool_choice</code> if supported</td>
+</tr>
+</tbody>
+</table>
+<p>到2026年,三个关闭的提供商将 konverge 在几乎相同的JSON-Schema基于格式.<code>tools</code>对于跨主机共享工具,更好选择MCP (Phase 11 · 14) 而不是直线函数调用.服务器对所有服务器都是相同的.</p>
+<h3>工具选择:自动,要求,具体</h3>
+<p>你控制模型使用工具时.</p>
+<p><strong>Auto</strong>模型决定是否打电话给工具,或者直接回答. &quot;2+2是什么?&quot; - - 直接回答. &quot;天气是什么?&quot; - - 打电话给工具.</p>
+<p><strong>Required</strong>模型必须调用至少一个工具. 当你知道用户的意图需要工具时,使用此方法. 防止模型猜测而不是寻找真实数据.</p>
+<p><strong>Specific function</strong>强迫模型调用特定函数. <code>tool_choice={&quot;type&quot;:&quot;function&quot;, &quot;function&quot;: {&quot;name&quot;: &quot;get_weather&quot;}}</code>无论查询如何,使用这个方法来路由 - - 当上游逻辑已经确定了需要哪个工具.</p>
+<h3>并行函数调用</h3>
+<p>基普特-4o和克劳德可以在一次转换中调用多个函数.一个用户问:&quot;东京和纽约的天气是什么?&quot;模型同时输出两个工具调用:</p>
+<pre><code class="language-json">[
+  {&quot;name&quot;: &quot;get_weather&quot;, &quot;arguments&quot;: {&quot;city&quot;: &quot;Tokyo&quot;}},
+  {&quot;name&quot;: &quot;get_weather&quot;, &quot;arguments&quot;: {&quot;city&quot;: &quot;New York&quot;}}
+]
+</code></pre>
+<p>您的代码执行了两者 (理想情况下同时),返回了两者结果,模型合成了单个响应. 这将回复次数从2降至1.对于每次查询的5-10个工具调用的代理人来说,并行调用会减少60-80%.</p>
+<h3>结构化输出与函数调用</h3>
+<p>课程03涵盖结构化输出. 函数调用使用相同的JSON方案机器,但用不同的目的.</p>
+<p><strong>Structured outputs</strong>输出是最终产品. 举个例子:从文本中提取产品信息.<code>{name, price, in_stock}</code>现在,我们要去.</p>
+<p><strong>Function calling</strong>模型声明执行行动的意图.输出是中间步骤. 示例: <code>get_weather(city=&quot;Tokyo&quot;)</code>模型要求采取行动,而不是产生最终答案.</p>
+<p>需要数据提取时使用结构化输出. 需要模型与外部系统交互时使用函数调用.</p>
+<h3>安全:不可谈判的规则</h3>
+<p>函数调用是您可以给LLM最危险的功能.模型选择执行什么.如果您的工具集包括数据库查询,模型构建查询.如果它包括命令,模型会写它们.</p>
+<p>**Rule 1: Never pass model-generated SQL directly to a database.**模型可以生成DROPTABLE,UNION注射或查询,返回每行. 始终参数化.始终验证.始终使用允许操作列表.</p>
+<p>**Rule 2: Allowlist functions.**模型只能调用您明确定义的函数. 永远不要构建一个通用的&quot;以名称执行任何函数&quot;工具. 如果您有50个内部函数,只会暴露用户需要的5.</p>
+<p>**Rule 3: Validate arguments.**模型可能会通过一个城市的名字<code>&quot;; DROP TABLE users; --&quot;</code>执行前验证所有对预期类型,范围和格式的参数.</p>
+<p>**Rule 4: Sanitize tool results.**如果工具返回敏感数据 (API密钥,PII,内部错误),在将其返回模型之前过它.模型将将工具结果包含在其响应中.</p>
+<p>**Rule 5: Rate limit tool calls.**循环中的模型可以将工具调用数百次.设置最大的 (10-20次通话是合理的).打破无限的循环.</p>
+<h3>错误处理</h3>
+<p>工具失败,API时间停用,数据库下降,文件不存在,模型需要知道工具何时失败以及为什么.</p>
+<p>作为结构化工具结果,而不是例外的错误返回:</p>
+<pre><code class="language-json">{
+  &quot;error&quot;: true,
+  &quot;message&quot;: &quot;City 'Toky' not found. Did you mean 'Tokyo'?&quot;,
+  &quot;code&quot;: &quot;CITY_NOT_FOUND&quot;
+}
+</code></pre>
+<p>模型读取此,调整其参数,再尝试.模型擅长自修改结构错误信息.它们擅长从空洞答案或通用&quot;有些事情错了&quot;错误中恢复.</p>
+<h3>标准:模式背景协议</h3>
+<p>MCP是安卓的工具互操作性开放标准.而不是每个应用程序定义其自己的工具,MCP提供了通用协议:工具由MCP服务器提供,由MCP客户端 (如Claude Code,Cursor或您的应用程序) 消费.</p>
+<p>一个MCP服务器可以向任何兼容的客户端暴露工具.一个Postgres MCP服务器可以让任何兼容MCP的代理数据库访问.一个GitHub MCP服务器可以让任何代理存储库访问.这些工具被定义一次,在任何地方都使用.</p>
+<p>通过MCP,它将运输层标准化,使工具变得便携式.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-8475f4bccea3221c88bf.png" alt="mx-tool-call-loop 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<h3>步骤1:定义工具登记库</h3>
+<p>建立一个存储工具定义及其实现的登记库.每个工具都有一个JSON Schema定义 (模型看到的) 和一个Python函数 (你的代码执行的).</p>
+<pre><code class="language-python">import ast
+import json
+import math
+import time
+import hashlib
+
+
+TOOL_REGISTRY = {}
+
+
+def register_tool(name, description, parameters, function):
+    TOOL_REGISTRY[name] = {
+        &quot;definition&quot;: {
+            &quot;type&quot;: &quot;function&quot;,
+            &quot;function&quot;: {
+                &quot;name&quot;: name,
+                &quot;description&quot;: description,
+                &quot;parameters&quot;: parameters,
+            },
+        },
+        &quot;function&quot;: function,
+    }
+</code></pre>
+<h3>步骤 2: 实施5种工具</h3>
+<p>建立一个计算器,天气查找,网页搜索模拟器,文件阅读器和代码运行器.</p>
+<pre><code class="language-python">def calculator(expression, precision=2):
+    allowed = set(&quot;0123456789+-*/.() &quot;)
+    if not all(c in allowed for c in expression):
+        return {&quot;error&quot;: True, &quot;message&quot;: f&quot;Invalid characters in expression: {expression}&quot;}
+    try:
+        result = eval(expression, {&quot;__builtins__&quot;: {}}, {&quot;math&quot;: math})
+        return {&quot;result&quot;: round(float(result), precision), &quot;expression&quot;: expression}
+    except Exception as e:
+        return {&quot;error&quot;: True, &quot;message&quot;: str(e)}
+
+
+WEATHER_DB = {
+    &quot;tokyo&quot;: {&quot;temp_c&quot;: 18, &quot;condition&quot;: &quot;cloudy&quot;, &quot;humidity&quot;: 72, &quot;wind_kph&quot;: 14},
+    &quot;new york&quot;: {&quot;temp_c&quot;: 22, &quot;condition&quot;: &quot;sunny&quot;, &quot;humidity&quot;: 45, &quot;wind_kph&quot;: 8},
+    &quot;london&quot;: {&quot;temp_c&quot;: 12, &quot;condition&quot;: &quot;rainy&quot;, &quot;humidity&quot;: 88, &quot;wind_kph&quot;: 22},
+    &quot;san francisco&quot;: {&quot;temp_c&quot;: 16, &quot;condition&quot;: &quot;foggy&quot;, &quot;humidity&quot;: 80, &quot;wind_kph&quot;: 18},
+    &quot;sydney&quot;: {&quot;temp_c&quot;: 25, &quot;condition&quot;: &quot;sunny&quot;, &quot;humidity&quot;: 55, &quot;wind_kph&quot;: 10},
+}
+
+
+def get_weather(city, units=&quot;celsius&quot;):
+    key = city.lower().strip()
+    if key not in WEATHER_DB:
+        suggestions = [c for c in WEATHER_DB if c.startswith(key[:3])]
+        return {
+            &quot;error&quot;: True,
+            &quot;message&quot;: f&quot;City '{city}' not found.&quot;,
+            &quot;suggestions&quot;: suggestions,
+            &quot;code&quot;: &quot;CITY_NOT_FOUND&quot;,
+        }
+    data = WEATHER_DB[key].copy()
+    if units == &quot;fahrenheit&quot;:
+        data[&quot;temp_f&quot;] = round(data[&quot;temp_c&quot;] * 9 / 5 + 32, 1)
+        del data[&quot;temp_c&quot;]
+    data[&quot;city&quot;] = city
+    return data
+
+
+SEARCH_DB = {
+    &quot;python function calling&quot;: [
+        {&quot;title&quot;: &quot;OpenAI Function Calling Guide&quot;, &quot;url&quot;: &quot;https://platform.openai.com/docs/guides/function-calling&quot;, &quot;snippet&quot;: &quot;Learn how to connect LLMs to external tools.&quot;},
+        {&quot;title&quot;: &quot;Anthropic Tool Use&quot;, &quot;url&quot;: &quot;https://docs.anthropic.com/en/docs/tool-use&quot;, &quot;snippet&quot;: &quot;Claude can interact with external tools and APIs.&quot;},
+    ],
+    &quot;MCP protocol&quot;: [
+        {&quot;title&quot;: &quot;Model Context Protocol&quot;, &quot;url&quot;: &quot;https://modelcontextprotocol.io&quot;, &quot;snippet&quot;: &quot;An open standard for connecting AI models to data sources.&quot;},
+    ],
+    &quot;weather API&quot;: [
+        {&quot;title&quot;: &quot;OpenWeatherMap API&quot;, &quot;url&quot;: &quot;https://openweathermap.org/api&quot;, &quot;snippet&quot;: &quot;Free weather API with current, forecast, and historical data.&quot;},
+    ],
+}
+
+
+def web_search(query, max_results=3):
+    key = query.lower().strip()
+    for db_key, results in SEARCH_DB.items():
+        if db_key in key or key in db_key:
+            return {&quot;query&quot;: query, &quot;results&quot;: results[:max_results], &quot;total&quot;: len(results)}
+    return {&quot;query&quot;: query, &quot;results&quot;: [], &quot;total&quot;: 0}
+
+
+FILE_SYSTEM = {
+    &quot;data/config.json&quot;: '{&quot;model&quot;: &quot;gpt-4o&quot;, &quot;temperature&quot;: 0.7, &quot;max_tokens&quot;: 4096}',
+    &quot;data/users.csv&quot;: &quot;name,email,role\nAlice,alice@example.com,admin\nBob,bob@example.com,user&quot;,
+    &quot;README.md&quot;: &quot;# My Project\nA tool-use agent built from scratch.&quot;,
+}
+
+
+def read_file(path):
+    if &quot;..&quot; in path or path.startswith(&quot;/&quot;):
+        return {&quot;error&quot;: True, &quot;message&quot;: &quot;Path traversal not allowed.&quot;, &quot;code&quot;: &quot;FORBIDDEN&quot;}
+    if path not in FILE_SYSTEM:
+        available = list(FILE_SYSTEM.keys())
+        return {&quot;error&quot;: True, &quot;message&quot;: f&quot;File '{path}' not found.&quot;, &quot;available_files&quot;: available, &quot;code&quot;: &quot;NOT_FOUND&quot;}
+    content = FILE_SYSTEM[path]
+    return {&quot;path&quot;: path, &quot;content&quot;: content, &quot;size_bytes&quot;: len(content), &quot;lines&quot;: content.count(&quot;\n&quot;) + 1}
+
+
+def run_code(code, language=&quot;python&quot;):
+    if language != &quot;python&quot;:
+        return {&quot;error&quot;: True, &quot;message&quot;: f&quot;Language '{language}' not supported. Only 'python' is available.&quot;}
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as e:
+        return {&quot;error&quot;: True, &quot;message&quot;: f&quot;SyntaxError: {e}&quot;, &quot;code&quot;: &quot;SYNTAX_ERROR&quot;}
+    unsafe_names = {&quot;exec&quot;, &quot;eval&quot;, &quot;compile&quot;, &quot;__import__&quot;, &quot;open&quot;, &quot;globals&quot;, &quot;locals&quot;, &quot;vars&quot;, &quot;getattr&quot;, &quot;setattr&quot;, &quot;delattr&quot;}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            return {&quot;error&quot;: True, &quot;message&quot;: &quot;Forbidden operation: import is not allowed&quot;, &quot;code&quot;: &quot;SECURITY_VIOLATION&quot;}
+        if isinstance(node, ast.Attribute) and node.attr.startswith(&quot;__&quot;) and node.attr.endswith(&quot;__&quot;):
+            return {&quot;error&quot;: True, &quot;message&quot;: &quot;Forbidden operation: dunder attribute access is not allowed&quot;, &quot;code&quot;: &quot;SECURITY_VIOLATION&quot;}
+        if isinstance(node, ast.Name) and node.id in unsafe_names:
+            return {&quot;error&quot;: True, &quot;message&quot;: f&quot;Forbidden operation: {node.id} is not allowed&quot;, &quot;code&quot;: &quot;SECURITY_VIOLATION&quot;}
+    try:
+        local_vars = {}
+        exec(code, {&quot;__builtins__&quot;: {&quot;print&quot;: print, &quot;range&quot;: range, &quot;len&quot;: len, &quot;str&quot;: str, &quot;int&quot;: int, &quot;float&quot;: float, &quot;list&quot;: list, &quot;dict&quot;: dict, &quot;sum&quot;: sum, &quot;min&quot;: min, &quot;max&quot;: max, &quot;abs&quot;: abs, &quot;round&quot;: round, &quot;sorted&quot;: sorted, &quot;enumerate&quot;: enumerate, &quot;zip&quot;: zip, &quot;map&quot;: map, &quot;filter&quot;: filter, &quot;math&quot;: math}}, local_vars)
+        result = local_vars.get(&quot;result&quot;, None)
+        return {&quot;success&quot;: True, &quot;result&quot;: result, &quot;variables&quot;: {k: str(v) for k, v in local_vars.items() if not k.startswith(&quot;_&quot;)}}
+    except Exception as e:
+        return {&quot;error&quot;: True, &quot;message&quot;: f&quot;{type(e).__name__}: {e}&quot;}
+</code></pre>
+<p>字符串区块列表将代码读取为文本,因此它会错过任何字符串匹配不字面上拼写的东西.将代码解析成语法树并行走它使得监护人拒绝<code>import</code>子属性访问 (<code>__class__</code>其他<code>__globals__</code>它们的结构是不安全的,而不是拼写的. 尽管如此,请把这看作是教学选,而不是一个真正的边界. 任何正在处理的监护者都会与翻译员共享运行的代码, 确定的调用者仍然可以找到可访问的物体. 制作系统在单独的过程或容器中运行不可信赖的代码 (一个被丢弃的特权的子进程, gVisor,火,或一个托管的代码运行器),</p>
+<h3>步骤3: 记录所有工具</h3>
+<pre><code class="language-python">def register_all_tools():
+    register_tool(
+        &quot;calculator&quot;, &quot;Evaluate a mathematical expression. Supports +, -, *, /, parentheses, and decimals. Returns the numeric result.&quot;,
+        {&quot;type&quot;: &quot;object&quot;, &quot;properties&quot;: {&quot;expression&quot;: {&quot;type&quot;: &quot;string&quot;, &quot;description&quot;: &quot;Math expression, e.g. '(10 + 5) * 3'&quot;}, &quot;precision&quot;: {&quot;type&quot;: &quot;integer&quot;, &quot;description&quot;: &quot;Decimal places in result&quot;, &quot;default&quot;: 2}}, &quot;required&quot;: [&quot;expression&quot;]},
+        calculator,
+    )
+    register_tool(
+        &quot;get_weather&quot;, &quot;Get current weather for a city. Returns temperature, condition, humidity, and wind speed.&quot;,
+        {&quot;type&quot;: &quot;object&quot;, &quot;properties&quot;: {&quot;city&quot;: {&quot;type&quot;: &quot;string&quot;, &quot;description&quot;: &quot;City name, e.g. 'Tokyo' or 'San Francisco'&quot;}, &quot;units&quot;: {&quot;type&quot;: &quot;string&quot;, &quot;enum&quot;: [&quot;celsius&quot;, &quot;fahrenheit&quot;], &quot;description&quot;: &quot;Temperature units, defaults to celsius&quot;}}, &quot;required&quot;: [&quot;city&quot;]},
+        get_weather,
+    )
+    register_tool(
+        &quot;web_search&quot;, &quot;Search the web for information. Returns a list of results with title, URL, and snippet.&quot;,
+        {&quot;type&quot;: &quot;object&quot;, &quot;properties&quot;: {&quot;query&quot;: {&quot;type&quot;: &quot;string&quot;, &quot;description&quot;: &quot;Search query&quot;}, &quot;max_results&quot;: {&quot;type&quot;: &quot;integer&quot;, &quot;description&quot;: &quot;Maximum results to return&quot;, &quot;default&quot;: 3}}, &quot;required&quot;: [&quot;query&quot;]},
+        web_search,
+    )
+    register_tool(
+        &quot;read_file&quot;, &quot;Read the contents of a file. Returns the file content, size, and line count.&quot;,
+        {&quot;type&quot;: &quot;object&quot;, &quot;properties&quot;: {&quot;path&quot;: {&quot;type&quot;: &quot;string&quot;, &quot;description&quot;: &quot;Relative file path, e.g. 'data/config.json'&quot;}}, &quot;required&quot;: [&quot;path&quot;]},
+        read_file,
+    )
+    register_tool(
+        &quot;run_code&quot;, &quot;Run a small Python snippet behind a static-analysis guard and a restricted interpreter. This is a teaching filter, not real isolation. Set a 'result' variable to return output.&quot;,
+        {&quot;type&quot;: &quot;object&quot;, &quot;properties&quot;: {&quot;code&quot;: {&quot;type&quot;: &quot;string&quot;, &quot;description&quot;: &quot;Python code to execute&quot;}, &quot;language&quot;: {&quot;type&quot;: &quot;string&quot;, &quot;enum&quot;: [&quot;python&quot;], &quot;description&quot;: &quot;Programming language&quot;}}, &quot;required&quot;: [&quot;code&quot;]},
+        run_code,
+    )
+</code></pre>
+<h3>步骤4: 建立一个叫环的功能</h3>
+<p>这就是核心引擎.它模拟模型,决定要调用哪个工具,执行工具,并传递结果.</p>
+<pre><code class="language-python">def simulate_model_decision(user_message, tools, conversation_history):
+    msg = user_message.lower()
+
+    if any(word in msg for word in [&quot;weather&quot;, &quot;temperature&quot;, &quot;forecast&quot;]):
+        cities = []
+        for city in WEATHER_DB:
+            if city in msg:
+                cities.append(city)
+        if not cities:
+            for word in msg.split():
+                if word.capitalize() in [c.title() for c in WEATHER_DB]:
+                    cities.append(word)
+        if not cities:
+            cities = [&quot;tokyo&quot;]
+        calls = []
+        for city in cities:
+            calls.append({&quot;name&quot;: &quot;get_weather&quot;, &quot;arguments&quot;: {&quot;city&quot;: city.title()}})
+        return calls
+
+    if any(word in msg for word in [&quot;calculate&quot;, &quot;compute&quot;, &quot;math&quot;, &quot;what is&quot;, &quot;how much&quot;]):
+        for token in msg.split():
+            if any(c in token for c in &quot;+-*/&quot;):
+                return [{&quot;name&quot;: &quot;calculator&quot;, &quot;arguments&quot;: {&quot;expression&quot;: token}}]
+        if &quot;+&quot; in msg or &quot;-&quot; in msg or &quot;*&quot; in msg or &quot;/&quot; in msg:
+            expr = &quot;&quot;.join(c for c in msg if c in &quot;0123456789+-*/.() &quot;)
+            if expr.strip():
+                return [{&quot;name&quot;: &quot;calculator&quot;, &quot;arguments&quot;: {&quot;expression&quot;: expr.strip()}}]
+        return [{&quot;name&quot;: &quot;calculator&quot;, &quot;arguments&quot;: {&quot;expression&quot;: &quot;0&quot;}}]
+
+    if any(word in msg for word in [&quot;search&quot;, &quot;find&quot;, &quot;look up&quot;, &quot;google&quot;]):
+        query = msg.replace(&quot;search for&quot;, &quot;&quot;).replace(&quot;look up&quot;, &quot;&quot;).replace(&quot;find&quot;, &quot;&quot;).strip()
+        return [{&quot;name&quot;: &quot;web_search&quot;, &quot;arguments&quot;: {&quot;query&quot;: query}}]
+
+    if any(word in msg for word in [&quot;read&quot;, &quot;file&quot;, &quot;open&quot;, &quot;cat&quot;, &quot;show&quot;]):
+        for path in FILE_SYSTEM:
+            if path.split(&quot;/&quot;)[-1].split(&quot;.&quot;)[0] in msg:
+                return [{&quot;name&quot;: &quot;read_file&quot;, &quot;arguments&quot;: {&quot;path&quot;: path}}]
+        return [{&quot;name&quot;: &quot;read_file&quot;, &quot;arguments&quot;: {&quot;path&quot;: &quot;README.md&quot;}}]
+
+    if any(word in msg for word in [&quot;run&quot;, &quot;execute&quot;, &quot;code&quot;, &quot;python&quot;]):
+        return [{&quot;name&quot;: &quot;run_code&quot;, &quot;arguments&quot;: {&quot;code&quot;: &quot;result = 'Hello from the sandbox!'&quot;, &quot;language&quot;: &quot;python&quot;}}]
+
+    return []
+
+
+def execute_tool_call(tool_call):
+    name = tool_call[&quot;name&quot;]
+    args = tool_call[&quot;arguments&quot;]
+
+    if name not in TOOL_REGISTRY:
+        return {&quot;error&quot;: True, &quot;message&quot;: f&quot;Unknown tool: {name}&quot;, &quot;code&quot;: &quot;UNKNOWN_TOOL&quot;}
+
+    tool = TOOL_REGISTRY[name]
+    func = tool[&quot;function&quot;]
+    start = time.time()
+
+    try:
+        result = func(**args)
+    except TypeError as e:
+        result = {&quot;error&quot;: True, &quot;message&quot;: f&quot;Invalid arguments: {e}&quot;}
+
+    elapsed_ms = round((time.time() - start) * 1000, 2)
+    return {&quot;tool&quot;: name, &quot;result&quot;: result, &quot;execution_time_ms&quot;: elapsed_ms}
+
+
+def run_function_calling_loop(user_message, max_iterations=5):
+    conversation = [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: user_message}]
+    tool_definitions = [t[&quot;definition&quot;] for t in TOOL_REGISTRY.values()]
+    all_tool_results = []
+
+    for iteration in range(max_iterations):
+        tool_calls = simulate_model_decision(user_message, tool_definitions, conversation)
+
+        if not tool_calls:
+            break
+
+        results = []
+        for call in tool_calls:
+            result = execute_tool_call(call)
+            results.append(result)
+
+        conversation.append({&quot;role&quot;: &quot;assistant&quot;, &quot;content&quot;: None, &quot;tool_calls&quot;: tool_calls})
+
+        for result in results:
+            conversation.append({&quot;role&quot;: &quot;tool&quot;, &quot;content&quot;: json.dumps(result[&quot;result&quot;]), &quot;tool_name&quot;: result[&quot;tool&quot;]})
+
+        all_tool_results.extend(results)
+        break
+
+    return {&quot;conversation&quot;: conversation, &quot;tool_results&quot;: all_tool_results, &quot;iterations&quot;: iteration + 1 if tool_calls else 0}
+</code></pre>
+<h3>步骤5:证明论点</h3>
+<p>在执行之前,建立一个验证器,以对JSON方案进行工具调用参数的检查.</p>
+<pre><code class="language-python">def validate_tool_arguments(tool_name, arguments):
+    if tool_name not in TOOL_REGISTRY:
+        return [f&quot;Unknown tool: {tool_name}&quot;]
+
+    schema = TOOL_REGISTRY[tool_name][&quot;definition&quot;][&quot;function&quot;][&quot;parameters&quot;]
+    errors = []
+
+    if not isinstance(arguments, dict):
+        return [f&quot;Arguments must be an object, got {type(arguments).__name__}&quot;]
+
+    for required_field in schema.get(&quot;required&quot;, []):
+        if required_field not in arguments:
+            errors.append(f&quot;Missing required argument: {required_field}&quot;)
+
+    properties = schema.get(&quot;properties&quot;, {})
+    for arg_name, arg_value in arguments.items():
+        if arg_name not in properties:
+            errors.append(f&quot;Unknown argument: {arg_name}&quot;)
+            continue
+
+        prop_schema = properties[arg_name]
+        expected_type = prop_schema.get(&quot;type&quot;)
+
+        type_checks = {&quot;string&quot;: str, &quot;integer&quot;: int, &quot;number&quot;: (int, float), &quot;boolean&quot;: bool, &quot;array&quot;: list, &quot;object&quot;: dict}
+        if expected_type in type_checks:
+            if not isinstance(arg_value, type_checks[expected_type]):
+                errors.append(f&quot;Argument '{arg_name}': expected {expected_type}, got {type(arg_value).__name__}&quot;)
+
+        if &quot;enum&quot; in prop_schema and arg_value not in prop_schema[&quot;enum&quot;]:
+            errors.append(f&quot;Argument '{arg_name}': '{arg_value}' not in {prop_schema['enum']}&quot;)
+
+    return errors
+</code></pre>
+<h3>步骤 6: 运行演示</h3>
+<pre><code class="language-python">def run_demo():
+    register_all_tools()
+
+    print(&quot;=&quot; * 60)
+    print(&quot;  Function Calling &amp; Tool Use Demo&quot;)
+    print(&quot;=&quot; * 60)
+
+    print(&quot;\n--- Registered Tools ---&quot;)
+    for name, tool in TOOL_REGISTRY.items():
+        desc = tool[&quot;definition&quot;][&quot;function&quot;][&quot;description&quot;][:60]
+        params = list(tool[&quot;definition&quot;][&quot;function&quot;][&quot;parameters&quot;].get(&quot;properties&quot;, {}).keys())
+        print(f&quot;  {name}: {desc}...&quot;)
+        print(f&quot;    params: {params}&quot;)
+
+    print(f&quot;\n--- Argument Validation ---&quot;)
+    validation_tests = [
+        (&quot;get_weather&quot;, {&quot;city&quot;: &quot;Tokyo&quot;}, &quot;Valid call&quot;),
+        (&quot;get_weather&quot;, {}, &quot;Missing required arg&quot;),
+        (&quot;get_weather&quot;, {&quot;city&quot;: &quot;Tokyo&quot;, &quot;units&quot;: &quot;kelvin&quot;}, &quot;Invalid enum value&quot;),
+        (&quot;calculator&quot;, {&quot;expression&quot;: 123}, &quot;Wrong type (int for string)&quot;),
+        (&quot;unknown_tool&quot;, {&quot;x&quot;: 1}, &quot;Unknown tool&quot;),
+    ]
+    for tool_name, args, label in validation_tests:
+        errors = validate_tool_arguments(tool_name, args)
+        status = &quot;VALID&quot; if not errors else f&quot;ERRORS: {errors}&quot;
+        print(f&quot;  {label}: {status}&quot;)
+
+    print(f&quot;\n--- Tool Execution ---&quot;)
+    direct_tests = [
+        {&quot;name&quot;: &quot;calculator&quot;, &quot;arguments&quot;: {&quot;expression&quot;: &quot;(10 + 5) * 3 / 2&quot;}},
+        {&quot;name&quot;: &quot;get_weather&quot;, &quot;arguments&quot;: {&quot;city&quot;: &quot;Tokyo&quot;}},
+        {&quot;name&quot;: &quot;get_weather&quot;, &quot;arguments&quot;: {&quot;city&quot;: &quot;Mars&quot;}},
+        {&quot;name&quot;: &quot;web_search&quot;, &quot;arguments&quot;: {&quot;query&quot;: &quot;python function calling&quot;}},
+        {&quot;name&quot;: &quot;read_file&quot;, &quot;arguments&quot;: {&quot;path&quot;: &quot;data/config.json&quot;}},
+        {&quot;name&quot;: &quot;read_file&quot;, &quot;arguments&quot;: {&quot;path&quot;: &quot;../etc/passwd&quot;}},
+        {&quot;name&quot;: &quot;run_code&quot;, &quot;arguments&quot;: {&quot;code&quot;: &quot;result = sum(range(1, 101))&quot;}},
+        {&quot;name&quot;: &quot;run_code&quot;, &quot;arguments&quot;: {&quot;code&quot;: &quot;import os; os.system('rm -rf /')&quot;}},
+    ]
+    for call in direct_tests:
+        result = execute_tool_call(call)
+        print(f&quot;\n  {call['name']}({json.dumps(call['arguments'])})&quot;)
+        print(f&quot;    -&gt; {json.dumps(result['result'], indent=None)[:100]}&quot;)
+        print(f&quot;    time: {result['execution_time_ms']}ms&quot;)
+
+    print(f&quot;\n--- Full Function Calling Loop ---&quot;)
+    test_queries = [
+        &quot;What's the weather in Tokyo?&quot;,
+        &quot;Calculate (100 + 250) * 0.15&quot;,
+        &quot;Search for MCP protocol&quot;,
+        &quot;Read the config file&quot;,
+        &quot;Run some Python code&quot;,
+        &quot;Tell me a joke&quot;,
+    ]
+    for query in test_queries:
+        print(f&quot;\n  User: {query}&quot;)
+        result = run_function_calling_loop(query)
+        if result[&quot;tool_results&quot;]:
+            for tr in result[&quot;tool_results&quot;]:
+                print(f&quot;    Tool: {tr['tool']} ({tr['execution_time_ms']}ms)&quot;)
+                print(f&quot;    Result: {json.dumps(tr['result'], indent=None)[:90]}&quot;)
+        else:
+            print(f&quot;    [No tool called -- direct response]&quot;)
+        print(f&quot;    Iterations: {result['iterations']}&quot;)
+
+    print(f&quot;\n--- Parallel Tool Calls ---&quot;)
+    multi_city_query = &quot;What's the weather in tokyo and london?&quot;
+    print(f&quot;  User: {multi_city_query}&quot;)
+    result = run_function_calling_loop(multi_city_query)
+    print(f&quot;  Tool calls made: {len(result['tool_results'])}&quot;)
+    for tr in result[&quot;tool_results&quot;]:
+        city = tr[&quot;result&quot;].get(&quot;city&quot;, &quot;unknown&quot;)
+        temp = tr[&quot;result&quot;].get(&quot;temp_c&quot;, &quot;N/A&quot;)
+        print(f&quot;    {city}: {temp}C, {tr['result'].get('condition', 'N/A')}&quot;)
+
+    print(f&quot;\n--- Security Checks ---&quot;)
+    security_tests = [
+        (&quot;read_file&quot;, {&quot;path&quot;: &quot;../../etc/passwd&quot;}),
+        (&quot;run_code&quot;, {&quot;code&quot;: &quot;import subprocess; subprocess.run(['ls'])&quot;}),
+        (&quot;calculator&quot;, {&quot;expression&quot;: &quot;__import__('os').system('ls')&quot;}),
+    ]
+    for tool_name, args in security_tests:
+        result = execute_tool_call({&quot;name&quot;: tool_name, &quot;arguments&quot;: args})
+        blocked = result[&quot;result&quot;].get(&quot;error&quot;, False)
+        print(f&quot;  {tool_name}({list(args.values())[0][:40]}): {'BLOCKED' if blocked else 'ALLOWED'}&quot;)
+</code></pre>
+<h2>用它</h2>
+<h3>开放AI函数调用</h3>
+<pre><code class="language-python"># from openai import OpenAI
+#
+# client = OpenAI()
+#
+# tools = [{
+#     &quot;type&quot;: &quot;function&quot;,
+#     &quot;function&quot;: {
+#         &quot;name&quot;: &quot;get_weather&quot;,
+#         &quot;description&quot;: &quot;Get current weather for a city&quot;,
+#         &quot;parameters&quot;: {
+#             &quot;type&quot;: &quot;object&quot;,
+#             &quot;properties&quot;: {
+#                 &quot;city&quot;: {&quot;type&quot;: &quot;string&quot;},
+#                 &quot;units&quot;: {&quot;type&quot;: &quot;string&quot;, &quot;enum&quot;: [&quot;celsius&quot;, &quot;fahrenheit&quot;]}
+#             },
+#             &quot;required&quot;: [&quot;city&quot;]
+#         }
+#     }
+# }]
+#
+# response = client.chat.completions.create(
+#     model=&quot;gpt-4o&quot;,
+#     messages=[{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;Weather in Tokyo?&quot;}],
+#     tools=tools,
+#     tool_choice=&quot;auto&quot;,
+# )
+#
+# tool_call = response.choices[0].message.tool_calls[0]
+# args = json.loads(tool_call.function.arguments)
+# result = get_weather(**args)
+#
+# final = client.chat.completions.create(
+#     model=&quot;gpt-4o&quot;,
+#     messages=[
+#         {&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;Weather in Tokyo?&quot;},
+#         response.choices[0].message,
+#         {&quot;role&quot;: &quot;tool&quot;, &quot;tool_call_id&quot;: tool_call.id, &quot;content&quot;: json.dumps(result)},
+#     ],
+# )
+# print(final.choices[0].message.content)
+</code></pre>
+<p>开放AI返回工具调用为 <code>response.choices[0].message.tool_calls</code>每次电话都有一个号码.<code>id</code>模型使用这个ID来匹配结果与调用.GPT-4o可以在一个回应中返回多个工具调用 - 代并执行它们全部.</p>
+<h3>人类工具的使用</h3>
+<pre><code class="language-python"># import anthropic
+#
+# client = anthropic.Anthropic()
+#
+# response = client.messages.create(
+#     model=&quot;claude-sonnet-5&quot;,
+#     max_tokens=1024,
+#     tools=[{
+#         &quot;name&quot;: &quot;get_weather&quot;,
+#         &quot;description&quot;: &quot;Get current weather for a city&quot;,
+#         &quot;input_schema&quot;: {
+#             &quot;type&quot;: &quot;object&quot;,
+#             &quot;properties&quot;: {
+#                 &quot;city&quot;: {&quot;type&quot;: &quot;string&quot;},
+#                 &quot;units&quot;: {&quot;type&quot;: &quot;string&quot;, &quot;enum&quot;: [&quot;celsius&quot;, &quot;fahrenheit&quot;]}
+#             },
+#             &quot;required&quot;: [&quot;city&quot;]
+#         }
+#     }],
+#     messages=[{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;Weather in Tokyo?&quot;}],
+# )
+#
+# tool_block = next(b for b in response.content if b.type == &quot;tool_use&quot;)
+# result = get_weather(**tool_block.input)
+#
+# final = client.messages.create(
+#     model=&quot;claude-sonnet-5&quot;,
+#     max_tokens=1024,
+#     tools=[...],
+#     messages=[
+#         {&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;Weather in Tokyo?&quot;},
+#         {&quot;role&quot;: &quot;assistant&quot;, &quot;content&quot;: response.content},
+#         {&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: [{&quot;type&quot;: &quot;tool_result&quot;, &quot;tool_use_id&quot;: tool_block.id, &quot;content&quot;: json.dumps(result)}]},
+#     ],
+# )
+</code></pre>
+<p>类返回工具调用为内容块<code>type: &quot;tool_use&quot;</code>工具结果将在用户消息中输入<code>type: &quot;tool_result&quot;</code>注意主要的区别:人类用法<code>input_schema</code>工具参数定义,而OpenAI使用<code>parameters</code>现在,我们要去.</p>
+<h3>集成MCP</h3>
+<pre><code class="language-python"># MCP servers expose tools over a standardized protocol.
+# Any MCP-compatible client can discover and call these tools.
+#
+# Example: connecting to a Postgres MCP server
+#
+# from mcp import ClientSession, StdioServerParameters
+# from mcp.client.stdio import stdio_client
+#
+# server_params = StdioServerParameters(
+#     command=&quot;npx&quot;,
+#     args=[&quot;-y&quot;, &quot;@modelcontextprotocol/server-postgres&quot;, &quot;postgresql://localhost/mydb&quot;],
+# )
+#
+# async with stdio_client(server_params) as (read, write):
+#     async with ClientSession(read, write) as session:
+#         await session.initialize()
+#         tools = await session.list_tools()
+#         result = await session.call_tool(&quot;query&quot;, {&quot;sql&quot;: &quot;SELECT count(*) FROM users&quot;})
+</code></pre>
+<p>软件将工具实现与工具消费分离.Postgres服务器知道SQL.GitHub服务器知道API.您的代理只会发现和调用工具 - - 它不需要供应商特定代码,每个集成.</p>
+<h2>运送它</h2>
+<p>这一课产生了<code>outputs/prompt-tool-designer.md</code>-- 设计工具定义的可重复使用提示模板. 给它描述你想要工具做什么,它会产生完整的JSON Schema定义,包含描述,类型和限制.</p>
+<p>它还产生了<code>outputs/skill-function-calling-patterns.md</code>-- 解决方案,包括工具设计,错误处理,安全和供应商特定模式.</p>
+<h2>运动</h2>
+<ol>
+<li>
+<p>**Add a 6th tool: database query.**实现一个模拟的SQL工具,使用内存表.该工具接受表名和过条件 (而不是原始SQL).验证表名在允许列表中,并且过操作员被限制在<code>=</code>现在<code>&gt;</code>现在<code>&lt;</code>现在<code>&gt;=</code>现在<code>&lt;=</code>返回匹配的行为JSON.</p>
+</li>
+<li>
+<p>**Implement retry with error feedback.**当工具调用失败时 (例如,城市未找到),将错误信息返回模型决策函数,让它纠正其参数. 追踪每个调用需要多少次重复. 每次调用工具,设置最大3次重复.</p>
+</li>
+<li>
+<p>**Build a multi-step agent.**某些查询需要链接工具: &quot;阅读配置文件,告诉我是什么模型配置,然后在网上搜索该模型的定价&quot;. 实现一个循环,直到模型决定不再需要工具,将积累的结果传递到每个决策步骤中. 限制到10次代以防止无限循环.</p>
+</li>
+<li>
+<p>**Measure tool selection accuracy.**创建30个测试查询,使用预期的工具名称.在所有30个工具上运行您的决策函数,并测量它选择正确的工具的百分比.确定哪些查询导致工具之间的最多混乱.</p>
+</li>
+<li>
+<p>**Implement tool call caching.**如果在60秒内使用相同的参数调用相同的工具,则返回缓存结果,而不是重新执行.<code>(tool_name, frozenset(args.items()))</code>通过20个查询来测量一个对话中的缓存访问率.</p>
+</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Function calling</td>
+<td>&quot;Tool use&quot;</td>
+<td>The model outputs structured JSON describing a function to invoke with specific arguments -- your code executes it, not the model</td>
+</tr>
+<tr>
+<td>Tool definition</td>
+<td>&quot;Function schema&quot;</td>
+<td>A JSON Schema object describing a tool's name, purpose, parameters, and types -- the model reads this to decide when and how to use the tool</td>
+</tr>
+<tr>
+<td>Tool choice</td>
+<td>&quot;Calling mode&quot;</td>
+<td>Controls whether the model must call a tool (required), may call a tool (auto), or must call a specific tool (named)</td>
+</tr>
+<tr>
+<td>Parallel calling</td>
+<td>&quot;Multi-tool&quot;</td>
+<td>The model outputs multiple tool calls in a single turn, reducing round trips -- GPT-4o and Claude both support this</td>
+</tr>
+<tr>
+<td>Tool result</td>
+<td>&quot;Function output&quot;</td>
+<td>The return value from executing a tool, sent back to the model as a message so it can use real data in its response</td>
+</tr>
+<tr>
+<td>Argument validation</td>
+<td>&quot;Input checking&quot;</td>
+<td>Verifying that model-generated arguments match the expected types, ranges, and constraints before executing the tool</td>
+</tr>
+<tr>
+<td>MCP</td>
+<td>&quot;Tool protocol&quot;</td>
+<td>Model Context Protocol -- Anthropic's open standard for exposing tools via servers that any compatible client can discover and call</td>
+</tr>
+<tr>
+<td>Agent loop</td>
+<td>&quot;ReAct loop&quot;</td>
+<td>The iterative cycle of model-decides-tool, code-executes-tool, result-feeds-back until the model has enough information to respond</td>
+</tr>
+<tr>
+<td>Tool poisoning</td>
+<td>&quot;Prompt injection via tools&quot;</td>
+<td>An attack where tool results contain instructions that manipulate the model's behavior -- sanitize all tool outputs</td>
+</tr>
+<tr>
+<td>Rate limiting</td>
+<td>&quot;Call budget&quot;</td>
+<td>Setting a maximum number of tool calls per conversation to prevent infinite loops and runaway API costs</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://platform.openai.com/docs/guides/function-calling" rel="noreferrer" data-network="true">OpenAI Function Calling Guide <small>↗ 需要联网</small></a>-- GPT-4o的工具使用的最终参考,包括并行调用,强制调用和结构性论证</li>
+<li><a href="https://docs.anthropic.com/en/docs/tool-use" rel="noreferrer" data-network="true">Anthropic Tool Use Guide <small>↗ 需要联网</small></a>-- 克劳德的工具使用输入_方案,多工具响应和工具_选择配置的实现</li>
+<li><a href="https://modelcontextprotocol.io" rel="noreferrer" data-network="true">Model Context Protocol Specification <small>↗ 需要联网</small></a>-- 通过服务器/客户端架构,在人工智能应用中实现工具互操作性的开放标准</li>
+<li><a href="https://arxiv.org/abs/2302.04761" rel="noreferrer" data-network="true">Schick et al., 2023 -- &quot;Toolformer: Language Models Can Teach Themselves to Use Tools&quot; <small>↗ 需要联网</small></a>关于培训法定法律学士的基础论文,以决定何时和如何调用外部工具</li>
+<li><a href="https://arxiv.org/abs/2305.15334" rel="noreferrer" data-network="true">Patil et al., 2023 -- &quot;Gorilla: Large Language Model Connected with Massive APIs&quot; <small>↗ 需要联网</small></a>-- 精细调整LLM,以实现在1645个API中精确的API调用,减少幻觉</li>
+<li><a href="https://gorilla.cs.berkeley.edu/leaderboard.html" rel="noreferrer" data-network="true">Berkeley Function Calling Leaderboard <small>↗ 需要联网</small></a>实时基准比较函数调用精度在GPT-4o,Claude,双胞胎和开放模型中</li>
+<li><a href="https://arxiv.org/abs/2210.03629" rel="noreferrer" data-network="true">Yao et al., &quot;ReAct: Synergizing Reasoning and Acting in Language Models&quot; (ICLR 2023) <small>↗ 需要联网</small></a>作为一个外在的代理环绕每个工具调用; 在这个课程结束时,阶段14开始.</li>
+<li><a href="https://www.anthropic.com/research/building-effective-agents" rel="noreferrer" data-network="true">Anthropic — Building effective agents (Dec 2024) <small>↗ 需要联网</small></a>-- 五种可组合的模式 (即时链接,路由,并行,管弦工作者,评估者优化器) 从单个工具使用原始的构建.</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Function Calling &amp; Tool Use</h1>
+<blockquote>
+<p>LLMs cannot do anything. They generate text. That is the entire capability. They cannot check the weather, query a database, send an email, run code, or read a file. Every &quot;AI agent&quot; you have ever seen is an LLM generating JSON that says which function to call -- and then your code actually calling it. The model is the brain. Tools are the hands. Function calling is the nervous system connecting them.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 11 Lesson 03 (Structured Outputs)
+<strong>Time:</strong> ~75 minutes
+<strong>Related:</strong> Phase 11 · 14 (Model Context Protocol) — when a tool is shared across hosts, graduate from inline function-calling to an MCP server. This lesson covers the inline case; MCP covers the protocol case.</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Implement a function calling loop: define tool schemas, parse the model's tool-call JSON, execute functions, and return results</li>
+<li>Design tool schemas with clear descriptions and typed parameters that the model can reliably invoke</li>
+<li>Build a multi-turn agent loop that chains multiple function calls to answer complex queries</li>
+<li>Handle function calling edge cases: parallel tool calls, error propagation, and preventing infinite tool loops</li>
+</ul>
+<h2>The Problem</h2>
+<p>You build a chatbot. A user asks: &quot;What's the weather in Tokyo right now?&quot;</p>
+<p>The model responds: &quot;I don't have access to real-time weather data, but based on the season, Tokyo is likely around 15 degrees Celsius...&quot;</p>
+<p>That is a hallucination dressed in a disclaimer. The model does not know the weather. It never will. Weather changes every hour. The model's training data is months old.</p>
+<p>The correct answer requires calling the OpenWeatherMap API, getting the current temperature, and returning the real number. The model cannot call APIs. Your code can. The missing piece: a structured protocol that lets the model say &quot;I need to call the weather API with these arguments&quot; and lets your code execute it and feed the result back.</p>
+<p>This is function calling. The model outputs structured JSON describing which function to invoke with what arguments. Your application executes the function. The result goes back into the conversation. The model uses the result to produce its final answer.</p>
+<p>Without function calling, LLMs are encyclopedias. With it, they become agents.</p>
+<h2>The Concept</h2>
+<h3>The Function Calling Loop</h3>
+<p>Every tool-use interaction follows the same 5-step loop.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-a78051f16f293ec5194a.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>Step 1: the user sends a message. Step 2: the model receives the message along with tool definitions (JSON Schema describing available functions). Step 3: instead of responding with text, the model outputs a tool call -- a structured JSON object with the function name and arguments. Step 4: your code executes the function and captures the result. Step 5: the result goes back to the model, which now has real data to produce its final answer.</p>
+<p>The model never executes anything. It only decides what to call and with what arguments. Your code is the executor.</p>
+<h3>Tool Definitions: The JSON Schema Contract</h3>
+<p>Each tool is defined by a JSON Schema that tells the model what the function does, what arguments it takes, and what types those arguments must be.</p>
+<pre><code class="language-json">{
+  &quot;type&quot;: &quot;function&quot;,
+  &quot;function&quot;: {
+    &quot;name&quot;: &quot;get_weather&quot;,
+    &quot;description&quot;: &quot;Get current weather for a city. Returns temperature in Celsius and conditions.&quot;,
+    &quot;parameters&quot;: {
+      &quot;type&quot;: &quot;object&quot;,
+      &quot;properties&quot;: {
+        &quot;city&quot;: {
+          &quot;type&quot;: &quot;string&quot;,
+          &quot;description&quot;: &quot;City name, e.g. 'Tokyo' or 'San Francisco'&quot;
+        },
+        &quot;units&quot;: {
+          &quot;type&quot;: &quot;string&quot;,
+          &quot;enum&quot;: [&quot;celsius&quot;, &quot;fahrenheit&quot;],
+          &quot;description&quot;: &quot;Temperature units&quot;
+        }
+      },
+      &quot;required&quot;: [&quot;city&quot;]
+    }
+  }
+}
+</code></pre>
+<p>The <code>description</code> fields are critical. The model reads them to decide when and how to use the tool. A vague description like &quot;gets weather&quot; produces worse tool selection than &quot;Get current weather for a city. Returns temperature in Celsius and conditions.&quot; The description is a prompt for tool selection.</p>
+<h3>Provider Comparison</h3>
+<p>Every major provider supports function calling, but the API surface differs.</p>
+<table>
+<thead>
+<tr>
+<th>Provider</th>
+<th>API Parameter</th>
+<th>Tool Call Format</th>
+<th>Parallel Calls</th>
+<th>Forced Calling</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>OpenAI (GPT-5, o4)</td>
+<td><code>tools</code></td>
+<td><code>tool_calls[].function</code></td>
+<td>Yes (multiple per turn)</td>
+<td><code>tool_choice=&quot;required&quot;</code></td>
+</tr>
+<tr>
+<td>Anthropic (Claude 4.6/4.7)</td>
+<td><code>tools</code></td>
+<td><code>content[].type=&quot;tool_use&quot;</code></td>
+<td>Yes (multiple blocks)</td>
+<td><code>tool_choice={&quot;type&quot;:&quot;any&quot;}</code></td>
+</tr>
+<tr>
+<td>Google (Gemini 3)</td>
+<td><code>function_declarations</code></td>
+<td><code>functionCall</code></td>
+<td>Yes</td>
+<td><code>function_calling_config</code></td>
+</tr>
+<tr>
+<td>Open-weight (Llama 4, Qwen3, DeepSeek-V3)</td>
+<td>Native <code>tools</code> on Llama 4; Hermes or ChatML on others</td>
+<td>Mixed</td>
+<td>Model-dependent</td>
+<td>Prompt-based or <code>tool_choice</code> if supported</td>
+</tr>
+</tbody>
+</table>
+<p>By 2026 the three closed providers have converged on near-identical JSON-Schema-based formats. Llama 4 ships with a native <code>tools</code> field that matches OpenAI's shape. Open-weight fine-tunes still vary — the Hermes format (NousResearch) is the most common for third-party fine-tunes. For shared tools across hosts, prefer MCP (Phase 11 · 14) over inline function-calling — the server is the same for all of them.</p>
+<h3>Tool Choice: Auto, Required, Specific</h3>
+<p>You control when the model uses tools.</p>
+<p><strong>Auto</strong> (default): the model decides whether to call a tool or respond directly. &quot;What's 2+2?&quot; -- responds directly. &quot;What's the weather?&quot; -- calls the tool.</p>
+<p><strong>Required</strong>: the model must call at least one tool. Use this when you know the user's intent requires a tool. Prevents the model from guessing instead of looking up real data.</p>
+<p><strong>Specific function</strong>: force the model to call a particular function. <code>tool_choice={&quot;type&quot;:&quot;function&quot;, &quot;function&quot;: {&quot;name&quot;: &quot;get_weather&quot;}}</code> guarantees the weather tool is called, regardless of the query. Use this for routing -- when upstream logic already determined which tool is needed.</p>
+<h3>Parallel Function Calling</h3>
+<p>GPT-4o and Claude can call multiple functions in a single turn. A user asks: &quot;What's the weather in Tokyo and New York?&quot; The model outputs two tool calls simultaneously:</p>
+<pre><code class="language-json">[
+  {&quot;name&quot;: &quot;get_weather&quot;, &quot;arguments&quot;: {&quot;city&quot;: &quot;Tokyo&quot;}},
+  {&quot;name&quot;: &quot;get_weather&quot;, &quot;arguments&quot;: {&quot;city&quot;: &quot;New York&quot;}}
+]
+</code></pre>
+<p>Your code executes both (ideally concurrently), returns both results, and the model synthesizes a single response. This cuts round trips from 2 to 1. For agents with 5-10 tool calls per query, parallel calling reduces latency by 60-80%.</p>
+<h3>Structured Outputs vs Function Calling</h3>
+<p>Lesson 03 covered structured outputs. Function calling uses the same JSON Schema machinery, but for a different purpose.</p>
+<p><strong>Structured outputs</strong>: force the model to produce data in a specific shape. The output is the final product. Example: extract product info from text as <code>{name, price, in_stock}</code>.</p>
+<p><strong>Function calling</strong>: the model declares an intent to execute an action. The output is an intermediate step. Example: <code>get_weather(city=&quot;Tokyo&quot;)</code> -- the model is requesting an action, not producing the final answer.</p>
+<p>Use structured outputs when you want data extraction. Use function calling when you want the model to interact with external systems.</p>
+<h3>Security: The Non-Negotiable Rules</h3>
+<p>Function calling is the most dangerous capability you can give an LLM. The model chooses what to execute. If your tool set includes database queries, the model constructs the queries. If it includes shell commands, the model writes them.</p>
+<p><strong>Rule 1: Never pass model-generated SQL directly to a database.</strong> The model can and will generate DROP TABLE, UNION injections, or queries that return every row. Always parameterize. Always validate. Always use an allowlist of operations.</p>
+<p><strong>Rule 2: Allowlist functions.</strong> The model can only call functions you explicitly define. Never build a generic &quot;execute any function by name&quot; tool. If you have 50 internal functions, expose only the 5 the user needs.</p>
+<p><strong>Rule 3: Validate arguments.</strong> The model might pass a city name of <code>&quot;; DROP TABLE users; --&quot;</code>. Validate every argument against expected types, ranges, and formats before execution.</p>
+<p><strong>Rule 4: Sanitize tool results.</strong> If a tool returns sensitive data (API keys, PII, internal errors), filter it before sending it back to the model. The model will include tool results in its response verbatim.</p>
+<p><strong>Rule 5: Rate limit tool calls.</strong> A model in a loop can call tools hundreds of times. Set a maximum (10-20 calls per conversation is reasonable). Break infinite loops.</p>
+<h3>Error Handling</h3>
+<p>Tools fail. APIs time out. Databases go down. Files do not exist. The model needs to know when a tool fails and why.</p>
+<p>Return errors as structured tool results, not exceptions:</p>
+<pre><code class="language-json">{
+  &quot;error&quot;: true,
+  &quot;message&quot;: &quot;City 'Toky' not found. Did you mean 'Tokyo'?&quot;,
+  &quot;code&quot;: &quot;CITY_NOT_FOUND&quot;
+}
+</code></pre>
+<p>The model reads this, adjusts its arguments, and retries. Models are good at self-correcting from structured error messages. They are bad at recovering from empty responses or generic &quot;something went wrong&quot; errors.</p>
+<h3>MCP: Model Context Protocol</h3>
+<p>MCP is Anthropic's open standard for tool interoperability. Instead of every application defining its own tools, MCP provides a universal protocol: tools are served by MCP servers, consumed by MCP clients (like Claude Code, Cursor, or your application).</p>
+<p>One MCP server can expose tools to any compatible client. A Postgres MCP server gives any MCP-compatible agent database access. A GitHub MCP server gives any agent repository access. The tools are defined once, used everywhere.</p>
+<p>MCP is to function calling what HTTP is to networking. It standardizes the transport layer so tools become portable.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-8475f4bccea3221c88bf.png" alt="mx-tool-call-loop 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<h3>Step 1: Define the Tool Registry</h3>
+<p>Build a registry that stores tool definitions and their implementations. Each tool has a JSON Schema definition (what the model sees) and a Python function (what your code executes).</p>
+<pre><code class="language-python">import ast
+import json
+import math
+import time
+import hashlib
+
+
+TOOL_REGISTRY = {}
+
+
+def register_tool(name, description, parameters, function):
+    TOOL_REGISTRY[name] = {
+        &quot;definition&quot;: {
+            &quot;type&quot;: &quot;function&quot;,
+            &quot;function&quot;: {
+                &quot;name&quot;: name,
+                &quot;description&quot;: description,
+                &quot;parameters&quot;: parameters,
+            },
+        },
+        &quot;function&quot;: function,
+    }
+</code></pre>
+<h3>Step 2: Implement 5 Tools</h3>
+<p>Build a calculator, weather lookup, web search simulator, file reader, and code runner.</p>
+<pre><code class="language-python">def calculator(expression, precision=2):
+    allowed = set(&quot;0123456789+-*/.() &quot;)
+    if not all(c in allowed for c in expression):
+        return {&quot;error&quot;: True, &quot;message&quot;: f&quot;Invalid characters in expression: {expression}&quot;}
+    try:
+        result = eval(expression, {&quot;__builtins__&quot;: {}}, {&quot;math&quot;: math})
+        return {&quot;result&quot;: round(float(result), precision), &quot;expression&quot;: expression}
+    except Exception as e:
+        return {&quot;error&quot;: True, &quot;message&quot;: str(e)}
+
+
+WEATHER_DB = {
+    &quot;tokyo&quot;: {&quot;temp_c&quot;: 18, &quot;condition&quot;: &quot;cloudy&quot;, &quot;humidity&quot;: 72, &quot;wind_kph&quot;: 14},
+    &quot;new york&quot;: {&quot;temp_c&quot;: 22, &quot;condition&quot;: &quot;sunny&quot;, &quot;humidity&quot;: 45, &quot;wind_kph&quot;: 8},
+    &quot;london&quot;: {&quot;temp_c&quot;: 12, &quot;condition&quot;: &quot;rainy&quot;, &quot;humidity&quot;: 88, &quot;wind_kph&quot;: 22},
+    &quot;san francisco&quot;: {&quot;temp_c&quot;: 16, &quot;condition&quot;: &quot;foggy&quot;, &quot;humidity&quot;: 80, &quot;wind_kph&quot;: 18},
+    &quot;sydney&quot;: {&quot;temp_c&quot;: 25, &quot;condition&quot;: &quot;sunny&quot;, &quot;humidity&quot;: 55, &quot;wind_kph&quot;: 10},
+}
+
+
+def get_weather(city, units=&quot;celsius&quot;):
+    key = city.lower().strip()
+    if key not in WEATHER_DB:
+        suggestions = [c for c in WEATHER_DB if c.startswith(key[:3])]
+        return {
+            &quot;error&quot;: True,
+            &quot;message&quot;: f&quot;City '{city}' not found.&quot;,
+            &quot;suggestions&quot;: suggestions,
+            &quot;code&quot;: &quot;CITY_NOT_FOUND&quot;,
+        }
+    data = WEATHER_DB[key].copy()
+    if units == &quot;fahrenheit&quot;:
+        data[&quot;temp_f&quot;] = round(data[&quot;temp_c&quot;] * 9 / 5 + 32, 1)
+        del data[&quot;temp_c&quot;]
+    data[&quot;city&quot;] = city
+    return data
+
+
+SEARCH_DB = {
+    &quot;python function calling&quot;: [
+        {&quot;title&quot;: &quot;OpenAI Function Calling Guide&quot;, &quot;url&quot;: &quot;https://platform.openai.com/docs/guides/function-calling&quot;, &quot;snippet&quot;: &quot;Learn how to connect LLMs to external tools.&quot;},
+        {&quot;title&quot;: &quot;Anthropic Tool Use&quot;, &quot;url&quot;: &quot;https://docs.anthropic.com/en/docs/tool-use&quot;, &quot;snippet&quot;: &quot;Claude can interact with external tools and APIs.&quot;},
+    ],
+    &quot;MCP protocol&quot;: [
+        {&quot;title&quot;: &quot;Model Context Protocol&quot;, &quot;url&quot;: &quot;https://modelcontextprotocol.io&quot;, &quot;snippet&quot;: &quot;An open standard for connecting AI models to data sources.&quot;},
+    ],
+    &quot;weather API&quot;: [
+        {&quot;title&quot;: &quot;OpenWeatherMap API&quot;, &quot;url&quot;: &quot;https://openweathermap.org/api&quot;, &quot;snippet&quot;: &quot;Free weather API with current, forecast, and historical data.&quot;},
+    ],
+}
+
+
+def web_search(query, max_results=3):
+    key = query.lower().strip()
+    for db_key, results in SEARCH_DB.items():
+        if db_key in key or key in db_key:
+            return {&quot;query&quot;: query, &quot;results&quot;: results[:max_results], &quot;total&quot;: len(results)}
+    return {&quot;query&quot;: query, &quot;results&quot;: [], &quot;total&quot;: 0}
+
+
+FILE_SYSTEM = {
+    &quot;data/config.json&quot;: '{&quot;model&quot;: &quot;gpt-4o&quot;, &quot;temperature&quot;: 0.7, &quot;max_tokens&quot;: 4096}',
+    &quot;data/users.csv&quot;: &quot;name,email,role\nAlice,alice@example.com,admin\nBob,bob@example.com,user&quot;,
+    &quot;README.md&quot;: &quot;# My Project\nA tool-use agent built from scratch.&quot;,
+}
+
+
+def read_file(path):
+    if &quot;..&quot; in path or path.startswith(&quot;/&quot;):
+        return {&quot;error&quot;: True, &quot;message&quot;: &quot;Path traversal not allowed.&quot;, &quot;code&quot;: &quot;FORBIDDEN&quot;}
+    if path not in FILE_SYSTEM:
+        available = list(FILE_SYSTEM.keys())
+        return {&quot;error&quot;: True, &quot;message&quot;: f&quot;File '{path}' not found.&quot;, &quot;available_files&quot;: available, &quot;code&quot;: &quot;NOT_FOUND&quot;}
+    content = FILE_SYSTEM[path]
+    return {&quot;path&quot;: path, &quot;content&quot;: content, &quot;size_bytes&quot;: len(content), &quot;lines&quot;: content.count(&quot;\n&quot;) + 1}
+
+
+def run_code(code, language=&quot;python&quot;):
+    if language != &quot;python&quot;:
+        return {&quot;error&quot;: True, &quot;message&quot;: f&quot;Language '{language}' not supported. Only 'python' is available.&quot;}
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as e:
+        return {&quot;error&quot;: True, &quot;message&quot;: f&quot;SyntaxError: {e}&quot;, &quot;code&quot;: &quot;SYNTAX_ERROR&quot;}
+    unsafe_names = {&quot;exec&quot;, &quot;eval&quot;, &quot;compile&quot;, &quot;__import__&quot;, &quot;open&quot;, &quot;globals&quot;, &quot;locals&quot;, &quot;vars&quot;, &quot;getattr&quot;, &quot;setattr&quot;, &quot;delattr&quot;}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            return {&quot;error&quot;: True, &quot;message&quot;: &quot;Forbidden operation: import is not allowed&quot;, &quot;code&quot;: &quot;SECURITY_VIOLATION&quot;}
+        if isinstance(node, ast.Attribute) and node.attr.startswith(&quot;__&quot;) and node.attr.endswith(&quot;__&quot;):
+            return {&quot;error&quot;: True, &quot;message&quot;: &quot;Forbidden operation: dunder attribute access is not allowed&quot;, &quot;code&quot;: &quot;SECURITY_VIOLATION&quot;}
+        if isinstance(node, ast.Name) and node.id in unsafe_names:
+            return {&quot;error&quot;: True, &quot;message&quot;: f&quot;Forbidden operation: {node.id} is not allowed&quot;, &quot;code&quot;: &quot;SECURITY_VIOLATION&quot;}
+    try:
+        local_vars = {}
+        exec(code, {&quot;__builtins__&quot;: {&quot;print&quot;: print, &quot;range&quot;: range, &quot;len&quot;: len, &quot;str&quot;: str, &quot;int&quot;: int, &quot;float&quot;: float, &quot;list&quot;: list, &quot;dict&quot;: dict, &quot;sum&quot;: sum, &quot;min&quot;: min, &quot;max&quot;: max, &quot;abs&quot;: abs, &quot;round&quot;: round, &quot;sorted&quot;: sorted, &quot;enumerate&quot;: enumerate, &quot;zip&quot;: zip, &quot;map&quot;: map, &quot;filter&quot;: filter, &quot;math&quot;: math}}, local_vars)
+        result = local_vars.get(&quot;result&quot;, None)
+        return {&quot;success&quot;: True, &quot;result&quot;: result, &quot;variables&quot;: {k: str(v) for k, v in local_vars.items() if not k.startswith(&quot;_&quot;)}}
+    except Exception as e:
+        return {&quot;error&quot;: True, &quot;message&quot;: f&quot;{type(e).__name__}: {e}&quot;}
+</code></pre>
+<p>A substring blocklist reads the code as text, so it misses anything the string match does not literally spell. Parsing the code into a syntax tree and walking it lets the guard reject <code>import</code> statements, dunder attribute access (the <code>__class__</code> and <code>__globals__</code> chains that reach back to the real interpreter), and unsafe builtin names by structure rather than spelling. Even so, treat this as a teaching filter, not a real boundary. Any in-process guard shares the interpreter with the code it runs, and a determined caller can still find reachable objects. Production systems run untrusted code in a separate process or container (a subprocess with dropped privileges, gVisor, Firecracker, or a hosted code runner), where an escape lands the attacker in a throwaway box instead of your service.</p>
+<h3>Step 3: Register All Tools</h3>
+<pre><code class="language-python">def register_all_tools():
+    register_tool(
+        &quot;calculator&quot;, &quot;Evaluate a mathematical expression. Supports +, -, *, /, parentheses, and decimals. Returns the numeric result.&quot;,
+        {&quot;type&quot;: &quot;object&quot;, &quot;properties&quot;: {&quot;expression&quot;: {&quot;type&quot;: &quot;string&quot;, &quot;description&quot;: &quot;Math expression, e.g. '(10 + 5) * 3'&quot;}, &quot;precision&quot;: {&quot;type&quot;: &quot;integer&quot;, &quot;description&quot;: &quot;Decimal places in result&quot;, &quot;default&quot;: 2}}, &quot;required&quot;: [&quot;expression&quot;]},
+        calculator,
+    )
+    register_tool(
+        &quot;get_weather&quot;, &quot;Get current weather for a city. Returns temperature, condition, humidity, and wind speed.&quot;,
+        {&quot;type&quot;: &quot;object&quot;, &quot;properties&quot;: {&quot;city&quot;: {&quot;type&quot;: &quot;string&quot;, &quot;description&quot;: &quot;City name, e.g. 'Tokyo' or 'San Francisco'&quot;}, &quot;units&quot;: {&quot;type&quot;: &quot;string&quot;, &quot;enum&quot;: [&quot;celsius&quot;, &quot;fahrenheit&quot;], &quot;description&quot;: &quot;Temperature units, defaults to celsius&quot;}}, &quot;required&quot;: [&quot;city&quot;]},
+        get_weather,
+    )
+    register_tool(
+        &quot;web_search&quot;, &quot;Search the web for information. Returns a list of results with title, URL, and snippet.&quot;,
+        {&quot;type&quot;: &quot;object&quot;, &quot;properties&quot;: {&quot;query&quot;: {&quot;type&quot;: &quot;string&quot;, &quot;description&quot;: &quot;Search query&quot;}, &quot;max_results&quot;: {&quot;type&quot;: &quot;integer&quot;, &quot;description&quot;: &quot;Maximum results to return&quot;, &quot;default&quot;: 3}}, &quot;required&quot;: [&quot;query&quot;]},
+        web_search,
+    )
+    register_tool(
+        &quot;read_file&quot;, &quot;Read the contents of a file. Returns the file content, size, and line count.&quot;,
+        {&quot;type&quot;: &quot;object&quot;, &quot;properties&quot;: {&quot;path&quot;: {&quot;type&quot;: &quot;string&quot;, &quot;description&quot;: &quot;Relative file path, e.g. 'data/config.json'&quot;}}, &quot;required&quot;: [&quot;path&quot;]},
+        read_file,
+    )
+    register_tool(
+        &quot;run_code&quot;, &quot;Run a small Python snippet behind a static-analysis guard and a restricted interpreter. This is a teaching filter, not real isolation. Set a 'result' variable to return output.&quot;,
+        {&quot;type&quot;: &quot;object&quot;, &quot;properties&quot;: {&quot;code&quot;: {&quot;type&quot;: &quot;string&quot;, &quot;description&quot;: &quot;Python code to execute&quot;}, &quot;language&quot;: {&quot;type&quot;: &quot;string&quot;, &quot;enum&quot;: [&quot;python&quot;], &quot;description&quot;: &quot;Programming language&quot;}}, &quot;required&quot;: [&quot;code&quot;]},
+        run_code,
+    )
+</code></pre>
+<h3>Step 4: Build the Function Calling Loop</h3>
+<p>This is the core engine. It simulates the model deciding which tool to call, executes the tool, and feeds results back.</p>
+<pre><code class="language-python">def simulate_model_decision(user_message, tools, conversation_history):
+    msg = user_message.lower()
+
+    if any(word in msg for word in [&quot;weather&quot;, &quot;temperature&quot;, &quot;forecast&quot;]):
+        cities = []
+        for city in WEATHER_DB:
+            if city in msg:
+                cities.append(city)
+        if not cities:
+            for word in msg.split():
+                if word.capitalize() in [c.title() for c in WEATHER_DB]:
+                    cities.append(word)
+        if not cities:
+            cities = [&quot;tokyo&quot;]
+        calls = []
+        for city in cities:
+            calls.append({&quot;name&quot;: &quot;get_weather&quot;, &quot;arguments&quot;: {&quot;city&quot;: city.title()}})
+        return calls
+
+    if any(word in msg for word in [&quot;calculate&quot;, &quot;compute&quot;, &quot;math&quot;, &quot;what is&quot;, &quot;how much&quot;]):
+        for token in msg.split():
+            if any(c in token for c in &quot;+-*/&quot;):
+                return [{&quot;name&quot;: &quot;calculator&quot;, &quot;arguments&quot;: {&quot;expression&quot;: token}}]
+        if &quot;+&quot; in msg or &quot;-&quot; in msg or &quot;*&quot; in msg or &quot;/&quot; in msg:
+            expr = &quot;&quot;.join(c for c in msg if c in &quot;0123456789+-*/.() &quot;)
+            if expr.strip():
+                return [{&quot;name&quot;: &quot;calculator&quot;, &quot;arguments&quot;: {&quot;expression&quot;: expr.strip()}}]
+        return [{&quot;name&quot;: &quot;calculator&quot;, &quot;arguments&quot;: {&quot;expression&quot;: &quot;0&quot;}}]
+
+    if any(word in msg for word in [&quot;search&quot;, &quot;find&quot;, &quot;look up&quot;, &quot;google&quot;]):
+        query = msg.replace(&quot;search for&quot;, &quot;&quot;).replace(&quot;look up&quot;, &quot;&quot;).replace(&quot;find&quot;, &quot;&quot;).strip()
+        return [{&quot;name&quot;: &quot;web_search&quot;, &quot;arguments&quot;: {&quot;query&quot;: query}}]
+
+    if any(word in msg for word in [&quot;read&quot;, &quot;file&quot;, &quot;open&quot;, &quot;cat&quot;, &quot;show&quot;]):
+        for path in FILE_SYSTEM:
+            if path.split(&quot;/&quot;)[-1].split(&quot;.&quot;)[0] in msg:
+                return [{&quot;name&quot;: &quot;read_file&quot;, &quot;arguments&quot;: {&quot;path&quot;: path}}]
+        return [{&quot;name&quot;: &quot;read_file&quot;, &quot;arguments&quot;: {&quot;path&quot;: &quot;README.md&quot;}}]
+
+    if any(word in msg for word in [&quot;run&quot;, &quot;execute&quot;, &quot;code&quot;, &quot;python&quot;]):
+        return [{&quot;name&quot;: &quot;run_code&quot;, &quot;arguments&quot;: {&quot;code&quot;: &quot;result = 'Hello from the sandbox!'&quot;, &quot;language&quot;: &quot;python&quot;}}]
+
+    return []
+
+
+def execute_tool_call(tool_call):
+    name = tool_call[&quot;name&quot;]
+    args = tool_call[&quot;arguments&quot;]
+
+    if name not in TOOL_REGISTRY:
+        return {&quot;error&quot;: True, &quot;message&quot;: f&quot;Unknown tool: {name}&quot;, &quot;code&quot;: &quot;UNKNOWN_TOOL&quot;}
+
+    tool = TOOL_REGISTRY[name]
+    func = tool[&quot;function&quot;]
+    start = time.time()
+
+    try:
+        result = func(**args)
+    except TypeError as e:
+        result = {&quot;error&quot;: True, &quot;message&quot;: f&quot;Invalid arguments: {e}&quot;}
+
+    elapsed_ms = round((time.time() - start) * 1000, 2)
+    return {&quot;tool&quot;: name, &quot;result&quot;: result, &quot;execution_time_ms&quot;: elapsed_ms}
+
+
+def run_function_calling_loop(user_message, max_iterations=5):
+    conversation = [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: user_message}]
+    tool_definitions = [t[&quot;definition&quot;] for t in TOOL_REGISTRY.values()]
+    all_tool_results = []
+
+    for iteration in range(max_iterations):
+        tool_calls = simulate_model_decision(user_message, tool_definitions, conversation)
+
+        if not tool_calls:
+            break
+
+        results = []
+        for call in tool_calls:
+            result = execute_tool_call(call)
+            results.append(result)
+
+        conversation.append({&quot;role&quot;: &quot;assistant&quot;, &quot;content&quot;: None, &quot;tool_calls&quot;: tool_calls})
+
+        for result in results:
+            conversation.append({&quot;role&quot;: &quot;tool&quot;, &quot;content&quot;: json.dumps(result[&quot;result&quot;]), &quot;tool_name&quot;: result[&quot;tool&quot;]})
+
+        all_tool_results.extend(results)
+        break
+
+    return {&quot;conversation&quot;: conversation, &quot;tool_results&quot;: all_tool_results, &quot;iterations&quot;: iteration + 1 if tool_calls else 0}
+</code></pre>
+<h3>Step 5: Argument Validation</h3>
+<p>Build a validator that checks tool call arguments against the JSON Schema before execution.</p>
+<pre><code class="language-python">def validate_tool_arguments(tool_name, arguments):
+    if tool_name not in TOOL_REGISTRY:
+        return [f&quot;Unknown tool: {tool_name}&quot;]
+
+    schema = TOOL_REGISTRY[tool_name][&quot;definition&quot;][&quot;function&quot;][&quot;parameters&quot;]
+    errors = []
+
+    if not isinstance(arguments, dict):
+        return [f&quot;Arguments must be an object, got {type(arguments).__name__}&quot;]
+
+    for required_field in schema.get(&quot;required&quot;, []):
+        if required_field not in arguments:
+            errors.append(f&quot;Missing required argument: {required_field}&quot;)
+
+    properties = schema.get(&quot;properties&quot;, {})
+    for arg_name, arg_value in arguments.items():
+        if arg_name not in properties:
+            errors.append(f&quot;Unknown argument: {arg_name}&quot;)
+            continue
+
+        prop_schema = properties[arg_name]
+        expected_type = prop_schema.get(&quot;type&quot;)
+
+        type_checks = {&quot;string&quot;: str, &quot;integer&quot;: int, &quot;number&quot;: (int, float), &quot;boolean&quot;: bool, &quot;array&quot;: list, &quot;object&quot;: dict}
+        if expected_type in type_checks:
+            if not isinstance(arg_value, type_checks[expected_type]):
+                errors.append(f&quot;Argument '{arg_name}': expected {expected_type}, got {type(arg_value).__name__}&quot;)
+
+        if &quot;enum&quot; in prop_schema and arg_value not in prop_schema[&quot;enum&quot;]:
+            errors.append(f&quot;Argument '{arg_name}': '{arg_value}' not in {prop_schema['enum']}&quot;)
+
+    return errors
+</code></pre>
+<h3>Step 6: Run the Demo</h3>
+<pre><code class="language-python">def run_demo():
+    register_all_tools()
+
+    print(&quot;=&quot; * 60)
+    print(&quot;  Function Calling &amp; Tool Use Demo&quot;)
+    print(&quot;=&quot; * 60)
+
+    print(&quot;\n--- Registered Tools ---&quot;)
+    for name, tool in TOOL_REGISTRY.items():
+        desc = tool[&quot;definition&quot;][&quot;function&quot;][&quot;description&quot;][:60]
+        params = list(tool[&quot;definition&quot;][&quot;function&quot;][&quot;parameters&quot;].get(&quot;properties&quot;, {}).keys())
+        print(f&quot;  {name}: {desc}...&quot;)
+        print(f&quot;    params: {params}&quot;)
+
+    print(f&quot;\n--- Argument Validation ---&quot;)
+    validation_tests = [
+        (&quot;get_weather&quot;, {&quot;city&quot;: &quot;Tokyo&quot;}, &quot;Valid call&quot;),
+        (&quot;get_weather&quot;, {}, &quot;Missing required arg&quot;),
+        (&quot;get_weather&quot;, {&quot;city&quot;: &quot;Tokyo&quot;, &quot;units&quot;: &quot;kelvin&quot;}, &quot;Invalid enum value&quot;),
+        (&quot;calculator&quot;, {&quot;expression&quot;: 123}, &quot;Wrong type (int for string)&quot;),
+        (&quot;unknown_tool&quot;, {&quot;x&quot;: 1}, &quot;Unknown tool&quot;),
+    ]
+    for tool_name, args, label in validation_tests:
+        errors = validate_tool_arguments(tool_name, args)
+        status = &quot;VALID&quot; if not errors else f&quot;ERRORS: {errors}&quot;
+        print(f&quot;  {label}: {status}&quot;)
+
+    print(f&quot;\n--- Tool Execution ---&quot;)
+    direct_tests = [
+        {&quot;name&quot;: &quot;calculator&quot;, &quot;arguments&quot;: {&quot;expression&quot;: &quot;(10 + 5) * 3 / 2&quot;}},
+        {&quot;name&quot;: &quot;get_weather&quot;, &quot;arguments&quot;: {&quot;city&quot;: &quot;Tokyo&quot;}},
+        {&quot;name&quot;: &quot;get_weather&quot;, &quot;arguments&quot;: {&quot;city&quot;: &quot;Mars&quot;}},
+        {&quot;name&quot;: &quot;web_search&quot;, &quot;arguments&quot;: {&quot;query&quot;: &quot;python function calling&quot;}},
+        {&quot;name&quot;: &quot;read_file&quot;, &quot;arguments&quot;: {&quot;path&quot;: &quot;data/config.json&quot;}},
+        {&quot;name&quot;: &quot;read_file&quot;, &quot;arguments&quot;: {&quot;path&quot;: &quot;../etc/passwd&quot;}},
+        {&quot;name&quot;: &quot;run_code&quot;, &quot;arguments&quot;: {&quot;code&quot;: &quot;result = sum(range(1, 101))&quot;}},
+        {&quot;name&quot;: &quot;run_code&quot;, &quot;arguments&quot;: {&quot;code&quot;: &quot;import os; os.system('rm -rf /')&quot;}},
+    ]
+    for call in direct_tests:
+        result = execute_tool_call(call)
+        print(f&quot;\n  {call['name']}({json.dumps(call['arguments'])})&quot;)
+        print(f&quot;    -&gt; {json.dumps(result['result'], indent=None)[:100]}&quot;)
+        print(f&quot;    time: {result['execution_time_ms']}ms&quot;)
+
+    print(f&quot;\n--- Full Function Calling Loop ---&quot;)
+    test_queries = [
+        &quot;What's the weather in Tokyo?&quot;,
+        &quot;Calculate (100 + 250) * 0.15&quot;,
+        &quot;Search for MCP protocol&quot;,
+        &quot;Read the config file&quot;,
+        &quot;Run some Python code&quot;,
+        &quot;Tell me a joke&quot;,
+    ]
+    for query in test_queries:
+        print(f&quot;\n  User: {query}&quot;)
+        result = run_function_calling_loop(query)
+        if result[&quot;tool_results&quot;]:
+            for tr in result[&quot;tool_results&quot;]:
+                print(f&quot;    Tool: {tr['tool']} ({tr['execution_time_ms']}ms)&quot;)
+                print(f&quot;    Result: {json.dumps(tr['result'], indent=None)[:90]}&quot;)
+        else:
+            print(f&quot;    [No tool called -- direct response]&quot;)
+        print(f&quot;    Iterations: {result['iterations']}&quot;)
+
+    print(f&quot;\n--- Parallel Tool Calls ---&quot;)
+    multi_city_query = &quot;What's the weather in tokyo and london?&quot;
+    print(f&quot;  User: {multi_city_query}&quot;)
+    result = run_function_calling_loop(multi_city_query)
+    print(f&quot;  Tool calls made: {len(result['tool_results'])}&quot;)
+    for tr in result[&quot;tool_results&quot;]:
+        city = tr[&quot;result&quot;].get(&quot;city&quot;, &quot;unknown&quot;)
+        temp = tr[&quot;result&quot;].get(&quot;temp_c&quot;, &quot;N/A&quot;)
+        print(f&quot;    {city}: {temp}C, {tr['result'].get('condition', 'N/A')}&quot;)
+
+    print(f&quot;\n--- Security Checks ---&quot;)
+    security_tests = [
+        (&quot;read_file&quot;, {&quot;path&quot;: &quot;../../etc/passwd&quot;}),
+        (&quot;run_code&quot;, {&quot;code&quot;: &quot;import subprocess; subprocess.run(['ls'])&quot;}),
+        (&quot;calculator&quot;, {&quot;expression&quot;: &quot;__import__('os').system('ls')&quot;}),
+    ]
+    for tool_name, args in security_tests:
+        result = execute_tool_call({&quot;name&quot;: tool_name, &quot;arguments&quot;: args})
+        blocked = result[&quot;result&quot;].get(&quot;error&quot;, False)
+        print(f&quot;  {tool_name}({list(args.values())[0][:40]}): {'BLOCKED' if blocked else 'ALLOWED'}&quot;)
+</code></pre>
+<h2>Use It</h2>
+<h3>OpenAI Function Calling</h3>
+<pre><code class="language-python"># from openai import OpenAI
+#
+# client = OpenAI()
+#
+# tools = [{
+#     &quot;type&quot;: &quot;function&quot;,
+#     &quot;function&quot;: {
+#         &quot;name&quot;: &quot;get_weather&quot;,
+#         &quot;description&quot;: &quot;Get current weather for a city&quot;,
+#         &quot;parameters&quot;: {
+#             &quot;type&quot;: &quot;object&quot;,
+#             &quot;properties&quot;: {
+#                 &quot;city&quot;: {&quot;type&quot;: &quot;string&quot;},
+#                 &quot;units&quot;: {&quot;type&quot;: &quot;string&quot;, &quot;enum&quot;: [&quot;celsius&quot;, &quot;fahrenheit&quot;]}
+#             },
+#             &quot;required&quot;: [&quot;city&quot;]
+#         }
+#     }
+# }]
+#
+# response = client.chat.completions.create(
+#     model=&quot;gpt-4o&quot;,
+#     messages=[{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;Weather in Tokyo?&quot;}],
+#     tools=tools,
+#     tool_choice=&quot;auto&quot;,
+# )
+#
+# tool_call = response.choices[0].message.tool_calls[0]
+# args = json.loads(tool_call.function.arguments)
+# result = get_weather(**args)
+#
+# final = client.chat.completions.create(
+#     model=&quot;gpt-4o&quot;,
+#     messages=[
+#         {&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;Weather in Tokyo?&quot;},
+#         response.choices[0].message,
+#         {&quot;role&quot;: &quot;tool&quot;, &quot;tool_call_id&quot;: tool_call.id, &quot;content&quot;: json.dumps(result)},
+#     ],
+# )
+# print(final.choices[0].message.content)
+</code></pre>
+<p>OpenAI returns tool calls as <code>response.choices[0].message.tool_calls</code>. Each call has an <code>id</code> you must include when returning the result. The model uses this ID to match results to calls. GPT-4o can return multiple tool calls in a single response -- iterate and execute all of them.</p>
+<h3>Anthropic Tool Use</h3>
+<pre><code class="language-python"># import anthropic
+#
+# client = anthropic.Anthropic()
+#
+# response = client.messages.create(
+#     model=&quot;claude-sonnet-5&quot;,
+#     max_tokens=1024,
+#     tools=[{
+#         &quot;name&quot;: &quot;get_weather&quot;,
+#         &quot;description&quot;: &quot;Get current weather for a city&quot;,
+#         &quot;input_schema&quot;: {
+#             &quot;type&quot;: &quot;object&quot;,
+#             &quot;properties&quot;: {
+#                 &quot;city&quot;: {&quot;type&quot;: &quot;string&quot;},
+#                 &quot;units&quot;: {&quot;type&quot;: &quot;string&quot;, &quot;enum&quot;: [&quot;celsius&quot;, &quot;fahrenheit&quot;]}
+#             },
+#             &quot;required&quot;: [&quot;city&quot;]
+#         }
+#     }],
+#     messages=[{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;Weather in Tokyo?&quot;}],
+# )
+#
+# tool_block = next(b for b in response.content if b.type == &quot;tool_use&quot;)
+# result = get_weather(**tool_block.input)
+#
+# final = client.messages.create(
+#     model=&quot;claude-sonnet-5&quot;,
+#     max_tokens=1024,
+#     tools=[...],
+#     messages=[
+#         {&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;Weather in Tokyo?&quot;},
+#         {&quot;role&quot;: &quot;assistant&quot;, &quot;content&quot;: response.content},
+#         {&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: [{&quot;type&quot;: &quot;tool_result&quot;, &quot;tool_use_id&quot;: tool_block.id, &quot;content&quot;: json.dumps(result)}]},
+#     ],
+# )
+</code></pre>
+<p>Anthropic returns tool calls as content blocks with <code>type: &quot;tool_use&quot;</code>. The tool result goes in a user message with <code>type: &quot;tool_result&quot;</code>. Note the key difference: Anthropic uses <code>input_schema</code> for tool parameter definitions, while OpenAI uses <code>parameters</code>.</p>
+<h3>MCP Integration</h3>
+<pre><code class="language-python"># MCP servers expose tools over a standardized protocol.
+# Any MCP-compatible client can discover and call these tools.
+#
+# Example: connecting to a Postgres MCP server
+#
+# from mcp import ClientSession, StdioServerParameters
+# from mcp.client.stdio import stdio_client
+#
+# server_params = StdioServerParameters(
+#     command=&quot;npx&quot;,
+#     args=[&quot;-y&quot;, &quot;@modelcontextprotocol/server-postgres&quot;, &quot;postgresql://localhost/mydb&quot;],
+# )
+#
+# async with stdio_client(server_params) as (read, write):
+#     async with ClientSession(read, write) as session:
+#         await session.initialize()
+#         tools = await session.list_tools()
+#         result = await session.call_tool(&quot;query&quot;, {&quot;sql&quot;: &quot;SELECT count(*) FROM users&quot;})
+</code></pre>
+<p>MCP decouples tool implementation from tool consumption. The Postgres server knows SQL. The GitHub server knows the API. Your agent just discovers and calls tools -- it does not need provider-specific code for each integration.</p>
+<h2>Ship It</h2>
+<p>This lesson produces <code>outputs/prompt-tool-designer.md</code> -- a reusable prompt template for designing tool definitions. Give it a description of what you want a tool to do, and it produces the complete JSON Schema definition with descriptions, types, and constraints.</p>
+<p>It also produces <code>outputs/skill-function-calling-patterns.md</code> -- a decision framework for implementing function calling in production, covering tool design, error handling, security, and provider-specific patterns.</p>
+<h2>Exercises</h2>
+<ol>
+<li>
+<p><strong>Add a 6th tool: database query.</strong> Implement a simulated SQL tool with an in-memory table. The tool accepts a table name and filter conditions (not raw SQL). Validate that the table name is in an allowlist and that filter operators are restricted to <code>=</code>, <code>&gt;</code>, <code>&lt;</code>, <code>&gt;=</code>, <code>&lt;=</code>. Return matching rows as JSON.</p>
+</li>
+<li>
+<p><strong>Implement retry with error feedback.</strong> When a tool call fails (e.g., city not found), feed the error message back to the model decision function and let it correct its arguments. Track how many retries each call takes. Set a maximum of 3 retries per tool call.</p>
+</li>
+<li>
+<p><strong>Build a multi-step agent.</strong> Some queries require chaining tool calls: &quot;Read the config file and tell me what model is configured, then search the web for that model's pricing.&quot; Implement a loop that runs until the model decides no more tools are needed, passing accumulated results into each decision step. Limit to 10 iterations to prevent infinite loops.</p>
+</li>
+<li>
+<p><strong>Measure tool selection accuracy.</strong> Create 30 test queries with expected tool names. Run your decision function on all 30 and measure what percentage of the time it selects the correct tool. Identify which queries cause the most confusion between tools.</p>
+</li>
+<li>
+<p><strong>Implement tool call caching.</strong> If the same tool is called with identical arguments within 60 seconds, return the cached result instead of re-executing. Use a dictionary keyed by <code>(tool_name, frozenset(args.items()))</code>. Measure cache hit rates across a conversation with 20 queries.</p>
+</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Function calling</td>
+<td>&quot;Tool use&quot;</td>
+<td>The model outputs structured JSON describing a function to invoke with specific arguments -- your code executes it, not the model</td>
+</tr>
+<tr>
+<td>Tool definition</td>
+<td>&quot;Function schema&quot;</td>
+<td>A JSON Schema object describing a tool's name, purpose, parameters, and types -- the model reads this to decide when and how to use the tool</td>
+</tr>
+<tr>
+<td>Tool choice</td>
+<td>&quot;Calling mode&quot;</td>
+<td>Controls whether the model must call a tool (required), may call a tool (auto), or must call a specific tool (named)</td>
+</tr>
+<tr>
+<td>Parallel calling</td>
+<td>&quot;Multi-tool&quot;</td>
+<td>The model outputs multiple tool calls in a single turn, reducing round trips -- GPT-4o and Claude both support this</td>
+</tr>
+<tr>
+<td>Tool result</td>
+<td>&quot;Function output&quot;</td>
+<td>The return value from executing a tool, sent back to the model as a message so it can use real data in its response</td>
+</tr>
+<tr>
+<td>Argument validation</td>
+<td>&quot;Input checking&quot;</td>
+<td>Verifying that model-generated arguments match the expected types, ranges, and constraints before executing the tool</td>
+</tr>
+<tr>
+<td>MCP</td>
+<td>&quot;Tool protocol&quot;</td>
+<td>Model Context Protocol -- Anthropic's open standard for exposing tools via servers that any compatible client can discover and call</td>
+</tr>
+<tr>
+<td>Agent loop</td>
+<td>&quot;ReAct loop&quot;</td>
+<td>The iterative cycle of model-decides-tool, code-executes-tool, result-feeds-back until the model has enough information to respond</td>
+</tr>
+<tr>
+<td>Tool poisoning</td>
+<td>&quot;Prompt injection via tools&quot;</td>
+<td>An attack where tool results contain instructions that manipulate the model's behavior -- sanitize all tool outputs</td>
+</tr>
+<tr>
+<td>Rate limiting</td>
+<td>&quot;Call budget&quot;</td>
+<td>Setting a maximum number of tool calls per conversation to prevent infinite loops and runaway API costs</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://platform.openai.com/docs/guides/function-calling" rel="noreferrer" data-network="true">OpenAI Function Calling Guide <small>↗ 需要联网</small></a> -- the definitive reference for tool use with GPT-4o, including parallel calls, forced calling, and structured arguments</li>
+<li><a href="https://docs.anthropic.com/en/docs/tool-use" rel="noreferrer" data-network="true">Anthropic Tool Use Guide <small>↗ 需要联网</small></a> -- Claude's tool use implementation with input_schema, multi-tool responses, and tool_choice configuration</li>
+<li><a href="https://modelcontextprotocol.io" rel="noreferrer" data-network="true">Model Context Protocol Specification <small>↗ 需要联网</small></a> -- the open standard for tool interoperability across AI applications, with server/client architecture</li>
+<li><a href="https://arxiv.org/abs/2302.04761" rel="noreferrer" data-network="true">Schick et al., 2023 -- &quot;Toolformer: Language Models Can Teach Themselves to Use Tools&quot; <small>↗ 需要联网</small></a> -- the foundational paper on training LLMs to decide when and how to call external tools</li>
+<li><a href="https://arxiv.org/abs/2305.15334" rel="noreferrer" data-network="true">Patil et al., 2023 -- &quot;Gorilla: Large Language Model Connected with Massive APIs&quot; <small>↗ 需要联网</small></a> -- fine-tuning LLMs for accurate API calls across 1,645 APIs with hallucination reduction</li>
+<li><a href="https://gorilla.cs.berkeley.edu/leaderboard.html" rel="noreferrer" data-network="true">Berkeley Function Calling Leaderboard <small>↗ 需要联网</small></a> -- real-time benchmark comparing function calling accuracy across GPT-4o, Claude, Gemini, and open models</li>
+<li><a href="https://arxiv.org/abs/2210.03629" rel="noreferrer" data-network="true">Yao et al., &quot;ReAct: Synergizing Reasoning and Acting in Language Models&quot; (ICLR 2023) <small>↗ 需要联网</small></a> -- the Thought-Action-Observation loop that is the outer agent loop around every tool call; where this lesson ends, Phase 14 picks up.</li>
+<li><a href="https://www.anthropic.com/research/building-effective-agents" rel="noreferrer" data-network="true">Anthropic — Building effective agents (Dec 2024) <small>↗ 需要联网</small></a> -- five composable patterns (prompt chaining, routing, parallelization, orchestrator-workers, evaluator-optimizer) built from the single tool-use primitive.</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-11-llm-engineering--09-function-calling.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-11-llm-engineering--09-function-calling.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/11-llm-engineering/09-function-calling/code/function_calling.py">phases/11-llm-engineering/09-function-calling/code/function_calling.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Function calling from scratch: a tool registry, the model-to-tool dispatch
+loop, and guarded tool implementations. See docs/en.md for the walkthrough.&quot;&quot;&quot;
+
+import ast
+import json
+import math
+import re
+import time
+
+
+TOOL_REGISTRY = {}
+
+
+def register_tool(name, description, parameters, function):
+    TOOL_REGISTRY[name] = {
+        &quot;definition&quot;: {
+            &quot;type&quot;: &quot;function&quot;,
+            &quot;function&quot;: {
+                &quot;name&quot;: name,
+                &quot;description&quot;: description,
+                &quot;parameters&quot;: parameters,
+            },
+        },
+        &quot;function&quot;: function,
+    }
+
+
+def calculator(expression, precision=2):
+    allowed = set(&quot;0123456789+-*/.() &quot;)
+    if not all(c in allowed for c in expression):
+        return {&quot;error&quot;: True, &quot;message&quot;: f&quot;Invalid characters in expression: {expression}&quot;}
+    try:
+        result = eval(expression, {&quot;__builtins__&quot;: {}}, {&quot;math&quot;: math})
+        return {&quot;result&quot;: round(float(result), precision), &quot;expression&quot;: expression}
+    except Exception as e:
+        return {&quot;error&quot;: True, &quot;message&quot;: str(e)}
+
+
+WEATHER_DB = {
+    &quot;tokyo&quot;: {&quot;temp_c&quot;: 18, &quot;condition&quot;: &quot;cloudy&quot;, &quot;humidity&quot;: 72, &quot;wind_kph&quot;: 14},
+    &quot;new york&quot;: {&quot;temp_c&quot;: 22, &quot;condition&quot;: &quot;sunny&quot;, &quot;humidity&quot;: 45, &quot;wind_kph&quot;: 8},
+    &quot;london&quot;: {&quot;temp_c&quot;: 12, &quot;condition&quot;: &quot;rainy&quot;, &quot;humidity&quot;: 88, &quot;wind_kph&quot;: 22},
+    &quot;san francisco&quot;: {&quot;temp_c&quot;: 16, &quot;condition&quot;: &quot;foggy&quot;, &quot;humidity&quot;: 80, &quot;wind_kph&quot;: 18},
+    &quot;sydney&quot;: {&quot;temp_c&quot;: 25, &quot;condition&quot;: &quot;sunny&quot;, &quot;humidity&quot;: 55, &quot;wind_kph&quot;: 10},
+}
+
+
+def get_weather(city, units=&quot;celsius&quot;):
+    key = city.lower().strip()
+    if key not in WEATHER_DB:
+        suggestions = [c for c in WEATHER_DB if c.startswith(key[:3])]
+        return {
+            &quot;error&quot;: True,
+            &quot;message&quot;: f&quot;City &#39;{city}&#39; not found.&quot;,
+            &quot;suggestions&quot;: suggestions,
+            &quot;code&quot;: &quot;CITY_NOT_FOUND&quot;,
+        }
+    data = WEATHER_DB[key].copy()
+    if units == &quot;fahrenheit&quot;:
+        data[&quot;temp_f&quot;] = round(data[&quot;temp_c&quot;] * 9 / 5 + 32, 1)
+        del data[&quot;temp_c&quot;]
+    data[&quot;city&quot;] = city
+    return data
+
+
+SEARCH_DB = {
+    &quot;python function calling&quot;: [
+        {&quot;title&quot;: &quot;OpenAI Function Calling Guide&quot;, &quot;url&quot;: &quot;https://platform.openai.com/docs/guides/function-calling&quot;, &quot;snippet&quot;: &quot;Learn how to connect LLMs to external tools.&quot;},
+        {&quot;title&quot;: &quot;Anthropic Tool Use&quot;, &quot;url&quot;: &quot;https://platform.claude.com/docs/en/agents-and-tools/tool-use/overview&quot;, &quot;snippet&quot;: &quot;Claude can interact with external tools and APIs.&quot;},
+    ],
+    &quot;MCP protocol&quot;: [
+        {&quot;title&quot;: &quot;Model Context Protocol&quot;, &quot;url&quot;: &quot;https://modelcontextprotocol.io&quot;, &quot;snippet&quot;: &quot;An open standard for connecting AI models to data sources.&quot;},
+    ],
+    &quot;weather API&quot;: [
+        {&quot;title&quot;: &quot;OpenWeatherMap API&quot;, &quot;url&quot;: &quot;https://openweathermap.org/api&quot;, &quot;snippet&quot;: &quot;Free weather API with current, forecast, and historical data.&quot;},
+    ],
+}
+
+
+def web_search(query, max_results=3):
+    key = query.lower().strip()
+    for db_key, results in SEARCH_DB.items():
+        if db_key in key or key in db_key:
+            return {&quot;query&quot;: query, &quot;results&quot;: results[:max_results], &quot;total&quot;: len(results)}
+    return {&quot;query&quot;: query, &quot;results&quot;: [], &quot;total&quot;: 0}
+
+
+FILE_SYSTEM = {
+    &quot;data/config.json&quot;: &#39;{&quot;model&quot;: &quot;gpt-4o&quot;, &quot;temperature&quot;: 0.7, &quot;max_tokens&quot;: 4096}&#39;,
+    &quot;data/users.csv&quot;: &quot;name,email,role\nAlice,alice@example.com,admin\nBob,bob@example.com,user&quot;,
+    &quot;README.md&quot;: &quot;# My Project\nA tool-use agent built from scratch.&quot;,
+}
+
+
+def read_file(path):
+    if &quot;..&quot; in path or path.startswith(&quot;/&quot;):
+        return {&quot;error&quot;: True, &quot;message&quot;: &quot;Path traversal not allowed.&quot;, &quot;code&quot;: &quot;FORBIDDEN&quot;}
+    if path not in FILE_SYSTEM:
+        available = list(FILE_SYSTEM.keys())
+        return {&quot;error&quot;: True, &quot;message&quot;: f&quot;File &#39;{path}&#39; not found.&quot;, &quot;available_files&quot;: available, &quot;code&quot;: &quot;NOT_FOUND&quot;}
+    content = FILE_SYSTEM[path]
+    return {&quot;path&quot;: path, &quot;content&quot;: content, &quot;size_bytes&quot;: len(content), &quot;lines&quot;: content.count(&quot;\n&quot;) + 1}
+
+
+def run_code(code, language=&quot;python&quot;):
+    if language != &quot;python&quot;:
+        return {&quot;error&quot;: True, &quot;message&quot;: f&quot;Language &#39;{language}&#39; not supported. Only &#39;python&#39; is available.&quot;}
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as e:
+        return {&quot;error&quot;: True, &quot;message&quot;: f&quot;SyntaxError: {e}&quot;, &quot;code&quot;: &quot;SYNTAX_ERROR&quot;}
+    unsafe_names = {&quot;exec&quot;, &quot;eval&quot;, &quot;compile&quot;, &quot;__import__&quot;, &quot;open&quot;, &quot;globals&quot;, &quot;locals&quot;, &quot;vars&quot;, &quot;getattr&quot;, &quot;setattr&quot;, &quot;delattr&quot;}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            return {&quot;error&quot;: True, &quot;message&quot;: &quot;Forbidden operation: import is not allowed&quot;, &quot;code&quot;: &quot;SECURITY_VIOLATION&quot;}
+        if isinstance(node, ast.Attribute) and node.attr.startswith(&quot;__&quot;) and node.attr.endswith(&quot;__&quot;):
+            return {&quot;error&quot;: True, &quot;message&quot;: &quot;Forbidden operation: dunder attribute access is not allowed&quot;, &quot;code&quot;: &quot;SECURITY_VIOLATION&quot;}
+        if isinstance(node, ast.Name) and node.id in unsafe_names:
+            return {&quot;error&quot;: True, &quot;message&quot;: f&quot;Forbidden operation: {node.id} is not allowed&quot;, &quot;code&quot;: &quot;SECURITY_VIOLATION&quot;}
+    try:
+        local_vars = {}
+        exec(
+            code,
+            {
+                &quot;__builtins__&quot;: {
+                    &quot;print&quot;: print, &quot;range&quot;: range, &quot;len&quot;: len, &quot;str&quot;: str,
+                    &quot;int&quot;: int, &quot;float&quot;: float, &quot;list&quot;: list, &quot;dict&quot;: dict,
+                    &quot;sum&quot;: sum, &quot;min&quot;: min, &quot;max&quot;: max, &quot;abs&quot;: abs, &quot;round&quot;: round,
+                    &quot;sorted&quot;: sorted, &quot;enumerate&quot;: enumerate, &quot;zip&quot;: zip,
+                    &quot;map&quot;: map, &quot;filter&quot;: filter, &quot;math&quot;: math,
+                }
+            },
+            local_vars,
+        )
+        result = local_vars.get(&quot;result&quot;, None)
+        return {
+            &quot;success&quot;: True,
+            &quot;result&quot;: result,
+            &quot;variables&quot;: {k: str(v) for k, v in local_vars.items() if not k.startswith(&quot;_&quot;)},
+        }
+    except Exception as e:
+        return {&quot;error&quot;: True, &quot;message&quot;: f&quot;{type(e).__name__}: {e}&quot;}
+
+
+def register_all_tools():
+    register_tool(
+        &quot;calculator&quot;,
+        &quot;Evaluate a mathematical expression. Supports +, -, *, /, parentheses, and decimals. Returns the numeric result.&quot;,
+        {
+            &quot;type&quot;: &quot;object&quot;,
+            &quot;properties&quot;: {
+                &quot;expression&quot;: {&quot;type&quot;: &quot;string&quot;, &quot;description&quot;: &quot;Math expression, e.g. &#39;(10 + 5) * 3&#39;&quot;},
+                &quot;precision&quot;: {&quot;type&quot;: &quot;integer&quot;, &quot;description&quot;: &quot;Decimal places in result&quot;, &quot;default&quot;: 2},
+            },
+            &quot;required&quot;: [&quot;expression&quot;],
+        },
+        calculator,
+    )
+    register_tool(
+        &quot;get_weather&quot;,
+        &quot;Get current weather for a city. Returns temperature, condition, humidity, and wind speed.&quot;,
+        {
+            &quot;type&quot;: &quot;object&quot;,
+            &quot;properties&quot;: {
+                &quot;city&quot;: {&quot;type&quot;: &quot;string&quot;, &quot;description&quot;: &quot;City name, e.g. &#39;Tokyo&#39; or &#39;San Francisco&#39;&quot;},
+                &quot;units&quot;: {&quot;type&quot;: &quot;string&quot;, &quot;enum&quot;: [&quot;celsius&quot;, &quot;fahrenheit&quot;], &quot;description&quot;: &quot;Temperature units, defaults to celsius&quot;},
+            },
+            &quot;required&quot;: [&quot;city&quot;],
+        },
+        get_weather,
+    )
+    register_tool(
+        &quot;web_search&quot;,
+        &quot;Search the web for information. Returns a list of results with title, URL, and snippet.&quot;,
+        {
+            &quot;type&quot;: &quot;object&quot;,
+            &quot;properties&quot;: {
+                &quot;query&quot;: {&quot;type&quot;: &quot;string&quot;, &quot;description&quot;: &quot;Search query&quot;},
+                &quot;max_results&quot;: {&quot;type&quot;: &quot;integer&quot;, &quot;description&quot;: &quot;Maximum results to return&quot;, &quot;default&quot;: 3},
+            },
+            &quot;required&quot;: [&quot;query&quot;],
+        },
+        web_search,
+    )
+    register_tool(
+        &quot;read_file&quot;,
+        &quot;Read the contents of a file. Returns the file content, size, and line count.&quot;,
+        {
+            &quot;type&quot;: &quot;object&quot;,
+            &quot;properties&quot;: {
+                &quot;path&quot;: {&quot;type&quot;: &quot;string&quot;, &quot;description&quot;: &quot;Relative file path, e.g. &#39;data/config.json&#39;&quot;},
+            },
+            &quot;required&quot;: [&quot;path&quot;],
+        },
+        read_file,
+    )
+    register_tool(
+        &quot;run_code&quot;,
+        &quot;Run a small Python snippet behind a static-analysis guard and a restricted interpreter. This is a teaching filter, not real isolation. Set a &#39;result&#39; variable to return output.&quot;,
+        {
+            &quot;type&quot;: &quot;object&quot;,
+            &quot;properties&quot;: {
+                &quot;code&quot;: {&quot;type&quot;: &quot;string&quot;, &quot;description&quot;: &quot;Python code to execute&quot;},
+                &quot;language&quot;: {&quot;type&quot;: &quot;string&quot;, &quot;enum&quot;: [&quot;python&quot;], &quot;description&quot;: &quot;Programming language&quot;},
+            },
+            &quot;required&quot;: [&quot;code&quot;],
+        },
+        run_code,
+    )
+
+
+def simulate_model_decision(user_message, tools, conversation_history):
+    msg = user_message.lower()
+
+    if any(word in msg for word in [&quot;weather&quot;, &quot;temperature&quot;, &quot;forecast&quot;]):
+        cities = []
+        for city in WEATHER_DB:
+            if city in msg:
+                cities.append(city)
+        if not cities:
+            for word in msg.split():
+                if word.capitalize() in [c.title() for c in WEATHER_DB]:
+                    cities.append(word)
+        if not cities:
+            cities = [&quot;tokyo&quot;]
+        calls = []
+        for city in cities:
+            calls.append({&quot;name&quot;: &quot;get_weather&quot;, &quot;arguments&quot;: {&quot;city&quot;: city.title()}})
+        return calls
+
+    if any(word in msg for word in [&quot;calculate&quot;, &quot;compute&quot;, &quot;math&quot;, &quot;what is&quot;, &quot;how much&quot;]):
+        for run in re.findall(r&quot;[0-9.+\-*/()\s]{3,}&quot;, msg):
+            expr = run.strip()
+            if not any(c.isdigit() for c in expr):
+                continue
+            if not any(c in expr for c in &quot;+-*/&quot;):
+                continue
+            if &quot;error&quot; not in calculator(expr):
+                return [{&quot;name&quot;: &quot;calculator&quot;, &quot;arguments&quot;: {&quot;expression&quot;: expr}}]
+        for token in msg.split():
+            if any(c in token for c in &quot;+-*/&quot;):
+                return [{&quot;name&quot;: &quot;calculator&quot;, &quot;arguments&quot;: {&quot;expression&quot;: token}}]
+        return [{&quot;name&quot;: &quot;calculator&quot;, &quot;arguments&quot;: {&quot;expression&quot;: &quot;0&quot;}}]
+
+    if any(word in msg for word in [&quot;search&quot;, &quot;find&quot;, &quot;look up&quot;, &quot;google&quot;]):
+        query = msg.replace(&quot;search for&quot;, &quot;&quot;).replace(&quot;look up&quot;, &quot;&quot;).replace(&quot;find&quot;, &quot;&quot;).strip()
+        return [{&quot;name&quot;: &quot;web_search&quot;, &quot;arguments&quot;: {&quot;query&quot;: query}}]
+
+    if any(word in msg for word in [&quot;read&quot;, &quot;file&quot;, &quot;open&quot;, &quot;cat&quot;, &quot;show&quot;]):
+        for path in FILE_SYSTEM:
+            if path.split(&quot;/&quot;)[-1].split(&quot;.&quot;)[0] in msg:
+                return [{&quot;name&quot;: &quot;read_file&quot;, &quot;arguments&quot;: {&quot;path&quot;: path}}]
+        return [{&quot;name&quot;: &quot;read_file&quot;, &quot;arguments&quot;: {&quot;path&quot;: &quot;README.md&quot;}}]
+
+    if any(word in msg for word in [&quot;run&quot;, &quot;execute&quot;, &quot;code&quot;, &quot;python&quot;]):
+        return [{&quot;name&quot;: &quot;run_code&quot;, &quot;arguments&quot;: {&quot;code&quot;: &quot;result = &#39;Hello from the sandbox!&#39;&quot;, &quot;language&quot;: &quot;python&quot;}}]
+
+    return []
+
+
+def execute_tool_call(tool_call):
+    name = tool_call[&quot;name&quot;]
+    args = tool_call[&quot;arguments&quot;]
+
+    if name not in TOOL_REGISTRY:
+        return {&quot;tool&quot;: name, &quot;result&quot;: {&quot;error&quot;: True, &quot;message&quot;: f&quot;Unknown tool: {name}&quot;, &quot;code&quot;: &quot;UNKNOWN_TOOL&quot;}, &quot;execution_time_ms&quot;: 0}
+
+    tool = TOOL_REGISTRY[name]
+    func = tool[&quot;function&quot;]
+    start = time.time()
+
+    try:
+        result = func(**args)
+    except TypeError as e:
+        result = {&quot;error&quot;: True, &quot;message&quot;: f&quot;Invalid arguments: {e}&quot;}
+
+    elapsed_ms = round((time.time() - start) * 1000, 2)
+    return {&quot;tool&quot;: name, &quot;result&quot;: result, &quot;execution_time_ms&quot;: elapsed_ms}
+
+
+def validate_tool_arguments(tool_name, arguments):
+    if tool_name not in TOOL_REGISTRY:
+        return [f&quot;Unknown tool: {tool_name}&quot;]
+
+    schema = TOOL_REGISTRY[tool_name][&quot;definition&quot;][&quot;function&quot;][&quot;parameters&quot;]
+    errors = []
+
+    if not isinstance(arguments, dict):
+        return [f&quot;Arguments must be an object, got {type(arguments).__name__}&quot;]
+
+    for required_field in schema.get(&quot;required&quot;, []):
+        if required_field not in arguments:
+            errors.append(f&quot;Missing required argument: {required_field}&quot;)
+
+    properties = schema.get(&quot;properties&quot;, {})
+    for arg_name, arg_value in arguments.items():
+        if arg_name not in properties:
+            errors.append(f&quot;Unknown argument: {arg_name}&quot;)
+            continue
+
+        prop_schema = properties[arg_name]
+        expected_type = prop_schema.get(&quot;type&quot;)
+
+        type_checks = {
+            &quot;string&quot;: str,
+            &quot;integer&quot;: int,
+            &quot;number&quot;: (int, float),
+            &quot;boolean&quot;: bool,
+            &quot;array&quot;: list,
+            &quot;object&quot;: dict,
+        }
+        if expected_type in type_checks:
+            if not isinstance(arg_value, type_checks[expected_type]):
+                errors.append(f&quot;Argument &#39;{arg_name}&#39;: expected {expected_type}, got {type(arg_value).__name__}&quot;)
+
+        if &quot;enum&quot; in prop_schema and arg_value not in prop_schema[&quot;enum&quot;]:
+            errors.append(f&quot;Argument &#39;{arg_name}&#39;: &#39;{arg_value}&#39; not in {prop_schema[&#39;enum&#39;]}&quot;)
+
+    return errors
+
+
+def run_function_calling_loop(user_message, max_iterations=5):
+    conversation = [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: user_message}]
+    tool_definitions = [t[&quot;definition&quot;] for t in TOOL_REGISTRY.values()]
+    all_tool_results = []
+
+    for iteration in range(max_iterations):
+        tool_calls = simulate_model_decision(user_message, tool_definitions, conversation)
+
+        if not tool_calls:
+            break
+
+        results = []
+        for call in tool_calls:
+            result = execute_tool_call(call)
+            results.append(result)
+
+        conversation.append({&quot;role&quot;: &quot;assistant&quot;, &quot;content&quot;: None, &quot;tool_calls&quot;: tool_calls})
+
+        for result in results:
+            conversation.append({
+                &quot;role&quot;: &quot;tool&quot;,
+                &quot;content&quot;: json.dumps(result[&quot;result&quot;]),
+                &quot;tool_name&quot;: result[&quot;tool&quot;],
+            })
+
+        all_tool_results.extend(results)
+        break
+
+    return {
+        &quot;conversation&quot;: conversation,
+        &quot;tool_results&quot;: all_tool_results,
+        &quot;iterations&quot;: iteration + 1 if tool_calls else 0,
+    }
+
+
+def run_demo():
+    register_all_tools()
+
+    print(&quot;=&quot; * 60)
+    print(&quot;  Function Calling &amp; Tool Use Demo&quot;)
+    print(&quot;=&quot; * 60)
+
+    print(&quot;\n--- Registered Tools ---&quot;)
+    for name, tool in TOOL_REGISTRY.items():
+        desc = tool[&quot;definition&quot;][&quot;function&quot;][&quot;description&quot;][:60]
+        params = list(tool[&quot;definition&quot;][&quot;function&quot;][&quot;parameters&quot;].get(&quot;properties&quot;, {}).keys())
+        print(f&quot;  {name}: {desc}...&quot;)
+        print(f&quot;    params: {params}&quot;)
+
+    print(f&quot;\n--- Argument Validation ---&quot;)
+    validation_tests = [
+        (&quot;get_weather&quot;, {&quot;city&quot;: &quot;Tokyo&quot;}, &quot;Valid call&quot;),
+        (&quot;get_weather&quot;, {}, &quot;Missing required arg&quot;),
+        (&quot;get_weather&quot;, {&quot;city&quot;: &quot;Tokyo&quot;, &quot;units&quot;: &quot;kelvin&quot;}, &quot;Invalid enum value&quot;),
+        (&quot;calculator&quot;, {&quot;expression&quot;: 123}, &quot;Wrong type (int for string)&quot;),
+        (&quot;unknown_tool&quot;, {&quot;x&quot;: 1}, &quot;Unknown tool&quot;),
+    ]
+    for tool_name, args, label in validation_tests:
+        errors = validate_tool_arguments(tool_name, args)
+        status = &quot;VALID&quot; if not errors else f&quot;ERRORS: {errors}&quot;
+        print(f&quot;  {label}: {status}&quot;)
+
+    print(f&quot;\n--- Tool Execution ---&quot;)
+    direct_tests = [
+        {&quot;name&quot;: &quot;calculator&quot;, &quot;arguments&quot;: {&quot;expression&quot;: &quot;(10 + 5) * 3 / 2&quot;}},
+        {&quot;name&quot;: &quot;get_weather&quot;, &quot;arguments&quot;: {&quot;city&quot;: &quot;Tokyo&quot;}},
+        {&quot;name&quot;: &quot;get_weather&quot;, &quot;arguments&quot;: {&quot;city&quot;: &quot;Mars&quot;}},
+        {&quot;name&quot;: &quot;web_search&quot;, &quot;arguments&quot;: {&quot;query&quot;: &quot;python function calling&quot;}},
+        {&quot;name&quot;: &quot;read_file&quot;, &quot;arguments&quot;: {&quot;path&quot;: &quot;data/config.json&quot;}},
+        {&quot;name&quot;: &quot;read_file&quot;, &quot;arguments&quot;: {&quot;path&quot;: &quot;../etc/passwd&quot;}},
+        {&quot;name&quot;: &quot;run_code&quot;, &quot;arguments&quot;: {&quot;code&quot;: &quot;result = sum(range(1, 101))&quot;}},
+        {&quot;name&quot;: &quot;run_code&quot;, &quot;arguments&quot;: {&quot;code&quot;: &quot;import os; os.system(&#39;rm -rf /&#39;)&quot;}},
+    ]
+    for call in direct_tests:
+        result = execute_tool_call(call)
+        print(f&quot;\n  {call[&#39;name&#39;]}({json.dumps(call[&#39;arguments&#39;])})&quot;)
+        print(f&quot;    -&gt; {json.dumps(result[&#39;result&#39;], indent=None)[:100]}&quot;)
+        print(f&quot;    time: {result[&#39;execution_time_ms&#39;]}ms&quot;)
+
+    print(f&quot;\n--- Full Function Calling Loop ---&quot;)
+    test_queries = [
+        &quot;What&#39;s the weather in Tokyo?&quot;,
+        &quot;Calculate (100 + 250) * 0.15&quot;,
+        &quot;Search for MCP protocol&quot;,
+        &quot;Read the config file&quot;,
+        &quot;Run some Python code&quot;,
+        &quot;Tell me a joke&quot;,
+    ]
+    for query in test_queries:
+        print(f&quot;\n  User: {query}&quot;)
+        result = run_function_calling_loop(query)
+        if result[&quot;tool_results&quot;]:
+            for tr in result[&quot;tool_results&quot;]:
+                print(f&quot;    Tool: {tr[&#39;tool&#39;]} ({tr[&#39;execution_time_ms&#39;]}ms)&quot;)
+                print(f&quot;    Result: {json.dumps(tr[&#39;result&#39;], indent=None)[:90]}&quot;)
+        else:
+            print(f&quot;    [No tool called -- direct response]&quot;)
+        print(f&quot;    Iterations: {result[&#39;iterations&#39;]}&quot;)
+
+    print(f&quot;\n--- Parallel Tool Calls ---&quot;)
+    multi_city_query = &quot;What&#39;s the weather in tokyo and london?&quot;
+    print(f&quot;  User: {multi_city_query}&quot;)
+    result = run_function_calling_loop(multi_city_query)
+    print(f&quot;  Tool calls made: {len(result[&#39;tool_results&#39;])}&quot;)
+    for tr in result[&quot;tool_results&quot;]:
+        city = tr[&quot;result&quot;].get(&quot;city&quot;, &quot;unknown&quot;)
+        temp = tr[&quot;result&quot;].get(&quot;temp_c&quot;, &quot;N/A&quot;)
+        print(f&quot;    {city}: {temp}C, {tr[&#39;result&#39;].get(&#39;condition&#39;, &#39;N/A&#39;)}&quot;)
+
+    print(f&quot;\n--- Security Checks ---&quot;)
+    security_tests = [
+        (&quot;read_file&quot;, {&quot;path&quot;: &quot;../../etc/passwd&quot;}),
+        (&quot;run_code&quot;, {&quot;code&quot;: &quot;import subprocess; subprocess.run([&#39;ls&#39;])&quot;}),
+        (&quot;calculator&quot;, {&quot;expression&quot;: &quot;__import__(&#39;os&#39;).system(&#39;ls&#39;)&quot;}),
+    ]
+    for tool_name, args in security_tests:
+        result = execute_tool_call({&quot;name&quot;: tool_name, &quot;arguments&quot;: args})
+        blocked = result[&quot;result&quot;].get(&quot;error&quot;, False)
+        print(f&quot;  {tool_name}({list(args.values())[0][:40]}): {&#39;BLOCKED&#39; if blocked else &#39;ALLOWED&#39;}&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    run_demo()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/11-llm-engineering/09-function-calling/code/main.ts">phases/11-llm-engineering/09-function-calling/code/main.ts</a><details><summary>查看原始文本</summary><pre><code>// Function calling in TypeScript: JSON-schema tool definitions, registry,
+// validator, sandboxed dispatcher, mock model decision loop, parallel calls.
+// Mirrors code/function_calling.py and follows the four-step pattern shared
+// by OpenAI, Anthropic, and Google: define, detect, execute, return.
+// Sources:
+//   https://platform.openai.com/docs/guides/function-calling
+//   https://platform.claude.com/docs/en/agents-and-tools/tool-use/overview
+//   https://ai.google.dev/gemini-api/docs/function-calling
+
+type JsonValue = string | number | boolean | null | JsonValue[] | { [k: string]: JsonValue };
+
+type ParamType = &quot;string&quot; | &quot;integer&quot; | &quot;number&quot; | &quot;boolean&quot; | &quot;array&quot; | &quot;object&quot;;
+
+type ParamSchema = {
+  type: ParamType;
+  description?: string;
+  enum?: readonly JsonValue[];
+  default?: JsonValue;
+};
+
+type ToolParameters = {
+  type: &quot;object&quot;;
+  properties: Readonly&lt;Record&lt;string, ParamSchema&gt;&gt;;
+  required?: readonly string[];
+};
+
+type ToolDefinition = {
+  type: &quot;function&quot;;
+  function: {
+    name: string;
+    description: string;
+    parameters: ToolParameters;
+  };
+};
+
+type ToolFunction = (args: Readonly&lt;Record&lt;string, JsonValue&gt;&gt;) =&gt; JsonValue;
+
+type RegisteredTool = {
+  definition: ToolDefinition;
+  fn: ToolFunction;
+};
+
+const TOOL_REGISTRY: Map&lt;string, RegisteredTool&gt; = new Map();
+
+function registerTool(name: string, description: string, parameters: ToolParameters, fn: ToolFunction): void {
+  TOOL_REGISTRY.set(name, {
+    definition: { type: &quot;function&quot;, function: { name, description, parameters } },
+    fn,
+  });
+}
+
+const ARITH_RE = /^[\d+\-*/().\s]+$/;
+
+function calculator(args: Readonly&lt;Record&lt;string, JsonValue&gt;&gt;): JsonValue {
+  const expression = String(args.expression ?? &quot;&quot;);
+  const precision = typeof args.precision === &quot;number&quot; ? args.precision : 2;
+  if (!ARITH_RE.test(expression)) {
+    return { error: true, message: &quot;Invalid characters in expression: &quot; + expression };
+  }
+  try {
+    // eslint-disable-next-line no-new-func
+    const value = new Function(&quot;return (&quot; + expression + &quot;)&quot;)() as unknown;
+    const num = Number(value);
+    if (!Number.isFinite(num)) return { error: true, message: &quot;non-finite result&quot; };
+    return { result: Number(num.toFixed(precision)), expression };
+  } catch (err) {
+    return { error: true, message: String(err) };
+  }
+}
+
+const WEATHER_DB: Readonly&lt;Record&lt;string, { temp_c: number; condition: string; humidity: number; wind_kph: number }&gt;&gt; = {
+  tokyo: { temp_c: 18, condition: &quot;cloudy&quot;, humidity: 72, wind_kph: 14 },
+  &quot;new york&quot;: { temp_c: 22, condition: &quot;sunny&quot;, humidity: 45, wind_kph: 8 },
+  london: { temp_c: 12, condition: &quot;rainy&quot;, humidity: 88, wind_kph: 22 },
+  &quot;san francisco&quot;: { temp_c: 16, condition: &quot;foggy&quot;, humidity: 80, wind_kph: 18 },
+  sydney: { temp_c: 25, condition: &quot;sunny&quot;, humidity: 55, wind_kph: 10 },
+};
+
+function getWeather(args: Readonly&lt;Record&lt;string, JsonValue&gt;&gt;): JsonValue {
+  const city = String(args.city ?? &quot;&quot;);
+  const units = String(args.units ?? &quot;celsius&quot;);
+  const key = city.toLowerCase().trim();
+  const row = WEATHER_DB[key];
+  if (!row) {
+    const suggestions = Object.keys(WEATHER_DB).filter((c) =&gt; c.startsWith(key.slice(0, 3)));
+    return { error: true, message: &quot;City &#39;&quot; + city + &quot;&#39; not found.&quot;, suggestions, code: &quot;CITY_NOT_FOUND&quot; };
+  }
+  if (units === &quot;fahrenheit&quot;) {
+    return { city, condition: row.condition, humidity: row.humidity, wind_kph: row.wind_kph, temp_f: Number((row.temp_c * 9 / 5 + 32).toFixed(1)) };
+  }
+  return { city, ...row };
+}
+
+const SEARCH_DB: Readonly&lt;Record&lt;string, ReadonlyArray&lt;{ title: string; url: string; snippet: string }&gt;&gt;&gt; = {
+  &quot;python function calling&quot;: [
+    { title: &quot;OpenAI Function Calling Guide&quot;, url: &quot;https://platform.openai.com/docs/guides/function-calling&quot;, snippet: &quot;Connect LLMs to external tools.&quot; },
+    { title: &quot;Anthropic Tool Use&quot;, url: &quot;https://platform.claude.com/docs/en/agents-and-tools/tool-use/overview&quot;, snippet: &quot;Claude can interact with tools and APIs.&quot; },
+  ],
+  &quot;mcp protocol&quot;: [
+    { title: &quot;Model Context Protocol&quot;, url: &quot;https://modelcontextprotocol.io&quot;, snippet: &quot;Open standard connecting models to data sources.&quot; },
+  ],
+  &quot;weather api&quot;: [
+    { title: &quot;OpenWeatherMap API&quot;, url: &quot;https://openweathermap.org/api&quot;, snippet: &quot;Free weather API.&quot; },
+  ],
+};
+
+function webSearch(args: Readonly&lt;Record&lt;string, JsonValue&gt;&gt;): JsonValue {
+  const query = String(args.query ?? &quot;&quot;);
+  const maxResults = typeof args.max_results === &quot;number&quot; ? args.max_results : 3;
+  const key = query.toLowerCase().trim();
+  for (const dbKey of Object.keys(SEARCH_DB)) {
+    if (dbKey.includes(key) || key.includes(dbKey)) {
+      const all = SEARCH_DB[dbKey];
+      return { query, results: all.slice(0, maxResults), total: all.length };
+    }
+  }
+  return { query, results: [], total: 0 };
+}
+
+const FILE_SYSTEM: Readonly&lt;Record&lt;string, string&gt;&gt; = {
+  &quot;data/config.json&quot;: &#39;{&quot;model&quot;: &quot;gpt-4o&quot;, &quot;temperature&quot;: 0.7, &quot;max_tokens&quot;: 4096}&#39;,
+  &quot;data/users.csv&quot;: &quot;name,email,role\nAlice,alice@example.com,admin\nBob,bob@example.com,user&quot;,
+  &quot;README.md&quot;: &quot;# My Project\nA tool-use agent built from scratch.&quot;,
+};
+
+function readFile(args: Readonly&lt;Record&lt;string, JsonValue&gt;&gt;): JsonValue {
+  const path = String(args.path ?? &quot;&quot;);
+  if (path.includes(&quot;..&quot;) || path.startsWith(&quot;/&quot;)) {
+    return { error: true, message: &quot;Path traversal not allowed.&quot;, code: &quot;FORBIDDEN&quot; };
+  }
+  if (!(path in FILE_SYSTEM)) {
+    return { error: true, message: &quot;File &#39;&quot; + path + &quot;&#39; not found.&quot;, available_files: Object.keys(FILE_SYSTEM), code: &quot;NOT_FOUND&quot; };
+  }
+  const content = FILE_SYSTEM[path];
+  return { path, content, size_bytes: content.length, lines: content.split(&quot;\n&quot;).length };
+}
+
+function runCode(args: Readonly&lt;Record&lt;string, JsonValue&gt;&gt;): JsonValue {
+  const code = String(args.code ?? &quot;&quot;);
+  const language = String(args.language ?? &quot;javascript&quot;);
+  if (language !== &quot;javascript&quot;) {
+    return { error: true, message: &quot;Language &#39;&quot; + language + &quot;&#39; not supported.&quot; };
+  }
+  const FORBIDDEN = [&quot;require(&quot;, &quot;process.&quot;, &quot;fs.&quot;, &quot;child_process&quot;, &quot;import &quot;, &quot;eval(&quot;, &quot;Function(&quot;, &quot;constructor&quot;, &quot;globalThis&quot;];
+  for (const p of FORBIDDEN) {
+    if (code.includes(p)) {
+      return { error: true, message: &quot;Forbidden operation: &quot; + p, code: &quot;SECURITY_VIOLATION&quot; };
+    }
+  }
+  try {
+    // eslint-disable-next-line no-new-func
+    const fn = new Function(&quot;Math&quot;, &quot;let result; &quot; + code + &quot;; return result;&quot;);
+    const result = fn(Math) as unknown;
+    return { success: true, result: result as JsonValue };
+  } catch (err) {
+    return { error: true, message: (err as Error).name + &quot;: &quot; + (err as Error).message };
+  }
+}
+
+function registerAllTools(): void {
+  registerTool(
+    &quot;calculator&quot;,
+    &quot;Evaluate a math expression. Supports +, -, *, /, parentheses, decimals.&quot;,
+    {
+      type: &quot;object&quot;,
+      properties: {
+        expression: { type: &quot;string&quot;, description: &quot;Math expression, e.g. &#39;(10 + 5) * 3&#39;&quot; },
+        precision: { type: &quot;integer&quot;, description: &quot;Decimal places&quot;, default: 2 },
+      },
+      required: [&quot;expression&quot;],
+    },
+    calculator,
+  );
+  registerTool(
+    &quot;get_weather&quot;,
+    &quot;Get current weather for a city.&quot;,
+    {
+      type: &quot;object&quot;,
+      properties: {
+        city: { type: &quot;string&quot;, description: &quot;City name&quot; },
+        units: { type: &quot;string&quot;, description: &quot;celsius or fahrenheit&quot;, enum: [&quot;celsius&quot;, &quot;fahrenheit&quot;] },
+      },
+      required: [&quot;city&quot;],
+    },
+    getWeather,
+  );
+  registerTool(
+    &quot;web_search&quot;,
+    &quot;Search the web.&quot;,
+    {
+      type: &quot;object&quot;,
+      properties: {
+        query: { type: &quot;string&quot;, description: &quot;Search query&quot; },
+        max_results: { type: &quot;integer&quot;, description: &quot;Max results&quot;, default: 3 },
+      },
+      required: [&quot;query&quot;],
+    },
+    webSearch,
+  );
+  registerTool(
+    &quot;read_file&quot;,
+    &quot;Read file contents.&quot;,
+    {
+      type: &quot;object&quot;,
+      properties: { path: { type: &quot;string&quot;, description: &quot;Relative path&quot; } },
+      required: [&quot;path&quot;],
+    },
+    readFile,
+  );
+  registerTool(
+    &quot;run_code&quot;,
+    &quot;Run a small JavaScript snippet behind a denylist and a restricted evaluator. This is a teaching filter, not real isolation. Assign to &#39;result&#39; to return output.&quot;,
+    {
+      type: &quot;object&quot;,
+      properties: {
+        code: { type: &quot;string&quot;, description: &quot;JavaScript code to run&quot; },
+        language: { type: &quot;string&quot;, description: &quot;javascript only&quot;, enum: [&quot;javascript&quot;] },
+      },
+      required: [&quot;code&quot;],
+    },
+    runCode,
+  );
+}
+
+type ToolCall = { name: string; arguments: Readonly&lt;Record&lt;string, JsonValue&gt;&gt; };
+
+function simulateModelDecision(userMessage: string): ToolCall[] {
+  const msg = userMessage.toLowerCase();
+  if (/weather|temperature|forecast/.test(msg)) {
+    const cities = Object.keys(WEATHER_DB).filter((c) =&gt; msg.includes(c));
+    const targets = cities.length &gt; 0 ? cities : [&quot;tokyo&quot;];
+    return targets.map((city) =&gt; ({
+      name: &quot;get_weather&quot;,
+      arguments: { city: city.replace(/\b\w/g, (c) =&gt; c.toUpperCase()) },
+    }));
+  }
+  if (/calculate|compute|math|what is|how much/.test(msg)) {
+    const m = msg.match(/[\d+\-*/().\s]{3,}/);
+    if (m) return [{ name: &quot;calculator&quot;, arguments: { expression: m[0].trim() } }];
+    return [{ name: &quot;calculator&quot;, arguments: { expression: &quot;0&quot; } }];
+  }
+  if (/search|find|look up/.test(msg)) {
+    const query = msg.replace(/search for|look up|find|search/g, &quot;&quot;).trim();
+    return [{ name: &quot;web_search&quot;, arguments: { query } }];
+  }
+  if (/read|file|open|show/.test(msg)) {
+    for (const path of Object.keys(FILE_SYSTEM)) {
+      const stem = path.split(&quot;/&quot;).pop()?.split(&quot;.&quot;)[0] ?? &quot;&quot;;
+      if (stem.length &gt; 0 &amp;&amp; msg.includes(stem)) {
+        return [{ name: &quot;read_file&quot;, arguments: { path } }];
+      }
+    }
+    return [{ name: &quot;read_file&quot;, arguments: { path: &quot;README.md&quot; } }];
+  }
+  if (/run|execute|code|javascript/.test(msg)) {
+    return [{ name: &quot;run_code&quot;, arguments: { code: &quot;result = &#39;Hello from the sandbox!&#39;&quot;, language: &quot;javascript&quot; } }];
+  }
+  return [];
+}
+
+type ToolResult = { tool: string; result: JsonValue; executionTimeMs: number };
+
+function executeToolCall(call: ToolCall): ToolResult {
+  const tool = TOOL_REGISTRY.get(call.name);
+  if (!tool) {
+    return { tool: call.name, result: { error: true, message: &quot;Unknown tool: &quot; + call.name, code: &quot;UNKNOWN_TOOL&quot; }, executionTimeMs: 0 };
+  }
+  const start = Date.now();
+  let result: JsonValue;
+  try {
+    result = tool.fn(call.arguments);
+  } catch (err) {
+    result = { error: true, message: &quot;Invalid arguments: &quot; + (err as Error).message };
+  }
+  return { tool: call.name, result, executionTimeMs: Date.now() - start };
+}
+
+function validateToolArguments(toolName: string, args: unknown): string[] {
+  const tool = TOOL_REGISTRY.get(toolName);
+  if (!tool) return [&quot;Unknown tool: &quot; + toolName];
+  if (args === null || typeof args !== &quot;object&quot; || Array.isArray(args)) {
+    return [&quot;Arguments must be an object, got &quot; + typeof args];
+  }
+  const schema = tool.definition.function.parameters;
+  const errors: string[] = [];
+  for (const required of schema.required ?? []) {
+    if (!(required in (args as Record&lt;string, unknown&gt;))) {
+      errors.push(&quot;Missing required argument: &quot; + required);
+    }
+  }
+  const typeChecks: Readonly&lt;Record&lt;ParamType, (v: unknown) =&gt; boolean&gt;&gt; = {
+    string: (v) =&gt; typeof v === &quot;string&quot;,
+    integer: (v) =&gt; Number.isInteger(v),
+    number: (v) =&gt; typeof v === &quot;number&quot;,
+    boolean: (v) =&gt; typeof v === &quot;boolean&quot;,
+    array: (v) =&gt; Array.isArray(v),
+    object: (v) =&gt; v !== null &amp;&amp; typeof v === &quot;object&quot; &amp;&amp; !Array.isArray(v),
+  };
+  for (const [argName, argValue] of Object.entries(args as Record&lt;string, unknown&gt;)) {
+    const prop = schema.properties[argName];
+    if (!prop) {
+      errors.push(&quot;Unknown argument: &quot; + argName);
+      continue;
+    }
+    if (!typeChecks[prop.type](argValue)) {
+      errors.push(&quot;Argument &#39;&quot; + argName + &quot;&#39;: expected &quot; + prop.type + &quot;, got &quot; + typeof argValue);
+    }
+    if (prop.enum &amp;&amp; !prop.enum.includes(argValue as JsonValue)) {
+      errors.push(&quot;Argument &#39;&quot; + argName + &quot;&#39;: &#39;&quot; + String(argValue) + &quot;&#39; not in &quot; + JSON.stringify(prop.enum));
+    }
+  }
+  return errors;
+}
+
+function runFunctionCallingLoop(userMessage: string): { toolResults: ToolResult[]; iterations: number } {
+  const calls = simulateModelDecision(userMessage);
+  if (calls.length === 0) return { toolResults: [], iterations: 0 };
+  const results = calls.map((c) =&gt; executeToolCall(c));
+  return { toolResults: results, iterations: 1 };
+}
+
+function main(): void {
+  registerAllTools();
+  console.log(&quot;=&quot;.repeat(60));
+  console.log(&quot;  Function Calling and Tool Use&quot;);
+  console.log(&quot;=&quot;.repeat(60));
+
+  console.log(&quot;\n--- Registered Tools ---&quot;);
+  for (const [name, tool] of TOOL_REGISTRY) {
+    const params = Object.keys(tool.definition.function.parameters.properties);
+    console.log(&quot;  &quot; + name + &quot;: &quot; + tool.definition.function.description.slice(0, 60) + &quot; | params: &quot; + params.join(&quot;,&quot;));
+  }
+
+  console.log(&quot;\n--- Argument Validation ---&quot;);
+  const validationTests: ReadonlyArray&lt;{ tool: string; args: unknown; label: string }&gt; = [
+    { tool: &quot;get_weather&quot;, args: { city: &quot;Tokyo&quot; }, label: &quot;Valid call&quot; },
+    { tool: &quot;get_weather&quot;, args: {}, label: &quot;Missing required arg&quot; },
+    { tool: &quot;get_weather&quot;, args: { city: &quot;Tokyo&quot;, units: &quot;kelvin&quot; }, label: &quot;Invalid enum value&quot; },
+    { tool: &quot;calculator&quot;, args: { expression: 123 }, label: &quot;Wrong type (number for string)&quot; },
+    { tool: &quot;unknown_tool&quot;, args: { x: 1 }, label: &quot;Unknown tool&quot; },
+  ];
+  for (const { tool, args, label } of validationTests) {
+    const errors = validateToolArguments(tool, args);
+    console.log(&quot;  &quot; + label + &quot;: &quot; + (errors.length === 0 ? &quot;VALID&quot; : &quot;ERRORS: &quot; + errors.join(&quot; / &quot;)));
+  }
+
+  console.log(&quot;\n--- Direct Tool Execution ---&quot;);
+  const directTests: readonly ToolCall[] = [
+    { name: &quot;calculator&quot;, arguments: { expression: &quot;(10 + 5) * 3 / 2&quot; } },
+    { name: &quot;get_weather&quot;, arguments: { city: &quot;Tokyo&quot; } },
+    { name: &quot;get_weather&quot;, arguments: { city: &quot;Mars&quot; } },
+    { name: &quot;web_search&quot;, arguments: { query: &quot;python function calling&quot; } },
+    { name: &quot;read_file&quot;, arguments: { path: &quot;data/config.json&quot; } },
+    { name: &quot;read_file&quot;, arguments: { path: &quot;../etc/passwd&quot; } },
+    { name: &quot;run_code&quot;, arguments: { code: &quot;let s=0; for(let i=1;i&lt;=100;i++) s+=i; result=s;&quot; } },
+    { name: &quot;run_code&quot;, arguments: { code: &quot;require(&#39;child_process&#39;).exec(&#39;ls&#39;)&quot; } },
+  ];
+  for (const call of directTests) {
+    const r = executeToolCall(call);
+    const argsStr = JSON.stringify(call.arguments);
+    const resStr = JSON.stringify(r.result).slice(0, 90);
+    console.log(&quot;\n  &quot; + call.name + &quot;(&quot; + argsStr.slice(0, 60) + &quot;)&quot;);
+    console.log(&quot;    -&gt; &quot; + resStr);
+    console.log(&quot;    time: &quot; + r.executionTimeMs + &quot;ms&quot;);
+  }
+
+  console.log(&quot;\n--- Function Calling Loop ---&quot;);
+  const queries = [
+    &quot;What&#39;s the weather in Tokyo?&quot;,
+    &quot;Calculate (100 + 250) * 0.15&quot;,
+    &quot;Search for MCP protocol&quot;,
+    &quot;Read the config file&quot;,
+    &quot;Run some JavaScript code&quot;,
+    &quot;Tell me a joke&quot;,
+  ];
+  for (const q of queries) {
+    const { toolResults, iterations } = runFunctionCallingLoop(q);
+    console.log(&quot;\n  User: &quot; + q);
+    for (const tr of toolResults) {
+      console.log(&quot;    Tool: &quot; + tr.tool + &quot; (&quot; + tr.executionTimeMs + &quot;ms)&quot;);
+    }
+    if (toolResults.length === 0) console.log(&quot;    [No tool called]&quot;);
+    console.log(&quot;    Iterations: &quot; + iterations);
+  }
+
+  console.log(&quot;\n--- Parallel Tool Calls ---&quot;);
+  const { toolResults: multi } = runFunctionCallingLoop(&quot;What&#39;s the weather in tokyo and london?&quot;);
+  console.log(&quot;  Tool calls made: &quot; + multi.length);
+  for (const tr of multi) {
+    const r = tr.result as Record&lt;string, JsonValue&gt;;
+    console.log(&quot;    &quot; + String(r.city) + &quot;: &quot; + String(r.temp_c ?? r.temp_f) + &quot;, &quot; + String(r.condition));
+  }
+
+  console.log(&quot;\n--- Security Checks ---&quot;);
+  const securityTests: ReadonlyArray&lt;{ tool: string; args: Record&lt;string, JsonValue&gt; }&gt; = [
+    { tool: &quot;read_file&quot;, args: { path: &quot;../../etc/passwd&quot; } },
+    { tool: &quot;run_code&quot;, args: { code: &quot;process.exit(0)&quot; } },
+    { tool: &quot;calculator&quot;, args: { expression: &quot;Function(&#39;return 1&#39;)()&quot; } },
+  ];
+  for (const { tool, args } of securityTests) {
+    const r = executeToolCall({ name: tool, arguments: args });
+    const blocked = typeof r.result === &quot;object&quot; &amp;&amp; r.result !== null &amp;&amp; (r.result as Record&lt;string, JsonValue&gt;).error === true;
+    const firstArg = Object.values(args)[0];
+    const argDisplay = String(firstArg).slice(0, 40);
+    console.log(&quot;  &quot; + tool + &quot;(&quot; + argDisplay + &quot;): &quot; + (blocked ? &quot;BLOCKED&quot; : &quot;ALLOWED&quot;));
+  }
+}
+
+main();
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/11-llm-engineering/09-function-calling/code/tests/test_main.py">phases/11-llm-engineering/09-function-calling/code/tests/test_main.py</a><details><summary>查看原始文本</summary><pre><code>import unittest
+import sys
+from pathlib import Path
+
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from function_calling import run_code, calculator, read_file
+
+
+class RunCodeGuardTests(unittest.TestCase):
+    def test_benign_code_runs(self):
+        out = run_code(&quot;result = sum(range(1, 101))&quot;)
+        self.assertTrue(out.get(&quot;success&quot;))
+        self.assertEqual(out[&quot;result&quot;], 5050)
+
+    def test_math_helper_available(self):
+        out = run_code(&quot;result = round(math.sqrt(2), 3)&quot;)
+        self.assertTrue(out.get(&quot;success&quot;))
+        self.assertEqual(out[&quot;result&quot;], 1.414)
+
+    def test_import_statement_blocked(self):
+        out = run_code(&quot;import os\nresult = os.getpid()&quot;)
+        self.assertEqual(out.get(&quot;code&quot;), &quot;SECURITY_VIOLATION&quot;)
+
+    def test_from_import_blocked(self):
+        out = run_code(&quot;from os import getpid\nresult = getpid()&quot;)
+        self.assertEqual(out.get(&quot;code&quot;), &quot;SECURITY_VIOLATION&quot;)
+
+    def test_dunder_attribute_chain_blocked(self):
+        payload = &quot;result = ().__class__.__base__.__subclasses__()&quot;
+        out = run_code(payload)
+        self.assertEqual(out.get(&quot;code&quot;), &quot;SECURITY_VIOLATION&quot;)
+
+    def test_unsafe_builtin_name_blocked(self):
+        out = run_code(&quot;result = eval(&#39;1 + 1&#39;)&quot;)
+        self.assertEqual(out.get(&quot;code&quot;), &quot;SECURITY_VIOLATION&quot;)
+
+    def test_syntax_error_reported(self):
+        out = run_code(&quot;result = (&quot;)
+        self.assertEqual(out.get(&quot;code&quot;), &quot;SYNTAX_ERROR&quot;)
+
+
+class OtherToolGuardTests(unittest.TestCase):
+    def test_calculator_rejects_non_math_characters(self):
+        out = calculator(&quot;__import__(&#39;os&#39;).system(&#39;ls&#39;)&quot;)
+        self.assertTrue(out.get(&quot;error&quot;))
+
+    def test_read_file_rejects_traversal(self):
+        out = read_file(&quot;../../etc/passwd&quot;)
+        self.assertEqual(out.get(&quot;code&quot;), &quot;FORBIDDEN&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    unittest.main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/11-llm-engineering/09-function-calling/outputs/prompt-tool-designer.md">phases/11-llm-engineering/09-function-calling/outputs/prompt-tool-designer.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: prompt-tool-designer
+description: Design complete tool definitions (JSON Schema) for function calling from a natural language description
+phase: 11
+lesson: 09
+---
+
+You are a tool definition designer for LLM function calling. I will describe what a tool should do. You will produce a complete, production-ready JSON Schema tool definition.
+
+## Design Protocol
+
+### 1. Analyze the Tool Purpose
+
+Before writing the schema:
+
+- Identify the core action (read, write, search, compute, transform)
+- Determine required vs optional parameters
+- Identify parameter types and constraints (enums, min/max, patterns)
+- Consider error cases and what the tool should return on failure
+- Determine if the tool has side effects (read-only vs mutating)
+
+### 2. Writing the Description
+
+The description is the most important field. The model reads it to decide when to use the tool.
+
+Rules:
+- Start with an action verb: &quot;Get&quot;, &quot;Search&quot;, &quot;Create&quot;, &quot;Calculate&quot;, &quot;Read&quot;
+- State what the tool returns: &quot;Returns temperature in Celsius and weather conditions&quot;
+- Mention limitations: &quot;Only supports cities with population &gt; 100,000&quot;
+- Keep it under 200 characters
+- Do not include parameter details in the description -- those go in parameter descriptions
+
+Bad: &quot;A weather tool&quot;
+Good: &quot;Get current weather for a city. Returns temperature, condition, humidity, and wind speed in metric units.&quot;
+
+### 3. Parameter Design
+
+For each parameter:
+- Use `description` to explain what it accepts and give examples
+- Use `enum` for categorical values -- never rely on the model inventing the right string
+- Use `minimum`/`maximum` for numbers to prevent hallucinated extreme values
+- Set `default` for optional parameters so the model knows the behavior when omitted
+- Mark only truly necessary parameters as `required`
+
+### 4. Output Format
+
+Return the tool definition in the OpenAI `tools` format:
+
+```json
+{
+  &quot;type&quot;: &quot;function&quot;,
+  &quot;function&quot;: {
+    &quot;name&quot;: &quot;tool_name&quot;,
+    &quot;description&quot;: &quot;What the tool does and what it returns.&quot;,
+    &quot;parameters&quot;: {
+      &quot;type&quot;: &quot;object&quot;,
+      &quot;properties&quot;: {
+        &quot;param_name&quot;: {
+          &quot;type&quot;: &quot;string&quot;,
+          &quot;description&quot;: &quot;What this parameter accepts, e.g. &#39;example value&#39;&quot;
+        }
+      },
+      &quot;required&quot;: [&quot;param_name&quot;]
+    }
+  }
+}
+```
+
+Also include:
+- An Anthropic-format version (using `input_schema` instead of `parameters`)
+- 3 example tool calls with expected arguments
+- 2 error scenarios the implementation should handle
+
+## Input Format
+
+**Tool description:**
+```
+{description}
+```
+
+**Context (optional):**
+```
+{context}
+```
+
+## Output
+
+A complete tool definition with both OpenAI and Anthropic formats, examples, and error scenarios.
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/11-llm-engineering/09-function-calling/outputs/skill-function-calling-patterns.md">phases/11-llm-engineering/09-function-calling/outputs/skill-function-calling-patterns.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: skill-function-calling-patterns
+description: Decision framework for implementing function calling in production -- tool design, error handling, security, and provider patterns
+version: 1.0.0
+phase: 11
+lesson: 09
+tags: [function-calling, tool-use, agents, mcp, security, openai, anthropic]
+---
+
+# Function Calling Patterns
+
+When building an LLM application that uses tools, apply this decision framework.
+
+## When to use function calling
+
+**Use function calling when:**
+- The model needs real-time data (weather, stock prices, database queries)
+- The task requires side effects (sending emails, creating records, deploying code)
+- The model must choose between multiple actions based on user intent
+- You are building an agent that interacts with external systems
+
+**Use structured outputs instead when:**
+- You need data extraction from text (no external calls needed)
+- The output is the final product, not an intermediate step
+- You have a single schema, not multiple tools to choose from
+
+**Use both when:**
+- The model calls a tool, then structures the tool result into a specific output format
+
+## Tool design guidelines
+
+1. **One tool, one action.** A tool named `manage_database` that handles queries, inserts, updates, and deletes is too broad. Split into `query_records`, `insert_record`, `update_record`. The model selects better with specific tools.
+
+2. **Descriptions are prompts.** The model reads tool descriptions to decide selection. Write them like you would write instructions for a junior developer. Include what the tool returns, not just what it does.
+
+3. **Constrain with enums.** If a parameter has 3-10 valid values, use an enum. The model will invent strings -- &quot;celsius&quot;, &quot;Celsius&quot;, &quot;C&quot;, &quot;metric&quot; -- unless you constrain it.
+
+4. **Fewer tools is better.** GPT-4o handles 5-10 tools well. At 20+ tools, selection accuracy drops. At 50+ tools, expect 10-15% wrong tool selection. Group related functionality or use a routing layer.
+
+5. **Required means required.** Only mark a parameter as required if the tool literally cannot function without it. Optional parameters with good defaults reduce tool call failures.
+
+## Provider-specific patterns
+
+### OpenAI (GPT-4o, o3, GPT-4o-mini)
+
+```python
+tools=[{&quot;type&quot;: &quot;function&quot;, &quot;function&quot;: {&quot;name&quot;: ..., &quot;parameters&quot;: ...}}]
+tool_choice=&quot;auto&quot;       # model decides
+tool_choice=&quot;required&quot;   # must call at least one tool
+tool_choice={&quot;type&quot;: &quot;function&quot;, &quot;function&quot;: {&quot;name&quot;: &quot;specific_tool&quot;}}
+```
+
+- Supports parallel tool calls (multiple `tool_calls` in one response)
+- Tool call IDs must be passed back with results
+- `gpt-4o-mini` is 10x cheaper and handles simple tool routing well
+- Structured outputs mode works with tool parameters for guaranteed schema compliance
+
+### Anthropic (Claude 3.5 Sonnet, Claude 4 Opus)
+
+```python
+tools=[{&quot;name&quot;: ..., &quot;description&quot;: ..., &quot;input_schema&quot;: ...}]
+tool_choice={&quot;type&quot;: &quot;auto&quot;}     # model decides
+tool_choice={&quot;type&quot;: &quot;any&quot;}      # must call at least one tool
+tool_choice={&quot;type&quot;: &quot;tool&quot;, &quot;name&quot;: &quot;specific_tool&quot;}
+```
+
+- Tool calls appear as content blocks with `type: &quot;tool_use&quot;`
+- Results go in user messages with `type: &quot;tool_result&quot;`
+- Field name is `input_schema`, not `parameters` (common migration bug)
+- Supports multiple tool calls per response
+
+### Google (Gemini 2.0 Flash, Gemini 2.0 Pro)
+
+```python
+function_declarations=[{&quot;name&quot;: ..., &quot;description&quot;: ..., &quot;parameters&quot;: ...}]
+function_calling_config={&quot;mode&quot;: &quot;AUTO&quot;}   # or &quot;ANY&quot; or &quot;NONE&quot;
+```
+
+- Uses `function_declarations` at the top level
+- Results returned via `function_response` parts
+- Supports parallel function calling
+
+### Open-source models (Llama 3, Hermes, Qwen)
+
+- No standardized format -- varies by model and serving framework
+- Hermes format (NousResearch) is the most common fine-tuned convention
+- vLLM supports OpenAI-compatible tool calling for supported models
+- Ollama supports basic tool calling with compatible models
+- Test tool selection accuracy before production -- open models are 15-30% less accurate than GPT-4o on the Berkeley Function Calling Leaderboard
+
+## Error handling patterns
+
+### Return structured errors
+
+```json
+{&quot;error&quot;: true, &quot;message&quot;: &quot;City &#39;Toky&#39; not found. Did you mean &#39;Tokyo&#39;?&quot;, &quot;code&quot;: &quot;NOT_FOUND&quot;, &quot;suggestions&quot;: [&quot;Tokyo&quot;]}
+```
+
+Include actionable information. &quot;Not found&quot; is bad. &quot;Not found, did you mean X?&quot; is good. The model uses error messages to self-correct.
+
+### Retry strategy
+
+1. Tool call fails with a correctable error (typo, wrong enum value)
+2. Send the error back to the model as a tool result
+3. The model adjusts and retries
+4. Maximum 3 retries per tool call
+5. After 3 failures, return the error to the user
+
+### Timeout handling
+
+Set timeouts on all tool executions. 30 seconds is a reasonable default. If a tool times out, return a structured timeout error so the model can inform the user rather than hanging.
+
+## Security checklist
+
+| Check | Why | How |
+|-------|-----|-----|
+| Allowlist functions | Prevent arbitrary code execution | Only register tools the user needs |
+| Validate argument types | Prevent type confusion attacks | Check types before execution |
+| Sanitize string arguments | Prevent injection | Reject or escape special characters |
+| Parameterize database queries | Prevent SQL injection | Never pass model-generated SQL directly |
+| Filter tool results | Prevent data leakage | Remove API keys, PII, internal errors |
+| Rate limit tool calls | Prevent runaway loops | Max 10-20 calls per conversation |
+| Log all tool calls | Audit trail | Store tool name, arguments, result, timestamp |
+| Block path traversal | Prevent file system access | Reject `..` and absolute paths in file tools |
+| Sandbox code execution | Prevent system access | Use containers or restricted builtins |
+| Validate return size | Prevent context stuffing | Truncate results over 10KB |
+
+## Performance optimization
+
+- **Parallel calls:** When the model requests multiple independent tools, execute them concurrently with `asyncio.gather()` or `concurrent.futures`
+- **Caching:** Cache tool results for identical arguments within the same session (weather does not change in 60 seconds)
+- **Streaming:** Stream the model&#39;s final response while tool results are being fetched
+- **Tool pruning:** If context is tight, only include tool definitions relevant to the current query (use a classifier to filter)
+- **Smaller models for routing:** Use `gpt-4o-mini` or `claude-haiku-4-5` for tool selection, then pass results to a stronger model for synthesis
+
+## Common failure patterns
+
+| Failure | Cause | Fix |
+|---------|-------|-----|
+| Wrong tool selected | Ambiguous descriptions | Rewrite descriptions with specific trigger words |
+| Missing required args | Model forgot a parameter | Add clear examples in parameter descriptions |
+| Infinite tool loop | Model keeps calling same tool | Set max iterations (5-10) and detect repeated calls |
+| Hallucinated arguments | Model invents plausible but wrong values | Use enums, validate against known values |
+| Tool result too large | API returned 100KB of data | Truncate or summarize before feeding back |
+| Model ignores tool result | Result format confusing | Return clean JSON with clear field names |
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. Can LLMs actually execute functions or access external systems?</legend><label class="option"><input type="radio" name="q0" value="0"> No -- LLMs only generate text (typically JSON) describing which function to call; your code must execute it</label><label class="option"><input type="radio" name="q0" value="1"> LLMs execute functions through embeddings</label><label class="option"><input type="radio" name="q0" value="2"> Only GPT-4 can execute functions</label><label class="option"><input type="radio" name="q0" value="3"> Yes, LLMs can call APIs directly</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. What is a tool schema in the context of function calling?</legend><label class="option"><input type="radio" name="q1" value="0"> The API endpoint URL</label><label class="option"><input type="radio" name="q1" value="1"> A database schema</label><label class="option"><input type="radio" name="q1" value="2"> The model&#39;s architecture diagram</label><label class="option"><input type="radio" name="q1" value="3"> A JSON description of a function&#39;s name, parameters, types, and purpose that tells the model what tools are available</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. What is the standard pattern for a multi-turn function calling loop?</legend><label class="option"><input type="radio" name="q2" value="0"> Call all functions at once</label><label class="option"><input type="radio" name="q2" value="1"> The model executes functions internally</label><label class="option"><input type="radio" name="q2" value="2"> Send message -&gt; model requests tool call -&gt; execute function -&gt; send result back -&gt; model generates final response (repeat if needed)</label><label class="option"><input type="radio" name="q2" value="3"> Parse the entire conversation as a batch</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. How do you prevent infinite tool calling loops?</legend><label class="option"><input type="radio" name="q3" value="0"> Use a faster model</label><label class="option"><input type="radio" name="q3" value="1"> Set a maximum number of tool call iterations and implement a timeout, breaking the loop if the limit is reached</label><label class="option"><input type="radio" name="q3" value="2"> Remove all tool schemas after the first call</label><label class="option"><input type="radio" name="q3" value="3"> Infinite loops can&#39;t happen with function calling</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. Why are clear, descriptive parameter names and descriptions important in tool schemas?</legend><label class="option"><input type="radio" name="q4" value="0"> The model uses descriptions to decide which tool to call and how to fill in parameters -- vague descriptions lead to wrong tool selections and incorrect arguments</label><label class="option"><input type="radio" name="q4" value="1"> They improve response time</label><label class="option"><input type="radio" name="q4" value="2"> They are required by the API</label><label class="option"><input type="radio" name="q4" value="3"> They make the code more readable</label><p data-feedback="4"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/11-llm-engineering/08-fine-tuning-lora/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/11-llm-engineering/10-evaluation/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/11-llm-engineering/09-function-calling/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

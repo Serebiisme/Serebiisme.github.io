@@ -1,0 +1,546 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>主题建模  LDA 和 BERTopic · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-05-nlp-foundations-to-advanced" data-lesson="05-nlp-foundations-to-advanced/15-topic-modeling" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/05-nlp-foundations-to-advanced/">自然语言处理</a> / LESSON 15</p><h1 class="lesson-title">主题建模  LDA 和 BERTopic</h1><p>Topic Modeling — LDA and BERTopic</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>主题建模  LDA 和 BERTopic</h1>
+<blockquote>
+<p>文件是主题的混合物,主题是词汇上的分布.BERTopic:文件集群在嵌入空间中,集群是主题.相同的目标,不同的分解.</p>
+</blockquote>
+<p><strong>Type:</strong> Learn
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 5 · 02 (BoW + TF-IDF), Phase 5 · 03 (Word2Vec)
+<strong>Time:</strong> ~45 minutes</p>
+<h2>问题</h2>
+<p>你有1万张客户支持门票,5万条新闻文章或200万条推文.你需要知道收集内容是什么,而不需要阅读它.你没有标签类别.你甚至不知道有多少类别.</p>
+<p>给它一个体积,回来一组连贯的主题,</p>
+<p>两个算法家族主导.LDA (2003) 将每个文档视为隐藏的主题的混合,每个主题视为词汇分布.推理是贝耶斯.它仍然在生产中运输,需要混合成员主题分配和可解释的词汇水平概率分布.</p>
+<p>BERTopic (2020) 用BERT编码文件,用UMAP减少维度,用HDBSCAN集群,并通过基于类的TF-IDF提取主题词.它在短文本,社交媒体和任何语义相似性比词汇重叠更重要的地方都赢得了胜利. 一份文件得到了一个主题,这是一种长形式内容的限制.</p>
+<p>这一课就建立了对两个人的直觉,</p>
+<h2>概念</h2>
+<p><img src="/learn/ai-from-scratch/files/phases/05-nlp-foundations-to-advanced/15-topic-modeling/assets/topic-modeling.svg" alt="LDA mixture model vs BERTopic clustering" loading="lazy"></p>
+<p>**LDA generative story.**每个主题都是单词的分布.每份文件都是单词的混合物.为了生成一个词,在文档中取样一个主题,然后取样一个词从该主题的分布中.推理逆转这一点:给出观察到的单词,推断每份文件的主题分布和每份话题的词分布.崩的吉布斯样本或变化贝斯做了数学.</p>
+<p>关键 LDA输出:</p>
+<ul>
+<li><code>doc_topic</code>列表<code>(n_docs, n_topics)</code>,每行总数为1 (文档的主题混合).</li>
+<li><code>topic_word</code>列表<code>(n_topics, vocab_size)</code>,每行总数为1 (主题的词分布).</li>
+</ul>
+<p><strong>BERTopic pipeline.</strong></p>
+<ol>
+<li>编码每个文档用句子变换器 (例如, <code>all-MiniLM-L6-v2</code>它们是384维向量.</li>
+<li>通过UMAP将维度降低到5维度.BERT嵌入式太低于结.</li>
+<li>基于密度,产生变量尺寸的集群和&quot;异常&quot;标签.</li>
+<li>对于每个集群,计算基于类的TF-IDF在集群文件中以提取顶级词.</li>
+</ol>
+<p>输出是每份文件的一个主题 (加上 -1 异常标签). 选择性是通过HDBSCAN的概率向量进行软会员.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-7421bbbbd97a19933f15.png" alt="topic-drift 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<h3>步骤1:通过 scikit-learn进行LDA</h3>
+<pre><code class="language-python">from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.decomposition import LatentDirichletAllocation
+import numpy as np
+
+
+def fit_lda(documents, n_topics=5, max_features=1000):
+    cv = CountVectorizer(
+        max_features=max_features,
+        stop_words=&quot;english&quot;,
+        min_df=2,
+        max_df=0.9,
+    )
+    X = cv.fit_transform(documents)
+    lda = LatentDirichletAllocation(
+        n_components=n_topics,
+        random_state=42,
+        max_iter=50,
+        learning_method=&quot;online&quot;,
+    )
+    doc_topic = lda.fit_transform(X)
+    feature_names = cv.get_feature_names_out()
+    return lda, cv, doc_topic, feature_names
+
+
+def print_top_words(lda, feature_names, n_top=10):
+    for idx, topic in enumerate(lda.components_):
+        top_idx = np.argsort(-topic)[:n_top]
+        words = [feature_names[i] for i in top_idx]
+        print(f&quot;topic {idx}: {' '.join(words)}&quot;)
+</code></pre>
+<p>注意:删除停止字,min_df和max_df过稀有和无处不在的术语, CountVectorizer (不是TfidfVectorizer) 因为LDA预计原始计数.</p>
+<h3>步骤2:BERTopic (生产)</h3>
+<pre><code class="language-python">from bertopic import BERTopic
+
+topic_model = BERTopic(
+    embedding_model=&quot;sentence-transformers/all-MiniLM-L6-v2&quot;,
+    min_topic_size=15,
+    verbose=True,
+)
+
+topics, probs = topic_model.fit_transform(documents)
+info = topic_model.get_topic_info()
+print(info.head(20))
+valid_topics = info[info[&quot;Topic&quot;] != -1][&quot;Topic&quot;].tolist()
+for topic_id in valid_topics[:5]:
+    print(f&quot;topic {topic_id}: {topic_model.get_topic(topic_id)[:10]}&quot;)
+</code></pre>
+<p>镜开了<code>Topic != -1</code>降低BERTopic的外向桶 (HDBSCAN无法集结文件). <code>min_topic_size</code>控制HDBSCAN的最小集群大小;BERTopic的库默认是10.本例明确设置为15为课程规模.对于超过10,000份文件,增加到50或100.</p>
+<h3>步骤3:评估</h3>
+<p>问题是,这些词是否一致.</p>
+<ul>
+<li>**Topic coherence (c_v).**结合了在滑动窗口背景下顶级词对的NPMI (标准化的点向互通信息),将分数集成成主题向量,并通过共数相似性进行比较.更高更好.使用 <code>gensim.models.CoherenceModel</code>随着<code>coherence=&quot;c_v&quot;</code>现在,我们要去.</li>
+<li>**Topic diversity.**专题中所有主题的顶级词中独特词的比例.</li>
+<li>**Qualitative inspection.**读一读每一个话题的头条词.它们是否命名一个真实的东西?</li>
+</ul>
+<h2>什么时候选择哪个</h2>
+<table>
+<thead>
+<tr>
+<th>Situation</th>
+<th>Pick</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Short text (tweets, reviews, headlines)</td>
+<td>BERTopic</td>
+</tr>
+<tr>
+<td>Long documents with topic mixtures</td>
+<td>LDA</td>
+</tr>
+<tr>
+<td>No GPU / limited compute</td>
+<td>LDA or NMF</td>
+</tr>
+<tr>
+<td>Need document-level multi-topic distributions</td>
+<td>LDA</td>
+</tr>
+<tr>
+<td>LLM integration for topic labeling</td>
+<td>BERTopic (direct support)</td>
+</tr>
+<tr>
+<td>Resource-constrained edge deployment</td>
+<td>LDA</td>
+</tr>
+<tr>
+<td>Max semantic coherence</td>
+<td>BERTopic</td>
+</tr>
+</tbody>
+</table>
+<p>文件长度是最大的实际考虑因素.BERT嵌入式缩短;LDA计算工作在任何长度.对于文件长于嵌入式模型的文本,要么使用chunk + agregate或使用LDA.</p>
+<h2>用它</h2>
+<p>现在,我们要做什么?</p>
+<ul>
+<li>**BERTopic.**默认的短文本和任何语义的东西.</li>
+<li>**<code>gensim.models.LdaModel</code>.**经典的LDA生产,成熟,战斗测试.</li>
+<li>**<code>sklearn.decomposition.LatentDirichletAllocation</code>.**实验的LDA很容易.</li>
+<li>**NMF.**快速替代LDA,短文本的质量相似.</li>
+<li>**Top2Vec.**类似于BERTopic的设计. 社区较小,但在一些基准上很好.</li>
+<li>**FASTopic.**在非常大的体体上,比BERTopic更快.</li>
+<li>**LLM-based labeling.**运行任何集群,然后要求一个模型命名每个集群.</li>
+</ul>
+<h2>运送它</h2>
+<p>保存如<code>outputs/skill-topic-picker.md</code>其他:</p>
+<pre><code class="language-markdown">---
+name: topic-picker
+description: Pick LDA or BERTopic for a corpus. Specify library, knobs, evaluation.
+version: 1.0.0
+phase: 5
+lesson: 15
+tags: [nlp, topic-modeling]
+---
+
+Given a corpus description (document count, avg length, domain, language, compute budget), output:
+
+1. Algorithm. LDA / NMF / BERTopic / Top2Vec / FASTopic. One-sentence reason.
+2. Configuration. Number of topics: `recommended = max(5, round(sqrt(n_docs)))`, clamped to 200 for corpora under 40,000 docs; permit &gt;200 only when the corpus is genuinely large (&gt;40k) and note the increased compute cost. `min_df` / `max_df` filters and embedding model for neural approaches also belong here.
+3. Evaluation. Topic coherence (c_v) via `gensim.models.CoherenceModel`, topic diversity, and a 20-sample human read.
+4. Failure mode to probe. For LDA, &quot;junk topics&quot; absorbing stopwords and frequent terms. For BERTopic, the -1 outlier cluster swallowing ambiguous documents.
+
+Refuse BERTopic on documents longer than the embedding model's context window without a chunking strategy. Refuse LDA on very short text (tweets, reviews under 10 tokens) as coherence collapses. Flag any n_topics choice below 5 as likely wrong; flag &gt;200 on corpora under 40k docs as likely over-splitting.
+</code></pre>
+<h2>运动</h2>
+<ol>
+<li>**Easy.**按LDA适应20个新闻群数据集中的5个主题.按主题打印前10个词.手动标记每个主题.算法是否找到真正的类别?</li>
+<li>**Medium.**根据LDA的数据,比较发现的主题数量,顶尖词汇和质量一致性.哪个更清洁地表现出实际类别?</li>
+<li>**Hard.**在您的作品中计算LDA和BERTopic的c_v一致性.运行每个 5, 10, 20, 50个主题.图集一致性与主题数量.报告哪种方法在主题数量中更稳定.</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Topic</td>
+<td>A thing the corpus is about</td>
+<td>A probability distribution over words (LDA) or a cluster of similar documents (BERTopic).</td>
+</tr>
+<tr>
+<td>Mixed membership</td>
+<td>Doc is multiple topics</td>
+<td>LDA assigns each document a distribution over all topics.</td>
+</tr>
+<tr>
+<td>UMAP</td>
+<td>Dimensionality reduction</td>
+<td>Manifold learning that preserves local structure; used in BERTopic.</td>
+</tr>
+<tr>
+<td>HDBSCAN</td>
+<td>Density clustering</td>
+<td>Finds variable-size clusters; produces &quot;noise&quot; label (-1) for outliers.</td>
+</tr>
+<tr>
+<td>c_v coherence</td>
+<td>Topic quality metric</td>
+<td>Average pointwise mutual information of top topic words within sliding windows.</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://www.jmlr.org/papers/volume3/blei03a/blei03a.pdf" rel="noreferrer" data-network="true">Blei, Ng, Jordan (2003). Latent Dirichlet Allocation <small>↗ 需要联网</small></a>LDA的报纸.</li>
+<li><a href="https://arxiv.org/abs/2203.05794" rel="noreferrer" data-network="true">Grootendorst (2022). BERTopic: Neural topic modeling with a class-based TF-IDF procedure <small>↗ 需要联网</small></a>BERTopic论文</li>
+<li><a href="https://svn.aksw.org/papers/2015/WSDM_Topic_Evaluation/public.pdf" rel="noreferrer" data-network="true">Röder, Both, Hinneburg (2015). Exploring the Space of Topic Coherence Measures <small>↗ 需要联网</small></a>报纸介绍了C_V和朋友.</li>
+<li><a href="https://maartengr.github.io/BERTopic/" rel="noreferrer" data-network="true">BERTopic documentation <small>↗ 需要联网</small></a>生产参考. 优秀的例子.</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Topic Modeling — LDA and BERTopic</h1>
+<blockquote>
+<p>LDA: documents are mixtures of topics, topics are distributions over words. BERTopic: documents cluster in embedding space, clusters are topics. Same goal, different decompositions.</p>
+</blockquote>
+<p><strong>Type:</strong> Learn
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 5 · 02 (BoW + TF-IDF), Phase 5 · 03 (Word2Vec)
+<strong>Time:</strong> ~45 minutes</p>
+<h2>The Problem</h2>
+<p>You have 10,000 customer support tickets, 50,000 news articles, or 200,000 tweets. You need to know what the collection is about without reading it. You do not have labeled categories. You do not even know how many categories exist.</p>
+<p>Topic modeling answers that without supervision. Give it a corpus, get back a small set of coherent topics and, for each document, a distribution over those topics.</p>
+<p>Two algorithmic families dominate. LDA (2003) treats each document as a mixture of latent topics and each topic as a distribution over words. Inference is Bayesian. It still ships in production where you need mixed-membership topic assignments and explainable word-level probability distributions.</p>
+<p>BERTopic (2020) encodes documents with BERT, reduces dimensionality with UMAP, clusters with HDBSCAN, and extracts topic words via class-based TF-IDF. It wins on short text, social media, and anything where semantic similarity matters more than word overlap. One document gets one topic, which is a limitation for long-form content.</p>
+<p>This lesson builds intuition for both and names which one to pick for a given corpus.</p>
+<h2>The Concept</h2>
+<p><img src="/learn/ai-from-scratch/files/phases/05-nlp-foundations-to-advanced/15-topic-modeling/assets/topic-modeling.svg" alt="LDA mixture model vs BERTopic clustering" loading="lazy"></p>
+<p><strong>LDA generative story.</strong> Each topic is a distribution over words. Each document is a mixture of topics. To generate a word in a document, sample a topic from the document's mixture, then sample a word from that topic's distribution. Inference reverses this: given observed words, infer the topic distribution per document and the word distribution per topic. Collapsed Gibbs sampling or variational Bayes does the math.</p>
+<p>Key LDA output:</p>
+<ul>
+<li><code>doc_topic</code>: matrix <code>(n_docs, n_topics)</code>, each row sums to 1 (document's topic mixture).</li>
+<li><code>topic_word</code>: matrix <code>(n_topics, vocab_size)</code>, each row sums to 1 (topic's word distribution).</li>
+</ul>
+<p><strong>BERTopic pipeline.</strong></p>
+<ol>
+<li>Encode each document with a sentence transformer (e.g., <code>all-MiniLM-L6-v2</code>). 384-dim vectors.</li>
+<li>Reduce dimensionality with UMAP to ~5 dimensions. BERT embeddings are too high-dim for clustering.</li>
+<li>Cluster with HDBSCAN. Density-based, produces variable-size clusters and an &quot;outlier&quot; label.</li>
+<li>For each cluster, compute class-based TF-IDF over the cluster's documents to extract top words.</li>
+</ol>
+<p>Output is one topic per document (plus a -1 outlier label). Optionally, a soft membership via HDBSCAN's probability vector.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-7421bbbbd97a19933f15.png" alt="topic-drift 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<h3>Step 1: LDA via scikit-learn</h3>
+<pre><code class="language-python">from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.decomposition import LatentDirichletAllocation
+import numpy as np
+
+
+def fit_lda(documents, n_topics=5, max_features=1000):
+    cv = CountVectorizer(
+        max_features=max_features,
+        stop_words=&quot;english&quot;,
+        min_df=2,
+        max_df=0.9,
+    )
+    X = cv.fit_transform(documents)
+    lda = LatentDirichletAllocation(
+        n_components=n_topics,
+        random_state=42,
+        max_iter=50,
+        learning_method=&quot;online&quot;,
+    )
+    doc_topic = lda.fit_transform(X)
+    feature_names = cv.get_feature_names_out()
+    return lda, cv, doc_topic, feature_names
+
+
+def print_top_words(lda, feature_names, n_top=10):
+    for idx, topic in enumerate(lda.components_):
+        top_idx = np.argsort(-topic)[:n_top]
+        words = [feature_names[i] for i in top_idx]
+        print(f&quot;topic {idx}: {' '.join(words)}&quot;)
+</code></pre>
+<p>Notice: stopwords removed, min_df and max_df filter rare and ubiquitous terms, CountVectorizer (not TfidfVectorizer) because LDA expects raw counts.</p>
+<h3>Step 2: BERTopic (production)</h3>
+<pre><code class="language-python">from bertopic import BERTopic
+
+topic_model = BERTopic(
+    embedding_model=&quot;sentence-transformers/all-MiniLM-L6-v2&quot;,
+    min_topic_size=15,
+    verbose=True,
+)
+
+topics, probs = topic_model.fit_transform(documents)
+info = topic_model.get_topic_info()
+print(info.head(20))
+valid_topics = info[info[&quot;Topic&quot;] != -1][&quot;Topic&quot;].tolist()
+for topic_id in valid_topics[:5]:
+    print(f&quot;topic {topic_id}: {topic_model.get_topic(topic_id)[:10]}&quot;)
+</code></pre>
+<p>The filter on <code>Topic != -1</code> drops BERTopic's outlier bucket (documents HDBSCAN could not cluster). <code>min_topic_size</code> controls HDBSCAN's minimum cluster size; BERTopic's library default is 10. This example sets it to 15 explicitly for the lesson's scale. For corpora over 10,000 documents, increase to 50 or 100.</p>
+<h3>Step 3: evaluation</h3>
+<p>Both methods output topic words. The question is whether those words cohere.</p>
+<ul>
+<li><strong>Topic coherence (c_v).</strong> Combines NPMI (normalized pointwise mutual information) of top-word pairs over sliding-window contexts, aggregates the scores into topic vectors, and compares those vectors via cosine similarity. Higher is better. Use <code>gensim.models.CoherenceModel</code> with <code>coherence=&quot;c_v&quot;</code>.</li>
+<li><strong>Topic diversity.</strong> Fraction of unique words across all topics' top words. Higher is better (topics do not overlap).</li>
+<li><strong>Qualitative inspection.</strong> Read the top words of each topic. Do they name a real thing? Human judgment is still the last line of defense.</li>
+</ul>
+<h2>When to pick which</h2>
+<table>
+<thead>
+<tr>
+<th>Situation</th>
+<th>Pick</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Short text (tweets, reviews, headlines)</td>
+<td>BERTopic</td>
+</tr>
+<tr>
+<td>Long documents with topic mixtures</td>
+<td>LDA</td>
+</tr>
+<tr>
+<td>No GPU / limited compute</td>
+<td>LDA or NMF</td>
+</tr>
+<tr>
+<td>Need document-level multi-topic distributions</td>
+<td>LDA</td>
+</tr>
+<tr>
+<td>LLM integration for topic labeling</td>
+<td>BERTopic (direct support)</td>
+</tr>
+<tr>
+<td>Resource-constrained edge deployment</td>
+<td>LDA</td>
+</tr>
+<tr>
+<td>Max semantic coherence</td>
+<td>BERTopic</td>
+</tr>
+</tbody>
+</table>
+<p>The biggest practical consideration is document length. BERT embeddings truncate; LDA counts work on whatever length. For documents longer than the embedding model's context, either chunk + aggregate or use LDA.</p>
+<h2>Use It</h2>
+<p>The 2026 stack:</p>
+<ul>
+<li><strong>BERTopic.</strong> Default for short text and anything where semantics matter.</li>
+<li><strong><code>gensim.models.LdaModel</code>.</strong> Classic LDA for production, mature, battle-tested.</li>
+<li><strong><code>sklearn.decomposition.LatentDirichletAllocation</code>.</strong> Easy LDA for experiments.</li>
+<li><strong>NMF.</strong> Non-negative matrix factorization. Fast alternative to LDA, comparable quality on short text.</li>
+<li><strong>Top2Vec.</strong> Similar design to BERTopic. Smaller community but good on some benchmarks.</li>
+<li><strong>FASTopic.</strong> Newer, faster than BERTopic on very large corpora.</li>
+<li><strong>LLM-based labeling.</strong> Run any clustering, then prompt a model to name each cluster.</li>
+</ul>
+<h2>Ship It</h2>
+<p>Save as <code>outputs/skill-topic-picker.md</code>:</p>
+<pre><code class="language-markdown">---
+name: topic-picker
+description: Pick LDA or BERTopic for a corpus. Specify library, knobs, evaluation.
+version: 1.0.0
+phase: 5
+lesson: 15
+tags: [nlp, topic-modeling]
+---
+
+Given a corpus description (document count, avg length, domain, language, compute budget), output:
+
+1. Algorithm. LDA / NMF / BERTopic / Top2Vec / FASTopic. One-sentence reason.
+2. Configuration. Number of topics: `recommended = max(5, round(sqrt(n_docs)))`, clamped to 200 for corpora under 40,000 docs; permit &gt;200 only when the corpus is genuinely large (&gt;40k) and note the increased compute cost. `min_df` / `max_df` filters and embedding model for neural approaches also belong here.
+3. Evaluation. Topic coherence (c_v) via `gensim.models.CoherenceModel`, topic diversity, and a 20-sample human read.
+4. Failure mode to probe. For LDA, &quot;junk topics&quot; absorbing stopwords and frequent terms. For BERTopic, the -1 outlier cluster swallowing ambiguous documents.
+
+Refuse BERTopic on documents longer than the embedding model's context window without a chunking strategy. Refuse LDA on very short text (tweets, reviews under 10 tokens) as coherence collapses. Flag any n_topics choice below 5 as likely wrong; flag &gt;200 on corpora under 40k docs as likely over-splitting.
+</code></pre>
+<h2>Exercises</h2>
+<ol>
+<li><strong>Easy.</strong> Fit LDA with 5 topics on the 20 Newsgroups dataset. Print top 10 words per topic. Label each topic by hand. Did the algorithm find the real categories?</li>
+<li><strong>Medium.</strong> Fit BERTopic on the same 20 Newsgroups subset. Compare the number of topics found, top words, and qualitative coherence against LDA. Which surfaces the real categories more cleanly?</li>
+<li><strong>Hard.</strong> Compute c_v coherence for both LDA and BERTopic on your corpus. Run each with 5, 10, 20, 50 topics. Plot coherence vs topic count. Report which method is more stable across topic counts.</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Topic</td>
+<td>A thing the corpus is about</td>
+<td>A probability distribution over words (LDA) or a cluster of similar documents (BERTopic).</td>
+</tr>
+<tr>
+<td>Mixed membership</td>
+<td>Doc is multiple topics</td>
+<td>LDA assigns each document a distribution over all topics.</td>
+</tr>
+<tr>
+<td>UMAP</td>
+<td>Dimensionality reduction</td>
+<td>Manifold learning that preserves local structure; used in BERTopic.</td>
+</tr>
+<tr>
+<td>HDBSCAN</td>
+<td>Density clustering</td>
+<td>Finds variable-size clusters; produces &quot;noise&quot; label (-1) for outliers.</td>
+</tr>
+<tr>
+<td>c_v coherence</td>
+<td>Topic quality metric</td>
+<td>Average pointwise mutual information of top topic words within sliding windows.</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://www.jmlr.org/papers/volume3/blei03a/blei03a.pdf" rel="noreferrer" data-network="true">Blei, Ng, Jordan (2003). Latent Dirichlet Allocation <small>↗ 需要联网</small></a> — the LDA paper.</li>
+<li><a href="https://arxiv.org/abs/2203.05794" rel="noreferrer" data-network="true">Grootendorst (2022). BERTopic: Neural topic modeling with a class-based TF-IDF procedure <small>↗ 需要联网</small></a> — the BERTopic paper.</li>
+<li><a href="https://svn.aksw.org/papers/2015/WSDM_Topic_Evaluation/public.pdf" rel="noreferrer" data-network="true">Röder, Both, Hinneburg (2015). Exploring the Space of Topic Coherence Measures <small>↗ 需要联网</small></a> — the paper that introduced c_v and friends.</li>
+<li><a href="https://maartengr.github.io/BERTopic/" rel="noreferrer" data-network="true">BERTopic documentation <small>↗ 需要联网</small></a> — the production reference. Excellent examples.</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-05-nlp-foundations-to-advanced--15-topic-modeling.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-05-nlp-foundations-to-advanced--15-topic-modeling.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/05-nlp-foundations-to-advanced/15-topic-modeling/code/main.py">phases/05-nlp-foundations-to-advanced/15-topic-modeling/code/main.py</a><details><summary>查看原始文本</summary><pre><code>import random
+import re
+
+
+SHORT_ALLOWLIST = {&quot;ai&quot;, &quot;ml&quot;, &quot;nn&quot;, &quot;s&quot;, &quot;p&quot;, &quot;pr&quot;}
+
+
+def tokenize(text):
+    tokens = re.findall(r&quot;[a-z0-9]+&quot;, text.lower())
+    return [t for t in tokens if len(t) &gt; 2 or t.isdigit() or t in SHORT_ALLOWLIST]
+
+
+def collapsed_gibbs_lda(docs, n_topics, n_iters=200, alpha=0.1, beta=0.01, seed=0):
+    if not isinstance(n_topics, int) or n_topics &lt;= 0:
+        raise ValueError(f&quot;n_topics must be a positive int, got {n_topics!r}&quot;)
+    if alpha &lt;= 0 or beta &lt;= 0:
+        raise ValueError(f&quot;alpha and beta must be positive, got alpha={alpha}, beta={beta}&quot;)
+    if not docs:
+        raise ValueError(&quot;docs must not be empty&quot;)
+
+    rng = random.Random(seed)
+    vocab = {}
+    for doc in docs:
+        for w in doc:
+            if w not in vocab:
+                vocab[w] = len(vocab)
+    V = len(vocab)
+    D = len(docs)
+    if V == 0:
+        raise ValueError(&quot;docs produced an empty vocabulary (no tokens found)&quot;)
+    indexed = [[vocab[w] for w in doc] for doc in docs]
+
+    z = [[rng.randint(0, n_topics - 1) for _ in doc] for doc in indexed]
+
+    ndt = [[0] * n_topics for _ in range(D)]
+    ntw = [[0] * V for _ in range(n_topics)]
+    nt = [0] * n_topics
+
+    for d in range(D):
+        for i, w in enumerate(indexed[d]):
+            t = z[d][i]
+            ndt[d][t] += 1
+            ntw[t][w] += 1
+            nt[t] += 1
+
+    for _ in range(n_iters):
+        for d in range(D):
+            for i, w in enumerate(indexed[d]):
+                t = z[d][i]
+                ndt[d][t] -= 1
+                ntw[t][w] -= 1
+                nt[t] -= 1
+
+                probs = []
+                for k in range(n_topics):
+                    p = (ndt[d][k] + alpha) * (ntw[k][w] + beta) / (nt[k] + V * beta)
+                    probs.append(p)
+                total = sum(probs)
+                r = rng.random() * total
+                acc = 0.0
+                new_t = 0
+                for k, p in enumerate(probs):
+                    acc += p
+                    if r &lt;= acc:
+                        new_t = k
+                        break
+
+                z[d][i] = new_t
+                ndt[d][new_t] += 1
+                ntw[new_t][w] += 1
+                nt[new_t] += 1
+
+    inv_vocab = {i: w for w, i in vocab.items()}
+    topics = []
+    for k in range(n_topics):
+        top_ids = sorted(range(V), key=lambda i: -ntw[k][i])[:8]
+        topics.append([inv_vocab[i] for i in top_ids])
+    doc_topic = []
+    for d in range(D):
+        total = sum(ndt[d]) + n_topics * alpha
+        doc_topic.append([(ndt[d][k] + alpha) / total for k in range(n_topics)])
+
+    return topics, doc_topic
+
+
+def main():
+    docs_raw = [
+        &quot;stocks rose after the fed cut interest rates&quot;,
+        &quot;bond yields fell as investors bought treasuries&quot;,
+        &quot;the s p 500 hit a new high on earnings reports&quot;,
+        &quot;chip makers reported strong demand for ai accelerators&quot;,
+        &quot;openai released a new model with multimodal reasoning&quot;,
+        &quot;deep learning researchers published a paper on efficient attention&quot;,
+        &quot;the senate passed a bill on healthcare spending&quot;,
+        &quot;the president signed new tariffs on steel imports&quot;,
+        &quot;congress debated a tax cut for small businesses&quot;,
+    ]
+    docs = [tokenize(d) for d in docs_raw]
+    topics, doc_topic = collapsed_gibbs_lda(docs, n_topics=3, n_iters=300, seed=42)
+
+    print(&quot;=== LDA topics (collapsed Gibbs, 300 iters) ===&quot;)
+    for k, words in enumerate(topics):
+        print(f&quot;  topic {k}: {&#39;, &#39;.join(words)}&quot;)
+    print()
+    print(&quot;=== document mixtures ===&quot;)
+    for doc_raw, mix in zip(docs_raw, doc_topic):
+        pretty = [f&quot;{p:.2f}&quot; for p in mix]
+        print(f&quot;  [{&#39;, &#39;.join(pretty)}]  {doc_raw[:50]}&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/05-nlp-foundations-to-advanced/15-topic-modeling/outputs/.gitkeep">phases/05-nlp-foundations-to-advanced/15-topic-modeling/outputs/.gitkeep</a><details><summary>查看原始文本</summary><pre><code></code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/05-nlp-foundations-to-advanced/15-topic-modeling/outputs/skill-topic-picker.md">phases/05-nlp-foundations-to-advanced/15-topic-modeling/outputs/skill-topic-picker.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: topic-picker
+description: Pick LDA or BERTopic for a corpus. Specify library, knobs, evaluation.
+version: 1.0.0
+phase: 5
+lesson: 15
+tags: [nlp, topic-modeling]
+---
+
+Given a corpus description (document count, avg length, domain, language, compute budget), output:
+
+1. Algorithm. LDA / NMF / BERTopic / Top2Vec / FASTopic. One-sentence reason.
+2. Configuration. Number of topics (start at ~sqrt(n_docs)), `min_df` / `max_df` filters, embedding model for neural approaches.
+3. Evaluation. Topic coherence (c_v) via `gensim.models.CoherenceModel`, topic diversity, plus a 20-sample human read.
+4. Failure mode to probe. For LDA, &quot;junk topics&quot; absorbing stopwords and frequent terms. For BERTopic, -1 outlier cluster swallowing ambiguous documents.
+
+Refuse BERTopic on documents longer than the embedding model&#39;s context window without a chunking strategy. Refuse LDA on very short text (tweets, reviews under 10 tokens) as coherence collapses. Flag any n_topics choice below 5 or above 200 as likely wrong for real data.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. What does LDA assume about each document?</legend><label class="option"><input type="radio" name="q0" value="0"> Each document belongs to exactly one topic</label><label class="option"><input type="radio" name="q0" value="1"> Documents are sentences</label><label class="option"><input type="radio" name="q0" value="2"> Each document is a mixture of topics; each topic is a distribution over words</label><label class="option"><input type="radio" name="q0" value="3"> Documents are independent of topics</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. What does BERTopic use to form topic clusters?</legend><label class="option"><input type="radio" name="q1" value="0"> Run BM25 followed by k-means</label><label class="option"><input type="radio" name="q1" value="1"> Encode docs with a sentence transformer, reduce dimensionality with UMAP, then cluster with HDBSCAN</label><label class="option"><input type="radio" name="q1" value="2"> Train an LSTM end-to-end</label><label class="option"><input type="radio" name="q1" value="3"> Direct softmax over the vocabulary</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. Why does scikit-learn&#39;s LDA expect raw counts (CountVectorizer), not TF-IDF?</legend><label class="option"><input type="radio" name="q2" value="0"> LDA cannot handle floats</label><label class="option"><input type="radio" name="q2" value="1"> LDA&#39;s probabilistic model is defined over integer term counts; TF-IDF distorts the underlying distribution</label><label class="option"><input type="radio" name="q2" value="2"> Memory limits</label><label class="option"><input type="radio" name="q2" value="3"> TF-IDF is too slow</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. What does HDBSCAN&#39;s -1 label mean in a BERTopic output?</legend><label class="option"><input type="radio" name="q3" value="0"> Stopword cluster</label><label class="option"><input type="radio" name="q3" value="1"> An outlier cluster of documents the density-based algorithm could not confidently assign</label><label class="option"><input type="radio" name="q3" value="2"> A reserved category</label><label class="option"><input type="radio" name="q3" value="3"> Top topic</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. Which coherence metric is the common default for topic-model evaluation?</legend><label class="option"><input type="radio" name="q4" value="0"> BLEU</label><label class="option"><input type="radio" name="q4" value="1"> c_v coherence via NPMI over sliding windows of top topic words</label><label class="option"><input type="radio" name="q4" value="2"> Accuracy</label><label class="option"><input type="radio" name="q4" value="3"> Perplexity only</label><p data-feedback="4"></p></fieldset><fieldset><legend>6. When is LDA usually a better fit than BERTopic?</legend><label class="option"><input type="radio" name="q5" value="0"> When embeddings are noisy</label><label class="option"><input type="radio" name="q5" value="1"> When you need a single topic per document</label><label class="option"><input type="radio" name="q5" value="2"> Long documents where mixed-membership topic distributions are useful and embeddings would truncate input</label><label class="option"><input type="radio" name="q5" value="3"> On short tweets</label><p data-feedback="5"></p></fieldset><fieldset><legend>7. Why does BERTopic typically win on short text (tweets, headlines)?</legend><label class="option"><input type="radio" name="q6" value="0"> Short text has fewer topics</label><label class="option"><input type="radio" name="q6" value="1"> It supports more languages</label><label class="option"><input type="radio" name="q6" value="2"> Semantic similarity in embedding space captures meaning where bag-of-words counts are too sparse</label><label class="option"><input type="radio" name="q6" value="3"> It is faster</label><p data-feedback="6"></p></fieldset><fieldset><legend>8. What is a common LDA failure mode for which you should monitor topics?</legend><label class="option"><input type="radio" name="q7" value="0"> Topics that match labeled categories perfectly</label><label class="option"><input type="radio" name="q7" value="1"> Topics with too few documents</label><label class="option"><input type="radio" name="q7" value="2"> Junk topics that absorb stopwords or extremely frequent terms</label><label class="option"><input type="radio" name="q7" value="3"> Document mixtures that sum to 1</label><p data-feedback="7"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/05-nlp-foundations-to-advanced/14-information-retrieval-search/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/05-nlp-foundations-to-advanced/16-text-generation-pre-transformer/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/05-nlp-foundations-to-advanced/15-topic-modeling/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

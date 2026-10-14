@@ -1,0 +1,506 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>思想和行动的树:故意搜索 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-14-agent-engineering" data-lesson="14-agent-engineering/04-tree-of-thoughts-lats" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/14-agent-engineering/">Agent 工程</a> / LESSON 04</p><h1 class="lesson-title">思想和行动的树:故意搜索</h1><p>Tree of Thoughts and LATS: Deliberate Search</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>思想和行动的树:故意搜索</h1>
+<blockquote>
+<p>单一的思想链轨迹没有回溯的空间.ToT (Yao等同,2023) 将推理转化为一个树,每个节点都具有自我评估.LATS (Zhou等同,2024) 在蒙特卡罗树搜索下统一了ToT与ReAct和反思.24的游戏从4% (CoT) 降至74% (ToT);LATS在HumanEval上达到92.7%的pass@1.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python (stdlib)
+<strong>Prerequisites:</strong> Phase 14 · 01 (Agent Loop), Phase 14 · 03 (Reflexion)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>框架推理是搜索:节点是&quot;思想&quot;,边缘是&quot;扩展&quot;,价值是&quot;有多有希望&quot;.</li>
+<li>执行一个以Stdlib ToT方式的BFS树搜索,并进行自我评估分数.</li>
+<li>扩展到玩具LATS MCTS循环,选择/扩展/模拟/反扩散.</li>
+<li>决定什么时候搜索值得代币乘法 (24的游戏,代码生成) 和什么时候一个轨迹足够 (简单的问答).</li>
+</ul>
+<h2>问题</h2>
+<p>思考链是一个线性走路.如果第一步是错误的,每一步都会基于一个错误的前提.在24游戏 (使用+ − × ÷的四个数字使24),GPT-4 CoT达到4%的准确性.模型早就选择错误的子表达,无法恢复.</p>
+<p>推理需要能够提出多个候选人,评估他们,选择有前途的候选人,然后在出现死胡同时回头.</p>
+<h2>概念</h2>
+<h3>思想树 (Yao等, NeurIPS 2023)</h3>
+<p>每个节点是一个连贯的中间步骤 (&quot;一个想法&quot;).每个节点可以扩展到K儿童思想.LLM自行评估每个节点.搜索探索树BFS,DFS或束.</p>
+<pre><code>                     (root: &quot;find 24 from 4 6 4 1&quot;)
+                    /               |            \
+           (&quot;6 - 4 = 2&quot;)    (&quot;4 + 1 = 5&quot;)    (&quot;4 * 6 = 24&quot;)  &lt;- Score: HIGH
+              /   \              |                  |
+          ...    ...          ...                finish
+</code></pre>
+<p>报告显示有三个变体:<code>sure / likely / impossible</code>类别<code>1..10</code>两位候选人都在24场比赛中大大击败了CoT (4% -&gt; 74%与GPT-4).</p>
+<h3>和其他 (LATS)</h3>
+<p>通过MCS,LATS统一了ToT,ReAct和Reflexion.</p>
+<ul>
+<li><strong>Policy</strong>:提出候选人下一步行动 (ReAct式).</li>
+<li><strong>Value function</strong>部分轨迹 (ToT式自计).</li>
+<li><strong>Self-reflector</strong>对于失败,请写一个自然语言反思 (反思式) 并使用它来重新考虑未来的推广.</li>
+</ul>
+<p>环境反 (观察) 混合在值函数中,因此搜索由实际工具结果进行信息,而不是仅仅是模型意见. 结果在纸质时间:HumanEval pass@1 92.7%与GPT-4 (SOTA),WebShop平均 75.9与GPT-3.5 (接近基梯度细调).</p>
+<h3>低于 MCTS</h3>
+<p>每次代的四个阶段:</p>
+<ol>
+<li><strong>Select</strong>使用UCT (树木上部的信任) 从根到叶子走路.</li>
+<li><strong>Expand</strong>通过政策产生K儿童.</li>
+<li><strong>Simulate</strong>使用政策的孩子的推广,以值函数 (或环境奖励) 评分.</li>
+<li><strong>Backpropagate</strong>更新访问数量和值估计.</li>
+</ol>
+<p>电气电气电气<code>Q(s, a) + c * sqrt(ln N(s) / N(s, a))</code>首先是剥削,第二是探索.<code>c</code>根据任务.</p>
+<h3>成本现实</h3>
+<p>搜索爆炸代币.24游戏的ToT使用了1001000倍的CoT代币.LATS类似.这不是免费的;保留搜索:</p>
+<ul>
+<li>单一轨迹显而易见不够的任务 (24个游戏,复杂代码).</li>
+<li>工作时钟的重点不如正确.</li>
+<li>具有廉价可靠值函数的任务 (代码的单元测试,数学的明确目标).</li>
+</ul>
+<p>如果你的任务只有一个正确的答案,并且有个杂的评价者,搜索往往会使事情变得更糟它会找到一个&quot;好评&quot;的错误答案.</p>
+<h3>2026 定位</h3>
+<p>许多生产代理都不运行LATS. 他们运行ReAct,使用工具基准验证 (CRITIC,课05).</p>
+<ul>
+<li>编码器,以值函数运行测试 (HumanEval式).</li>
+<li>探讨多个查询路径的深度研究代理.</li>
+<li>计划重的工作流程在LangGraph子图中.</li>
+</ul>
+<p>炼 (课 11) 是2025年的极端:进化搜索代码,机器可检查的健身,边界增长 (56年来第一次4×4的炼改善).</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-7577f2f641779b3f3070.png" alt="tree-of-thoughts 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<p><code>code/main.py</code>执行:</p>
+<ul>
+<li>对于一个风格化的&quot;选择算术运营&quot;任务.</li>
+<li>玩具LATS MCTS循环在同一任务上 (选择/扩展/模拟/回传) 与UCT选择.</li>
+<li>构成一个象征性分数加上一个自我等值分数的值函数.</li>
+</ul>
+<p>运行它:</p>
+<pre><code>python3 code/main.py
+</code></pre>
+<p>随着BFS的扩展,TT的每个节点扩展了3个候选人,而LATS通过MCTS在最佳推出时相对而相比.</p>
+<h2>用它</h2>
+<p>兰格拉夫将ToT类型的探索作为子图案;兰格莱恩团队在LATS上的博客 (2024年5月) 是参考教程.<code>TreeOfThoughts</code>对于大多数2026年生产代理人来说,这种模式存在于<code>if task_complexity &gt; threshold: use_search()</code>查看课05中的评估者优化模式.</p>
+<h2>运送它</h2>
+<p><code>outputs/skill-search-policy.md</code>根据任务形状,预算和评估者忠诚度,选择线性ReAct,ToT,LATS和进化搜索.</p>
+<h2>运动</h2>
+<ol>
+<li>运行玩具LATS与UCT c=0.1vsc=2.0. 什么改变的痕迹?</li>
+<li>换取一个噪音得分器的值函数 (添加随机震动). MCTS是否仍然找到最好的叶子?它容忍的最低信号噪音是多少?</li>
+<li>执行光束搜索ToT (在每个级别保持顶级) 和比较BFS. 紧张的代币预算中哪个更好?</li>
+<li>读LATS第5.1节. 复制HumanEval轨迹数量:需要多少次推出才能达到报告的pass@1?</li>
+<li>阅读LATS论文讨论&quot;LATS帮助不多的时候&quot;.写一段决定规则,绘制任务形状,以搜索策略.</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Tree of Thoughts</td>
+<td>&quot;Branching CoT&quot;</td>
+<td>Yao et al. — tree of thought nodes with self-evaluation</td>
+</tr>
+<tr>
+<td>LATS</td>
+<td>&quot;MCTS for LLMs&quot;</td>
+<td>Zhou et al. — unifies ToT + ReAct + Reflexion under MCTS</td>
+</tr>
+<tr>
+<td>UCT</td>
+<td>&quot;Upper confidence bound&quot;</td>
+<td>Select formula balancing exploitation (Q) and exploration (ln N / n)</td>
+</tr>
+<tr>
+<td>Value function</td>
+<td>&quot;How good is this state&quot;</td>
+<td>Prompted LLM score or environment reward; feeds backprop</td>
+</tr>
+<tr>
+<td>Policy</td>
+<td>&quot;Action proposer&quot;</td>
+<td>ReAct-style generator; emits candidate next thoughts/actions</td>
+</tr>
+<tr>
+<td>Rollout</td>
+<td>&quot;Simulated trajectory&quot;</td>
+<td>Walk from a node to a leaf using policy, score with value</td>
+</tr>
+<tr>
+<td>Backpropagate</td>
+<td>&quot;Update ancestors&quot;</td>
+<td>Push the leaf's reward up the path, updating visit counts and Q</td>
+</tr>
+<tr>
+<td>Search cost</td>
+<td>&quot;Token explosion&quot;</td>
+<td>100-1000x CoT on Game of 24; budget before you adopt</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2305.10601" rel="noreferrer" data-network="true">Yao et al., Tree of Thoughts (arXiv:2305.10601) <small>↗ 需要联网</small></a>法典论文</li>
+<li><a href="https://arxiv.org/abs/2310.04406" rel="noreferrer" data-network="true">Zhou et al., LATS (arXiv:2310.04406) <small>↗ 需要联网</small></a> MCTS与反思反</li>
+<li><a href="https://docs.langchain.com/oss/python/langgraph/overview" rel="noreferrer" data-network="true">LangGraph overview <small>↗ 需要联网</small></a>搜索的子图模式</li>
+<li><a href="https://arxiv.org/abs/2506.13131" rel="noreferrer" data-network="true">AlphaEvolve (arXiv:2506.13131) <small>↗ 需要联网</small></a>与程序评价者进行进化搜索</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Tree of Thoughts and LATS: Deliberate Search</h1>
+<blockquote>
+<p>A single chain-of-thought trajectory has no room to backtrack. ToT (Yao et al., 2023) turns reasoning into a tree with self-evaluation on each node. LATS (Zhou et al., 2024) unifies ToT with ReAct and Reflexion under Monte Carlo Tree Search. Game of 24 goes from 4% (CoT) to 74% (ToT); LATS hits 92.7% pass@1 on HumanEval.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python (stdlib)
+<strong>Prerequisites:</strong> Phase 14 · 01 (Agent Loop), Phase 14 · 03 (Reflexion)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Frame reasoning as search: nodes are &quot;thoughts,&quot; edges are &quot;expansions,&quot; value is &quot;how promising.&quot;</li>
+<li>Implement a stdlib ToT-style BFS tree search with self-evaluation scoring.</li>
+<li>Extend to a toy LATS MCTS loop with select / expand / simulate / backpropagate.</li>
+<li>Decide when search is worth the token multiplier (Game of 24, code generation) and when a single trajectory is enough (simple Q&amp;A).</li>
+</ul>
+<h2>The Problem</h2>
+<p>Chain-of-thought is a linear walk. If the first step is wrong, every subsequent step works on a bad premise. On Game of 24 (use four digits with + − × ÷ to make 24), GPT-4 CoT hits 4% accuracy. The model picks the wrong subexpression early and cannot recover.</p>
+<p>What reasoning needs is the ability to propose multiple candidates, evaluate them, pick the promising ones, and backtrack when dead ends appear. That is search. Tree of Thoughts and LATS are the two canonical formulations.</p>
+<h2>The Concept</h2>
+<h3>Tree of Thoughts (Yao et al., NeurIPS 2023)</h3>
+<p>Each node is a coherent intermediate step (&quot;a thought&quot;). Each node can expand to K child thoughts. The LLM self-evaluates each node with a scoring prompt. Search explores the tree — BFS, DFS, or beam.</p>
+<pre><code>                     (root: &quot;find 24 from 4 6 4 1&quot;)
+                    /               |            \
+           (&quot;6 - 4 = 2&quot;)    (&quot;4 + 1 = 5&quot;)    (&quot;4 * 6 = 24&quot;)  &lt;- Score: HIGH
+              /   \              |                  |
+          ...    ...          ...                finish
+</code></pre>
+<p>Self-evaluation is the load-bearing piece. The paper shows three variants: <code>sure / likely / impossible</code> classification, <code>1..10</code> numeric score, and vote among candidates. All three beat CoT substantially on Game of 24 (4% -&gt; 74% with GPT-4).</p>
+<h3>LATS (Zhou et al., ICML 2024)</h3>
+<p>LATS unifies ToT, ReAct, and Reflexion under MCTS. The LLM plays three roles:</p>
+<ul>
+<li><strong>Policy</strong>: propose candidate next actions (ReAct-style).</li>
+<li><strong>Value function</strong>: score a partial trajectory (ToT-style self-eval).</li>
+<li><strong>Self-reflector</strong>: on failure, write a natural-language reflection (Reflexion-style) and use it to reseed future rollouts.</li>
+</ul>
+<p>Environment feedback (observations) mixes into the value function so the search is informed by real tool results, not just model opinions. Results at paper time: HumanEval pass@1 92.7% with GPT-4 (SOTA), WebShop average 75.9 with GPT-3.5 (approaching gradient-based fine-tuning).</p>
+<h3>MCTS, minimally</h3>
+<p>Four phases per iteration:</p>
+<ol>
+<li><strong>Select</strong> — walk from root to a leaf using UCT (upper confidence bound for trees).</li>
+<li><strong>Expand</strong> — generate K children via the policy.</li>
+<li><strong>Simulate</strong> — rollout from a child using the policy, score the leaf with the value function (or environment reward).</li>
+<li><strong>Backpropagate</strong> — update visit counts and value estimates up the path.</li>
+</ol>
+<p>UCT formula: <code>Q(s, a) + c * sqrt(ln N(s) / N(s, a))</code>. First term is exploitation; second is exploration. Tune <code>c</code> per task.</p>
+<h3>The cost reality</h3>
+<p>Search explodes tokens. ToT on Game of 24 uses 100–1000x the tokens of CoT. LATS is similar. This is not free; reserve search for:</p>
+<ul>
+<li>Tasks where a single trajectory is demonstrably insufficient (Game of 24, complex code).</li>
+<li>Tasks where wall-clock is less important than correctness.</li>
+<li>Tasks with a cheap, reliable value function (unit tests for code, explicit target for math).</li>
+</ul>
+<p>If your task has a single right answer and a noisy evaluator, search often makes things worse — it finds a &quot;good-scoring&quot; wrong answer.</p>
+<h3>2026 positioning</h3>
+<p>Most production agents do not run LATS. They run ReAct with tool-grounded verification (CRITIC, Lesson 05). Search shows up in specialized niches:</p>
+<ul>
+<li>Coding agents that run tests as the value function (HumanEval-style).</li>
+<li>Deep-research agents that explore multiple query paths.</li>
+<li>Planning-heavy workflows inside LangGraph subgraphs.</li>
+</ul>
+<p>AlphaEvolve (Lesson 11) is the 2025 extreme: evolutionary search over code, machine-checkable fitness, frontier gains (first 4x4 matmul improvement in 56 years).</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-7577f2f641779b3f3070.png" alt="tree-of-thoughts 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<p><code>code/main.py</code> implements:</p>
+<ul>
+<li>A tiny ToT BFS on a stylized &quot;pick arithmetic ops&quot; task.</li>
+<li>A toy LATS MCTS loop on the same task (Select / Expand / Simulate / Backpropagate) with UCT selection.</li>
+<li>A value function that composes a symbolic score plus a self-eval score.</li>
+</ul>
+<p>Run it:</p>
+<pre><code>python3 code/main.py
+</code></pre>
+<p>The trace shows ToT expanding three candidates per node with BFS, compared to LATS converging on the best rollout via MCTS. Token counts printed for both.</p>
+<h2>Use It</h2>
+<p>LangGraph ships ToT-style exploration as subgraph patterns; the LangChain team's blog on LATS (May 2024) is the reference tutorial. LlamaIndex ships a <code>TreeOfThoughts</code> agent. For most 2026 production agents this pattern lives behind an <code>if task_complexity &gt; threshold: use_search()</code> gate — see the evaluator-optimizer pattern in Lesson 05.</p>
+<h2>Ship It</h2>
+<p><code>outputs/skill-search-policy.md</code> selects between linear ReAct, ToT, LATS, and evolutionary search given task shape, budget, and evaluator fidelity.</p>
+<h2>Exercises</h2>
+<ol>
+<li>Run the toy LATS with UCT c=0.1 vs c=2.0. What changes in the trace?</li>
+<li>Swap the value function for a noisier scorer (add random jitter). Does MCTS still find the best leaf? What is the minimum signal-to-noise it tolerates?</li>
+<li>Implement beam-search ToT (keep top-k at each level) and compare to BFS. Which is better on a tight token budget?</li>
+<li>Read LATS Section 5.1. Reproduce the HumanEval trajectory count: how many rollouts does it take to hit the reported pass@1?</li>
+<li>Read the LATS paper's discussion on &quot;when LATS helps less.&quot; Write a one-paragraph decision rule mapping task shape to search strategy.</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Tree of Thoughts</td>
+<td>&quot;Branching CoT&quot;</td>
+<td>Yao et al. — tree of thought nodes with self-evaluation</td>
+</tr>
+<tr>
+<td>LATS</td>
+<td>&quot;MCTS for LLMs&quot;</td>
+<td>Zhou et al. — unifies ToT + ReAct + Reflexion under MCTS</td>
+</tr>
+<tr>
+<td>UCT</td>
+<td>&quot;Upper confidence bound&quot;</td>
+<td>Select formula balancing exploitation (Q) and exploration (ln N / n)</td>
+</tr>
+<tr>
+<td>Value function</td>
+<td>&quot;How good is this state&quot;</td>
+<td>Prompted LLM score or environment reward; feeds backprop</td>
+</tr>
+<tr>
+<td>Policy</td>
+<td>&quot;Action proposer&quot;</td>
+<td>ReAct-style generator; emits candidate next thoughts/actions</td>
+</tr>
+<tr>
+<td>Rollout</td>
+<td>&quot;Simulated trajectory&quot;</td>
+<td>Walk from a node to a leaf using policy, score with value</td>
+</tr>
+<tr>
+<td>Backpropagate</td>
+<td>&quot;Update ancestors&quot;</td>
+<td>Push the leaf's reward up the path, updating visit counts and Q</td>
+</tr>
+<tr>
+<td>Search cost</td>
+<td>&quot;Token explosion&quot;</td>
+<td>100-1000x CoT on Game of 24; budget before you adopt</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2305.10601" rel="noreferrer" data-network="true">Yao et al., Tree of Thoughts (arXiv:2305.10601) <small>↗ 需要联网</small></a> — the canonical paper</li>
+<li><a href="https://arxiv.org/abs/2310.04406" rel="noreferrer" data-network="true">Zhou et al., LATS (arXiv:2310.04406) <small>↗ 需要联网</small></a> — MCTS with Reflexion feedback</li>
+<li><a href="https://docs.langchain.com/oss/python/langgraph/overview" rel="noreferrer" data-network="true">LangGraph overview <small>↗ 需要联网</small></a> — subgraph patterns for search</li>
+<li><a href="https://arxiv.org/abs/2506.13131" rel="noreferrer" data-network="true">AlphaEvolve (arXiv:2506.13131) <small>↗ 需要联网</small></a> — evolutionary search with programmatic evaluators</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-14-agent-engineering--04-tree-of-thoughts-lats.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-14-agent-engineering--04-tree-of-thoughts-lats.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/14-agent-engineering/04-tree-of-thoughts-lats/code/main.py">phases/14-agent-engineering/04-tree-of-thoughts-lats/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Toy Tree-of-Thoughts BFS and LATS MCTS on a stylized arithmetic search.
+
+Task: given integers [4, 6, 4, 1], find an expression using +, -, *, / that
+evaluates to 24. This mirrors the Game of 24 benchmark from Yao et al.
+
+ToT is a BFS with a prompted value function. LATS is MCTS over the same
+search space with UCT selection.
+
+Stdlib only; no LLM. Value function is symbolic (distance from 24).
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import itertools
+import math
+import random
+from dataclasses import dataclass, field
+
+
+NUMBERS = [4, 6, 4, 1]
+TARGET = 24
+OPS = [&quot;+&quot;, &quot;-&quot;, &quot;*&quot;, &quot;/&quot;]
+
+
+@dataclass
+class Node:
+    state: tuple[float, ...]
+    trace: list[str]
+    visits: int = 0
+    value_sum: float = 0.0
+    children: list[&quot;Node&quot;] = field(default_factory=list)
+
+    @property
+    def q(self) -&gt; float:
+        return self.value_sum / self.visits if self.visits else 0.0
+
+
+def evaluate(a: float, op: str, b: float) -&gt; float | None:
+    if op == &quot;+&quot;:
+        return a + b
+    if op == &quot;-&quot;:
+        return a - b
+    if op == &quot;*&quot;:
+        return a * b
+    if op == &quot;/&quot;:
+        return a / b if b != 0 else None
+    return None
+
+
+def expand(node: Node) -&gt; list[Node]:
+    children: list[Node] = []
+    state = node.state
+    if len(state) &lt; 2:
+        return children
+    for i, j in itertools.combinations(range(len(state)), 2):
+        for op in OPS:
+            a, b = state[i], state[j]
+            v = evaluate(a, op, b)
+            if v is None:
+                continue
+            remaining = [s for k, s in enumerate(state) if k not in (i, j)]
+            new_state = tuple(sorted(remaining + [v], reverse=True))
+            step = f&quot;{a}{op}{b}={v}&quot;
+            children.append(Node(state=new_state, trace=node.trace + [step]))
+    return children
+
+
+def value(node: Node) -&gt; float:
+    if len(node.state) == 1:
+        result = node.state[0]
+        return 1.0 if abs(result - TARGET) &lt; 1e-6 else -abs(result - TARGET) / 100.0
+    best_distance = min(abs(v - TARGET) for v in node.state)
+    return -best_distance / 100.0
+
+
+def tot_bfs(root: Node, max_expansions_per_level: int = 8,
+            max_depth: int = 3) -&gt; tuple[Node | None, int]:
+    frontier = [root]
+    expansions = 0
+    for _ in range(max_depth):
+        scored: list[tuple[float, Node]] = []
+        for node in frontier:
+            for child in expand(node):
+                expansions += 1
+                scored.append((value(child), child))
+                if value(child) &gt; 0.99:
+                    return child, expansions
+        scored.sort(key=lambda p: p[0], reverse=True)
+        frontier = [n for _, n in scored[:max_expansions_per_level]]
+    best = max(frontier, key=value) if frontier else None
+    return best, expansions
+
+
+def uct(parent: Node, child: Node, c: float = 1.4) -&gt; float:
+    if child.visits == 0:
+        return float(&quot;inf&quot;)
+    return child.q + c * math.sqrt(math.log(parent.visits) / child.visits)
+
+
+def select(node: Node) -&gt; Node:
+    while node.children:
+        node = max(node.children, key=lambda ch: uct(node, ch))
+    return node
+
+
+def simulate(node: Node, depth: int, rng: random.Random) -&gt; float:
+    current = node
+    for _ in range(depth):
+        options = expand(current)
+        if not options:
+            break
+        current = rng.choice(options)
+    return value(current)
+
+
+def backprop(path: list[Node], reward: float) -&gt; None:
+    for n in path:
+        n.visits += 1
+        n.value_sum += reward
+
+
+def mcts(root: Node, iterations: int, rng: random.Random) -&gt; tuple[Node, int]:
+    expansions = 0
+    for _ in range(iterations):
+        path = [root]
+        cur = root
+        while cur.children:
+            cur = max(cur.children, key=lambda ch: uct(cur, ch))
+            path.append(cur)
+        if cur.visits &gt; 0 and len(cur.state) &gt; 1:
+            cur.children = expand(cur)
+            expansions += len(cur.children)
+            if cur.children:
+                cur = cur.children[0]
+                path.append(cur)
+        reward = simulate(cur, depth=max(0, 3 - len(cur.trace)), rng=rng)
+        backprop(path, reward)
+    best_leaf = max(_all_leaves(root), key=value, default=root)
+    return best_leaf, expansions
+
+
+def _all_leaves(node: Node) -&gt; list[Node]:
+    if not node.children:
+        return [node]
+    out: list[Node] = []
+    for ch in node.children:
+        out.extend(_all_leaves(ch))
+    return out
+
+
+def main() -&gt; None:
+    print(&quot;=&quot; * 70)
+    print(&quot;TREE OF THOUGHTS + LATS — Phase 14, Lesson 04&quot;)
+    print(&quot;=&quot; * 70)
+    print(f&quot;numbers: {NUMBERS}  target: {TARGET}&quot;)
+
+    root_tot = Node(state=tuple(sorted(NUMBERS, reverse=True)), trace=[])
+    best_tot, n_tot = tot_bfs(root_tot)
+    print(&quot;\nToT BFS&quot;)
+    print(&quot;-&quot; * 60)
+    if best_tot is not None:
+        print(f&quot;  best trace: {best_tot.trace}&quot;)
+        print(f&quot;  final state: {best_tot.state}  value: {value(best_tot):.3f}&quot;)
+    print(f&quot;  expansions: {n_tot}&quot;)
+
+    rng = random.Random(7)
+    root_lats = Node(state=tuple(sorted(NUMBERS, reverse=True)), trace=[])
+    root_lats.children = expand(root_lats)
+    for ch in root_lats.children:
+        ch.visits = 0
+    best_lats, n_lats = mcts(root_lats, iterations=80, rng=rng)
+    print(&quot;\nLATS MCTS&quot;)
+    print(&quot;-&quot; * 60)
+    print(f&quot;  best trace: {best_lats.trace}&quot;)
+    print(f&quot;  final state: {best_lats.state}  value: {value(best_lats):.3f}&quot;)
+    print(f&quot;  node expansions: {n_lats}&quot;)
+
+    print()
+    print(&quot;Paper headlines (for reference):&quot;)
+    print(&quot;  ToT Game-of-24:  GPT-4 CoT 4%  -&gt; ToT 74%&quot;)
+    print(&quot;  LATS HumanEval:  pass@1 92.7% with GPT-4 (SOTA at paper time)&quot;)
+    print(&quot;  Cost: ToT uses 100-1000x the tokens of CoT. Use with intent.&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/14-agent-engineering/04-tree-of-thoughts-lats/outputs/skill-search-policy.md">phases/14-agent-engineering/04-tree-of-thoughts-lats/outputs/skill-search-policy.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: search-policy
+description: Pick a search strategy (ReAct, ToT, LATS, evolutionary) given task shape, token budget, and evaluator quality.
+version: 1.0.0
+phase: 14
+lesson: 04
+tags: [tree-of-thoughts, lats, mcts, search, value-function]
+---
+
+Given a task shape (single-answer / multi-answer / open-ended), a token budget, and an available evaluator (scalar test / heuristic / self-eval), produce a search strategy recommendation with concrete parameters.
+
+Produce:
+
+1. Decision. One of: linear ReAct, beam ToT (with beam width k), BFS ToT (with max depth), DFS ToT with pruning, MCTS LATS (with iterations and UCT c), evolutionary search (only if evaluator is programmatic and checkable).
+2. Parameters. For every strategy, concrete numeric defaults: beam width, depth cap, branching factor K, rollouts per level, UCT c (default 1.4), timeout.
+3. Value function. Specify exactly what scores a node. Options: unit-test pass rate, numeric distance to target, prompted LLM score with format (sure/likely/impossible or 1..10 or vote), or environment reward.
+4. Token budget estimate. Worst-case tokens = branching_factor ^ depth * avg_prompt_tokens. Show the number. If it exceeds the user&#39;s budget, recommend a cheaper strategy.
+5. Failure modes. For each chosen strategy, list the top-two failure modes and their mitigations (e.g. LATS + noisy evaluator -&gt; add tool-grounded verification per CRITIC, Lesson 05).
+
+Hard rejects:
+
+- Recommending search when the evaluator is unreliable (self-eval only, no ground truth). Fall back to ReAct + CRITIC.
+- Setting branching factor K higher than 5 without a compelling reason. K=3-5 is the paper default; K=10 explodes cost.
+- Applying LATS to chat-style tasks. Search does not help conversational Q&amp;A with no programmatic target.
+- Evolutionary search without a machine-checkable fitness. AlphaEvolve is only interesting when fitness is programmatic (run tests, measure speed, verify theorem).
+
+Refusal rules:
+
+- If token budget &lt; 5x single-trajectory cost, refuse search and recommend ReAct + Reflexion (Lesson 03).
+- If wall-clock latency budget &lt; 10 seconds, refuse LATS and recommend ReAct.
+- If the task is pure information retrieval, refuse search and recommend ReWOO (Lesson 02).
+
+Output: a recommendation block (chosen strategy, parameters, value function, budget estimate) plus a &quot;what to read next&quot; note pointing to Lesson 05 (CRITIC) for evaluator reliability, Lesson 11 (AlphaEvolve) for evolutionary variants, or Lesson 30 (eval-driven development) for benchmark-grade validation.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. Why does chain-of-thought struggle on Game of 24?</legend><label class="option"><input type="radio" name="q0" value="0"> A linear walk cannot backtrack when an early step is wrong, so later steps compound the error</label><label class="option"><input type="radio" name="q0" value="1"> CoT requires a calculator tool that GPT-4 lacks</label><label class="option"><input type="radio" name="q0" value="2"> The model cannot multiply integers</label><label class="option"><input type="radio" name="q0" value="3"> The prompt is too short</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. What is a node in a Tree of Thoughts search?</legend><label class="option"><input type="radio" name="q1" value="0"> A tool registered with the runtime</label><label class="option"><input type="radio" name="q1" value="1"> A weight update during fine-tuning</label><label class="option"><input type="radio" name="q1" value="2"> A token produced by the model</label><label class="option"><input type="radio" name="q1" value="3"> A coherent intermediate step or thought, with K possible child expansions</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. Which of these three is NOT one of LATS&#39;s roles for the LLM?</legend><label class="option"><input type="radio" name="q2" value="0"> Self-reflector that writes reflections on failure</label><label class="option"><input type="radio" name="q2" value="1"> Optimizer that updates model weights between rollouts</label><label class="option"><input type="radio" name="q2" value="2"> Value function that scores partial trajectories</label><label class="option"><input type="radio" name="q2" value="3"> Policy that proposes next actions</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. Name the four MCTS phases the lesson lists.</legend><label class="option"><input type="radio" name="q3" value="0"> Sample, Score, Sort, Submit</label><label class="option"><input type="radio" name="q3" value="1"> Plan, Execute, Reflect, Stop</label><label class="option"><input type="radio" name="q3" value="2"> Select, Expand, Simulate, Backpropagate</label><label class="option"><input type="radio" name="q3" value="3"> Search, Synthesize, Synthesize-Again, Stop</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. In UCT, what is the role of the exploration constant c?</legend><label class="option"><input type="radio" name="q4" value="0"> It scales the value estimate Q</label><label class="option"><input type="radio" name="q4" value="1"> It sets the maximum tree depth</label><label class="option"><input type="radio" name="q4" value="2"> It controls the number of rollouts</label><label class="option"><input type="radio" name="q4" value="3"> It weights the exploration term sqrt(ln N / n) against the exploitation term Q</label><p data-feedback="4"></p></fieldset><fieldset><legend>6. When is search actively harmful compared to a single trajectory?</legend><label class="option"><input type="radio" name="q5" value="0"> Whenever tokens are cheap</label><label class="option"><input type="radio" name="q5" value="1"> When the task is code generation</label><label class="option"><input type="radio" name="q5" value="2"> When the task involves multiple correct answers</label><label class="option"><input type="radio" name="q5" value="3"> When the evaluator is noisy and there is a single right answer, so the search converges on a good-scoring wrong answer</label><p data-feedback="5"></p></fieldset><fieldset><legend>7. Roughly how much more token usage should you budget for ToT on Game of 24 compared with CoT?</legend><label class="option"><input type="radio" name="q6" value="0"> 100x to 1000x</label><label class="option"><input type="radio" name="q6" value="1"> Less than CoT because of pruning</label><label class="option"><input type="radio" name="q6" value="2"> About 2x</label><label class="option"><input type="radio" name="q6" value="3"> About 10x</label><p data-feedback="6"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/14-agent-engineering/03-reflexion-verbal-rl/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/14-agent-engineering/05-self-refine-and-critic/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/14-agent-engineering/04-tree-of-thoughts-lats/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

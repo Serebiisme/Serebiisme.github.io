@@ -1,0 +1,770 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>欧CR和文件理解 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-04-computer-vision" data-lesson="04-computer-vision/19-ocr-document-understanding" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/04-computer-vision/">计算机视觉</a> / LESSON 19</p><h1 class="lesson-title">欧CR和文件理解</h1><p>OCR &amp; Document Understanding</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>欧CR和文件理解</h1>
+<blockquote>
+<p>任何现代的OCR系统都会重新排序这些阶段或将它们合并.</p>
+</blockquote>
+<p><strong>Type:</strong> Learn + Use
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 4 Lesson 06 (Detection), Phase 7 Lesson 02 (Self-Attention)
+<strong>Time:</strong> ~45 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>追踪经典的OCR管道 (检测 -&gt;识别 -&gt;布局) 和现代端到端替代方案 (Donut,Qwen-VL-OCR)</li>
+<li>实现连接器时间分类 (CTC) 损失对序列到序列OCR培训</li>
+<li>使用PaddleOCR或EasyOCR进行无需培训的生产文件分析</li>
+<li>区分OCR,布局分析和文档理解,并选择每项任务的正确工具</li>
+</ul>
+<h2>问题</h2>
+<p>图像中包含文本的图像遍布各处:收据,账单,身份证,扫描书,表格,白板,标志,截图.从中提取结构化数据不仅是字符,而且&quot;这是总数&quot;是应用视觉中最具价值的一个问题.</p>
+<p>专业分为三个技能层次:</p>
+<ol>
+<li><strong>OCR proper</strong>转换像素成文字.</li>
+<li><strong>Layout parsing</strong>: 集团 OCR输出按区域 (标题,体格,表格,标题).</li>
+<li><strong>Document understanding</strong>:从布局中提取结构化字段 (&quot;发票_总额 = 42.50美元&quot;).</li>
+</ol>
+<p>每层都有经典和现代的方法, &quot;我想要图像中的文字&quot;和&quot;我需要这个收件的总数&quot;之间的差距比大多数团队所意识到的更大.</p>
+<h2>概念</h2>
+<h3>经典管道</h3>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-09aeb75615c1b794cb26.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><ul>
+<li><strong>Text detection</strong>产生每行或每字四边形.</li>
+<li><strong>Recognition</strong>运行一个CNN+BiLSTM+CTC,以产生一个字符序列.</li>
+<li><strong>Layout</strong>修复阅读顺序 (拉丁语的左到右,阿拉伯语,日本语的不同).</li>
+</ul>
+<h3>单段中CTC</h3>
+<p>基于CTC (Graves等,2006) 的功能,您可以在没有字符级调整的情况下训练.模型在每一步都输出了分布 (语音+空白);CTC损失将所有在重复和删除空白后减少到目标文本的调整进行边缘化.</p>
+<pre><code>raw output: &quot;h h h _ _ e e l l _ l l o _ _&quot;
+after merge repeats and remove blanks: &quot;hello&quot;
+</code></pre>
+<p>根据CTC的规定,CRNN在2015年工作,并仍在2026年培训大多数生产OCR模型.</p>
+<h3>现代端到端型号</h3>
+<ul>
+<li><strong>Donut</strong> ViT编码器 + 文本解码器; 读取图像并直接发射JSON. 没有文本探测器,没有布局模块.</li>
+<li><strong>TrOCR</strong> ViT+变压器解码器用于线级OCR.</li>
+<li><strong>Qwen-VL-OCR / InternVL</strong>完整的视觉语言模型,为OCR任务进行精细调节;在2026年,对复杂文件提供最佳准确性.</li>
+<li><strong>PaddleOCR</strong>经典的DB+CRNN管道在成熟的生产包中;仍然是开源工作马.</li>
+</ul>
+<p>端到端模型需要更多的数据和计算,但避免多阶段管道的错误积累.</p>
+<h3>布局分析</h3>
+<p>对于结构文件,运行一个布局检测器 (LayoutLMv3, DocLayNet) 将每个区域标记为:标题,段落,图形,表格,脚注.读取顺序将成为&quot;通过布局顺序区域进行反复,连接&quot;.</p>
+<p>关于表格的使用<strong>Key-Value extraction</strong>模型 (可视化丰富的文件,LayoutLMv3可用于简单扫描).它们采集图像+检测的文本+位置,并预测结构化的键值对.</p>
+<h3>评估指标</h3>
+<ul>
+<li><strong>Character Error Rate (CER)</strong> 莱文施泰因距离/参考长度.较低更好.生产目标:在清洁扫描中&lt; 2%.</li>
+<li>**Word Error Rate (WER)**字面上也是如此.</li>
+<li><strong>F1 on structured fields</strong>关键价值任务;<code>{invoice_total: 42.50}</code>似乎是正确的.</li>
+<li><strong>Edit distance on JSON</strong>用于端到端的文件分析;唐草纸引入了标准化的树编辑距离.</li>
+</ul>
+<figure><img src="/learn/ai-from-scratch/figures/figure-f99403c52703385c989e.png" alt="cv3-ctc-collapse 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<h3>步骤1:CTC损失+贪的解码器</h3>
+<pre><code class="language-python">import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+def ctc_loss(log_probs, targets, input_lengths, target_lengths, blank=0):
+    &quot;&quot;&quot;
+    log_probs:      (T, N, C) log-softmax over vocab including blank at index 0
+    targets:        (N, S) int targets (no blanks)
+    input_lengths:  (N,) per-sample time steps used
+    target_lengths: (N,) per-sample target length
+    &quot;&quot;&quot;
+    return F.ctc_loss(log_probs, targets, input_lengths, target_lengths,
+                      blank=blank, reduction=&quot;mean&quot;, zero_infinity=True)
+
+
+def greedy_ctc_decode(log_probs, blank=0):
+    &quot;&quot;&quot;
+    log_probs: (T, N, C) log-softmax
+    returns: list of index sequences (blanks removed, repeats merged)
+    &quot;&quot;&quot;
+    preds = log_probs.argmax(dim=-1).transpose(0, 1).cpu().tolist()
+    out = []
+    for seq in preds:
+        decoded = []
+        prev = None
+        for idx in seq:
+            if idx != prev and idx != blank:
+                decoded.append(idx)
+            prev = idx
+        out.append(decoded)
+    return out
+</code></pre>
+<p><code>F.ctc_loss</code>利的解码器比光束搜索更简单,通常在 1% 的CER内.</p>
+<h3>步骤2:小的CRNN识别器</h3>
+<p>对于线路OCR的最低CNN+BiLSTM.</p>
+<pre><code class="language-python">class TinyCRNN(nn.Module):
+    def __init__(self, vocab_size=40, hidden=128, feat=32):
+        super().__init__()
+        self.cnn = nn.Sequential(
+            nn.Conv2d(1, feat, 3, 1, 1), nn.BatchNorm2d(feat), nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+            nn.Conv2d(feat, feat * 2, 3, 1, 1), nn.BatchNorm2d(feat * 2), nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+            nn.Conv2d(feat * 2, feat * 4, 3, 1, 1), nn.BatchNorm2d(feat * 4), nn.ReLU(inplace=True),
+            nn.MaxPool2d((2, 1)),
+            nn.Conv2d(feat * 4, feat * 4, 3, 1, 1), nn.BatchNorm2d(feat * 4), nn.ReLU(inplace=True),
+            nn.MaxPool2d((2, 1)),
+        )
+        self.rnn = nn.LSTM(feat * 4, hidden, bidirectional=True, batch_first=True)
+        self.head = nn.Linear(hidden * 2, vocab_size)
+
+    def forward(self, x):
+        # x: (N, 1, H, W)
+        f = self.cnn(x)                # (N, C, H', W')
+        f = f.mean(dim=2).transpose(1, 2)  # (N, W', C)
+        h, _ = self.rnn(f)
+        return F.log_softmax(self.head(h).transpose(0, 1), dim=-1)  # (W', N, vocab)
+</code></pre>
+<p>固定高度输入 (CNN最大积分高度为 1).宽度是CTC的时间尺寸.</p>
+<h3>步骤3:合成OCR</h3>
+<p>产生黑色到白色的数字字符串,</p>
+<pre><code class="language-python">import numpy as np
+
+def synthetic_line(text, height=32, char_width=16):
+    W = char_width * len(text)
+    img = np.ones((height, W), dtype=np.float32)
+    for i, c in enumerate(text):
+        x = i * char_width
+        shade = 0.0 if c.isalnum() else 0.5
+        img[6:height - 6, x + 2:x + char_width - 2] = shade
+    return img
+
+
+def build_batch(strings, vocab):
+    H = 32
+    W = 16 * max(len(s) for s in strings)
+    imgs = np.ones((len(strings), 1, H, W), dtype=np.float32)
+    target_lengths = []
+    targets = []
+    for i, s in enumerate(strings):
+        imgs[i, 0, :, :16 * len(s)] = synthetic_line(s)
+        ids = [vocab.index(c) for c in s]
+        targets.extend(ids)
+        target_lengths.append(len(ids))
+    return torch.from_numpy(imgs), torch.tensor(targets), torch.tensor(target_lengths)
+
+
+vocab = [&quot;_&quot;] + list(&quot;0123456789abcdefghijklmnopqrstuvwxyz&quot;)
+imgs, targets, lengths = build_batch([&quot;hello&quot;, &quot;world&quot;], vocab)
+print(f&quot;images: {imgs.shape}   targets: {targets.shape}   lengths: {lengths.tolist()}&quot;)
+</code></pre>
+<p>实际的OCR数据集添加字体,噪音,旋转,模糊和颜色.上面的管道是相同的.</p>
+<h3>步骤4:培训草图</h3>
+<pre><code class="language-python">model = TinyCRNN(vocab_size=len(vocab))
+opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+for step in range(200):
+    strings = [&quot;abc&quot; + str(step % 10)] * 4 + [&quot;xyz&quot; + str((step + 1) % 10)] * 4
+    imgs, targets, target_lens = build_batch(strings, vocab)
+    log_probs = model(imgs)  # (W', 8, vocab)
+    input_lens = torch.full((8,), log_probs.size(0), dtype=torch.long)
+    loss = ctc_loss(log_probs, targets, input_lens, target_lens, blank=0)
+    opt.zero_grad(); loss.backward(); opt.step()
+</code></pre>
+<p>在这次微不足道的合成数据上,损失应该从3到0.2以上降低.</p>
+<h2>用它</h2>
+<p>生产的三个途径:</p>
+<ul>
+<li><strong>PaddleOCR</strong>成熟,快速,多语言. 一行使用: <code>paddleocr.PaddleOCR(lang=&quot;en&quot;).ocr(image_path)</code>现在,我们要去.</li>
+<li><strong>EasyOCR</strong> 字符串原生,多语言,PyTorch脊柱.</li>
+<li><strong>Tesseract</strong>经典;在模型难以完成时,仍然适用于旧扫描文件.</li>
+</ul>
+<p>对于端到端文件分析,使用Donut或VLM:</p>
+<pre><code class="language-python">from transformers import DonutProcessor, VisionEncoderDecoderModel
+
+processor = DonutProcessor.from_pretrained(&quot;naver-clova-ix/donut-base-finetuned-cord-v2&quot;)
+model = VisionEncoderDecoderModel.from_pretrained(&quot;naver-clova-ix/donut-base-finetuned-cord-v2&quot;)
+</code></pre>
+<p>对于可重复结构的收据,发票和表格,请调整Donut.对于任意文件或有理由的OCR,如Qwen-VL-OCR这样的VLM是当前默认的.</p>
+<h2>运送它</h2>
+<p>这一课产生了:</p>
+<ul>
+<li><code>outputs/prompt-ocr-stack-picker.md</code>一个提示,选择 Tesseract / PaddleOCR / Donut / VLM-OCR 给定的文档类型,语言和结构.</li>
+<li><code>outputs/skill-ctc-decoder.md</code>从零开始编写贪和光束搜索的CTC解码器的技能,包括长度规范化.</li>
+</ul>
+<h2>运动</h2>
+<ol>
+<li>**(Easy)**训练TinyCRNN在500步的5位数字随机数字串上.</li>
+<li>**(Medium)**报道 CER 德尔塔. 在哪些输入中,beam 搜索获胜?</li>
+<li>**(Hard)**根据&quot;项目名称,价格&quot;对,使用PaddleOCR在20个收据,提取线条项的集合上,并计算F1与手标记的地面真相.</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>OCR</td>
+<td>&quot;Text from pixels&quot;</td>
+<td>Turning image regions into character sequences</td>
+</tr>
+<tr>
+<td>CTC</td>
+<td>&quot;Alignment-free loss&quot;</td>
+<td>Loss that trains a sequence model without per-timestep labels; marginalises over alignments</td>
+</tr>
+<tr>
+<td>CRNN</td>
+<td>&quot;Classic OCR model&quot;</td>
+<td>Conv feature extractor + BiLSTM + CTC; the 2015 baseline still used in production</td>
+</tr>
+<tr>
+<td>Donut</td>
+<td>&quot;End-to-end OCR&quot;</td>
+<td>ViT encoder + text decoder; emits JSON directly from image</td>
+</tr>
+<tr>
+<td>Layout parsing</td>
+<td>&quot;Find regions&quot;</td>
+<td>Detect and label Title/Table/Figure/Paragraph regions in a document</td>
+</tr>
+<tr>
+<td>Reading order</td>
+<td>&quot;Text sequence&quot;</td>
+<td>Ordering of recognised regions into a sentence; trivial for Latin, non-trivial for mixed layouts</td>
+</tr>
+<tr>
+<td>CER / WER</td>
+<td>&quot;Error rates&quot;</td>
+<td>Levenshtein distance / reference length at character or word granularity</td>
+</tr>
+<tr>
+<td>VLM-OCR</td>
+<td>&quot;LLM that reads&quot;</td>
+<td>A vision-language model trained or prompted for OCR tasks; current SOTA on complex documents</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/1507.05717" rel="noreferrer" data-network="true">CRNN (Shi et al., 2015) <small>↗ 需要联网</small></a>原始的CNN+RNN+CTC架构</li>
+<li><a href="https://www.cs.toronto.edu/~graves/icml_2006.pdf" rel="noreferrer" data-network="true">CTC (Graves et al., 2006) <small>↗ 需要联网</small></a>原始的CTC纸;密集包装了算法的想法</li>
+<li><a href="https://arxiv.org/abs/2111.15664" rel="noreferrer" data-network="true">Donut (Kim et al., 2022) <small>↗ 需要联网</small></a>无OCR文件理解变压器</li>
+<li><a href="https://github.com/PaddlePaddle/PaddleOCR" rel="noreferrer" data-network="true">PaddleOCR <small>↗ 需要联网</small></a>开源生产OCR堆</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>OCR &amp; Document Understanding</h1>
+<blockquote>
+<p>OCR is a three-stage pipeline — detect text boxes, recognise the characters, then lay them out. Every modern OCR system reorders these stages or merges them.</p>
+</blockquote>
+<p><strong>Type:</strong> Learn + Use
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 4 Lesson 06 (Detection), Phase 7 Lesson 02 (Self-Attention)
+<strong>Time:</strong> ~45 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Trace the classical OCR pipeline (detect -&gt; recognise -&gt; layout) and the modern end-to-end alternatives (Donut, Qwen-VL-OCR)</li>
+<li>Implement CTC (Connectionist Temporal Classification) loss for sequence-to-sequence OCR training</li>
+<li>Use PaddleOCR or EasyOCR for production document parsing without training</li>
+<li>Distinguish OCR, layout parsing, and document understanding — and pick the right tool per task</li>
+</ul>
+<h2>The Problem</h2>
+<p>Images full of text are everywhere: receipts, invoices, IDs, scanned books, forms, whiteboards, signs, screenshots. Extracting structured data from them — not just the characters, but &quot;this is the total amount&quot; — is one of the highest-value applied-vision problems.</p>
+<p>The field splits into three skill layers:</p>
+<ol>
+<li><strong>OCR proper</strong>: turn pixels into text.</li>
+<li><strong>Layout parsing</strong>: group OCR output into regions (title, body, table, header).</li>
+<li><strong>Document understanding</strong>: extract structured fields (&quot;invoice_total = $42.50&quot;) from layout.</li>
+</ol>
+<p>Each layer has classical and modern approaches, and the gap between &quot;I want text from an image&quot; and &quot;I need the total amount from this receipt&quot; is bigger than most teams realise.</p>
+<h2>The Concept</h2>
+<h3>The classical pipeline</h3>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-09aeb75615c1b794cb26.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><ul>
+<li><strong>Text detection</strong> produces per-line or per-word quadrilaterals.</li>
+<li><strong>Recognition</strong> crops each region to a fixed height, runs a CNN + BiLSTM + CTC to produce a character sequence.</li>
+<li><strong>Layout</strong> rebuilds reading order (top-to-bottom, left-to-right for Latin; different for Arabic, Japanese).</li>
+</ul>
+<h3>CTC in one paragraph</h3>
+<p>OCR recognition produces a variable-length sequence from a fixed-length feature map. CTC (Graves et al., 2006) lets you train this without character-level alignment. The model outputs a distribution over (vocab + blank) at every time step; CTC loss marginalises over all alignments that reduce to the target text after merging repeats and removing blanks.</p>
+<pre><code>raw output: &quot;h h h _ _ e e l l _ l l o _ _&quot;
+after merge repeats and remove blanks: &quot;hello&quot;
+</code></pre>
+<p>CTC is the reason CRNN worked in 2015 and still trains most production OCR models in 2026.</p>
+<h3>Modern end-to-end models</h3>
+<ul>
+<li><strong>Donut</strong> (Kim et al., 2022) — a ViT encoder + a text decoder; reads an image and emits JSON directly. No text detector, no layout module.</li>
+<li><strong>TrOCR</strong> — ViT + transformer decoder for line-level OCR.</li>
+<li><strong>Qwen-VL-OCR / InternVL</strong> — full vision-language models fine-tuned for OCR tasks; best accuracy in 2026 on complex documents.</li>
+<li><strong>PaddleOCR</strong> — classical DB + CRNN pipeline in a mature production package; still the open-source workhorse.</li>
+</ul>
+<p>End-to-end models need more data and compute but skip the error accumulation of multi-stage pipelines.</p>
+<h3>Layout parsing</h3>
+<p>For structured documents, run a layout detector (LayoutLMv3, DocLayNet) that labels each region: Title, Paragraph, Figure, Table, Footnote. Reading order then becomes &quot;iterate through regions in layout order, concatenate.&quot;</p>
+<p>For forms, use <strong>Key-Value extraction</strong> models (Donut for visually-rich documents, LayoutLMv3 for plain scans). They take image + detected text + positions and predict structured key-value pairs.</p>
+<h3>Evaluation metrics</h3>
+<ul>
+<li><strong>Character Error Rate (CER)</strong> — Levenshtein distance / length of reference. Lower is better. Production target: &lt; 2% on clean scans.</li>
+<li><strong>Word Error Rate (WER)</strong> — same at the word level.</li>
+<li><strong>F1 on structured fields</strong> — for key-value tasks; measures whether <code>{invoice_total: 42.50}</code> appears correctly.</li>
+<li><strong>Edit distance on JSON</strong> — for end-to-end document parsing; the Donut paper introduced normalised tree edit distance.</li>
+</ul>
+<figure><img src="/learn/ai-from-scratch/figures/figure-f99403c52703385c989e.png" alt="cv3-ctc-collapse 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<h3>Step 1: CTC loss + greedy decoder</h3>
+<pre><code class="language-python">import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+def ctc_loss(log_probs, targets, input_lengths, target_lengths, blank=0):
+    &quot;&quot;&quot;
+    log_probs:      (T, N, C) log-softmax over vocab including blank at index 0
+    targets:        (N, S) int targets (no blanks)
+    input_lengths:  (N,) per-sample time steps used
+    target_lengths: (N,) per-sample target length
+    &quot;&quot;&quot;
+    return F.ctc_loss(log_probs, targets, input_lengths, target_lengths,
+                      blank=blank, reduction=&quot;mean&quot;, zero_infinity=True)
+
+
+def greedy_ctc_decode(log_probs, blank=0):
+    &quot;&quot;&quot;
+    log_probs: (T, N, C) log-softmax
+    returns: list of index sequences (blanks removed, repeats merged)
+    &quot;&quot;&quot;
+    preds = log_probs.argmax(dim=-1).transpose(0, 1).cpu().tolist()
+    out = []
+    for seq in preds:
+        decoded = []
+        prev = None
+        for idx in seq:
+            if idx != prev and idx != blank:
+                decoded.append(idx)
+            prev = idx
+        out.append(decoded)
+    return out
+</code></pre>
+<p><code>F.ctc_loss</code> uses the efficient CuDNN implementation when available. The greedy decoder is simpler than a beam search and usually within 1% CER of it.</p>
+<h3>Step 2: Tiny CRNN recogniser</h3>
+<p>Minimal CNN + BiLSTM for line OCR.</p>
+<pre><code class="language-python">class TinyCRNN(nn.Module):
+    def __init__(self, vocab_size=40, hidden=128, feat=32):
+        super().__init__()
+        self.cnn = nn.Sequential(
+            nn.Conv2d(1, feat, 3, 1, 1), nn.BatchNorm2d(feat), nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+            nn.Conv2d(feat, feat * 2, 3, 1, 1), nn.BatchNorm2d(feat * 2), nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+            nn.Conv2d(feat * 2, feat * 4, 3, 1, 1), nn.BatchNorm2d(feat * 4), nn.ReLU(inplace=True),
+            nn.MaxPool2d((2, 1)),
+            nn.Conv2d(feat * 4, feat * 4, 3, 1, 1), nn.BatchNorm2d(feat * 4), nn.ReLU(inplace=True),
+            nn.MaxPool2d((2, 1)),
+        )
+        self.rnn = nn.LSTM(feat * 4, hidden, bidirectional=True, batch_first=True)
+        self.head = nn.Linear(hidden * 2, vocab_size)
+
+    def forward(self, x):
+        # x: (N, 1, H, W)
+        f = self.cnn(x)                # (N, C, H', W')
+        f = f.mean(dim=2).transpose(1, 2)  # (N, W', C)
+        h, _ = self.rnn(f)
+        return F.log_softmax(self.head(h).transpose(0, 1), dim=-1)  # (W', N, vocab)
+</code></pre>
+<p>Fixed-height input (the CNN max-pools height to 1). Width is the time dimension for CTC.</p>
+<h3>Step 3: Synthetic OCR</h3>
+<p>Generate black-on-white digit strings for an end-to-end smoke test.</p>
+<pre><code class="language-python">import numpy as np
+
+def synthetic_line(text, height=32, char_width=16):
+    W = char_width * len(text)
+    img = np.ones((height, W), dtype=np.float32)
+    for i, c in enumerate(text):
+        x = i * char_width
+        shade = 0.0 if c.isalnum() else 0.5
+        img[6:height - 6, x + 2:x + char_width - 2] = shade
+    return img
+
+
+def build_batch(strings, vocab):
+    H = 32
+    W = 16 * max(len(s) for s in strings)
+    imgs = np.ones((len(strings), 1, H, W), dtype=np.float32)
+    target_lengths = []
+    targets = []
+    for i, s in enumerate(strings):
+        imgs[i, 0, :, :16 * len(s)] = synthetic_line(s)
+        ids = [vocab.index(c) for c in s]
+        targets.extend(ids)
+        target_lengths.append(len(ids))
+    return torch.from_numpy(imgs), torch.tensor(targets), torch.tensor(target_lengths)
+
+
+vocab = [&quot;_&quot;] + list(&quot;0123456789abcdefghijklmnopqrstuvwxyz&quot;)
+imgs, targets, lengths = build_batch([&quot;hello&quot;, &quot;world&quot;], vocab)
+print(f&quot;images: {imgs.shape}   targets: {targets.shape}   lengths: {lengths.tolist()}&quot;)
+</code></pre>
+<p>A real OCR dataset adds fonts, noise, rotation, blur, and colour. The pipeline above is identical.</p>
+<h3>Step 4: Training sketch</h3>
+<pre><code class="language-python">model = TinyCRNN(vocab_size=len(vocab))
+opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+for step in range(200):
+    strings = [&quot;abc&quot; + str(step % 10)] * 4 + [&quot;xyz&quot; + str((step + 1) % 10)] * 4
+    imgs, targets, target_lens = build_batch(strings, vocab)
+    log_probs = model(imgs)  # (W', 8, vocab)
+    input_lens = torch.full((8,), log_probs.size(0), dtype=torch.long)
+    loss = ctc_loss(log_probs, targets, input_lens, target_lens, blank=0)
+    opt.zero_grad(); loss.backward(); opt.step()
+</code></pre>
+<p>Loss should drop from ~3 to ~0.2 over 200 steps on this trivial synthetic data.</p>
+<h2>Use It</h2>
+<p>Three production paths:</p>
+<ul>
+<li><strong>PaddleOCR</strong> — mature, fast, multilingual. One-line usage: <code>paddleocr.PaddleOCR(lang=&quot;en&quot;).ocr(image_path)</code>.</li>
+<li><strong>EasyOCR</strong> — Python-native, multilingual, PyTorch backbone.</li>
+<li><strong>Tesseract</strong> — classical; still useful for old scanned documents when models struggle.</li>
+</ul>
+<p>For end-to-end document parsing, use Donut or a VLM:</p>
+<pre><code class="language-python">from transformers import DonutProcessor, VisionEncoderDecoderModel
+
+processor = DonutProcessor.from_pretrained(&quot;naver-clova-ix/donut-base-finetuned-cord-v2&quot;)
+model = VisionEncoderDecoderModel.from_pretrained(&quot;naver-clova-ix/donut-base-finetuned-cord-v2&quot;)
+</code></pre>
+<p>For receipts, invoices, and forms with repeatable structure, fine-tune Donut. For arbitrary documents or OCR with reasoning, a VLM like Qwen-VL-OCR is the current default.</p>
+<h2>Ship It</h2>
+<p>This lesson produces:</p>
+<ul>
+<li><code>outputs/prompt-ocr-stack-picker.md</code> — a prompt that picks Tesseract / PaddleOCR / Donut / VLM-OCR given document type, language, and structure.</li>
+<li><code>outputs/skill-ctc-decoder.md</code> — a skill that writes greedy and beam-search CTC decoders from scratch, including length normalisation.</li>
+</ul>
+<h2>Exercises</h2>
+<ol>
+<li><strong>(Easy)</strong> Train the TinyCRNN on 5-digit random numeric strings for 500 steps. Report CER on a held-out set.</li>
+<li><strong>(Medium)</strong> Replace greedy decoding with beam search (beam_width=5). Report CER delta. On which inputs does beam search win?</li>
+<li><strong>(Hard)</strong> Use PaddleOCR on a set of 20 receipts, extract line items, and compute F1 against hand-labelled ground truth for {item_name, price} pairs.</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>OCR</td>
+<td>&quot;Text from pixels&quot;</td>
+<td>Turning image regions into character sequences</td>
+</tr>
+<tr>
+<td>CTC</td>
+<td>&quot;Alignment-free loss&quot;</td>
+<td>Loss that trains a sequence model without per-timestep labels; marginalises over alignments</td>
+</tr>
+<tr>
+<td>CRNN</td>
+<td>&quot;Classic OCR model&quot;</td>
+<td>Conv feature extractor + BiLSTM + CTC; the 2015 baseline still used in production</td>
+</tr>
+<tr>
+<td>Donut</td>
+<td>&quot;End-to-end OCR&quot;</td>
+<td>ViT encoder + text decoder; emits JSON directly from image</td>
+</tr>
+<tr>
+<td>Layout parsing</td>
+<td>&quot;Find regions&quot;</td>
+<td>Detect and label Title/Table/Figure/Paragraph regions in a document</td>
+</tr>
+<tr>
+<td>Reading order</td>
+<td>&quot;Text sequence&quot;</td>
+<td>Ordering of recognised regions into a sentence; trivial for Latin, non-trivial for mixed layouts</td>
+</tr>
+<tr>
+<td>CER / WER</td>
+<td>&quot;Error rates&quot;</td>
+<td>Levenshtein distance / reference length at character or word granularity</td>
+</tr>
+<tr>
+<td>VLM-OCR</td>
+<td>&quot;LLM that reads&quot;</td>
+<td>A vision-language model trained or prompted for OCR tasks; current SOTA on complex documents</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/1507.05717" rel="noreferrer" data-network="true">CRNN (Shi et al., 2015) <small>↗ 需要联网</small></a> — the original CNN+RNN+CTC architecture</li>
+<li><a href="https://www.cs.toronto.edu/~graves/icml_2006.pdf" rel="noreferrer" data-network="true">CTC (Graves et al., 2006) <small>↗ 需要联网</small></a> — the original CTC paper; densely packed with the algorithmic ideas</li>
+<li><a href="https://arxiv.org/abs/2111.15664" rel="noreferrer" data-network="true">Donut (Kim et al., 2022) <small>↗ 需要联网</small></a> — OCR-free document understanding transformer</li>
+<li><a href="https://github.com/PaddlePaddle/PaddleOCR" rel="noreferrer" data-network="true">PaddleOCR <small>↗ 需要联网</small></a> — the open-source production OCR stack</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-04-computer-vision--19-ocr-document-understanding.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-04-computer-vision--19-ocr-document-understanding.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/04-computer-vision/19-ocr-document-understanding/code/main.py">phases/04-computer-vision/19-ocr-document-understanding/code/main.py</a><details><summary>查看原始文本</summary><pre><code>import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+VOCAB = [&quot;_&quot;] + list(&quot;0123456789abcdefghijklmnopqrstuvwxyz&quot;)
+
+
+def ctc_loss(log_probs, targets, input_lengths, target_lengths, blank=0):
+    return F.ctc_loss(log_probs, targets, input_lengths, target_lengths,
+                      blank=blank, reduction=&quot;mean&quot;, zero_infinity=True)
+
+
+def greedy_ctc_decode(log_probs, blank=0):
+    preds = log_probs.argmax(dim=-1).transpose(0, 1).cpu().tolist()
+    out = []
+    for seq in preds:
+        decoded = []
+        prev = None
+        for idx in seq:
+            if idx != prev and idx != blank:
+                decoded.append(idx)
+            prev = idx
+        out.append(decoded)
+    return out
+
+
+class TinyCRNN(nn.Module):
+    def __init__(self, vocab_size=len(VOCAB), hidden=128, feat=32):
+        super().__init__()
+        self.cnn = nn.Sequential(
+            nn.Conv2d(1, feat, 3, 1, 1), nn.BatchNorm2d(feat), nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+            nn.Conv2d(feat, feat * 2, 3, 1, 1), nn.BatchNorm2d(feat * 2), nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+            nn.Conv2d(feat * 2, feat * 4, 3, 1, 1), nn.BatchNorm2d(feat * 4), nn.ReLU(inplace=True),
+            nn.MaxPool2d((2, 1)),
+            nn.Conv2d(feat * 4, feat * 4, 3, 1, 1), nn.BatchNorm2d(feat * 4), nn.ReLU(inplace=True),
+            nn.MaxPool2d((2, 1)),
+        )
+        self.rnn = nn.LSTM(feat * 4, hidden, bidirectional=True, batch_first=True)
+        self.head = nn.Linear(hidden * 2, vocab_size)
+
+    def forward(self, x):
+        f = self.cnn(x)
+        f = f.mean(dim=2).transpose(1, 2)
+        h, _ = self.rnn(f)
+        return F.log_softmax(self.head(h).transpose(0, 1), dim=-1)
+
+
+def synthetic_line(text, height=32, char_width=16):
+    W = char_width * max(1, len(text))
+    img = np.ones((height, W), dtype=np.float32)
+    for i, c in enumerate(text):
+        x = i * char_width
+        shade = 0.0 if c.isalnum() else 0.5
+        img[6:height - 6, x + 2:x + char_width - 2] = shade
+    return img
+
+
+def build_batch(strings, max_len=None):
+    H = 32
+    max_len = max_len or max(len(s) for s in strings)
+    W = 16 * max_len
+    imgs = np.ones((len(strings), 1, H, W), dtype=np.float32)
+    targets = []
+    target_lengths = []
+    for i, s in enumerate(strings):
+        line = synthetic_line(s)
+        imgs[i, 0, :, :line.shape[1]] = line
+        ids = [VOCAB.index(c) for c in s]
+        targets.extend(ids)
+        target_lengths.append(len(ids))
+    return torch.from_numpy(imgs), torch.tensor(targets, dtype=torch.long), torch.tensor(target_lengths, dtype=torch.long)
+
+
+def decode_to_str(ids):
+    return &quot;&quot;.join(VOCAB[i] for i in ids)
+
+
+def main():
+    torch.manual_seed(0)
+    model = TinyCRNN()
+    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+    print(f&quot;params: {sum(p.numel() for p in model.parameters()):,}&quot;)
+
+    train_strings = [f&quot;abc{d}&quot; for d in range(10)] + [f&quot;xy{d}{d+1}&quot; for d in range(10)]
+    for step in range(200):
+        idx = np.random.choice(len(train_strings), 8)
+        strings = [train_strings[i] for i in idx]
+        imgs, targets, target_lens = build_batch(strings, max_len=5)
+        log_probs = model(imgs)
+        input_lens = torch.full((imgs.size(0),), log_probs.size(0), dtype=torch.long)
+        loss = ctc_loss(log_probs, targets, input_lens, target_lens, blank=0)
+        opt.zero_grad(); loss.backward(); opt.step()
+        if step % 40 == 0:
+            print(f&quot;step {step:3d}  loss {loss.item():.3f}&quot;)
+
+    model.eval()
+    test_strings = [&quot;abc7&quot;, &quot;xy45&quot;, &quot;abc2&quot;]
+    imgs, _, _ = build_batch(test_strings, max_len=5)
+    with torch.no_grad():
+        log_probs = model(imgs)
+    preds = [decode_to_str(ids) for ids in greedy_ctc_decode(log_probs)]
+    for target, pred in zip(test_strings, preds):
+        match = &quot;ok&quot; if target == pred else &quot;diff&quot;
+        print(f&quot;  target {target!r:10s} -&gt; pred {pred!r:10s}  {match}&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/04-computer-vision/19-ocr-document-understanding/outputs/prompt-ocr-stack-picker.md">phases/04-computer-vision/19-ocr-document-understanding/outputs/prompt-ocr-stack-picker.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: prompt-ocr-stack-picker
+description: Pick Tesseract / PaddleOCR / Donut / VLM-OCR given document type, language, and structure
+phase: 4
+lesson: 19
+---
+
+You are an OCR stack selector.
+
+## Inputs
+
+- `doc_type`: scanned_book | form | receipt | invoice | ID_card | meme | handwriting
+- `language`: en | multi | rtl | cjk
+- `structured_fields_needed`: yes | no
+- `accuracy_floor_cer`: target CER (%, lower is stricter)
+- `latency_target_ms`: per-page budget
+
+## Decision
+
+1. `structured_fields_needed == yes` and `doc_type in [receipt, invoice, ID_card, form]` -&gt; **fine-tuned Donut** or **Qwen-VL-OCR**.
+2. `structured_fields_needed == no` and `doc_type == scanned_book` and `language == en` -&gt; **PaddleOCR** (en) or **Tesseract** for very old scans.
+3. `language == cjk` -&gt; **PaddleOCR** (ch, ja, ko) — historically strongest on these scripts.
+4. `language == rtl` (Arabic, Hebrew) -&gt; **PaddleOCR** or the specific `transformers` OCR models for those scripts.
+5. `doc_type == handwriting` -&gt; **TrOCR handwritten** fine-tune or **VLM-OCR**; never Tesseract.
+6. `doc_type == meme` -&gt; a VLM with OCR capability (Qwen-VL, InternVL); layout and style variability break pipeline OCR.
+7. `language == multi` (mixed-script pages, e.g. English + Arabic, or German + Chinese) -&gt; **PaddleOCR** with multi-lingual detection, or a VLM with native multilingual OCR when latency allows. Running a single Tesseract pass across multiple scripts is unreliable.
+8. `language == en` with `doc_type in [form, receipt, invoice]` and `structured_fields_needed == no` -&gt; **PaddleOCR** as the fast baseline before jumping to a VLM.
+
+## Output
+
+```
+[stack]
+  primary:     &lt;name&gt;
+  fallback:    &lt;name, for when primary is low confidence&gt;
+  language:    &lt;list&gt;
+  structured:  yes | no
+
+[training need]
+  - pretrained off-the-shelf works
+  - requires fine-tune on &lt;N&gt; labelled examples
+  - requires from-scratch training (rare)
+
+[risks]
+  - known failure modes on this doc_type
+  - latency estimate
+```
+
+## Rules
+
+- Never recommend Tesseract as primary for anything published after 2020 unless the document genuinely looks like an old scan.
+- For `accuracy_floor_cer &lt; 1%` on printed documents, default to PaddleOCR; VLM-OCR is strong but slower.
+- When `structured_fields_needed == yes`, the pipeline must include a parser that converts OCR output to the field schema, not just raw text.
+- For latency &lt; 100 ms per page, rule out VLM-OCR on commodity GPUs.
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/04-computer-vision/19-ocr-document-understanding/outputs/skill-ctc-decoder.md">phases/04-computer-vision/19-ocr-document-understanding/outputs/skill-ctc-decoder.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: skill-ctc-decoder
+description: Write greedy and beam-search CTC decoders from scratch, including length normalisation
+version: 1.0.0
+phase: 4
+lesson: 19
+tags: [ocr, ctc, decoding, sequence-models]
+---
+
+# CTC Decoder
+
+Produce two decoding routines for CTC outputs: greedy (fast) and beam (better on noisy inputs).
+
+## When to use
+
+- Running OCR inference on custom CRNN outputs.
+- Benchmarking a pretrained OCR model against different decoders.
+- Implementing a simple beam search without pulling in ctcdecode.
+
+## Inputs
+
+- `log_probs`: (T, N, C) log-softmax over vocab (index 0 = blank by convention).
+- `vocab`: list of C characters.
+- `beam_width` (beam only): typically 5-10.
+
+## Greedy decoder
+
+```python
+def greedy_ctc_decode(log_probs, vocab, blank=0):
+    preds = log_probs.argmax(dim=-1).transpose(0, 1).cpu().tolist()
+    out = []
+    for seq in preds:
+        decoded = []
+        prev = None
+        for idx in seq:
+            if idx != prev and idx != blank:
+                decoded.append(vocab[idx])
+            prev = idx
+        out.append(&quot;&quot;.join(decoded))
+    return out
+```
+
+## Beam search decoder
+
+```python
+import heapq
+import math
+
+def beam_ctc_decode(log_probs, vocab, beam_width=5, blank=0):
+    T, N, C = log_probs.shape
+    lp = log_probs.cpu()
+    results = []
+    for n in range(N):
+        beams = {(&quot;&quot;,): (0.0, -math.inf)}  # (prefix_tuple) -&gt; (p_blank, p_nonblank)
+        for t in range(T):
+            logits_t = lp[t, n]
+            new_beams = {}
+            for prefix, (p_b, p_nb) in beams.items():
+                for c in range(C):
+                    p = logits_t[c].item()
+                    if c == blank:
+                        nb = p_b + p
+                        nnb = p_nb + p
+                        upd = new_beams.get(prefix, (-math.inf, -math.inf))
+                        new_beams[prefix] = (
+                            _logsumexp(upd[0], _logsumexp(nb, nnb)),
+                            upd[1],
+                        )
+                    else:
+                        last = prefix[-1] if prefix else &quot;&quot;
+                        char = vocab[c]
+                        if char == last:
+                            # Case 1: stay on same prefix (collapse from p_nb)
+                            upd = new_beams.get(prefix, (-math.inf, -math.inf))
+                            new_beams[prefix] = (upd[0], _logsumexp(upd[1], p_nb + p))
+                            # Case 2: extend prefix via blank-separated repeat (&quot;a_a&quot; -&gt; &quot;aa&quot;)
+                            new_prefix = prefix + (char,)
+                            upd = new_beams.get(new_prefix, (-math.inf, -math.inf))
+                            new_beams[new_prefix] = (upd[0], _logsumexp(upd[1], p_b + p))
+                        else:
+                            new_prefix = prefix + (char,)
+                            upd = new_beams.get(new_prefix, (-math.inf, -math.inf))
+                            nb = _logsumexp(p_b, p_nb) + p
+                            new_beams[new_prefix] = (upd[0], _logsumexp(upd[1], nb))
+            beams = dict(heapq.nlargest(
+                beam_width,
+                new_beams.items(),
+                key=lambda kv: _logsumexp(kv[1][0], kv[1][1]),
+            ))
+        best = max(beams.items(), key=lambda kv: _logsumexp(kv[1][0], kv[1][1]))[0]
+        results.append(&quot;&quot;.join(best))
+    return results
+
+
+def _logsumexp(a, b):
+    if a == -math.inf: return b
+    if b == -math.inf: return a
+    m = max(a, b)
+    return m + math.log(math.exp(a - m) + math.exp(b - m))
+```
+
+## Rules
+
+- The blank index in CTC is 0 by convention in PyTorch&#39;s `nn.CTCLoss`.
+- Beam search improves accuracy on low-confidence inputs; on clean inputs the improvement is &lt;1% CER.
+- Never prune the beam below 5; the accuracy-latency trade flattens below that.
+- When running beam search inside a tight latency budget, drop to greedy; the quality hit is small on most production OCR data.
+- For large vocabularies (CJK with 3000+ characters), switch to `ctcdecode` (C++) instead of the pure Python version above; the Python beam quickly becomes the bottleneck.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. Why does OCR use CTC loss instead of plain cross-entropy?</legend><label class="option"><input type="radio" name="q0" value="0"> CTC is required by PyTorch</label><label class="option"><input type="radio" name="q0" value="1"> OCR maps a fixed-length feature sequence to a variable-length character sequence without per-timestep alignment; CTC loss marginalises over all alignments that reduce to the target after removing repeats and blanks, so you can train without character-level timing labels</label><label class="option"><input type="radio" name="q0" value="2"> Cross-entropy overflows for long sequences</label><label class="option"><input type="radio" name="q0" value="3"> CTC is faster</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. In CTC decoding, what does the blank token do?</legend><label class="option"><input type="radio" name="q1" value="0"> Indicates end of sequence</label><label class="option"><input type="radio" name="q1" value="1"> Pads the sequence to a fixed length</label><label class="option"><input type="radio" name="q1" value="2"> Masks noisy regions</label><label class="option"><input type="radio" name="q1" value="3"> Separates adjacent identical characters so that outputs like &#39;hello&#39; with a double L can be produced by the model emitting &#39;h e l _ l o&#39; — without the blank, &#39;l l&#39; would collapse to one &#39;l&#39;</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. Why is greedy CTC decoding sometimes better than beam search on simple datasets?</legend><label class="option"><input type="radio" name="q2" value="0"> Greedy is easier to implement</label><label class="option"><input type="radio" name="q2" value="1"> Beam search requires a language model</label><label class="option"><input type="radio" name="q2" value="2"> Greedy is always better</label><label class="option"><input type="radio" name="q2" value="3"> When the model is confident at every step (clean handwriting, printed fonts), greedy&#39;s argmax is usually the beam winner; beam search adds latency with no accuracy gain. On noisy or ambiguous inputs, beam search helps</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. Donut skips explicit text detection and character recognition. How?</legend><label class="option"><input type="radio" name="q3" value="0"> It is a ViT encoder + text decoder trained to produce the final output string (often JSON) directly from the image; the model learns both localisation and recognition implicitly through the training objective</label><label class="option"><input type="radio" name="q3" value="1"> It preprocesses images with a CNN text detector</label><label class="option"><input type="radio" name="q3" value="2"> It is limited to document categories with fixed layouts</label><label class="option"><input type="radio" name="q3" value="3"> It uses an external OCR engine internally</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. For extracting `invoice_total` from receipts, which approach is typically best in 2026?</legend><label class="option"><input type="radio" name="q4" value="0"> Only classical OCR is reliable enough</label><label class="option"><input type="radio" name="q4" value="1"> A separate CNN for each field</label><label class="option"><input type="radio" name="q4" value="2"> Fine-tuned Donut or a VLM on a small labelled set of the target receipts; both handle layout and semantic extraction in one model and generalise across receipt variants better than pipeline-based approaches</label><label class="option"><input type="radio" name="q4" value="3"> A hand-crafted regex on Tesseract output</label><p data-feedback="4"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/04-computer-vision/18-open-vocab-clip/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/04-computer-vision/20-image-retrieval-metric/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/04-computer-vision/19-ocr-document-understanding/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

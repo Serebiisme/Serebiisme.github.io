@@ -1,0 +1,656 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>获取信息和搜索 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-05-nlp-foundations-to-advanced" data-lesson="05-nlp-foundations-to-advanced/14-information-retrieval-search" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/05-nlp-foundations-to-advanced/">自然语言处理</a> / LESSON 14</p><h1 class="lesson-title">获取信息和搜索</h1><p>Information Retrieval and Search</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>获取信息和搜索</h1>
+<blockquote>
+<p>虽然BM25是精确的,但很脆弱.密集的网投宽,但错过关键字.混合型是2026年默认的.其他一切都在调整.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 5 · 02 (BoW + TF-IDF), Phase 5 · 04 (GloVe, FastText, Subword)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>问题</h2>
+<p>用户输入&quot;如果有人说谎来获得钱会发生什么?&quot;并希望找到实际覆盖该条例:&quot;IPC第420条&quot;.一个关键词搜索完全错过了它 (没有共享的词汇库).一个语义搜索错过了它如果嵌入式没有训练在法律文本.真正的搜索必须处理两者.</p>
+<p>根据&quot;图库&quot;的定义,每一个图库都会被查到一个位置,每一个图库都会被查到一个位置.</p>
+<p>这一课构建了每一个小块,每一个捕获都失败了.</p>
+<h2>概念</h2>
+<p><img src="/learn/ai-from-scratch/files/phases/05-nlp-foundations-to-advanced/14-information-retrieval-search/assets/retrieval.svg" alt="Hybrid retrieval: BM25 + dense + RRF + cross-encoder rerank" loading="lazy"></p>
+<p>选择你需要的四层.</p>
+<ol>
+<li>**Sparse retrieval (BM25).**快速,准确的匹配,可怕的语义. 翻转索引. 每次查询在数百万文件中. 获得法规引用,产品代码,错误信息,命名实体正确.</li>
+<li>**Dense retrieval.**编码查询和文件成向量. 最近邻居搜索.捕捉句子和语义相似性. 错过一个字符不同的关键字匹配. 50-200ms 每个查询与FAISS或向量DB.</li>
+<li>**Fusion.**合并排名列表从稀疏和密集. 相互排名融合 (RRF) 是简单的默认,因为它忽略原始分数 (生活在不同的尺度中) 并仅使用排名位置.当你知道一个信号为你的域占主导地位时,重量融合是一个选择.</li>
+<li>**Cross-encoder rerank.**通过合,运行一个跨编码器 (查询+文档一起,分分分每对).保持前五个.跨编码器比双编码器较慢,但更准确.</li>
+</ol>
+<p>两向检索 (BM25 +密集 +学习空间,如SPLADE) 在2026年比较高于两向检索,但需要学习空间指数的基础设施.对于大多数团队来说,双向加加密交叉编码重排是最好的点.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-f8c480b6a95bb1862a78.png" alt="gx-hybrid-retrieval 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<h3>步骤1:从零开始BM25</h3>
+<pre><code class="language-python">import math
+import re
+from collections import Counter
+
+TOKEN_RE = re.compile(r&quot;[a-z0-9]+&quot;)
+
+
+def tokenize(text):
+    return TOKEN_RE.findall(text.lower())
+
+
+class BM25:
+    def __init__(self, corpus, k1=1.5, b=0.75):
+        if not corpus:
+            raise ValueError(&quot;corpus must not be empty&quot;)
+        self.corpus = [tokenize(d) for d in corpus]
+        self.k1 = k1
+        self.b = b
+        self.n_docs = len(self.corpus)
+        self.avg_dl = sum(len(d) for d in self.corpus) / self.n_docs
+        self.df = Counter()
+        for doc in self.corpus:
+            for term in set(doc):
+                self.df[term] += 1
+
+    def idf(self, term):
+        n = self.df.get(term, 0)
+        return math.log(1 + (self.n_docs - n + 0.5) / (n + 0.5))
+
+    def score(self, query, doc_idx):
+        q_tokens = tokenize(query)
+        doc = self.corpus[doc_idx]
+        dl = len(doc)
+        freq = Counter(doc)
+        score = 0.0
+        for term in q_tokens:
+            f = freq.get(term, 0)
+            if f == 0:
+                continue
+            numerator = f * (self.k1 + 1)
+            denominator = f + self.k1 * (1 - self.b + self.b * dl / self.avg_dl)
+            score += self.idf(term) * numerator / denominator
+        return score
+
+    def rank(self, query, top_k=10):
+        scored = [(self.score(query, i), i) for i in range(self.n_docs)]
+        scored.sort(reverse=True)
+        return scored[:top_k]
+</code></pre>
+<p>值得知道的两个参数.<code>k1=1.5</code>控制术语频率和;更高意味着更重的术语重复. <code>b=0.75</code>根据罗伯逊的建议,通常需要调整. 根据罗伯逊的建议, 罗伯逊的建议, 罗伯逊的建议是完全正常化的.</p>
+<h3>步骤2:使用双编码器进行密集检索</h3>
+<pre><code class="language-python">from sentence_transformers import SentenceTransformer
+import numpy as np
+
+
+def build_dense_index(corpus, model_id=&quot;sentence-transformers/all-MiniLM-L6-v2&quot;):
+    encoder = SentenceTransformer(model_id)
+    embeddings = encoder.encode(corpus, normalize_embeddings=True)
+    return encoder, embeddings
+
+
+def dense_search(encoder, embeddings, query, top_k=10):
+    q_emb = encoder.encode([query], normalize_embeddings=True)
+    sims = (embeddings @ q_emb.T).flatten()
+    order = np.argsort(-sims)[:top_k]
+    return [(float(sims[i]), int(i)) for i in order]
+</code></pre>
+<p>点产量等于kosine.<code>all-MiniLM-L6-v2</code>对于多语言工作,使用 <code>paraphrase-multilingual-MiniLM-L12-v2</code>为了最准确的,<code>bge-large-en-v1.5</code>或<code>e5-large-v2</code>现在,我们要去.</p>
+<h3>步骤3:相互级别的融合</h3>
+<pre><code class="language-python">def reciprocal_rank_fusion(rankings, k=60):
+    scores = {}
+    for ranking in rankings:
+        for rank, (_, doc_idx) in enumerate(ranking):
+            scores[doc_idx] = scores.get(doc_idx, 0.0) + 1.0 / (k + rank + 1)
+    fused = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    return [(score, doc_idx) for doc_idx, score in fused]
+</code></pre>
+<p>其他<code>k=60</code>常数来自原始的RRF纸.<code>k</code>降低了排名差异的贡献;<code>k</code>现在,我们在这个问题上,我们需要一个问题.</p>
+<h3>步骤4:混合搜索+重排</h3>
+<pre><code class="language-python">from sentence_transformers import CrossEncoder
+
+reranker = CrossEncoder(&quot;cross-encoder/ms-marco-MiniLM-L-6-v2&quot;)
+
+
+def hybrid_search(query, bm25, encoder, dense_embeddings, corpus, top_k=5, pool_size=30, reranker=reranker):
+    sparse_ranking = bm25.rank(query, top_k=pool_size)
+    dense_ranking = dense_search(encoder, dense_embeddings, query, top_k=pool_size)
+    fused = reciprocal_rank_fusion([sparse_ranking, dense_ranking])[:pool_size]
+
+    pairs = [(query, corpus[doc_idx]) for _, doc_idx in fused]
+    scores = reranker.predict(pairs)
+    reranked = sorted(zip(scores, [doc_idx for _, doc_idx in fused]), reverse=True)
+    return reranked[:top_k]
+</code></pre>
+<p>组建三个阶段.BM25发现词汇匹配.密集发现语义匹配.RRF不需要分数校准的情况下合并两个排名.跨编码器使用查询文档对进行重新评分,从而捕获了双编码器错过的细粒度相关性.保持前-5.</p>
+<h3>五步:评估</h3>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Recall@k</td>
+<td>Of queries where the correct document exists, how often is it in the top-k?</td>
+</tr>
+<tr>
+<td>MRR (Mean Reciprocal Rank)</td>
+<td>Average of 1/rank of first relevant document.</td>
+</tr>
+<tr>
+<td>nDCG@k</td>
+<td>Accounts for relevance gradations, not just binary relevant/not.</td>
+</tr>
+</tbody>
+</table>
+<p>对于RAG而言,<strong>Recall@k</strong>如果没有正确的段落,读者不能回答.</p>
+<p>调试提示:对于失败的查询,分别稀疏和密集的排名.如果一个找到正确的文档,而另一个没有,你会出现词汇不匹配 (修正:添加缺失的一半) 或语义模糊 (修正:更好的嵌入或重新排名).</p>
+<h2>用它</h2>
+<p>现在,我们要做什么?</p>
+<table>
+<thead>
+<tr>
+<th>Scale</th>
+<th>Stack</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1k-100k docs</td>
+<td>In-memory BM25 + <code>all-MiniLM-L6-v2</code> embeddings + RRF. No separate DB.</td>
+</tr>
+<tr>
+<td>100k-10M docs</td>
+<td>FAISS or pgvector for dense + Elasticsearch / OpenSearch for BM25. Run in parallel.</td>
+</tr>
+<tr>
+<td>10M+ docs</td>
+<td>Qdrant / Weaviate / Vespa / Milvus with hybrid support. Cross-encoder rerank on top-30.</td>
+</tr>
+<tr>
+<td>Best-quality frontier</td>
+<td>Three-way (BM25 + dense + SPLADE) + ColBERT late-interaction reranking</td>
+</tr>
+</tbody>
+</table>
+<p>根据您选择的预算进行评估. 预测检索提醒,然后再进行预测,以检测到RAG的精度.</p>
+<h3>2026年生产RAG的难以获取教训</h3>
+<ul>
+<li>**80% of RAG failures trace to ingestion and chunking, not the model.**团队花了几周时间交换LLM和调整提示,而检索每第三次查询都会地返回错误的文本.</li>
+<li>**Chunking strategy matters more than chunk size.**固定尺寸分开分开表,代码和嵌入式标题.句子意识是默认的;语义或LLM基于的分断为技术文件和产品手册付出代价.</li>
+<li>**Parent-doc pattern.**检索小小的&quot;孩子&quot;块以获得精确性.当来自同一父母部分的多个孩子出现时,在父母块中交换以保持文本.这在不需要重新训练的情况下不断提高答案质量.</li>
+<li>**k_rerank=3 is usually optimal.**如果 k=8 对你来说仍然比 k=3 更好,那么重新排名器的性能低.</li>
+<li>**HyDE / query expansion.**通过查询生成一个假设答案,嵌入,检索. 弥合短问题和长文档之间的措辞差距. 免费的精确升降,没有训练.</li>
+<li>**Context budget under 8K tokens.**连续击中这个极限意味着重排门太松散了.</li>
+<li>**Version everything.**提示,分量规则,嵌入模型,重新排序器.任何漂移都会默默破坏答案质量. CI 关闭信任,文本精确性和未回答问题的率,用户在看到之前阻止回归.</li>
+<li><strong>Three-way retrieval (BM25 + dense + learned-sparse like SPLADE) outperforms two-way</strong>根据2026年基准,特别是对混合正确名词和语义的查询.</li>
+</ul>
+<p>根据2026年行业测量,正确的检索设计可以减少70-90%.大多数RAG性能增长来自更好的检索,而不是模型细节调整.</p>
+<h2>运送它</h2>
+<p>保存如<code>outputs/skill-retrieval-picker.md</code>其他:</p>
+<pre><code class="language-markdown">---
+name: retrieval-picker
+description: Pick a retrieval stack for a given corpus and query pattern.
+version: 1.0.0
+phase: 5
+lesson: 14
+tags: [nlp, retrieval, rag, search]
+---
+
+Given requirements (corpus size, query pattern, latency budget, quality bar, infra constraints), output:
+
+1. Stack. BM25 only, dense only, hybrid (BM25 + dense + RRF), hybrid + cross-encoder rerank, or three-way (BM25 + dense + learned-sparse).
+2. Dense encoder. Name the specific model. Match to language(s), domain, and context length.
+3. Reranker. Name the specific cross-encoder model if used. Flag that rerank adds 30-100ms latency on top-30.
+4. Evaluation plan. Recall@10 is the primary retriever metric. MRR for multi-answer. Baseline first, incremental improvements measured against it.
+
+Refuse to recommend dense-only for corpora with named entities, error codes, or product SKUs unless the user has evidence dense handles exact matches. Refuse to skip reranking for high-stakes retrieval (legal, medical) where the final top-5 decides the user's answer.
+</code></pre>
+<h2>运动</h2>
+<ol>
+<li>**Easy.**实施<code>hybrid_search</code>测试20个查询. 仅BM25,仅密集和混合物之间的5个回忆.</li>
+<li>**Medium.**添加MRR计算.对于每个已知正确文档的测试查询,在BM25,密集和混合排名中找到正确文档的排名. 报告每个文档的MRR.</li>
+<li>**Hard.**通过多个负面排名输失 (Sentence Transformers) 调整域名上的密集编码器.从500个查询文档对构建训练集.比较调整前和调整后的回忆.</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>BM25</td>
+<td>Keyword search</td>
+<td>Okapi BM25. Scores documents by term frequency, IDF, and length.</td>
+</tr>
+<tr>
+<td>Dense retrieval</td>
+<td>Vector search</td>
+<td>Encode query + doc into vectors, find nearest neighbors.</td>
+</tr>
+<tr>
+<td>Bi-encoder</td>
+<td>Embedding model</td>
+<td>Encodes query and doc independently. Fast at query time.</td>
+</tr>
+<tr>
+<td>Cross-encoder</td>
+<td>Reranker model</td>
+<td>Encodes query + doc together. Slow but accurate.</td>
+</tr>
+<tr>
+<td>RRF</td>
+<td>Rank fusion</td>
+<td>Combine two rankings by summing <code>1/(k + rank)</code>.</td>
+</tr>
+<tr>
+<td>Recall@k</td>
+<td>Retrieval metric</td>
+<td>Fraction of queries where a relevant doc is in the top-k.</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://www.staff.city.ac.uk/~sbrp622/papers/foundations_bm25_review.pdf" rel="noreferrer" data-network="true">Robertson and Zaragoza (2009). The Probabilistic Relevance Framework: BM25 and Beyond <small>↗ 需要联网</small></a>最终的BM25治疗.</li>
+<li><a href="https://arxiv.org/abs/2004.04906" rel="noreferrer" data-network="true">Karpukhin et al. (2020). Dense Passage Retrieval for Open-Domain QA <small>↗ 需要联网</small></a>DPR,是法典双码码器.</li>
+<li><a href="https://arxiv.org/abs/2107.05720" rel="noreferrer" data-network="true">Formal et al. (2021). SPLADE: Sparse Lexical and Expansion Model <small>↗ 需要联网</small></a></li>
+<li><a href="https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf" rel="noreferrer" data-network="true">Cormack, Clarke, Büttcher (2009). Reciprocal Rank Fusion outperforms Condorcet and individual Rank Learning Methods <small>↗ 需要联网</small></a>  纸质</li>
+<li><a href="https://arxiv.org/abs/2004.12832" rel="noreferrer" data-network="true">Khattab and Zaharia (2020). ColBERT: Efficient and Effective Passage Search <small>↗ 需要联网</small></a> 晚间互动检索.</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Information Retrieval and Search</h1>
+<blockquote>
+<p>BM25 is precise but brittle. Dense casts a wide net but misses keywords. Hybrid is the 2026 default. Everything else is tuning.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 5 · 02 (BoW + TF-IDF), Phase 5 · 04 (GloVe, FastText, Subword)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>The Problem</h2>
+<p>The user types &quot;what happens if someone lies to get money&quot; and expects to find the statute that actually covers that: &quot;Section 420 IPC.&quot; A keyword search misses it entirely (no shared vocabulary). A semantic search misses it if the embeddings were not trained on legal text. Real search has to handle both.</p>
+<p>IR is the pipeline under every RAG system, every search bar, every docs site's fuzzy lookup. The 2026 architecture that works in production is not a single method. It is a chain of complementary methods, each catching the failures of the one before.</p>
+<p>This lesson builds each piece and names which failures each catches.</p>
+<h2>The Concept</h2>
+<p><img src="/learn/ai-from-scratch/files/phases/05-nlp-foundations-to-advanced/14-information-retrieval-search/assets/retrieval.svg" alt="Hybrid retrieval: BM25 + dense + RRF + cross-encoder rerank" loading="lazy"></p>
+<p>Four layers. Pick the ones you need.</p>
+<ol>
+<li><strong>Sparse retrieval (BM25).</strong> Fast, precise on exact matches, terrible on semantics. Run over an inverted index. Sub-10ms per query on millions of documents. Gets you statute references, product codes, error messages, named entities right.</li>
+<li><strong>Dense retrieval.</strong> Encode query and documents into vectors. Nearest neighbor search. Captures paraphrases and semantic similarity. Misses exact keyword matches that differ by one character. 50-200ms per query with FAISS or a vector DB.</li>
+<li><strong>Fusion.</strong> Merge the ranked lists from sparse and dense. Reciprocal Rank Fusion (RRF) is the easy default because it ignores raw scores (which live in different scales) and only uses rank positions. Weighted fusion is an option when you know one signal dominates for your domain.</li>
+<li><strong>Cross-encoder rerank.</strong> Take the top-30 from fusion. Run a cross-encoder (query + document together, scoring each pair). Keep the top-5. Cross-encoders are slower per pair than bi-encoders but far more accurate. You amortize by only running them on the top-30.</li>
+</ol>
+<p>Three-way retrieval (BM25 + dense + learned-sparse like SPLADE) outperforms two-way in 2026 benchmarks but needs infrastructure for learned-sparse indexes. For most teams, two-way plus cross-encoder rerank is the sweet spot.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-f8c480b6a95bb1862a78.png" alt="gx-hybrid-retrieval 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<h3>Step 1: BM25 from scratch</h3>
+<pre><code class="language-python">import math
+import re
+from collections import Counter
+
+TOKEN_RE = re.compile(r&quot;[a-z0-9]+&quot;)
+
+
+def tokenize(text):
+    return TOKEN_RE.findall(text.lower())
+
+
+class BM25:
+    def __init__(self, corpus, k1=1.5, b=0.75):
+        if not corpus:
+            raise ValueError(&quot;corpus must not be empty&quot;)
+        self.corpus = [tokenize(d) for d in corpus]
+        self.k1 = k1
+        self.b = b
+        self.n_docs = len(self.corpus)
+        self.avg_dl = sum(len(d) for d in self.corpus) / self.n_docs
+        self.df = Counter()
+        for doc in self.corpus:
+            for term in set(doc):
+                self.df[term] += 1
+
+    def idf(self, term):
+        n = self.df.get(term, 0)
+        return math.log(1 + (self.n_docs - n + 0.5) / (n + 0.5))
+
+    def score(self, query, doc_idx):
+        q_tokens = tokenize(query)
+        doc = self.corpus[doc_idx]
+        dl = len(doc)
+        freq = Counter(doc)
+        score = 0.0
+        for term in q_tokens:
+            f = freq.get(term, 0)
+            if f == 0:
+                continue
+            numerator = f * (self.k1 + 1)
+            denominator = f + self.k1 * (1 - self.b + self.b * dl / self.avg_dl)
+            score += self.idf(term) * numerator / denominator
+        return score
+
+    def rank(self, query, top_k=10):
+        scored = [(self.score(query, i), i) for i in range(self.n_docs)]
+        scored.sort(reverse=True)
+        return scored[:top_k]
+</code></pre>
+<p>Two parameters worth knowing. <code>k1=1.5</code> controls term-frequency saturation; higher means more weight on term repetition. <code>b=0.75</code> controls length normalization; 0 ignores document length, 1 fully normalizes. The defaults are Robertson's recommendations from the original paper and rarely need tuning.</p>
+<h3>Step 2: dense retrieval with a bi-encoder</h3>
+<pre><code class="language-python">from sentence_transformers import SentenceTransformer
+import numpy as np
+
+
+def build_dense_index(corpus, model_id=&quot;sentence-transformers/all-MiniLM-L6-v2&quot;):
+    encoder = SentenceTransformer(model_id)
+    embeddings = encoder.encode(corpus, normalize_embeddings=True)
+    return encoder, embeddings
+
+
+def dense_search(encoder, embeddings, query, top_k=10):
+    q_emb = encoder.encode([query], normalize_embeddings=True)
+    sims = (embeddings @ q_emb.T).flatten()
+    order = np.argsort(-sims)[:top_k]
+    return [(float(sims[i]), int(i)) for i in order]
+</code></pre>
+<p>L2-normalize embeddings so dot product equals cosine. <code>all-MiniLM-L6-v2</code> is 384-dim, fast, and strong enough for most English retrieval. For multilingual work, use <code>paraphrase-multilingual-MiniLM-L12-v2</code>. For top accuracy, <code>bge-large-en-v1.5</code> or <code>e5-large-v2</code>.</p>
+<h3>Step 3: Reciprocal Rank Fusion</h3>
+<pre><code class="language-python">def reciprocal_rank_fusion(rankings, k=60):
+    scores = {}
+    for ranking in rankings:
+        for rank, (_, doc_idx) in enumerate(ranking):
+            scores[doc_idx] = scores.get(doc_idx, 0.0) + 1.0 / (k + rank + 1)
+    fused = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    return [(score, doc_idx) for doc_idx, score in fused]
+</code></pre>
+<p>The <code>k=60</code> constant comes from the original RRF paper. Higher <code>k</code> flattens the contribution of rank differences; lower <code>k</code> makes top ranks dominate. 60 is the published default and rarely needs tuning.</p>
+<h3>Step 4: hybrid search + rerank</h3>
+<pre><code class="language-python">from sentence_transformers import CrossEncoder
+
+reranker = CrossEncoder(&quot;cross-encoder/ms-marco-MiniLM-L-6-v2&quot;)
+
+
+def hybrid_search(query, bm25, encoder, dense_embeddings, corpus, top_k=5, pool_size=30, reranker=reranker):
+    sparse_ranking = bm25.rank(query, top_k=pool_size)
+    dense_ranking = dense_search(encoder, dense_embeddings, query, top_k=pool_size)
+    fused = reciprocal_rank_fusion([sparse_ranking, dense_ranking])[:pool_size]
+
+    pairs = [(query, corpus[doc_idx]) for _, doc_idx in fused]
+    scores = reranker.predict(pairs)
+    reranked = sorted(zip(scores, [doc_idx for _, doc_idx in fused]), reverse=True)
+    return reranked[:top_k]
+</code></pre>
+<p>Three stages composed. BM25 finds lexical matches. Dense finds semantic matches. RRF merges the two rankings without needing score calibration. Cross-encoder rescores the top-30 using query-document pairs together, which captures fine-grained relevance the bi-encoder missed. Keep top-5.</p>
+<h3>Step 5: evaluation</h3>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Recall@k</td>
+<td>Of queries where the correct document exists, how often is it in the top-k?</td>
+</tr>
+<tr>
+<td>MRR (Mean Reciprocal Rank)</td>
+<td>Average of 1/rank of first relevant document.</td>
+</tr>
+<tr>
+<td>nDCG@k</td>
+<td>Accounts for relevance gradations, not just binary relevant/not.</td>
+</tr>
+</tbody>
+</table>
+<p>For RAG specifically, <strong>Recall@k</strong> of the retriever is the most important number. Your reader cannot answer if the right passage is not in the retrieved set.</p>
+<p>Debugging tip: for failing queries, diff the sparse and dense rankings. If one finds the right document and the other does not, you have a vocabulary mismatch (fix: add the missing half) or a semantic ambiguity (fix: better embeddings or a reranker).</p>
+<h2>Use It</h2>
+<p>The 2026 stack:</p>
+<table>
+<thead>
+<tr>
+<th>Scale</th>
+<th>Stack</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1k-100k docs</td>
+<td>In-memory BM25 + <code>all-MiniLM-L6-v2</code> embeddings + RRF. No separate DB.</td>
+</tr>
+<tr>
+<td>100k-10M docs</td>
+<td>FAISS or pgvector for dense + Elasticsearch / OpenSearch for BM25. Run in parallel.</td>
+</tr>
+<tr>
+<td>10M+ docs</td>
+<td>Qdrant / Weaviate / Vespa / Milvus with hybrid support. Cross-encoder rerank on top-30.</td>
+</tr>
+<tr>
+<td>Best-quality frontier</td>
+<td>Three-way (BM25 + dense + SPLADE) + ColBERT late-interaction reranking</td>
+</tr>
+</tbody>
+</table>
+<p>Whatever you pick, budget for evaluation. Benchmark retrieval recall before benchmarking end-to-end RAG accuracy. A reader cannot fix what the retriever missed.</p>
+<h3>The hard-won lessons from 2026 production RAG</h3>
+<ul>
+<li><strong>80% of RAG failures trace to ingestion and chunking, not the model.</strong> Teams spend weeks swapping LLMs and tuning prompts while the retrieval quietly returns the wrong context every third query. Fix chunking first.</li>
+<li><strong>Chunking strategy matters more than chunk size.</strong> Fixed-size splits break tables, code, and nested headers. Sentence-aware is the default; semantic or LLM-based chunking pays off for technical docs and product manuals.</li>
+<li><strong>Parent-doc pattern.</strong> Retrieve small &quot;child&quot; chunks for precision. When multiple children from the same parent section appear, swap in the parent block to preserve context. This consistently lifts answer quality without retraining.</li>
+<li><strong>k_rerank=3 is usually optimal.</strong> Every extra chunk past that adds token cost and generation latency without lifting answer quality. If k=8 is still better than k=3 for you, the reranker is underperforming.</li>
+<li><strong>HyDE / query expansion.</strong> Generate a hypothetical answer from the query, embed that, retrieve. Bridges the phrasing gap between short questions and long documents. Free precision lift with no training.</li>
+<li><strong>Context budget under 8K tokens.</strong> Consistent hits at that limit mean the reranker threshold is too loose.</li>
+<li><strong>Version everything.</strong> Prompts, chunking rules, embedding model, reranker. Any drift silently breaks answer quality. CI gates on faithfulness, context precision, and unanswered-question rate block regressions before users see them.</li>
+<li><strong>Three-way retrieval (BM25 + dense + learned-sparse like SPLADE) outperforms two-way</strong> on 2026 benchmarks, especially for queries mixing proper nouns with semantics. Ship it when infrastructure supports SPLADE indexes.</li>
+</ul>
+<p>Proper retrieval design reduces hallucinations by 70-90% according to 2026 industry measurements. Most RAG performance gains come from better retrieval, not model fine-tuning.</p>
+<h2>Ship It</h2>
+<p>Save as <code>outputs/skill-retrieval-picker.md</code>:</p>
+<pre><code class="language-markdown">---
+name: retrieval-picker
+description: Pick a retrieval stack for a given corpus and query pattern.
+version: 1.0.0
+phase: 5
+lesson: 14
+tags: [nlp, retrieval, rag, search]
+---
+
+Given requirements (corpus size, query pattern, latency budget, quality bar, infra constraints), output:
+
+1. Stack. BM25 only, dense only, hybrid (BM25 + dense + RRF), hybrid + cross-encoder rerank, or three-way (BM25 + dense + learned-sparse).
+2. Dense encoder. Name the specific model. Match to language(s), domain, and context length.
+3. Reranker. Name the specific cross-encoder model if used. Flag that rerank adds 30-100ms latency on top-30.
+4. Evaluation plan. Recall@10 is the primary retriever metric. MRR for multi-answer. Baseline first, incremental improvements measured against it.
+
+Refuse to recommend dense-only for corpora with named entities, error codes, or product SKUs unless the user has evidence dense handles exact matches. Refuse to skip reranking for high-stakes retrieval (legal, medical) where the final top-5 decides the user's answer.
+</code></pre>
+<h2>Exercises</h2>
+<ol>
+<li><strong>Easy.</strong> Implement <code>hybrid_search</code> above on a 500-document corpus. Test 20 queries. Compare recall at 5 between BM25-only, dense-only, and hybrid.</li>
+<li><strong>Medium.</strong> Add MRR calculation. For each test query with a known correct document, find the rank of the correct doc in BM25, dense, and hybrid rankings. Report the MRR for each.</li>
+<li><strong>Hard.</strong> Fine-tune a dense encoder on your domain using MultipleNegativesRankingLoss (Sentence Transformers). Build a training set from 500 query-document pairs. Compare pre- and post-fine-tune recall.</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>BM25</td>
+<td>Keyword search</td>
+<td>Okapi BM25. Scores documents by term frequency, IDF, and length.</td>
+</tr>
+<tr>
+<td>Dense retrieval</td>
+<td>Vector search</td>
+<td>Encode query + doc into vectors, find nearest neighbors.</td>
+</tr>
+<tr>
+<td>Bi-encoder</td>
+<td>Embedding model</td>
+<td>Encodes query and doc independently. Fast at query time.</td>
+</tr>
+<tr>
+<td>Cross-encoder</td>
+<td>Reranker model</td>
+<td>Encodes query + doc together. Slow but accurate.</td>
+</tr>
+<tr>
+<td>RRF</td>
+<td>Rank fusion</td>
+<td>Combine two rankings by summing <code>1/(k + rank)</code>.</td>
+</tr>
+<tr>
+<td>Recall@k</td>
+<td>Retrieval metric</td>
+<td>Fraction of queries where a relevant doc is in the top-k.</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://www.staff.city.ac.uk/~sbrp622/papers/foundations_bm25_review.pdf" rel="noreferrer" data-network="true">Robertson and Zaragoza (2009). The Probabilistic Relevance Framework: BM25 and Beyond <small>↗ 需要联网</small></a> — the definitive BM25 treatment.</li>
+<li><a href="https://arxiv.org/abs/2004.04906" rel="noreferrer" data-network="true">Karpukhin et al. (2020). Dense Passage Retrieval for Open-Domain QA <small>↗ 需要联网</small></a> — DPR, the canonical bi-encoder.</li>
+<li><a href="https://arxiv.org/abs/2107.05720" rel="noreferrer" data-network="true">Formal et al. (2021). SPLADE: Sparse Lexical and Expansion Model <small>↗ 需要联网</small></a> — the learned-sparse retriever that closes the gap with dense.</li>
+<li><a href="https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf" rel="noreferrer" data-network="true">Cormack, Clarke, Büttcher (2009). Reciprocal Rank Fusion outperforms Condorcet and individual Rank Learning Methods <small>↗ 需要联网</small></a> — RRF paper.</li>
+<li><a href="https://arxiv.org/abs/2004.12832" rel="noreferrer" data-network="true">Khattab and Zaharia (2020). ColBERT: Efficient and Effective Passage Search <small>↗ 需要联网</small></a> — late-interaction retrieval.</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-05-nlp-foundations-to-advanced--14-information-retrieval-search.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-05-nlp-foundations-to-advanced--14-information-retrieval-search.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/05-nlp-foundations-to-advanced/14-information-retrieval-search/code/main.py">phases/05-nlp-foundations-to-advanced/14-information-retrieval-search/code/main.py</a><details><summary>查看原始文本</summary><pre><code>import math
+import re
+from collections import Counter
+
+
+def tokenize(text):
+    return re.findall(r&quot;[a-z0-9]+&quot;, text.lower())
+
+
+class BM25:
+    def __init__(self, corpus, k1=1.5, b=0.75):
+        if not corpus:
+            raise ValueError(&quot;BM25 corpus must not be empty&quot;)
+        self.corpus = [tokenize(d) for d in corpus]
+        self.k1 = k1
+        self.b = b
+        self.n_docs = len(self.corpus)
+        self.avg_dl = sum(len(d) for d in self.corpus) / self.n_docs
+        self.df = Counter()
+        for doc in self.corpus:
+            for term in set(doc):
+                self.df[term] += 1
+
+    def idf(self, term):
+        n = self.df.get(term, 0)
+        return math.log(1 + (self.n_docs - n + 0.5) / (n + 0.5))
+
+    def score(self, query, doc_idx):
+        q_tokens = tokenize(query)
+        doc = self.corpus[doc_idx]
+        dl = len(doc)
+        freq = Counter(doc)
+        total = 0.0
+        for term in q_tokens:
+            f = freq.get(term, 0)
+            if f == 0:
+                continue
+            num = f * (self.k1 + 1)
+            den = f + self.k1 * (1 - self.b + self.b * dl / self.avg_dl)
+            total += self.idf(term) * num / den
+        return total
+
+    def rank(self, query, top_k=10):
+        scored = [(self.score(query, i), i) for i in range(self.n_docs)]
+        scored.sort(reverse=True)
+        return scored[:top_k]
+
+
+def reciprocal_rank_fusion(rankings, k=60):
+    scores = {}
+    for ranking in rankings:
+        for rank, (_, doc_idx) in enumerate(ranking):
+            scores[doc_idx] = scores.get(doc_idx, 0.0) + 1.0 / (k + rank + 1)
+    fused = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    return [(score, doc_idx) for doc_idx, score in fused]
+
+
+def fake_dense_rank(query, corpus, top_k=5):
+    q_tokens = set(tokenize(query))
+    scored = []
+    for i, d in enumerate(corpus):
+        d_tokens = set(tokenize(d))
+        if not d_tokens or not q_tokens:
+            scored.append((0.0, i))
+            continue
+        jaccard = len(q_tokens &amp; d_tokens) / len(q_tokens | d_tokens)
+        expansion = 0.0
+        for qt in q_tokens:
+            for dt in d_tokens:
+                if qt != dt and min(len(qt), len(dt)) &gt;= 4 and (qt in dt or dt in qt):
+                    expansion += 0.15
+        scored.append((jaccard + expansion, i))
+    scored.sort(reverse=True)
+    return scored[:top_k]
+
+
+def main():
+    corpus = [
+        &quot;Apple Inc. released the first iPhone on June 29, 2007.&quot;,
+        &quot;Macworld 2007 featured the iPhone announcement by Steve Jobs.&quot;,
+        &quot;Android launched in 2008 as Google&#39;s mobile smartphone operating system.&quot;,
+        &quot;The first iPod was released by Apple in 2001.&quot;,
+        &quot;Section 420 of the Indian Penal Code covers cheating and dishonest inducement.&quot;,
+        &quot;Fraud refers to wrongful or criminal deception intended to result in financial gain.&quot;,
+        &quot;Cheating someone to obtain money is a criminal offence in most jurisdictions.&quot;,
+    ]
+
+    bm25 = BM25(corpus)
+
+    query = &quot;what happens if someone lies to get money&quot;
+    print(f&quot;query: {query}\n&quot;)
+
+    sparse = bm25.rank(query, top_k=5)
+    print(&quot;BM25 (sparse):&quot;)
+    for score, idx in sparse:
+        print(f&quot;  {score:.3f}  {corpus[idx]}&quot;)
+    print()
+
+    dense = fake_dense_rank(query, corpus, top_k=5)
+    print(&quot;fake-dense (shape demonstration):&quot;)
+    for score, idx in dense:
+        print(f&quot;  {score:.3f}  {corpus[idx]}&quot;)
+    print()
+
+    fused = reciprocal_rank_fusion([sparse, dense])[:5]
+    print(&quot;RRF fused:&quot;)
+    for score, idx in fused:
+        print(f&quot;  {score:.4f}  {corpus[idx]}&quot;)
+
+    print()
+    print(&quot;note: this code uses a toy &#39;fake-dense&#39; ranker for teaching.&quot;)
+    print(&quot;real dense retrieval needs a sentence-transformer encoder; see docs/en.md.&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/05-nlp-foundations-to-advanced/14-information-retrieval-search/outputs/.gitkeep">phases/05-nlp-foundations-to-advanced/14-information-retrieval-search/outputs/.gitkeep</a><details><summary>查看原始文本</summary><pre><code></code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/05-nlp-foundations-to-advanced/14-information-retrieval-search/outputs/skill-retrieval-picker.md">phases/05-nlp-foundations-to-advanced/14-information-retrieval-search/outputs/skill-retrieval-picker.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: retrieval-picker
+description: Pick a retrieval stack for a given corpus and query pattern.
+version: 1.0.0
+phase: 5
+lesson: 14
+tags: [nlp, retrieval, rag, search]
+---
+
+Given requirements (corpus size, query pattern, latency budget, quality bar, infra constraints), output:
+
+1. Stack. BM25 only, dense only, hybrid (BM25 + dense + RRF), hybrid + cross-encoder rerank, or three-way (BM25 + dense + learned-sparse).
+2. Dense encoder. Name the specific model (`all-MiniLM-L6-v2`, `bge-large-en-v1.5`, `e5-large-v2`, `paraphrase-multilingual-MiniLM-L12-v2`). Match to language, domain, context length.
+3. Reranker. Name the cross-encoder model if used (`cross-encoder/ms-marco-MiniLM-L-6-v2`, `BAAI/bge-reranker-large`). Flag ~30-100ms added latency on top-30.
+4. Evaluation plan. Recall@10 is the primary retriever metric. MRR for multi-answer. Baseline first, incremental improvements measured against it.
+
+Refuse to recommend dense-only for corpora with named entities, error codes, or product SKUs unless the user has evidence dense handles exact matches. Refuse to skip reranking for high-stakes retrieval (legal, medical) where the final top-5 decides the user&#39;s answer.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. What does BM25 score a document on?</legend><label class="option"><input type="radio" name="q0" value="0"> Term frequency, IDF, and document-length-normalized presence of query terms</label><label class="option"><input type="radio" name="q0" value="1"> Edit distance to the query</label><label class="option"><input type="radio" name="q0" value="2"> Embedding cosine to the query</label><label class="option"><input type="radio" name="q0" value="3"> PageRank over the corpus</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. What is the main weakness of dense-only retrieval that BM25 catches?</legend><label class="option"><input type="radio" name="q1" value="0"> Multilingual queries</label><label class="option"><input type="radio" name="q1" value="1"> Latency</label><label class="option"><input type="radio" name="q1" value="2"> Exact keyword and identifier matches (product codes, error strings, named entities) that semantic embeddings can miss</label><label class="option"><input type="radio" name="q1" value="3"> Long documents</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. Why does Reciprocal Rank Fusion (RRF) ignore raw scores from each retriever?</legend><label class="option"><input type="radio" name="q2" value="0"> BM25 and dense scores live in different scales; using only rank positions makes the fusion robust to calibration</label><label class="option"><input type="radio" name="q2" value="1"> Speeds up sorting</label><label class="option"><input type="radio" name="q2" value="2"> RRF requires probabilities</label><label class="option"><input type="radio" name="q2" value="3"> Raw scores are illegal to use</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. Why run a cross-encoder reranker only on the top-30 fused results?</legend><label class="option"><input type="radio" name="q3" value="0"> Cross-encoders are slow per pair; amortizing them on a small candidate pool gives high accuracy with acceptable latency</label><label class="option"><input type="radio" name="q3" value="1"> Rerankers reduce recall</label><label class="option"><input type="radio" name="q3" value="2"> Cross-encoders are required at every step</label><label class="option"><input type="radio" name="q3" value="3"> Top-30 is required by FAISS</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. Which metric is most important to optimize for RAG retrievers?</legend><label class="option"><input type="radio" name="q4" value="0"> Throughput</label><label class="option"><input type="radio" name="q4" value="1"> Recall@k, since the reader cannot answer if the correct passage is missing from the top-k</label><label class="option"><input type="radio" name="q4" value="2"> BLEU</label><label class="option"><input type="radio" name="q4" value="3"> Latency</label><p data-feedback="4"></p></fieldset><fieldset><legend>6. Where do most production RAG failures originate, per 2026 industry experience?</legend><label class="option"><input type="radio" name="q5" value="0"> Ingestion and chunking, not the model; bad context defeats good readers</label><label class="option"><input type="radio" name="q5" value="1"> Prompt verbosity</label><label class="option"><input type="radio" name="q5" value="2"> Reranker tuning</label><label class="option"><input type="radio" name="q5" value="3"> The LLM choice</label><p data-feedback="5"></p></fieldset><fieldset><legend>7. What is the &#39;parent-doc&#39; retrieval pattern?</legend><label class="option"><input type="radio" name="q6" value="0"> Pick the longest document</label><label class="option"><input type="radio" name="q6" value="1"> Use parent doc embeddings only</label><label class="option"><input type="radio" name="q6" value="2"> Retrieve small child chunks for precision, then expand to the parent block when multiple children from the same parent appear, preserving context</label><label class="option"><input type="radio" name="q6" value="3"> Embed only parent documents</label><p data-feedback="6"></p></fieldset><fieldset><legend>8. When should you ship three-way retrieval (BM25 + dense + SPLADE)?</legend><label class="option"><input type="radio" name="q7" value="0"> Always</label><label class="option"><input type="radio" name="q7" value="1"> When infrastructure supports learned-sparse indexes and queries mix proper nouns with semantic intent</label><label class="option"><input type="radio" name="q7" value="2"> Only on under 1000 documents</label><label class="option"><input type="radio" name="q7" value="3"> Only for English-only corpora</label><p data-feedback="7"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/05-nlp-foundations-to-advanced/13-question-answering/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/05-nlp-foundations-to-advanced/15-topic-modeling/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/05-nlp-foundations-to-advanced/14-information-retrieval-search/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

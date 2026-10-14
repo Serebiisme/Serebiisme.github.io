@@ -1,0 +1,173 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>Distributed Eval Farm Coordinator · Serebii Labs</title></head><body data-pack="ai-from-scratch-project-distributed-eval-farm" data-lesson="" data-project="distributed-eval-farm"><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow">PROJECT / distributed-eval-farm</p><h1 class="lesson-title">Distributed Eval Farm Coordinator</h1><p class="notice">本站中文导读 + 原作者英文全文 · 代码运行未验证</p><p>这是原课程的「Distributed Eval Farm Coordinator」实践项目。先阅读下方原始目标与阶段说明，再按课序实现功能、运行评分器并比较参考实现。英文全文未缩写；中文长文尚未翻译。</p><p>练习骨架 starter：原项目未提供，勿将 solution 当作骨架；参考实现 solution：12 个文件。运行前按 README 准备依赖与输入；模型、数据或在线服务不包含在离线阅读包中。</p><div class="save-panel"><button type="button" data-save>保存本项目阅读资料</button><span data-save-status role="status">未检测离线状态</span></div><p><a download href="/learn/ai-from-scratch/downloads/project-distributed-eval-farm.zip">下载完整项目 ZIP（需联网，或单独保存）</a> <button data-save-download="/learn/ai-from-scratch/downloads/project-distributed-eval-farm.zip" type="button">单独保存项目 ZIP</button></p><section><h2>学习目标（原作者）</h2><ul><li>Partition stable case identities</li><li>Fence each shard lease</li><li>Accept idempotent completion receipts</li><li>Run a bounded local worker pool</li></ul></section><section class="prose" lang="en"><h1>Distributed Eval Farm Coordinator</h1>
+<p>Turn a file of recorded model predictions into a resumable evaluation run. Separate worker processes acquire persisted shards, compare answers and publish fenced receipts. Kill a worker after its claim, restart the run and prove an old worker cannot overwrite the replacement's result.</p>
+<p>Go fits the coordinator because the same dependency-free binary can launch child workers, bound concurrency and coordinate filesystem state. This implementation distributes work across processes on one Linux or macOS host. It does not provide a multi-machine transport or perform model inference.</p>
+<p>Four stages take about 8 hours. You need Go 1.22+, Python 3.10+ for the grader, structs, errors, JSON, goroutines, channels and cancellation. Start with <a href="https://go.dev/tour/" rel="noreferrer" data-network="true">A Tour of Go <small>↗ 需要联网</small></a> and <a href="https://go.dev/blog/pipelines" rel="noreferrer" data-network="true">Go pipelines <small>↗ 需要联网</small></a> if channels are unfamiliar. Completing <a href="/learn/ai-from-scratch/projects/durable-agent-jobs/">Durable Agent Jobs</a> makes the persistence stage easier.</p>
+<h2>Build and run your version</h2>
+<p>From the repository root:</p>
+<pre><code class="language-bash">python3 scripts/project_test.py distributed-eval-farm --init /tmp/distributed-eval-farm-work
+python3 scripts/project_test.py distributed-eval-farm --stage 1 --path /tmp/distributed-eval-farm-work --strict
+</code></pre>
+<p>Initialization supplies types, process glue and sample predictions. The first test intentionally fails until you implement <code>stage1.go</code>. Finish all four stages, then run your composed artifact:</p>
+<pre><code class="language-bash">python3 scripts/project_test.py distributed-eval-farm --all --path /tmp/distributed-eval-farm-work --strict --report /tmp/farm-learner.json
+cd /tmp/distributed-eval-farm-work
+go build -o /tmp/farm-learner .
+/tmp/farm-learner demo --input samples/cases.json --workers 2 --shards 4
+</code></pre>
+<p>The demo crashes a real worker after its durable claim, prints the incomplete snapshot, then starts replacement workers at the expiry boundary. The supplied coordinator calls your stage implementations. A reference pass is instructor evidence, not learner completion.</p>
+<h2>Run the reference on a prediction file</h2>
+<pre><code class="language-bash">cd projects/distributed-eval-farm/solution
+go build -o /tmp/eval-farm .
+STORE=$(mktemp -d /tmp/eval-farm.XXXXXX)
+/tmp/eval-farm init --store &quot;$STORE&quot; --input samples/cases.json --shards 4
+/tmp/eval-farm run --store &quot;$STORE&quot; --input samples/cases.json --shards 4 --workers 2
+/tmp/eval-farm status --store &quot;$STORE&quot;
+</code></pre>
+<p>Each input record has id, prompt, expected and response. Pass your own JSON array or edit a copy of the sample. Scoring lowercases and collapses whitespace before comparing expected with response. The four authored records score 3/4. Before run, completed_shards and evaluated are 0. Afterwards, complete is true, completed_shards is 4, evaluated is 4 and correct is 3.</p>
+<p>The report retains the SHA256 of the ordered dataset and per-shard case results, owners, versions and actual worker PIDs. With the sample and workers 2, two bounded waves launch four short-lived processes. PIDs vary; the concurrency cap remains 2. A finished rerun emits no new worker events and preserves receipts. Recorded sample answers demonstrate coordination, not a model benchmark.</p>
+<h2>Recover a crashed worker</h2>
+<p>Use a separate store and one shard so the recovery is easy to follow:</p>
+<pre><code class="language-bash">CRASH_STORE=$(mktemp -d /tmp/eval-crash.XXXXXX)
+/tmp/eval-farm init --store &quot;$CRASH_STORE&quot; --input samples/cases.json --shards 1
+/tmp/eval-farm worker --store &quot;$CRASH_STORE&quot; --worker-id old --now-ms 100 --lease-ms 10 --crash-after-claim
+/tmp/eval-farm status --store &quot;$CRASH_STORE&quot;
+/tmp/eval-farm run --store &quot;$CRASH_STORE&quot; --input samples/cases.json --shards 1 --workers 2 --now-ms 110 --lease-ms 10
+</code></pre>
+<p>The crash intentionally exits 86. Status shows owner old, version 1, expiry 110 and Done false. Recovery at 110 finishes version 2 with all four case results. Recovery at 109 instead reports a pending run and exits 1; it does not steal a live lease. Omit now-ms for wall-clock operation. <code>--delay-ms</code> pauses after a claim to expose a stale-worker race without changing the scoring function.</p>
+<h2>Learn and integrate</h2>
+<ol>
+<li><a href="/learn/ai-from-scratch/projects/distributed-eval-farm/#01-partition-stable-case-identities">Partition stable case identities</a>.</li>
+<li><a href="/learn/ai-from-scratch/projects/distributed-eval-farm/#02-fence-each-shard-lease">Persist and fence shard leases</a>.</li>
+<li><a href="/learn/ai-from-scratch/projects/distributed-eval-farm/#03-accept-idempotent-completion-receipts">Accept idempotent receipts</a>.</li>
+<li><a href="/learn/ai-from-scratch/projects/distributed-eval-farm/#04-run-a-bounded-local-worker-pool">Compose a bounded process coordinator</a>.</li>
+</ol>
+<p><a href="/learn/ai-from-scratch/files/projects/distributed-eval-farm/API.md">API.md</a> documents the JSON and process boundary. Any language can write a prediction file and parse the report. Final-stage tests build the selected learner binary, use actual worker processes, test crash recovery, delayed stale writers, dataset changes and corrupt-state preservation:</p>
+<pre><code class="language-bash">python3 scripts/project_test.py distributed-eval-farm --all --solution --strict
+</code></pre>
+<h2>Honest limits</h2>
+<p>The coordinator uses a 4 MiB whole-run snapshot and a local POSIX advisory lock. All writers must cooperate. Network filesystems, untrusted store writers and multi-host clocks are outside the contract. File sync and atomic rename demonstrate process-crash recovery; directory sync and power-loss guarantees are not implemented.</p>
+<p>Predictions are already recorded. Exact-match scoring does not judge semantic quality, citations or fairness, and no model API is called. There is no network worker protocol, lease heartbeat, dynamic resharding, retry backoff or scheduling daemon. <code>run</code> makes bounded waves and reports pending leases instead of waiting indefinitely; invoke it again after expiry. Context cancellation bounds cooperative callbacks; the CLI additionally gives the run a two-minute deadline. These are visible starting points for an advanced extension, not hidden production guarantees.</p>
+</section><section id="01-partition-stable-case-identities"><h2>01-partition-stable-case-identities · 原始阶段说明</h2><div class="prose" lang="en"><h1>Partition stable case identities</h1>
+<blockquote>
+<p>A restarted evaluation should know which cases belong to each shard before any worker starts.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Go
+<strong>Prerequisites:</strong> Go structs, pointers, errors, JSON files and a shell; complete earlier stages in order.
+<strong>Stage:</strong> 1 of 4
+<strong>Time:</strong> ~2 hours</p>
+<h2>What you build</h2>
+<p>Make dataset placement reproducible. Implement <code>stage1.go</code> in your initialized workspace. The supplied CLI calls your implementation; it does not import the reference solution.</p>
+<h2>Work through the mechanism</h2>
+<p>Partitioning assigns identifiers to buckets. Start the FNV-1a32 hash at 2166136261, XOR each UTF-8 byte and multiply by 16777619 with 32-bit wraparound. Take hash modulo shard count. Go's <code>hash/fnv</code> implements this primitive; the learning work is defining and testing the identity contract around it.</p>
+<p>With four shards, the sample identifiers land as case-d in 0, case-c in 1, case-b in 2 and case-a in 3. Reordering the input changes each bucket's local order but never an identifier's bucket. Do not assert that every bucket has equal size: deterministic assignment is not a load-balancing guarantee.</p>
+<p>Reject empty identifiers, duplicates and shard counts outside 1..1024. The supplied persistent store also fingerprints the ordered input records, including prompts, expected answers and recorded responses. A changed prediction or shard count needs a different store. Otherwise a resumed run could combine results from two experiments while keeping one apparent dataset name.</p>
+<p>Empty partitions need no lease and are omitted from the stored active shard list. Coverage still counts every actual case. A sample with one record and four buckets has one active shard, not four artificial completed tasks.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-b096411ad9eda938a123.png" alt="pj-distributed-eval-farm-1 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Your contract</h2>
+<pre><code class="language-go">func Partition(ids []string, shards int) ([][]string, error)
+</code></pre>
+<p>Keep the public signature and errors in <code>types.go</code>. Rejected calls must preserve the caller's prior state. Read <a href="/learn/ai-from-scratch/files/projects/distributed-eval-farm/API.md">the project API</a> for the final artifact's file and process boundaries.</p>
+<h2>Implementation hint</h2>
+<p>Allocate all requested buckets first, track seen identifiers, hash bytes and append to exactly one bucket. Keep IDs intact; normalization can merge distinct cases.</p>
+<h2>Verify your work</h2>
+<p>From the repository root:</p>
+<pre><code class="language-bash">python3 scripts/project_test.py distributed-eval-farm --stage 1 --path /tmp/distributed-eval-farm-work --strict
+</code></pre>
+<p>The grader exercises your selected workspace, including the earlier stages. Its reference mode is a separate instructor check and does not earn learner completion.</p>
+<h2>Investigate a failure</h2>
+<p>Partition the sample into 4 and 3 buckets. Which case IDs move? Explain why changing only a prompt also changes the run fingerprint even though its shard assignment remains stable.</p>
+<h2>Sources and limits</h2>
+<p>Study the standard-library <a href="https://pkg.go.dev/os" rel="noreferrer" data-network="true">os package <small>↗ 需要联网</small></a>, <a href="https://pkg.go.dev/context" rel="noreferrer" data-network="true">context <small>↗ 需要联网</small></a> and <a href="https://go.dev/blog/pipelines" rel="noreferrer" data-network="true">Go pipelines guide <small>↗ 需要联网</small></a> as needed. These exercises and samples are original. Process recovery is demonstrated on one host; the README names the filesystem and evaluation limits you must preserve when adapting the artifact.</p>
+</div></section><section id="02-fence-each-shard-lease"><h2>02-fence-each-shard-lease · 原始阶段说明</h2><div class="prose" lang="en"><h1>Fence each shard lease</h1>
+<blockquote>
+<p>A lease must survive the process that acquired it. The next process must advance the same version.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Go
+<strong>Prerequisites:</strong> Complete stage 1; understand its exported types and failure contracts.
+<strong>Stage:</strong> 2 of 4
+<strong>Time:</strong> ~2 hours</p>
+<h2>What you build</h2>
+<p>Let another process take over safely. Implement <code>stage2.go</code> in your initialized workspace. The supplied CLI calls your implementation; it does not import the reference solution.</p>
+<h2>Work through the mechanism</h2>
+<p>The first worker claims shard-0 at 100 ms with a 10 ms lease. Its stored record has owner old, version 1 and until 110. A second worker at 109 cannot acquire it. At 110 it can become owner new with version 2. Completed shards stay closed regardless of time.</p>
+<p><code>Acquire</code> changes one Lease in memory. <code>ClaimShard</code> composes it with a whole-run snapshot under <code>ledger.lock</code>. It reloads while holding the lock, chooses an eligible shard, calls Acquire, saves, and only then returns cases to the worker. Starting an evaluation before the claim is durable would leave no recoverable owner after a crash.</p>
+<p>Run <code>farm worker --crash-after-claim</code> after initialization. This starts a real process and exits 86 after the rename, leaving its lease on disk. A replacement process at the expiry boundary can recover the shard. No network, model service or synthetic callback is needed to observe that failure.</p>
+<p>All participants must use the locking wrapper on a local Linux or macOS filesystem. A raw call to Acquire does not coordinate processes. A network filesystem or remote database requires its own transaction and clock contract.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-015b4104aa59a8c360a2.png" alt="pj-distributed-eval-farm-2 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Your contract</h2>
+<pre><code class="language-go">func Acquire(l *Lease, worker string, now, ttl int64) error
+</code></pre>
+<p>Keep the public signature and errors in <code>types.go</code>. Rejected calls must preserve the caller's prior state. Read <a href="/learn/ai-from-scratch/files/projects/distributed-eval-farm/API.md">the project API</a> for the final artifact's file and process boundaries.</p>
+<h2>Implementation hint</h2>
+<p>Check Done and a currently owned unexpired lease before mutation. Validate clock arithmetic. Keep owner, version and expiry changes together.</p>
+<h2>Verify your work</h2>
+<p>From the repository root:</p>
+<pre><code class="language-bash">python3 scripts/project_test.py distributed-eval-farm --stage 2 --path /tmp/distributed-eval-farm-work --strict
+</code></pre>
+<p>The grader exercises your selected workspace, including the earlier stages. Its reference mode is a separate instructor check and does not earn learner completion.</p>
+<h2>Investigate a failure</h2>
+<p>Pause a worker after it claims, then run another at the same logical time. Confirm that pending work is reported instead of stolen. Resume at 110 and inspect the persisted version.</p>
+<h2>Sources and limits</h2>
+<p>Study the standard-library <a href="https://pkg.go.dev/os" rel="noreferrer" data-network="true">os package <small>↗ 需要联网</small></a>, <a href="https://pkg.go.dev/context" rel="noreferrer" data-network="true">context <small>↗ 需要联网</small></a> and <a href="https://go.dev/blog/pipelines" rel="noreferrer" data-network="true">Go pipelines guide <small>↗ 需要联网</small></a> as needed. These exercises and samples are original. Process recovery is demonstrated on one host; the README names the filesystem and evaluation limits you must preserve when adapting the artifact.</p>
+</div></section><section id="03-accept-idempotent-completion-receipts"><h2>03-accept-idempotent-completion-receipts · 原始阶段说明</h2><div class="prose" lang="en"><h1>Accept idempotent completion receipts</h1>
+<blockquote>
+<p>Correct results from the wrong lease are still stale results.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Go
+<strong>Prerequisites:</strong> Complete stages 1 through 2; understand their exported types and failure contracts.
+<strong>Stage:</strong> 3 of 4
+<strong>Time:</strong> ~2 hours</p>
+<h2>What you build</h2>
+<p>Accept one result for one lease. Implement <code>stage3.go</code> in your initialized workspace. The supplied CLI calls your implementation; it does not import the reference solution.</p>
+<h2>Work through the mechanism</h2>
+<p>A result is tied to shard, owner and version. Suppose old/v1 computed the right answer but new/v2 already completed the shard. Submitting old/v1 must fail before comparing result text. The worker's intelligence does not give it current write authority.</p>
+<p>Before completion, require now &lt; Until and a nonempty result of at most 1 MiB. After completion, the same owner, version and exact result can be delivered again successfully, even after the lease time has passed. It acknowledges the existing receipt; it does not reopen evaluation. Changing any result byte conflicts.</p>
+<p>The CLI evaluates the supplied recorded response against expected text after lowercasing and collapsing whitespace. <code>GET</code> and <code>get</code> match; <code>no</code> and <code>yes</code> do not. Each shard receipt stores ordered case IDs, correctness flags and the actual worker PID. The coordinator verifies the receipt's coverage and counts before writing it into the persisted Lease.Result.</p>
+<p>This is a narrow exact-match evaluator. It cannot grade paraphrases, citation support or model reasoning. Replace the evaluator only after defining a stable scoring version and including that version in the run identity.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-af22507b7029f2feafba.png" alt="pj-distributed-eval-farm-3 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Your contract</h2>
+<pre><code class="language-go">func Submit(l *Lease, worker string, version int, now int64, result string) error
+</code></pre>
+<p>Keep the public signature and errors in <code>types.go</code>. Rejected calls must preserve the caller's prior state. Read <a href="/learn/ai-from-scratch/files/projects/distributed-eval-farm/API.md">the project API</a> for the final artifact's file and process boundaries.</p>
+<h2>Implementation hint</h2>
+<p>Check owner and version first. Then handle an already completed result. Apply the expiry condition only to a first completion; this ordering permits identical receipt redelivery.</p>
+<h2>Verify your work</h2>
+<p>From the repository root:</p>
+<pre><code class="language-bash">python3 scripts/project_test.py distributed-eval-farm --stage 3 --path /tmp/distributed-eval-farm-work --strict
+</code></pre>
+<p>The grader exercises your selected workspace, including the earlier stages. Its reference mode is a separate instructor check and does not earn learner completion.</p>
+<h2>Investigate a failure</h2>
+<p>Complete at 109, redeliver at 200 with identical data, then change one result byte. Predict all three outcomes. Try an old owner with identical data and explain why it still fails.</p>
+<h2>Sources and limits</h2>
+<p>Study the standard-library <a href="https://pkg.go.dev/os" rel="noreferrer" data-network="true">os package <small>↗ 需要联网</small></a>, <a href="https://pkg.go.dev/context" rel="noreferrer" data-network="true">context <small>↗ 需要联网</small></a> and <a href="https://go.dev/blog/pipelines" rel="noreferrer" data-network="true">Go pipelines guide <small>↗ 需要联网</small></a> as needed. These exercises and samples are original. Process recovery is demonstrated on one host; the README names the filesystem and evaluation limits you must preserve when adapting the artifact.</p>
+</div></section><section id="04-run-a-bounded-local-worker-pool"><h2>04-run-a-bounded-local-worker-pool · 原始阶段说明</h2><div class="prose" lang="en"><h1>Run a bounded local worker pool</h1>
+<blockquote>
+<p>Concurrency becomes useful when every dispatched worker uses the same durable claim and receipt path.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Go
+<strong>Prerequisites:</strong> Complete stages 1 through 3; understand their exported types and failure contracts.
+<strong>Stage:</strong> 4 of 4
+<strong>Time:</strong> ~2 hours</p>
+<h2>What you build</h2>
+<p>Run the whole farm across processes. Implement <code>stage4.go</code> in your initialized workspace. The supplied CLI calls your implementation; it does not import the reference solution.</p>
+<h2>Work through the mechanism</h2>
+<p>Implement a bounded goroutine pool around an injected callback. A channel carries unique work IDs; at most the configured worker count calls the callback simultaneously. Collect successful Items and sort by ID. If one callback fails, return its error alongside the successes you actually collected. Cancellation stops new useful work and is passed into every callback.</p>
+<p>The final <code>run</code> command uses this pool to launch operating-system worker processes. Each callback executes this same compiled binary with the worker command. Each process acquires one persisted shard, evaluates its recorded predictions and submits through the current lease. Work runs in bounded waves until all shards finish or every remaining shard has an unexpired owner.</p>
+<p>For the four-case sample and workers 2, two waves create four short-lived processes. The bound 2 describes simultaneous processes, not total process count. The resulting report shows 3 correct out of 4, complete coverage, the dataset hash, shard owners and actual process IDs. PIDs vary between runs; the scores come from the supplied responses.</p>
+<p>The final-stage tests run a delayed old worker alongside a replacement. After the replacement commits, the old process exits with a fencing error and the persisted snapshot remains unchanged. The tests also crash a worker, restart from disk, reject changed datasets and preserve corrupt input for diagnosis. This is same-host coordination, not a multi-machine transport.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-3dceca12ecaf38b65bf2.png" alt="pj-distributed-eval-farm-4 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Your contract</h2>
+<pre><code class="language-go">func Parallel(ctx context.Context, ids []string, workers int, run func(context.Context, string) (string, error)) ([]Item, error)
+</code></pre>
+<p>Keep the public signature and errors in <code>types.go</code>. Rejected calls must preserve the caller's prior state. Read <a href="/learn/ai-from-scratch/files/projects/distributed-eval-farm/API.md">the project API</a> for the final artifact's file and process boundaries.</p>
+<h2>Implementation hint</h2>
+<p>Only the dispatch goroutine closes the jobs channel. Close results after all workers exit. Give result collection enough capacity or keep draining it after an error to avoid stranding senders.</p>
+<h2>Verify your work</h2>
+<p>From the repository root:</p>
+<pre><code class="language-bash">python3 scripts/project_test.py distributed-eval-farm --stage 4 --path /tmp/distributed-eval-farm-work --strict
+</code></pre>
+<p>The grader exercises your selected workspace, including the earlier stages. Its reference mode is a separate instructor check and does not earn learner completion.</p>
+<h2>Investigate a failure</h2>
+<p>Run the sample with workers 1 and 2 and compare coverage and receipts, not wall-clock speed. Try workers 0 and a canceled context. Explain why a callback that ignores context can still delay pool shutdown.</p>
+<h2>Sources and limits</h2>
+<p>Study the standard-library <a href="https://pkg.go.dev/os" rel="noreferrer" data-network="true">os package <small>↗ 需要联网</small></a>, <a href="https://pkg.go.dev/context" rel="noreferrer" data-network="true">context <small>↗ 需要联网</small></a> and <a href="https://go.dev/blog/pipelines" rel="noreferrer" data-network="true">Go pipelines guide <small>↗ 需要联网</small></a> as needed. These exercises and samples are original. Process recovery is demonstrated on one host; the README names the filesystem and evaluation limits you must preserve when adapting the artifact.</p>
+</div></section><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

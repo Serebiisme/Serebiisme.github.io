@@ -1,0 +1,776 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>多型评估 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-19-capstone-projects" data-lesson="19-capstone-projects/63-multimodal-eval" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/19-capstone-projects/">综合项目</a> / LESSON 63</p><h1 class="lesson-title">多型评估</h1><p>Multimodal Evaluation</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>多型评估</h1>
+<blockquote>
+<p>训练是半循环.另一半是测量.这个课程从原始的基础上构建了三个评估表面:图像标题检索报告为R@1,R@5,R@10;视觉问题回答报告为精确匹配准确性;图像标题报告为BLEU-4.每个度量是模型输出的函数和合成评估套件,运行在秒钟内.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 19 lessons 58-62 (Track E foundations: encoder, transformer, projection, cross-attention fusion, pretraining)
+<strong>Time:</strong> ~90 minutes</p>
+<h2>学习目标</h2>
+<ul>
+<li>计算图像和标题嵌入之间的类似性矩阵 Recall@K.</li>
+<li>从绘制对 (图像,问题) 的模型计算到固定答案词汇库的精确匹配VQA准确性.</li>
+<li>根据生成的代币序列计算BLEU-4,并且没有任何外部库.</li>
+<li>运行所有三个评估与一个合成套件建立在训练模型的上课62.</li>
+</ul>
+<h2>问题</h2>
+<p>试图在训练损失平原时宣布一个多模模型完成.训练损失量度适合训练分布;它不测量模型是否可以在一批被持久的批量中排名对,回答问题,或写一个字幕一个人会接受.三个评估表面是标准的:</p>
+<ul>
+<li>**Retrieval (R@1, R@5, R@10).**构建查询标题的联合嵌入;按代数排列评估池中的每个图像;报告是否匹配图像落在前1位,前5位,前10位.对称 (图像到文本) 形式运行相同.</li>
+<li>**Visual question answering (exact match).**给出 (图像,问题),模型输出了一个答案代号. 精确的匹配是每样本的一位:预测答案是否等于参考答案?</li>
+<li>**Captioning (BLEU-4).**生成标题. 计算1克到4克精度的几何平均值与参考标题,使用简短处罚.多引用是标准形式 (一个图像,多个参考标题).</li>
+</ul>
+<p>每个指标都是一个薄型的函数.课程都以代码构建它们,所以数学是具体的,表面保持在你的控制之下.真正的基准套件 (MS-COCO,VQA v2,GQA,OK-VQA) 插入相同的函数形状.</p>
+<h2>概念</h2>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-a094d2aea1bc922c466d.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>从类似性矩阵中回忆@K</h3>
+<p>建立一个<code>(N, N)</code>图像和标题嵌入之间的共数相似性矩阵. 按下降的相似性来排序列. 记住@K是线索对角列指数位于顶部K位置的部分. 交换矩阵的代码是: 报道了两位数字. 对于N=100的评价,R@1 =0.6意味着60个标题中100个获取了正确的图像作为顶部匹配.</p>
+<h3>完全匹配的VQA</h3>
+<p>对于每一个图像 (图像,问题,答案),编码图像,嵌入问题,通过解码器并阅读下一个标志. 预测的代币ID与参考ID进行比较;如果等,则正确. 平均值超过评估集. 实际的VQA数据集每一个问题都包含多个人注释的答案,使用柔软精度公式 (1.0如果至少有3个注释者同意,以下缩小);课程使用单个答案的精确匹配来提供清晰度.</p>
+<h3>蓝色-4</h3>
+<pre><code class="language-text">BLEU-4 = BP * exp(mean(log p1, log p2, log p3, log p4))
+</code></pre>
+<p>在哪里?<code>p_n</code>是修改的 n-gram精度 (任何参考中出现的生成 n-gram 的剪切数量,分为生成的 n-gram 总数),以及<code>BP</code>是短暂的处罚:</p>
+<pre><code class="language-text">BP = 1                if generated length &gt; reference length
+   = exp(1 - r/g)     otherwise, where r is reference length and g is generated
+</code></pre>
+<p>需要滑滑小样本,其中一些样本<code>p_n</code>实现使用陈和桃&quot;方法 1&quot; (为任何零数量添加1到数量和命名器),这是低数量模式的最安全默认.</p>
+<h3>合成评估套件</h3>
+<p>根据第62课中使用的模拟体格,在内存中构建了一个50个样本的评估套件,其中有一个持久的种子.</p>
+<ul>
+<li><code>pairs</code>: 50 (图片,字幕_字幕) 对可检索.</li>
+<li><code>vqa</code>图片,问题,答案:50倍</li>
+<li><code>caps</code>: 50 (图片, [引用_标题_字符, ...]) 条目每张图片最多有3个引用.</li>
+</ul>
+<p>套件是从种子中确定性的,并从训练体中延伸出来,因此测量表是基于模型从未见过的数据计算的.将套件保持到JSON是作为一个练习 (见下面).</p>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th>Range</th>
+<th>Random baseline (N=50)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>R@1</td>
+<td>0 to 1</td>
+<td>0.02 (1 / N)</td>
+</tr>
+<tr>
+<td>R@5</td>
+<td>0 to 1</td>
+<td>0.10</td>
+</tr>
+<tr>
+<td>R@10</td>
+<td>0 to 1</td>
+<td>0.20</td>
+</tr>
+<tr>
+<td>VQA EM</td>
+<td>0 to 1</td>
+<td>1 / vocab</td>
+</tr>
+<tr>
+<td>BLEU-4</td>
+<td>0 to 1</td>
+<td>small but nonzero</td>
+</tr>
+</tbody>
+</table>
+<p>对于基于合成数据的50步训练,预计测量不会高,预计将超过随机基线,这是演示测试的结果.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-55eb3ccca2981bf8e3f1.png" alt="ch-recall-window 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<p><code>code/main.py</code>执行:</p>
+<ul>
+<li><code>recall_at_k(sim_matrix, k)</code>回一个浮动的<code>[0, 1]</code>两方向都会发生.</li>
+<li><code>vqa_exact_match(predictions, references)</code>返回平均值<code>int</code>平等.</li>
+<li><code>bleu4(generated, references, smoothing=True)</code>通过多个参考支持.</li>
+<li><code>build_eval_suite(seed, n_samples, vocab_size, max_len)</code>返回三个确定性评估列表.</li>
+<li><code>evaluate(model, suite)</code>运行所有三个指标,返回一个<code>dict</code>它们是数字的.</li>
+<li>通过一个测试,从第62课中装载一个新启动的多模式模型, 评估它, 然后训练它50步,</li>
+</ul>
+<p>运行它:</p>
+<pre><code class="language-bash">python3 code/main.py
+</code></pre>
+<p>输出:前后的表表显示,从近随机到模型学习的信号的检索改善,VQA在随机上改善,BLEU-4的改善 (合成结构足以实现4克精密升降).</p>
+<h2>用它</h2>
+<p>每个指标直接映射到生产基准指标上:</p>
+<ul>
+<li>**Retrieval.**基于相同的类似性矩阵的R@K问题,可以将合成的 eval取代为真实文件,并且函数签名保持不变.</li>
+<li>**VQA.**VQA v2,GQA,OK-VQA使用相同的完全匹配形状 (VQA v2 采用软 acc 而不是单响应 EM).</li>
+<li>**BLEU-4.**加入CIDEr是另一个功能.</li>
+</ul>
+<p>对于真正的基准,交换<code>build_eval_suite</code>算法是基准无知的.</p>
+<h2>测试</h2>
+<p><code>code/test_main.py</code>覆盖:</p>
+<ul>
+<li>返回回回0在完美的身份相似性矩阵上,并返回0在翻转的矩阵上为k &lt; N</li>
+<li>提醒@k尊重<code>k &lt;= N</code>上边界</li>
+<li>当生成时, bleu4返回1.0是相当于一个引用的确切值</li>
+<li>蓝色4返回了0.0的分离词汇库</li>
+<li>完全匹配的vqa等于等于等对的分数</li>
+<li>build_eval_suite返回预期对数,vqa项和标题入口</li>
+</ul>
+<p>运行它们:</p>
+<pre><code class="language-bash">python3 -m unittest code/test_main.py
+</code></pre>
+<h2>运动</h2>
+<ol>
+<li>
+<p>添加CIDEr到标题指标中.CIDEr使用TF-IDF权重在n克,从而奖励信息代币.</p>
+</li>
+<li>
+<p>实施柔性精度VQA:每一个问题多个人答案,精度是<code>min(human_count / 3, 1)</code>如果有任何匹配,则复制VQA v2.</p>
+</li>
+<li>
+<p>添加一个安全的 NaN 变体<code>bleu4</code>无需毁,处理空格生成的序列.</p>
+</li>
+<li>
+<p>计算与R@K的平均对方级别 (MRR).MRR对正确项落在顶部K之外的位置敏感;R@K对它落在顶部K是否敏感.</p>
+</li>
+<li>
+<p>在训练期间,在五个检查点 (步骤0, 10, 20, 30, 40, 50) 运行模型的评估,绘制学习曲线.确认测量轨迹跟踪损失轨迹.</p>
+</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What it means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>R@K</td>
+<td>Fraction of queries where the correct match lands in the top K results</td>
+</tr>
+<tr>
+<td>Exact match</td>
+<td>The simplest VQA scoring: predicted answer equals reference</td>
+</tr>
+<tr>
+<td>BLEU-4</td>
+<td>Geometric mean of 1- to 4-gram precisions, with brevity penalty</td>
+</tr>
+<tr>
+<td>Multi-reference</td>
+<td>A captioning metric accepts several reference captions per image</td>
+</tr>
+<tr>
+<td>Held-out</td>
+<td>The eval set is sampled from a seed disjoint from the training corpus</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li>软精度公式和数据集统计的VQA v2文件.</li>
+<li>对于TF-IDF权重 n克字幕的CIDER纸.</li>
+<li>对于滑滑变体,BLEU原始 (Papineni等人,2002).</li>
+<li>标题标题的MS-COCO评价脚本用于可信参考实现.</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Multimodal Evaluation</h1>
+<blockquote>
+<p>Training is half the loop. The other half is measurement. This lesson builds three evaluation surfaces from primitives: image-caption retrieval reported as R@1, R@5, R@10; visual question answering reported as exact match accuracy; and image captioning reported as BLEU-4. Each metric is a function over the model's outputs and a synthetic eval suite that runs in seconds.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 19 lessons 58-62 (Track E foundations: encoder, transformer, projection, cross-attention fusion, pretraining)
+<strong>Time:</strong> ~90 minutes</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Compute Recall@K from a similarity matrix between image and caption embeddings.</li>
+<li>Compute exact-match VQA accuracy from a model that maps (image, question) pairs to a fixed answer vocabulary.</li>
+<li>Compute BLEU-4 from generated and reference token sequences without any external library.</li>
+<li>Run all three evals against a synthetic suite built on top of the trained model from lesson 62.</li>
+</ul>
+<h2>The Problem</h2>
+<p>The temptation is to declare a multimodal model finished when the training loss plateaus. Training loss measures fit on the training distribution; it does not measure whether the model can rank pairs in a held-out batch, answer a question, or write a caption a human would accept. Three eval surfaces are standard:</p>
+<ul>
+<li><strong>Retrieval (R@1, R@5, R@10).</strong> Build the joint embedding for a query caption; rank every image in the eval pool by cosine; report whether the matching image lands in the top 1, top 5, top 10. Symmetric (image-to-text) form runs the same way.</li>
+<li><strong>Visual question answering (exact match).</strong> Given (image, question), the model outputs an answer token. Exact match is one-bit per sample: did the predicted answer equal the reference answer? Average over the eval set.</li>
+<li><strong>Captioning (BLEU-4).</strong> Generate a caption. Compute the geometric mean of 1-gram through 4-gram precisions against reference captions, with a brevity penalty. Multi-reference is the standard form (one image, several reference captions).</li>
+</ul>
+<p>Each metric is a thin function. The lesson builds them all in code so the math is concrete and the surface stays under your control. Real benchmark suites (MS-COCO, VQA v2, GQA, OK-VQA) plug into the same function shapes.</p>
+<h2>The Concept</h2>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-a094d2aea1bc922c466d.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><h3>Recall@K from a similarity matrix</h3>
+<p>Build the <code>(N, N)</code> cosine similarity matrix between image and caption embeddings. For each row, sort the columns by descending similarity. Recall@K is the fraction of rows where the diagonal column index lies within the top K positions. Symmetric Recall@K (caption-to-image) is computed on the transposed matrix. Both numbers are reported. For an N=100 eval, R@1 = 0.6 means 60 of the 100 captions retrieved their correct image as the top match.</p>
+<h3>VQA exact match</h3>
+<p>For each (image, question, answer), encode the image, embed the question, fuse via the decoder, and read out the next token. The predicted token id is compared to the reference id; correct if equal. Average over the eval set. Real VQA datasets ship with multiple human-annotated answers per question and use a soft-accuracy formula (1.0 if at least 3 of 10 annotators agree, scaled below); the lesson uses single-answer exact match for clarity.</p>
+<h3>BLEU-4</h3>
+<pre><code class="language-text">BLEU-4 = BP * exp(mean(log p1, log p2, log p3, log p4))
+</code></pre>
+<p>Where <code>p_n</code> is the modified n-gram precision (clipped count of generated n-grams that appear in any reference, divided by total generated n-grams), and <code>BP</code> is the brevity penalty:</p>
+<pre><code class="language-text">BP = 1                if generated length &gt; reference length
+   = exp(1 - r/g)     otherwise, where r is reference length and g is generated
+</code></pre>
+<p>Smoothing is needed for small samples where some <code>p_n</code> is zero. The implementation uses Chen and Cherry &quot;method 1&quot; (add 1 to numerator and denominator for any zero count), which is the safest default for low-count regimes.</p>
+<h3>Synthetic eval suite</h3>
+<p>A 50-sample eval suite is built in memory from the same mock corpus pattern used in lesson 62, with a held-out seed. Three lists make up the suite:</p>
+<ul>
+<li><code>pairs</code>: 50 (image, caption_ids) pairs for retrieval.</li>
+<li><code>vqa</code>: 50 (image, question_ids, answer_id) triples.</li>
+<li><code>caps</code>: 50 (image, [reference_caption_ids, ...]) entries with up to 3 references per image.</li>
+</ul>
+<p>The suite is deterministic from the seed and held out from the training corpus, so the metrics are computed on data the model never saw. Persisting the suite to JSON is left as an exercise (see below).</p>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th>Range</th>
+<th>Random baseline (N=50)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>R@1</td>
+<td>0 to 1</td>
+<td>0.02 (1 / N)</td>
+</tr>
+<tr>
+<td>R@5</td>
+<td>0 to 1</td>
+<td>0.10</td>
+</tr>
+<tr>
+<td>R@10</td>
+<td>0 to 1</td>
+<td>0.20</td>
+</tr>
+<tr>
+<td>VQA EM</td>
+<td>0 to 1</td>
+<td>1 / vocab</td>
+</tr>
+<tr>
+<td>BLEU-4</td>
+<td>0 to 1</td>
+<td>small but nonzero</td>
+</tr>
+</tbody>
+</table>
+<p>For a 50-step training run on synthetic data, the metrics are not expected to be high; they are expected to be above the random baseline, which is what the demo checks.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-55eb3ccca2981bf8e3f1.png" alt="ch-recall-window 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<p><code>code/main.py</code> implements:</p>
+<ul>
+<li><code>recall_at_k(sim_matrix, k)</code>, returning a float in <code>[0, 1]</code> for both directions.</li>
+<li><code>vqa_exact_match(predictions, references)</code>, returning the mean over <code>int</code> equality.</li>
+<li><code>bleu4(generated, references, smoothing=True)</code>, with multi-reference support.</li>
+<li><code>build_eval_suite(seed, n_samples, vocab_size, max_len)</code>, returning three deterministic eval lists.</li>
+<li><code>evaluate(model, suite)</code>, which runs all three metrics and returns a <code>dict</code> of numbers.</li>
+<li>A demo that loads a freshly-initialized multimodal model from lesson 62, evaluates it, then trains it for 50 steps and evaluates again, printing the before/after metrics.</li>
+</ul>
+<p>Run it:</p>
+<pre><code class="language-bash">python3 code/main.py
+</code></pre>
+<p>Output: the before/after metric table shows retrieval improving from near-random toward the model's learned signal, VQA improving above random, and BLEU-4 improving (the synthetic structure is enough for a 4-gram precision lift).</p>
+<h2>Use It</h2>
+<p>Each metric maps directly onto a production benchmark:</p>
+<ul>
+<li><strong>Retrieval.</strong> MS-COCO 5K val, Flickr30K, ImageNet zero-shot are all R@K problems on the same similarity matrix. Replace the synthetic eval with the real files and the function signature is unchanged.</li>
+<li><strong>VQA.</strong> VQA v2, GQA, OK-VQA use the same exact-match shape (with soft-acc instead of single-answer EM for VQA v2).</li>
+<li><strong>BLEU-4.</strong> MS-COCO captioning, NoCaps, Flickr30K captioning all use BLEU-4 plus CIDEr and METEOR. Adding CIDEr is one more function.</li>
+</ul>
+<p>For real benchmarks, swap <code>build_eval_suite</code> for a real loader and keep the function bodies. The math is benchmark-agnostic.</p>
+<h2>Tests</h2>
+<p><code>code/test_main.py</code> covers:</p>
+<ul>
+<li>recall@k returns 1.0 on a perfect identity similarity matrix and 0.0 on a flipped one for k &lt; N</li>
+<li>recall@k respects <code>k &lt;= N</code> upper bound</li>
+<li>bleu4 returns 1.0 when generated equals one of the references exactly</li>
+<li>bleu4 returns 0.0 on disjoint vocabulary</li>
+<li>vqa exact match equals the fraction of equal pairs</li>
+<li>build_eval_suite returns the expected number of pairs, vqa items, and caption entries</li>
+</ul>
+<p>Run them:</p>
+<pre><code class="language-bash">python3 -m unittest code/test_main.py
+</code></pre>
+<h2>Exercises</h2>
+<ol>
+<li>
+<p>Add CIDEr to the captioning metrics. CIDEr uses TF-IDF weighting on n-grams, which rewards informative tokens.</p>
+</li>
+<li>
+<p>Implement soft-accuracy VQA: multiple human answers per question, accuracy is <code>min(human_count / 3, 1)</code> if any matches. Replicates VQA v2.</p>
+</li>
+<li>
+<p>Add a NaN-safe variant of <code>bleu4</code> that handles empty generated sequences without crashing.</p>
+</li>
+<li>
+<p>Compute mean reciprocal rank (MRR) alongside R@K. MRR is sensitive to where the correct item lands beyond the top K; R@K is sensitive to whether it lands in the top K.</p>
+</li>
+<li>
+<p>Run the eval on the model at five checkpoints during training (step 0, 10, 20, 30, 40, 50) and plot the learning curve. Confirm the metric trajectories track the loss trajectory.</p>
+</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What it means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>R@K</td>
+<td>Fraction of queries where the correct match lands in the top K results</td>
+</tr>
+<tr>
+<td>Exact match</td>
+<td>The simplest VQA scoring: predicted answer equals reference</td>
+</tr>
+<tr>
+<td>BLEU-4</td>
+<td>Geometric mean of 1- to 4-gram precisions, with brevity penalty</td>
+</tr>
+<tr>
+<td>Multi-reference</td>
+<td>A captioning metric accepts several reference captions per image</td>
+</tr>
+<tr>
+<td>Held-out</td>
+<td>The eval set is sampled from a seed disjoint from the training corpus</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li>VQA v2 paper for the soft-accuracy formula and dataset statistics.</li>
+<li>CIDEr paper for TF-IDF-weighted n-gram captioning.</li>
+<li>BLEU original (Papineni et al., 2002) for the smoothing variants.</li>
+<li>MS-COCO captioning eval scripts for the canonical reference implementation.</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-19-capstone-projects--63-multimodal-eval.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-19-capstone-projects--63-multimodal-eval.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/63-multimodal-eval/code/main.py">phases/19-capstone-projects/63-multimodal-eval/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Multimodal evaluation: retrieval, VQA, and captioning.
+
+Three metric surfaces:
+  - Recall@K from a cosine similarity matrix between image and caption vectors
+  - VQA exact match between predicted and reference answer ids
+  - BLEU-4 with multi-reference smoothing
+
+The demo evaluates an untrained model, trains it for 50 steps on a synthetic
+mock corpus, and re-evaluates to show the metrics move above their random
+baselines.
+
+Run with: python3 main.py
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import importlib.util
+import math
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+THIS_DIR = Path(__file__).resolve().parent
+LESSON_62 = THIS_DIR.parent.parent / &quot;62-vision-language-pretraining&quot; / &quot;code&quot;
+
+
+def _load_module(name: str, path: Path):
+    if name in sys.modules:
+        return sys.modules[name]
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f&quot;could not load {path}&quot;)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_pretrain = _load_module(&quot;pretrain_lesson62&quot;, LESSON_62 / &quot;main.py&quot;)
+MultimodalModel = _pretrain.MultimodalModel
+PretrainConfig = _pretrain.PretrainConfig
+make_mock_corpus = _pretrain.make_mock_corpus
+sample_batch = _pretrain.sample_batch
+PAD_ID = _pretrain.PAD_ID
+
+
+@dataclass
+class RetrievalPair:
+    image: torch.Tensor
+    caption_ids: torch.Tensor
+
+
+@dataclass
+class VQATriple:
+    image: torch.Tensor
+    question_ids: torch.Tensor
+    answer_id: int
+
+
+@dataclass
+class CaptionSample:
+    image: torch.Tensor
+    references: list[list[int]]
+
+
+@dataclass
+class EvalSuite:
+    retrieval: list[RetrievalPair]
+    vqa: list[VQATriple]
+    caps: list[CaptionSample]
+
+
+def recall_at_k(sim: torch.Tensor, k: int) -&gt; tuple[float, float]:
+    &quot;&quot;&quot;Return (i2t, t2i) recall@k.
+
+    sim is (N, N) where row i is the similarity of image i to every caption.
+    &quot;&quot;&quot;
+    if sim.dim() != 2 or sim.shape[0] != sim.shape[1]:
+        raise ValueError(f&quot;sim must be square (N, N), got {tuple(sim.shape)}&quot;)
+    n = sim.shape[0]
+    if k &lt; 1 or k &gt; n:
+        raise ValueError(f&quot;k {k} not in [1, N={n}]&quot;)
+
+    targets = torch.arange(n, device=sim.device)
+
+    topk_i2t = sim.topk(k, dim=1).indices
+    hits_i2t = (topk_i2t == targets.unsqueeze(1)).any(dim=1).float().mean().item()
+
+    sim_t = sim.T
+    topk_t2i = sim_t.topk(k, dim=1).indices
+    hits_t2i = (topk_t2i == targets.unsqueeze(1)).any(dim=1).float().mean().item()
+
+    return hits_i2t, hits_t2i
+
+
+def vqa_exact_match(predictions: list[int], references: list[int]) -&gt; float:
+    if len(predictions) != len(references):
+        raise ValueError(f&quot;length mismatch: pred {len(predictions)} vs ref {len(references)}&quot;)
+    if not predictions:
+        return 0.0
+    hits = sum(1 for p, r in zip(predictions, references) if int(p) == int(r))
+    return hits / len(predictions)
+
+
+def _ngrams(seq: list[int], n: int) -&gt; list[tuple[int, ...]]:
+    if len(seq) &lt; n:
+        return []
+    return [tuple(seq[i:i + n]) for i in range(len(seq) - n + 1)]
+
+
+def _count(ngrams: list[tuple[int, ...]]) -&gt; dict[tuple[int, ...], int]:
+    out: dict[tuple[int, ...], int] = {}
+    for g in ngrams:
+        out[g] = out.get(g, 0) + 1
+    return out
+
+
+def bleu4(generated: list[int], references: list[list[int]],
+          smoothing: bool = True) -&gt; float:
+    &quot;&quot;&quot;BLEU-4 against multiple reference captions.
+
+    Uses Chen and Cherry &quot;method 1&quot; smoothing when any n-gram precision is 0
+    and `smoothing` is True.
+    &quot;&quot;&quot;
+    if not references:
+        raise ValueError(&quot;bleu4 requires at least one reference&quot;)
+    if not generated:
+        return 0.0
+
+    weights = [0.25, 0.25, 0.25, 0.25]
+    log_p_sum = 0.0
+    for n in range(1, 5):
+        gen_ngrams = _ngrams(generated, n)
+        gen_counts = _count(gen_ngrams)
+        ref_max_counts: dict[tuple[int, ...], int] = {}
+        for ref in references:
+            ref_counts = _count(_ngrams(ref, n))
+            for g, c in ref_counts.items():
+                if c &gt; ref_max_counts.get(g, 0):
+                    ref_max_counts[g] = c
+
+        clipped = 0
+        for g, c in gen_counts.items():
+            clipped += min(c, ref_max_counts.get(g, 0))
+        total = sum(gen_counts.values())
+
+        if total == 0:
+            return 0.0
+
+        if clipped == 0:
+            if smoothing:
+                clipped = 1
+                total = total + 1
+            else:
+                return 0.0
+        log_p_sum += weights[n - 1] * math.log(clipped / total)
+
+    gen_len = len(generated)
+    closest_ref_len = min(references, key=lambda r: (abs(len(r) - gen_len), len(r)))
+    ref_len = len(closest_ref_len)
+    if gen_len &gt; ref_len:
+        bp = 1.0
+    else:
+        bp = math.exp(1.0 - ref_len / max(1, gen_len))
+
+    return bp * math.exp(log_p_sum)
+
+
+def build_eval_suite(seed: int, n_samples: int, vocab_size: int, max_len: int
+                     ) -&gt; EvalSuite:
+    &quot;&quot;&quot;Build a deterministic eval suite with three surfaces.&quot;&quot;&quot;
+    rng = np.random.default_rng(seed)
+    retrieval: list[RetrievalPair] = []
+    vqa: list[VQATriple] = []
+    caps: list[CaptionSample] = []
+
+    base_pairs = make_mock_corpus(seed=seed, n_pairs=n_samples,
+                                  vocab_size=vocab_size, max_len=max_len)
+
+    for i, (img, ids) in enumerate(base_pairs):
+        retrieval.append(RetrievalPair(image=img, caption_ids=ids))
+
+        q_seed = seed + 7919 + i
+        q_rng = np.random.default_rng(q_seed)
+        q_len = min(int(q_rng.integers(3, max(4, max_len // 2))), max_len)
+        question_ids = np.zeros((max_len,), dtype=np.int64)
+        question_ids[:q_len] = q_rng.integers(1, vocab_size, size=q_len)
+        answer_id = int(ids[0, 0].item())
+        vqa.append(VQATriple(image=img,
+                             question_ids=torch.from_numpy(question_ids).unsqueeze(0),
+                             answer_id=answer_id))
+
+        cap_refs: list[list[int]] = [[int(t) for t in ids[0].tolist() if int(t) != PAD_ID]]
+        for k in range(2):
+            shift = (i + k + 1) % 5
+            variant = [(t + shift) % vocab_size if t != 0 else 0 for t in cap_refs[0]]
+            variant = [t for t in variant if t != PAD_ID]
+            if variant:
+                cap_refs.append(variant)
+        caps.append(CaptionSample(image=img, references=cap_refs))
+
+    return EvalSuite(retrieval=retrieval, vqa=vqa, caps=caps)
+
+
+def _stack_images(samples: list[torch.Tensor]) -&gt; torch.Tensor:
+    return torch.cat(samples, dim=0)
+
+
+def evaluate(model: MultimodalModel, suite: EvalSuite) -&gt; dict:
+    model.eval()
+    with torch.no_grad():
+        images = _stack_images([p.image for p in suite.retrieval])
+        captions = torch.cat([p.caption_ids for p in suite.retrieval], dim=0)
+
+        memory, img_emb = model.encode_image(images)
+        txt_emb = model.text_encoder(captions)
+        img_n = F.normalize(img_emb, dim=-1)
+        txt_n = F.normalize(txt_emb, dim=-1)
+        sim = img_n @ txt_n.T
+
+        r1_i, r1_t = recall_at_k(sim, 1)
+        r5_i, r5_t = recall_at_k(sim, min(5, sim.shape[0]))
+        r10_i, r10_t = recall_at_k(sim, min(10, sim.shape[0]))
+
+        vqa_imgs = _stack_images([t.image for t in suite.vqa])
+        vqa_q = torch.cat([t.question_ids for t in suite.vqa], dim=0)
+        vqa_memory, _ = model.encode_image(vqa_imgs)
+        vqa_logits = model.decoder(vqa_q, vqa_memory)
+        last_non_pad = (vqa_q != PAD_ID).sum(dim=1).clamp(min=1) - 1
+        batch_idx = torch.arange(vqa_logits.size(0), device=vqa_logits.device)
+        last_step = vqa_logits[batch_idx, last_non_pad, :]
+        preds = last_step.argmax(dim=-1).tolist()
+        refs = [t.answer_id for t in suite.vqa]
+        vqa_em = vqa_exact_match(preds, refs)
+
+        cap_imgs = _stack_images([c.image for c in suite.caps])
+        cap_memory, _ = model.encode_image(cap_imgs)
+        cap_len = min(8, model.cfg.max_text_len - 1)
+        prompts = torch.zeros(cap_memory.shape[0], 1, dtype=torch.long)
+        generated_ids: list[list[int]] = [[] for _ in range(cap_memory.shape[0])]
+        for step in range(cap_len):
+            logits = model.decoder(prompts, cap_memory)
+            next_tok = logits[:, -1, :].argmax(dim=-1)
+            for b, t in enumerate(next_tok.tolist()):
+                generated_ids[b].append(int(t))
+            prompts = torch.cat([prompts, next_tok.unsqueeze(1)], dim=1)
+
+        bleu_scores: list[float] = []
+        for gen, ref_sample in zip(generated_ids, suite.caps):
+            score = bleu4(gen, ref_sample.references, smoothing=True)
+            bleu_scores.append(score)
+        bleu_mean = sum(bleu_scores) / max(1, len(bleu_scores))
+
+    return {
+        &quot;R@1_i2t&quot;: r1_i,
+        &quot;R@1_t2i&quot;: r1_t,
+        &quot;R@5_i2t&quot;: r5_i,
+        &quot;R@5_t2i&quot;: r5_t,
+        &quot;R@10_i2t&quot;: r10_i,
+        &quot;R@10_t2i&quot;: r10_t,
+        &quot;vqa_em&quot;: vqa_em,
+        &quot;bleu4&quot;: bleu_mean,
+    }
+
+
+def _print_metrics(label: str, metrics: dict) -&gt; None:
+    print(f&quot;\n{label}&quot;)
+    for k, v in metrics.items():
+        print(f&quot;  {k:12s} : {v:.4f}&quot;)
+
+
+def main() -&gt; None:
+    print(&quot;=&quot; * 60)
+    print(&quot;MULTIMODAL EVALUATION&quot;)
+    print(&quot;=&quot; * 60)
+
+    cfg = PretrainConfig(
+        vision_hidden=64,
+        projection_hidden=128,
+        embed_dim=64,
+        text_vocab=128,
+        max_text_len=10,
+        n_pairs=200,
+        batch_size=16,
+        steps=50,
+        lr=5e-4,
+        seed=0,
+    )
+    print(f&quot;  text vocab : {cfg.text_vocab}&quot;)
+    print(f&quot;  embed dim  : {cfg.embed_dim}&quot;)
+    print(f&quot;  steps      : {cfg.steps}&quot;)
+
+    torch.manual_seed(cfg.seed)
+    model = MultimodalModel(cfg).train()
+
+    print(&quot;\nbuilding eval suite (50 samples, held-out seed)...&quot;)
+    suite = build_eval_suite(seed=cfg.seed + 7777, n_samples=50,
+                             vocab_size=cfg.text_vocab, max_len=cfg.max_text_len)
+    print(f&quot;  retrieval pairs : {len(suite.retrieval)}&quot;)
+    print(f&quot;  vqa triples     : {len(suite.vqa)}&quot;)
+    print(f&quot;  caption samples : {len(suite.caps)}&quot;)
+
+    before = evaluate(model, suite)
+    _print_metrics(&quot;metrics BEFORE training (50-step random init):&quot;, before)
+
+    print(&quot;\ntraining for 50 steps on the mock corpus...&quot;)
+    model.train()
+    opt = torch.optim.Adam(model.parameters(), lr=cfg.lr)
+    corpus = make_mock_corpus(cfg.seed + 1, cfg.n_pairs, cfg.text_vocab, cfg.max_text_len)
+    rng = np.random.default_rng(cfg.seed + 2)
+    for step in range(cfg.steps):
+        idx = rng.choice(len(corpus), size=cfg.batch_size, replace=False).tolist()
+        imgs, ids = sample_batch(corpus, idx)
+        contrast, lm, _ = model(imgs, ids)
+        total = contrast + lm
+        opt.zero_grad(set_to_none=True)
+        total.backward()
+        opt.step()
+        if step % 10 == 0 or step == cfg.steps - 1:
+            print(f&quot;  step {step:3d}  total {total.item():.4f}&quot;)
+
+    after = evaluate(model, suite)
+    _print_metrics(&quot;metrics AFTER training:&quot;, after)
+
+    print(&quot;\nmetric deltas (after - before):&quot;)
+    for k in before:
+        d = after[k] - before[k]
+        marker = &quot;+&quot; if d &gt;= 0 else &quot;-&quot;
+        print(f&quot;  {k:12s} : {after[k]:.4f}  ({marker}{abs(d):.4f})&quot;)
+
+    print(&quot;\ndone.&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/63-multimodal-eval/code/test_main.py">phases/19-capstone-projects/63-multimodal-eval/code/test_main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Unit tests for multimodal evaluation metrics.&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import unittest
+
+import torch
+
+from main import (
+    EvalSuite,
+    bleu4,
+    build_eval_suite,
+    recall_at_k,
+    vqa_exact_match,
+)
+
+
+class TestRecallAtK(unittest.TestCase):
+    def test_perfect_identity_matrix(self) -&gt; None:
+        n = 10
+        sim = torch.eye(n) * 10.0
+        i2t, t2i = recall_at_k(sim, 1)
+        self.assertAlmostEqual(i2t, 1.0)
+        self.assertAlmostEqual(t2i, 1.0)
+
+    def test_flipped_matrix_below_top(self) -&gt; None:
+        n = 6
+        sim = torch.full((n, n), 10.0)
+        sim.fill_diagonal_(0.0)
+        i2t, _ = recall_at_k(sim, 1)
+        self.assertAlmostEqual(i2t, 0.0)
+
+    def test_rejects_invalid_k(self) -&gt; None:
+        sim = torch.eye(4)
+        with self.assertRaises(ValueError):
+            recall_at_k(sim, 0)
+        with self.assertRaises(ValueError):
+            recall_at_k(sim, 5)
+
+
+class TestVQAExactMatch(unittest.TestCase):
+    def test_all_correct(self) -&gt; None:
+        em = vqa_exact_match([1, 2, 3], [1, 2, 3])
+        self.assertAlmostEqual(em, 1.0)
+
+    def test_half_correct(self) -&gt; None:
+        em = vqa_exact_match([1, 2, 3, 4], [1, 0, 3, 0])
+        self.assertAlmostEqual(em, 0.5)
+
+    def test_length_mismatch_raises(self) -&gt; None:
+        with self.assertRaises(ValueError):
+            vqa_exact_match([1], [1, 2])
+
+
+class TestBLEU(unittest.TestCase):
+    def test_exact_match_returns_one(self) -&gt; None:
+        gen = [3, 1, 4, 1, 5, 9, 2, 6, 5]
+        score = bleu4(gen, [gen], smoothing=True)
+        self.assertGreater(score, 0.99)
+
+    def test_disjoint_vocab_returns_zero_without_smoothing(self) -&gt; None:
+        gen = [1, 1, 1, 1, 1, 1, 1, 1]
+        refs = [[2, 2, 2, 2, 2, 2, 2, 2]]
+        score = bleu4(gen, refs, smoothing=False)
+        self.assertEqual(score, 0.0)
+
+    def test_disjoint_vocab_smoothed_is_below_match(self) -&gt; None:
+        gen = [1, 1, 1, 1, 1, 1, 1, 1]
+        refs = [[2, 2, 2, 2, 2, 2, 2, 2]]
+        smoothed = bleu4(gen, refs, smoothing=True)
+        exact = bleu4(gen, [gen], smoothing=True)
+        self.assertLess(smoothed, exact)
+
+    def test_brevity_penalty_applies_when_generated_short(self) -&gt; None:
+        gen = [1, 2, 3, 4]
+        refs = [[1, 2, 3, 4, 5, 6, 7, 8]]
+        score = bleu4(gen, refs, smoothing=True)
+        self.assertLess(score, 1.0)
+
+
+class TestEvalSuite(unittest.TestCase):
+    def test_build_shapes(self) -&gt; None:
+        suite = build_eval_suite(seed=11, n_samples=8, vocab_size=64, max_len=8)
+        self.assertEqual(len(suite.retrieval), 8)
+        self.assertEqual(len(suite.vqa), 8)
+        self.assertEqual(len(suite.caps), 8)
+        for pair in suite.retrieval:
+            self.assertEqual(pair.caption_ids.shape, (1, 8))
+
+
+if __name__ == &quot;__main__&quot;:
+    unittest.main()
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. Why is training loss alone an insufficient measure of a multimodal model&#39;s quality?</legend><label class="option"><input type="radio" name="q0" value="0"> Loss is a string</label><label class="option"><input type="radio" name="q0" value="1"> Loss values are random</label><label class="option"><input type="radio" name="q0" value="2"> Training loss measures fit on the training distribution; eval surfaces (retrieval, VQA, captioning) measure whether the model generalizes to held-out tasks</label><label class="option"><input type="radio" name="q0" value="3"> Loss is hard to compute</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. What is R@5 measuring in a 100-sample retrieval eval?</legend><label class="option"><input type="radio" name="q1" value="0"> Fraction of queries whose correct match lands in the top 5 retrieved candidates out of 100</label><label class="option"><input type="radio" name="q1" value="1"> Five percent accuracy</label><label class="option"><input type="radio" name="q1" value="2"> Five queries per second</label><label class="option"><input type="radio" name="q1" value="3"> The fifth caption is always correct</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. Why does BLEU-4 take the geometric mean of 1- to 4-gram precisions instead of the arithmetic mean?</legend><label class="option"><input type="radio" name="q2" value="0"> Geometric mean is bigger</label><label class="option"><input type="radio" name="q2" value="1"> PyTorch supports only geometric mean</label><label class="option"><input type="radio" name="q2" value="2"> Arithmetic is slower</label><label class="option"><input type="radio" name="q2" value="3"> Geometric mean is zero if any n-gram precision is zero, which is the strict matching property BLEU wants; smoothing handles the zero case</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. What does the brevity penalty in BLEU-4 protect against?</legend><label class="option"><input type="radio" name="q3" value="0"> Memory leaks</label><label class="option"><input type="radio" name="q3" value="1"> Long captions getting penalized</label><label class="option"><input type="radio" name="q3" value="2"> Short captions gaming high precision by emitting only safe high-frequency tokens; BP &lt; 1 when generated &lt; reference length</label><label class="option"><input type="radio" name="q3" value="3"> Tokenizer errors</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. Why does multi-reference BLEU usually score higher than single-reference BLEU on the same generation?</legend><label class="option"><input type="radio" name="q4" value="0"> Each n-gram in the generation can match any reference, so the clipped count is higher when more references are available</label><label class="option"><input type="radio" name="q4" value="1"> Single-reference is broken</label><label class="option"><input type="radio" name="q4" value="2"> References cost extra memory</label><label class="option"><input type="radio" name="q4" value="3"> The math is different</label><p data-feedback="4"></p></fieldset><fieldset><legend>6. Which eval surface uses no model embeddings and only id-level matching?</legend><label class="option"><input type="radio" name="q5" value="0"> Cosine similarity</label><label class="option"><input type="radio" name="q5" value="1"> BLEU-4</label><label class="option"><input type="radio" name="q5" value="2"> VQA exact match: a predicted answer id is compared directly to a reference id with no embedding step</label><label class="option"><input type="radio" name="q5" value="3"> Retrieval</label><p data-feedback="5"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/19-capstone-projects/62-vision-language-pretraining/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/19-capstone-projects/64-chunking-strategies-advanced/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/19-capstone-projects/63-multimodal-eval/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

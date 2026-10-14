@@ -1,0 +1,1775 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>结构化输出:JSON,方案验证,限制解码 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-11-llm-engineering" data-lesson="11-llm-engineering/03-structured-outputs" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/11-llm-engineering/">大语言模型工程</a> / LESSON 03</p><h1 class="lesson-title">结构化输出:JSON,方案验证,限制解码</h1><p>Structured Outputs: JSON, Schema Validation, Constrained Decoding</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>结构化输出:JSON,方案验证,限制解码</h1>
+<blockquote>
+<p>你的LLM返回一个字符串.你的应用程序需要JSON. 这个差距已经破解了更多的生产系统比任何模型幻觉. 结构化输出是自然语言和打字数据之间的桥梁. 得到正确的,你的LLM成为可靠的API. 错误的,你在3点上通过regex解析自由文本.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 10, Lessons 01-05 (LLMs from Scratch)
+<strong>Time:</strong> ~90 minutes
+**Related:**阶段5 · 20 (结构化输出和限制式解码) 涵盖了解码级理论 (FSM/CFG逻辑处理器,概要,XGrammar).本课程重点关注生产SDK表面 (OpenAI <code>response_format</code>阅读第5阶段 · 20 首先,如果你想了解API下面发生了什么.</p>
+<h2>学习目标</h2>
+<ul>
+<li>使用OpenAI和人类API参数实现JSON模式和方案限制输出</li>
+<li>建立一个拒绝错误的LLM输出和反复试验的Pydantic验证层</li>
+<li>解释限制解码如何在代币级别上有效的JSON,而不需要后处理</li>
+<li>设计强大的提取提示器,可靠地将未结构化的文本转换为打字数据结构</li>
+</ul>
+<h2>问题</h2>
+<p>你问一个法学士:&quot;从本文中取出产品名称,价格和可用性&quot;.</p>
+<pre><code>The product is the Sony WH-1000XM5 headphones, which cost $348.00 and are currently in stock.
+</code></pre>
+<p>您的库存系统需要<code>{&quot;product&quot;: &quot;Sony WH-1000XM5&quot;, &quot;price&quot;: 348.00, &quot;in_stock&quot;: true}</code>您需要一个具有特定键,特定类型和特定值限制的JSON对象.</p>
+<p>简单的解决方案:在提示中添加&quot;JSON中回答&quot;. 这种方法90%的时间都能有效. 另外10%的模型将JSON包裹在标记码围中,或者添加一个序言,如&quot;这里是JSON:&quot;,或者产生语法不有效的JSON,因为它关闭了一个括号早些时候. 你的JSON解析器崩了. 你的管道断裂. 加入试/除外,然后再试循环. 试验有时会产生不同的数据. 现在你有一个连贯性问题,</p>
+<p>这不是一个快速工程问题.这是一个解码问题.模型生成左到右的代币.在每个位置,它从100K+选项的词汇库中选择了最有可能的下一个代币.这些选项中的大多数将在任何位置产生无效的JSON.如果模型刚刚发射<code>{&quot;price&quot;:</code>接下来的代币必须是数字,一个引用 (为字符串),<code>null</code>现在<code>true</code>现在<code>false</code>没有限制,模型可能会选择一个完全合理的英语词,这是灾难性的语法错误.</p>
+<h2>概念</h2>
+<h3>结构化输出频谱</h3>
+<p>结构化输出控制的四个层次,每个层次比前一个更可靠.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-5a52052012df9b871667.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p><strong>Prompt-based</strong>(&quot;有效的JSON中回复&quot;):没有执行.模型通常符合,但有时不.可靠性: ~90%.失败模式:标记围,序言文本,缩短输出,结构错误.</p>
+<p><strong>JSON mode</strong>通过 API 确保输出是有效的 JSON.<code>response_format: { type: &quot;json_object&quot; }</code>输出将没有错误进行分析. 但它可能不符合预期的方案 - - 额外的键,错误的类型,缺失的字段.</p>
+<p><strong>Schema mode</strong>通过JSON模式,确保输出与它匹配. 到2026年,所有主要供应商都支持本地:OpenAI的<code>response_format: { type: &quot;json_schema&quot;, json_schema: {...} }</code>(也称为<code>tool_choice=&quot;required&quot;</code>), 类的工具使用<code>input_schema</code>双子座的<code>response_schema</code>其他<code>response_mime_type: &quot;application/json&quot;</code>输出中包含了你指定的密钥,类型和限制.</p>
+<p><strong>Constrained decoding</strong>代码器在生成过程中在每个代币位置上掩盖所有将产生不有效输出的代币.如果该方案需要一个数字,模型即将发出一字母,则该代币设置为概率零.该模型只能产生导致有效输出的代币.这是OpenAI的结构化输出模式和图书馆如概况和指导在罩杯下实现的.</p>
+<h3>约定语言</h3>
+<p>JSON 方案是如何告诉模型 (或验证层) 输出必须有什么形状.</p>
+<pre><code class="language-json">{
+  &quot;type&quot;: &quot;object&quot;,
+  &quot;properties&quot;: {
+    &quot;product&quot;: { &quot;type&quot;: &quot;string&quot; },
+    &quot;price&quot;: { &quot;type&quot;: &quot;number&quot;, &quot;minimum&quot;: 0 },
+    &quot;in_stock&quot;: { &quot;type&quot;: &quot;boolean&quot; },
+    &quot;categories&quot;: {
+      &quot;type&quot;: &quot;array&quot;,
+      &quot;items&quot;: { &quot;type&quot;: &quot;string&quot; }
+    }
+  },
+  &quot;required&quot;: [&quot;product&quot;, &quot;price&quot;, &quot;in_stock&quot;]
+}
+</code></pre>
+<p>这个方案说:输出必须是具有字符串的对象<code>product</code>没有负数<code>price</code>尔式<code>in_stock</code>并且可选的字符串阵列<code>categories</code>任何不匹配的输出都会被拒绝.</p>
+<p>方案处理硬件:嵌套物体,有打字的物体的阵列,enums (限制一个字符串到特定值),图案匹配 (在字符串上重复),和组合器 (oneOf, anyOf,allOf多形输出).</p>
+<h3>皮达因特模式</h3>
+<p>在Python中,你不用手写JSON Schema.你定义一个Pydantic模型,它为你生成了该方案.</p>
+<pre><code class="language-python">from pydantic import BaseModel
+
+class Product(BaseModel):
+    product: str
+    price: float
+    in_stock: bool
+    categories: list[str] = []
+</code></pre>
+<p>这产生了如上所述的JSON方案.教师库 (和OpenAI的SDK) 直接接受Pydantic模型:通过模型类,获得验证实例.如果LLM输出不匹配,教师自动重新尝试.</p>
+<h3>函数调用/工具使用</h3>
+<p>模特将一个函数调用,并将其输出到一个函数. 模特将其输出一个函数调用,并将其输出到一个函数调用. OpenAI称之为&quot;函数调用&quot;.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-f6b0c0f5463c96bef439.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>如果您有10种不同的提取方案,并且模型必须根据输入选择正确的方案,则工具使用将给您提供既方案选择,又结构化输出.</p>
+<h3>常见的失败方式</h3>
+<p>即使是执行方案,结构化输出也可能以微妙的方式失败.</p>
+<p><strong>Hallucinated values</strong>输出与方案相匹配,但包含发明的数据.<code>{&quot;price&quot;: 299.99}</code>图表验证不能捕获这个-- 类型是正确的,值是错误的.</p>
+<p><strong>Enum confusion</strong>限制一个字段到<code>[&quot;in_stock&quot;, &quot;out_of_stock&quot;, &quot;preorder&quot;]</code>模型的输出<code>&quot;available&quot;</code>虽然它是基于语义上的,但不是允许的集合. 良好的限制解码阻止了这一点.</p>
+<p><strong>Nested object depth</strong>密集化模式 (4+级) 产生更多错误. 每个级别的嵌套化是模型可能失去结构的另一个地方.</p>
+<p><strong>Array length</strong>模型可能会在数组中产生太多或太少的项目.<code>minItems</code>其他<code>maxItems</code>但并非所有提供商都在解码层面执行它们.</p>
+<p><strong>Optional field omission</strong>模型遗漏技术上可选但对您的使用情况具有意义上的重要性的字段.即使有时数据缺失,也可以根据图案要求设置它们.<code>null</code>显然.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-0436af1db4e2a1977e51.png" alt="mx-schema-funnel 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<h3>步骤1: JSON 方案验证器</h3>
+<p>建立一个验证器从零开始,以检查Python对象是否匹配JSON方案.这是输出侧运行的,以验证合规性.</p>
+<pre><code class="language-python">import json
+
+def validate_schema(data, schema):
+    errors = []
+    _validate(data, schema, &quot;&quot;, errors)
+    return errors
+
+def _validate(data, schema, path, errors):
+    schema_type = schema.get(&quot;type&quot;)
+
+    if schema_type == &quot;object&quot;:
+        if not isinstance(data, dict):
+            errors.append(f&quot;{path}: expected object, got {type(data).__name__}&quot;)
+            return
+        for key in schema.get(&quot;required&quot;, []):
+            if key not in data:
+                errors.append(f&quot;{path}.{key}: required field missing&quot;)
+        properties = schema.get(&quot;properties&quot;, {})
+        for key, value in data.items():
+            if key in properties:
+                _validate(value, properties[key], f&quot;{path}.{key}&quot;, errors)
+
+    elif schema_type == &quot;array&quot;:
+        if not isinstance(data, list):
+            errors.append(f&quot;{path}: expected array, got {type(data).__name__}&quot;)
+            return
+        min_items = schema.get(&quot;minItems&quot;, 0)
+        max_items = schema.get(&quot;maxItems&quot;, float(&quot;inf&quot;))
+        if len(data) &lt; min_items:
+            errors.append(f&quot;{path}: array has {len(data)} items, minimum is {min_items}&quot;)
+        if len(data) &gt; max_items:
+            errors.append(f&quot;{path}: array has {len(data)} items, maximum is {max_items}&quot;)
+        items_schema = schema.get(&quot;items&quot;, {})
+        for i, item in enumerate(data):
+            _validate(item, items_schema, f&quot;{path}[{i}]&quot;, errors)
+
+    elif schema_type == &quot;string&quot;:
+        if not isinstance(data, str):
+            errors.append(f&quot;{path}: expected string, got {type(data).__name__}&quot;)
+            return
+        enum_values = schema.get(&quot;enum&quot;)
+        if enum_values and data not in enum_values:
+            errors.append(f&quot;{path}: '{data}' not in allowed values {enum_values}&quot;)
+
+    elif schema_type == &quot;number&quot;:
+        if not isinstance(data, (int, float)):
+            errors.append(f&quot;{path}: expected number, got {type(data).__name__}&quot;)
+            return
+        minimum = schema.get(&quot;minimum&quot;)
+        maximum = schema.get(&quot;maximum&quot;)
+        if minimum is not None and data &lt; minimum:
+            errors.append(f&quot;{path}: {data} is less than minimum {minimum}&quot;)
+        if maximum is not None and data &gt; maximum:
+            errors.append(f&quot;{path}: {data} is greater than maximum {maximum}&quot;)
+
+    elif schema_type == &quot;boolean&quot;:
+        if not isinstance(data, bool):
+            errors.append(f&quot;{path}: expected boolean, got {type(data).__name__}&quot;)
+
+    elif schema_type == &quot;integer&quot;:
+        if not isinstance(data, int) or isinstance(data, bool):
+            errors.append(f&quot;{path}: expected integer, got {type(data).__name__}&quot;)
+</code></pre>
+<h3>步骤2:从皮达因式模型到方案</h3>
+<p>建立一个最小的类到方案转换器.定义一个Python类,自动生成其JSON方案.</p>
+<pre><code class="language-python">class SchemaField:
+    def __init__(self, field_type, required=True, default=None, enum=None, minimum=None, maximum=None):
+        self.field_type = field_type
+        self.required = required
+        self.default = default
+        self.enum = enum
+        self.minimum = minimum
+        self.maximum = maximum
+
+def python_type_to_schema(field):
+    type_map = {
+        str: &quot;string&quot;,
+        int: &quot;integer&quot;,
+        float: &quot;number&quot;,
+        bool: &quot;boolean&quot;,
+    }
+
+    schema = {}
+
+    if field.field_type in type_map:
+        schema[&quot;type&quot;] = type_map[field.field_type]
+    elif field.field_type == list:
+        schema[&quot;type&quot;] = &quot;array&quot;
+        schema[&quot;items&quot;] = {&quot;type&quot;: &quot;string&quot;}
+    elif isinstance(field.field_type, dict):
+        schema = field.field_type
+
+    if field.enum:
+        schema[&quot;enum&quot;] = field.enum
+    if field.minimum is not None:
+        schema[&quot;minimum&quot;] = field.minimum
+    if field.maximum is not None:
+        schema[&quot;maximum&quot;] = field.maximum
+
+    return schema
+
+def model_to_schema(name, fields):
+    properties = {}
+    required = []
+
+    for field_name, field in fields.items():
+        properties[field_name] = python_type_to_schema(field)
+        if field.required:
+            required.append(field_name)
+
+    return {
+        &quot;type&quot;: &quot;object&quot;,
+        &quot;properties&quot;: properties,
+        &quot;required&quot;: required,
+    }
+</code></pre>
+<h3>步骤3: 限制的标志过</h3>
+<p>模拟限制解码. 鉴于部分JSON字符串和图案,确定当前位置是否有效的代币类别.</p>
+<pre><code class="language-python">def next_valid_tokens(partial_json, schema):
+    stripped = partial_json.strip()
+
+    if not stripped:
+        return [&quot;{&quot;]
+
+    try:
+        json.loads(stripped)
+        return [&quot;&lt;EOS&gt;&quot;]
+    except json.JSONDecodeError:
+        pass
+
+    last_char = stripped[-1] if stripped else &quot;&quot;
+
+    if last_char == &quot;{&quot;:
+        return ['&quot;', &quot;}&quot;]
+    elif last_char == '&quot;':
+        if stripped.endswith('&quot;:'):
+            return ['&quot;', &quot;0-9&quot;, &quot;true&quot;, &quot;false&quot;, &quot;null&quot;, &quot;[&quot;, &quot;{&quot;]
+        return [&quot;a-z&quot;, '&quot;']
+    elif last_char == &quot;:&quot;:
+        return [&quot; &quot;, '&quot;', &quot;0-9&quot;, &quot;true&quot;, &quot;false&quot;, &quot;null&quot;, &quot;[&quot;, &quot;{&quot;]
+    elif last_char == &quot;,&quot;:
+        return [&quot; &quot;, '&quot;', &quot;{&quot;, &quot;[&quot;]
+    elif last_char in &quot;0123456789&quot;:
+        return [&quot;0-9&quot;, &quot;.&quot;, &quot;,&quot;, &quot;}&quot;, &quot;]&quot;]
+    elif last_char == &quot;}&quot;:
+        return [&quot;,&quot;, &quot;}&quot;, &quot;]&quot;, &quot;&lt;EOS&gt;&quot;]
+    elif last_char == &quot;]&quot;:
+        return [&quot;,&quot;, &quot;}&quot;, &quot;&lt;EOS&gt;&quot;]
+    elif last_char == &quot;[&quot;:
+        return ['&quot;', &quot;0-9&quot;, &quot;true&quot;, &quot;false&quot;, &quot;null&quot;, &quot;{&quot;, &quot;[&quot;, &quot;]&quot;]
+    else:
+        return [&quot;any&quot;]
+
+def demonstrate_constrained_decoding():
+    partial_states = [
+        '',
+        '{',
+        '{&quot;product&quot;',
+        '{&quot;product&quot;:',
+        '{&quot;product&quot;: &quot;Sony&quot;',
+        '{&quot;product&quot;: &quot;Sony&quot;,',
+        '{&quot;product&quot;: &quot;Sony&quot;, &quot;price&quot;:',
+        '{&quot;product&quot;: &quot;Sony&quot;, &quot;price&quot;: 348',
+        '{&quot;product&quot;: &quot;Sony&quot;, &quot;price&quot;: 348}',
+    ]
+
+    print(f&quot;{'Partial JSON':&lt;45} {'Valid Next Tokens'}&quot;)
+    print(&quot;-&quot; * 80)
+    for state in partial_states:
+        valid = next_valid_tokens(state, {})
+        display = state if state else &quot;(empty)&quot;
+        print(f&quot;{display:&lt;45} {valid}&quot;)
+</code></pre>
+<h3>步骤4:提取管道</h3>
+<p>将所有东西结合到一个提取管道中:定义一个方案,模拟一个LLM产生结构化输出,验证输出,并处理重试.</p>
+<pre><code class="language-python">def simulate_llm_extraction(text, schema, attempt=0):
+    if &quot;headphones&quot; in text.lower() or &quot;sony&quot; in text.lower():
+        if attempt == 0:
+            return '{&quot;product&quot;: &quot;Sony WH-1000XM5&quot;, &quot;price&quot;: 348.00, &quot;in_stock&quot;: true, &quot;categories&quot;: [&quot;audio&quot;, &quot;headphones&quot;]}'
+        return '{&quot;product&quot;: &quot;Sony WH-1000XM5&quot;, &quot;price&quot;: 348.00, &quot;in_stock&quot;: true}'
+
+    if &quot;laptop&quot; in text.lower():
+        return '{&quot;product&quot;: &quot;MacBook Pro 16&quot;, &quot;price&quot;: 2499.00, &quot;in_stock&quot;: false, &quot;categories&quot;: [&quot;computers&quot;]}'
+
+    return '{&quot;product&quot;: &quot;Unknown&quot;, &quot;price&quot;: 0, &quot;in_stock&quot;: false}'
+
+def extract_with_retry(text, schema, max_retries=3):
+    for attempt in range(max_retries):
+        raw = simulate_llm_extraction(text, schema, attempt)
+
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as e:
+            print(f&quot;  Attempt {attempt + 1}: JSON parse error -- {e}&quot;)
+            continue
+
+        errors = validate_schema(data, schema)
+        if not errors:
+            return data
+
+        print(f&quot;  Attempt {attempt + 1}: Schema validation errors -- {errors}&quot;)
+
+    return None
+
+product_schema = {
+    &quot;type&quot;: &quot;object&quot;,
+    &quot;properties&quot;: {
+        &quot;product&quot;: {&quot;type&quot;: &quot;string&quot;},
+        &quot;price&quot;: {&quot;type&quot;: &quot;number&quot;, &quot;minimum&quot;: 0},
+        &quot;in_stock&quot;: {&quot;type&quot;: &quot;boolean&quot;},
+        &quot;categories&quot;: {&quot;type&quot;: &quot;array&quot;, &quot;items&quot;: {&quot;type&quot;: &quot;string&quot;}},
+    },
+    &quot;required&quot;: [&quot;product&quot;, &quot;price&quot;, &quot;in_stock&quot;],
+}
+</code></pre>
+<h3>步骤5: 运行全管道</h3>
+<pre><code class="language-python">def run_demo():
+    print(&quot;=&quot; * 60)
+    print(&quot;  Structured Output Pipeline Demo&quot;)
+    print(&quot;=&quot; * 60)
+
+    print(&quot;\n--- Schema Definition ---&quot;)
+    product_fields = {
+        &quot;product&quot;: SchemaField(str),
+        &quot;price&quot;: SchemaField(float, minimum=0),
+        &quot;in_stock&quot;: SchemaField(bool),
+        &quot;categories&quot;: SchemaField(list, required=False),
+    }
+    generated_schema = model_to_schema(&quot;Product&quot;, product_fields)
+    print(json.dumps(generated_schema, indent=2))
+
+    print(&quot;\n--- Schema Validation ---&quot;)
+    test_cases = [
+        ({&quot;product&quot;: &quot;Test&quot;, &quot;price&quot;: 10.0, &quot;in_stock&quot;: True}, &quot;Valid object&quot;),
+        ({&quot;product&quot;: &quot;Test&quot;, &quot;price&quot;: -5.0, &quot;in_stock&quot;: True}, &quot;Negative price&quot;),
+        ({&quot;product&quot;: &quot;Test&quot;, &quot;in_stock&quot;: True}, &quot;Missing price&quot;),
+        ({&quot;product&quot;: &quot;Test&quot;, &quot;price&quot;: &quot;ten&quot;, &quot;in_stock&quot;: True}, &quot;String as price&quot;),
+        (&quot;not an object&quot;, &quot;String instead of object&quot;),
+    ]
+
+    for data, label in test_cases:
+        errors = validate_schema(data, product_schema)
+        status = &quot;PASS&quot; if not errors else f&quot;FAIL: {errors}&quot;
+        print(f&quot;  {label}: {status}&quot;)
+
+    print(&quot;\n--- Constrained Decoding Simulation ---&quot;)
+    demonstrate_constrained_decoding()
+
+    print(&quot;\n--- Extraction Pipeline ---&quot;)
+    texts = [
+        &quot;The Sony WH-1000XM5 headphones are priced at $348 and currently available.&quot;,
+        &quot;The new MacBook Pro 16-inch laptop costs $2499 but is sold out.&quot;,
+        &quot;This is a random sentence with no product info.&quot;,
+    ]
+
+    for text in texts:
+        print(f&quot;\n  Input: {text[:60]}...&quot;)
+        result = extract_with_retry(text, product_schema)
+        if result:
+            print(f&quot;  Output: {json.dumps(result)}&quot;)
+        else:
+            print(f&quot;  Output: FAILED after retries&quot;)
+</code></pre>
+<h2>用它</h2>
+<h3>开放AI结构化输出</h3>
+<pre><code class="language-python"># from openai import OpenAI
+# from pydantic import BaseModel
+#
+# client = OpenAI()
+#
+# class Product(BaseModel):
+#     product: str
+#     price: float
+#     in_stock: bool
+#
+# response = client.beta.chat.completions.parse(
+#     model=&quot;gpt-5-mini&quot;,
+#     messages=[
+#         {&quot;role&quot;: &quot;system&quot;, &quot;content&quot;: &quot;Extract product information.&quot;},
+#         {&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;Sony WH-1000XM5, $348, in stock&quot;},
+#     ],
+#     response_format=Product,
+# )
+#
+# product = response.choices[0].message.parsed
+# print(product.product, product.price, product.in_stock)
+</code></pre>
+<p>开放AI的结构化输出模式使用内部限制式解码.模型生成的每个代币都保证与Pydantic方案相匹配的输出.不需要重试.不需要验证.限制被入解码过程中.</p>
+<h3>人类工具的使用</h3>
+<pre><code class="language-python"># import anthropic
+#
+# client = anthropic.Anthropic()
+#
+# response = client.messages.create(
+#     model=&quot;claude-opus-4-7&quot;,
+#     max_tokens=1024,
+#     tools=[{
+#         &quot;name&quot;: &quot;extract_product&quot;,
+#         &quot;description&quot;: &quot;Extract product information from text&quot;,
+#         &quot;input_schema&quot;: {
+#             &quot;type&quot;: &quot;object&quot;,
+#             &quot;properties&quot;: {
+#                 &quot;product&quot;: {&quot;type&quot;: &quot;string&quot;},
+#                 &quot;price&quot;: {&quot;type&quot;: &quot;number&quot;},
+#                 &quot;in_stock&quot;: {&quot;type&quot;: &quot;boolean&quot;},
+#             },
+#             &quot;required&quot;: [&quot;product&quot;, &quot;price&quot;, &quot;in_stock&quot;],
+#         },
+#     }],
+#     messages=[{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;Extract: Sony WH-1000XM5, $348, in stock&quot;}],
+# )
+</code></pre>
+<p>通过工具使用,Anthropic实现结构化输出.该模型发出一个与 input_schema相匹配的结构化参数的工具调用.相同的结果,不同的API表面.</p>
+<h3>导师图书馆</h3>
+<pre><code class="language-python"># pip install instructor
+# import instructor
+# from openai import OpenAI
+# from pydantic import BaseModel
+#
+# client = instructor.from_openai(OpenAI())
+#
+# class Product(BaseModel):
+#     product: str
+#     price: float
+#     in_stock: bool
+#
+# product = client.chat.completions.create(
+#     model=&quot;gpt-5-mini&quot;,
+#     response_model=Product,
+#     messages=[{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;Sony WH-1000XM5, $348, in stock&quot;}],
+# )
+</code></pre>
+<p>导师将任何LLM客户端包裹并添加自动复试验证.如果第一次尝试失败验证,它将错误作为文本返回模型,并要求它修复输出.这与任何提供商都能合作,而不仅仅是OpenAI.</p>
+<h2>运送它</h2>
+<p>这一课产生了<code>outputs/prompt-structured-extractor.md</code>--一个可重复使用的提示模板,从任何定义的图案中提取结构化数据. 给它提供一个JSON图案和非结构化文本,然后返回验证的JSON.</p>
+<p>它还产生了<code>outputs/skill-structured-outputs.md</code>根据供应商,可靠性要求和方案复杂性,选择正确的结构化输出策略的决策框架.</p>
+<h2>运动</h2>
+<ol>
+<li>
+<p>扩展到支持的方案验证器<code>oneOf</code>处理多形输出,例如,一个可以是<code>Product</code>或是<code>Service</code>具有不同形状的物体.</p>
+</li>
+<li>
+<p>建立一个&quot;方案差异&quot;工具,可以比较两个方案,并识别破解变化 (删除所需的字段,改变类型) 与不破解变化 (添加选项字段,放松的限制).这是生产中版本化您的提取方案的必不可少.</p>
+</li>
+<li>
+<p>实施一个更现实的限制解码模拟器. 鉴于JSON方案和100个代码 (字母,数字,分区别,关键字) 的词汇库,一步一步通过生成,每个位置都掩盖了无效代码. 测量每个步骤中的词汇库有多少个百分比有效.</p>
+</li>
+<li>
+<p>建立一个提取评估套件. 创建50个产品描述,使用手动标记的JSON输出. 在所有50个中运行提取管道,测量准确匹配,场面级准确性和类型合规性. 确定哪些领域最难正确地提取.</p>
+</li>
+<li>
+<p>对于每一个提取的字段,估计模型的信心程度 (基于代币概率,或通过运行提取3次和测量一致性). 标签低信心字段用于人类审查.</p>
+</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>JSON mode</td>
+<td>&quot;Returns JSON&quot;</td>
+<td>API flag that guarantees syntactically valid JSON output, but does not enforce any particular schema</td>
+</tr>
+<tr>
+<td>Structured output</td>
+<td>&quot;Typed JSON&quot;</td>
+<td>Output that matches a specific JSON Schema with correct keys, types, and constraints</td>
+</tr>
+<tr>
+<td>Constrained decoding</td>
+<td>&quot;Guided generation&quot;</td>
+<td>At each token position, mask out tokens that would produce invalid output -- guarantees 100% schema compliance</td>
+</tr>
+<tr>
+<td>JSON Schema</td>
+<td>&quot;A JSON template&quot;</td>
+<td>A declarative language for describing the structure, types, and constraints of JSON data (used by OpenAPI, JSON Forms, etc.)</td>
+</tr>
+<tr>
+<td>Pydantic</td>
+<td>&quot;Python dataclasses+&quot;</td>
+<td>Python library that defines data models with type validation, used by FastAPI and Instructor to generate JSON Schemas</td>
+</tr>
+<tr>
+<td>Function calling</td>
+<td>&quot;Tool use&quot;</td>
+<td>LLM outputs a structured function invocation (name + typed arguments) instead of free text -- OpenAI and Anthropic both support this</td>
+</tr>
+<tr>
+<td>Instructor</td>
+<td>&quot;Pydantic for LLMs&quot;</td>
+<td>Python library that wraps LLM clients to return validated Pydantic instances, with automatic retry on validation failure</td>
+</tr>
+<tr>
+<td>Token masking</td>
+<td>&quot;Filtering the vocabulary&quot;</td>
+<td>Setting specific token probabilities to zero during generation so the model cannot produce them</td>
+</tr>
+<tr>
+<td>Schema compliance</td>
+<td>&quot;Matches the shape&quot;</td>
+<td>The output has every required field, correct types, values within constraints, and no extra disallowed fields</td>
+</tr>
+<tr>
+<td>Retry loop</td>
+<td>&quot;Try again until it works&quot;</td>
+<td>Send validation errors back to the model and ask it to fix the output -- Instructor does this automatically, up to a configurable max</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://platform.openai.com/docs/guides/structured-outputs" rel="noreferrer" data-network="true">OpenAI Structured Outputs Guide <small>↗ 需要联网</small></a>-- 基于JSON方案的限制解码在OpenAIAPI中的官方文档</li>
+<li><a href="https://arxiv.org/abs/2307.09702" rel="noreferrer" data-network="true">Willard &amp; Louf, 2023 -- &quot;Efficient Guided Generation for Large Language Models&quot; <small>↗ 需要联网</small></a>-- 概述论文,描述如何将JSON图案编译成有限状态机,</li>
+<li><a href="https://python.useinstructor.com/" rel="noreferrer" data-network="true">Instructor documentation <small>↗ 需要联网</small></a>-- 获得任何具有Pydantic验证和重试的LLM结构化输出的标准图书馆</li>
+<li><a href="https://docs.anthropic.com/en/docs/tool-use" rel="noreferrer" data-network="true">Anthropic Tool Use Guide <small>↗ 需要联网</small></a>-- 克劳德如何通过工具使用JSON Schema input_schema实现结构化输出</li>
+<li><a href="https://json-schema.org/" rel="noreferrer" data-network="true">JSON Schema specification <small>↗ 需要联网</small></a>-- 对于每个主要结构化输出系统所使用的方案语言的完整规格</li>
+<li><a href="https://github.com/outlines-dev/outlines" rel="noreferrer" data-network="true">Outlines library <small>↗ 需要联网</small></a>--使用 regex 和 JSON 方案编译到有限状态机器的开源限制生成</li>
+<li><a href="https://arxiv.org/abs/2411.15100" rel="noreferrer" data-network="true">Dong et al., &quot;XGrammar: Flexible and Efficient Structured Generation Engine for Large Language Models&quot; (MLSys 2025) <small>↗ 需要联网</small></a>现在的最先进的语法引擎; 按下自动组合, 掩盖代币的代币为100ns/代币.</li>
+<li><a href="https://arxiv.org/abs/2212.06094" rel="noreferrer" data-network="true">Beurer-Kellner et al., &quot;Prompting Is Programming: A Query Language for Large Language Models&quot; (LMQL) <small>↗ 需要联网</small></a>-- LMQL 纸张框架限制了解码作为一个查询语言,</li>
+<li><a href="https://github.com/guidance-ai/guidance" rel="noreferrer" data-network="true">Microsoft Guidance (framework docs) <small>↗ 需要联网</small></a>--基于模板的限制生成; 供应商无知的补充到概要和XGrammar.</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Structured Outputs: JSON, Schema Validation, Constrained Decoding</h1>
+<blockquote>
+<p>Your LLM returns a string. Your application needs JSON. That gap has crashed more production systems than any model hallucination. Structured output is the bridge between natural language and typed data. Get it right and your LLM becomes a reliable API. Get it wrong and you're parsing free-text with regex at 3am.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python
+<strong>Prerequisites:</strong> Phase 10, Lessons 01-05 (LLMs from Scratch)
+<strong>Time:</strong> ~90 minutes
+<strong>Related:</strong> Phase 5 · 20 (Structured Outputs &amp; Constrained Decoding) covers the decoder-level theory (FSM/CFG logit processors, Outlines, XGrammar). This lesson focuses on the production SDK surface (OpenAI <code>response_format</code>, Anthropic tool use, Instructor) — read Phase 5 · 20 first if you want to understand what is happening below the API.</p>
+<h2>Learning Objectives</h2>
+<ul>
+<li>Implement JSON-mode and schema-constrained outputs using OpenAI and Anthropic API parameters</li>
+<li>Build a Pydantic validation layer that rejects malformed LLM outputs and retries with error feedback</li>
+<li>Explain how constrained decoding forces valid JSON at the token level without post-processing</li>
+<li>Design robust extraction prompts that reliably convert unstructured text into typed data structures</li>
+</ul>
+<h2>The Problem</h2>
+<p>You ask an LLM: &quot;Extract the product name, price, and availability from this text.&quot; It responds:</p>
+<pre><code>The product is the Sony WH-1000XM5 headphones, which cost $348.00 and are currently in stock.
+</code></pre>
+<p>That is a perfectly correct answer. It is also completely useless to your application. Your inventory system needs <code>{&quot;product&quot;: &quot;Sony WH-1000XM5&quot;, &quot;price&quot;: 348.00, &quot;in_stock&quot;: true}</code>. You need a JSON object with specific keys, specific types, and specific value constraints. You do not need a sentence.</p>
+<p>The naive solution: add &quot;Respond in JSON&quot; to your prompt. This works 90% of the time. The other 10% the model wraps the JSON in markdown code fences, or adds a preamble like &quot;Here's the JSON:&quot;, or produces syntactically invalid JSON because it closed a bracket early. Your JSON parser crashes. Your pipeline breaks. You add try/except and a retry loop. The retry sometimes produces different data. Now you have a consistency problem on top of a parsing problem.</p>
+<p>This is not a prompt engineering problem. It is a decoding problem. The model generates tokens left to right. At each position, it picks the most likely next token from a vocabulary of 100K+ options. Most of those options would produce invalid JSON at any given position. If the model just emitted <code>{&quot;price&quot;:</code>, the next token must be a digit, a quote (for string), <code>null</code>, <code>true</code>, <code>false</code>, or a negative sign. Anything else produces invalid JSON. Without constraints, the model might pick a perfectly reasonable English word that is catastrophically wrong syntactically.</p>
+<h2>The Concept</h2>
+<h3>The Structured Output Spectrum</h3>
+<p>There are four levels of structured output control, each more reliable than the last.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-5a52052012df9b871667.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p><strong>Prompt-based</strong> (&quot;Respond in valid JSON&quot;): no enforcement. The model usually complies but sometimes does not. Reliability: ~90%. Failure mode: markdown fences, preamble text, truncated output, wrong structure.</p>
+<p><strong>JSON mode</strong>: the API guarantees the output is valid JSON. OpenAI's <code>response_format: { type: &quot;json_object&quot; }</code> enables this. The output will parse without errors. But it may not match your expected schema -- extra keys, wrong types, missing fields.</p>
+<p><strong>Schema mode</strong>: the API takes a JSON Schema and guarantees the output matches it. In 2026 every major provider supports this natively: OpenAI's <code>response_format: { type: &quot;json_schema&quot;, json_schema: {...} }</code> (also as <code>tool_choice=&quot;required&quot;</code>), Anthropic's tool use with <code>input_schema</code>, and Gemini's <code>response_schema</code> + <code>response_mime_type: &quot;application/json&quot;</code>. The output has the exact keys, types, and constraints you specified.</p>
+<p><strong>Constrained decoding</strong>: at each token position during generation, the decoder masks out all tokens that would produce invalid output. If the schema requires a number and the model is about to emit a letter, that token is set to probability zero. The model can only produce tokens that lead to valid output. This is what OpenAI's structured output mode and libraries like Outlines and Guidance implement under the hood.</p>
+<h3>JSON Schema: The Contract Language</h3>
+<p>JSON Schema is how you tell the model (or validation layer) what shape the output must have. Every major structured output system uses it.</p>
+<pre><code class="language-json">{
+  &quot;type&quot;: &quot;object&quot;,
+  &quot;properties&quot;: {
+    &quot;product&quot;: { &quot;type&quot;: &quot;string&quot; },
+    &quot;price&quot;: { &quot;type&quot;: &quot;number&quot;, &quot;minimum&quot;: 0 },
+    &quot;in_stock&quot;: { &quot;type&quot;: &quot;boolean&quot; },
+    &quot;categories&quot;: {
+      &quot;type&quot;: &quot;array&quot;,
+      &quot;items&quot;: { &quot;type&quot;: &quot;string&quot; }
+    }
+  },
+  &quot;required&quot;: [&quot;product&quot;, &quot;price&quot;, &quot;in_stock&quot;]
+}
+</code></pre>
+<p>This schema says: the output must be an object with a string <code>product</code>, a non-negative number <code>price</code>, a boolean <code>in_stock</code>, and an optional array of string <code>categories</code>. Any output that does not match gets rejected.</p>
+<p>Schemas handle the hard cases: nested objects, arrays with typed items, enums (constrain a string to specific values), pattern matching (regex on strings), and combinators (oneOf, anyOf, allOf for polymorphic outputs).</p>
+<h3>The Pydantic Pattern</h3>
+<p>In Python, you do not write JSON Schema by hand. You define a Pydantic model and it generates the schema for you.</p>
+<pre><code class="language-python">from pydantic import BaseModel
+
+class Product(BaseModel):
+    product: str
+    price: float
+    in_stock: bool
+    categories: list[str] = []
+</code></pre>
+<p>This produces the same JSON Schema as above. The Instructor library (and OpenAI's SDK) accept Pydantic models directly: pass the model class, get back a validated instance. If the LLM output does not match, Instructor retries automatically.</p>
+<h3>Function Calling / Tool Use</h3>
+<p>An alternative interface for the same problem. Instead of asking the model to produce JSON directly, you define &quot;tools&quot; (functions) with typed parameters. The model outputs a function call with structured arguments. OpenAI calls this &quot;function calling.&quot; Anthropic calls it &quot;tool use.&quot; The result is the same: structured data.</p>
+<figure><img src="/learn/ai-from-scratch/figures/mermaid-f6b0c0f5463c96bef439.png" alt="原课流程图 图解" loading="lazy"><figcaption>原课 Mermaid 图 · 本地静态渲染</figcaption></figure><p>Tool use is preferred when the model needs to choose which function to call, not just fill in parameters. If you have 10 different extraction schemas and the model must pick the right one based on the input, tool use gives you both the schema selection and the structured output.</p>
+<h3>Common Failure Modes</h3>
+<p>Even with schema enforcement, structured outputs can fail in subtle ways.</p>
+<p><strong>Hallucinated values</strong>: the output matches the schema but contains invented data. The model produces <code>{&quot;price&quot;: 299.99}</code> when the text says $348. Schema validation cannot catch this -- the type is correct, the value is wrong.</p>
+<p><strong>Enum confusion</strong>: you constrain a field to <code>[&quot;in_stock&quot;, &quot;out_of_stock&quot;, &quot;preorder&quot;]</code>. The model outputs <code>&quot;available&quot;</code> -- semantically correct, but not in the allowed set. Good constrained decoding prevents this. Prompt-based approaches do not.</p>
+<p><strong>Nested object depth</strong>: deeply nested schemas (4+ levels) produce more errors. Each level of nesting is another place where the model can lose track of structure.</p>
+<p><strong>Array length</strong>: the model may produce too many or too few items in an array. Schemas support <code>minItems</code> and <code>maxItems</code> but not all providers enforce them at the decoding level.</p>
+<p><strong>Optional field omission</strong>: the model omits fields that are technically optional but semantically important for your use case. Set them as required in the schema even if the data is sometimes missing -- force the model to produce <code>null</code> explicitly.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-0436af1db4e2a1977e51.png" alt="mx-schema-funnel 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<h3>Step 1: JSON Schema Validator</h3>
+<p>Build a validator from scratch that checks whether a Python object matches a JSON Schema. This is what runs on the output side to verify compliance.</p>
+<pre><code class="language-python">import json
+
+def validate_schema(data, schema):
+    errors = []
+    _validate(data, schema, &quot;&quot;, errors)
+    return errors
+
+def _validate(data, schema, path, errors):
+    schema_type = schema.get(&quot;type&quot;)
+
+    if schema_type == &quot;object&quot;:
+        if not isinstance(data, dict):
+            errors.append(f&quot;{path}: expected object, got {type(data).__name__}&quot;)
+            return
+        for key in schema.get(&quot;required&quot;, []):
+            if key not in data:
+                errors.append(f&quot;{path}.{key}: required field missing&quot;)
+        properties = schema.get(&quot;properties&quot;, {})
+        for key, value in data.items():
+            if key in properties:
+                _validate(value, properties[key], f&quot;{path}.{key}&quot;, errors)
+
+    elif schema_type == &quot;array&quot;:
+        if not isinstance(data, list):
+            errors.append(f&quot;{path}: expected array, got {type(data).__name__}&quot;)
+            return
+        min_items = schema.get(&quot;minItems&quot;, 0)
+        max_items = schema.get(&quot;maxItems&quot;, float(&quot;inf&quot;))
+        if len(data) &lt; min_items:
+            errors.append(f&quot;{path}: array has {len(data)} items, minimum is {min_items}&quot;)
+        if len(data) &gt; max_items:
+            errors.append(f&quot;{path}: array has {len(data)} items, maximum is {max_items}&quot;)
+        items_schema = schema.get(&quot;items&quot;, {})
+        for i, item in enumerate(data):
+            _validate(item, items_schema, f&quot;{path}[{i}]&quot;, errors)
+
+    elif schema_type == &quot;string&quot;:
+        if not isinstance(data, str):
+            errors.append(f&quot;{path}: expected string, got {type(data).__name__}&quot;)
+            return
+        enum_values = schema.get(&quot;enum&quot;)
+        if enum_values and data not in enum_values:
+            errors.append(f&quot;{path}: '{data}' not in allowed values {enum_values}&quot;)
+
+    elif schema_type == &quot;number&quot;:
+        if not isinstance(data, (int, float)):
+            errors.append(f&quot;{path}: expected number, got {type(data).__name__}&quot;)
+            return
+        minimum = schema.get(&quot;minimum&quot;)
+        maximum = schema.get(&quot;maximum&quot;)
+        if minimum is not None and data &lt; minimum:
+            errors.append(f&quot;{path}: {data} is less than minimum {minimum}&quot;)
+        if maximum is not None and data &gt; maximum:
+            errors.append(f&quot;{path}: {data} is greater than maximum {maximum}&quot;)
+
+    elif schema_type == &quot;boolean&quot;:
+        if not isinstance(data, bool):
+            errors.append(f&quot;{path}: expected boolean, got {type(data).__name__}&quot;)
+
+    elif schema_type == &quot;integer&quot;:
+        if not isinstance(data, int) or isinstance(data, bool):
+            errors.append(f&quot;{path}: expected integer, got {type(data).__name__}&quot;)
+</code></pre>
+<h3>Step 2: Pydantic-Style Model to Schema</h3>
+<p>Build a minimal class-to-schema converter. Define a Python class and generate its JSON Schema automatically.</p>
+<pre><code class="language-python">class SchemaField:
+    def __init__(self, field_type, required=True, default=None, enum=None, minimum=None, maximum=None):
+        self.field_type = field_type
+        self.required = required
+        self.default = default
+        self.enum = enum
+        self.minimum = minimum
+        self.maximum = maximum
+
+def python_type_to_schema(field):
+    type_map = {
+        str: &quot;string&quot;,
+        int: &quot;integer&quot;,
+        float: &quot;number&quot;,
+        bool: &quot;boolean&quot;,
+    }
+
+    schema = {}
+
+    if field.field_type in type_map:
+        schema[&quot;type&quot;] = type_map[field.field_type]
+    elif field.field_type == list:
+        schema[&quot;type&quot;] = &quot;array&quot;
+        schema[&quot;items&quot;] = {&quot;type&quot;: &quot;string&quot;}
+    elif isinstance(field.field_type, dict):
+        schema = field.field_type
+
+    if field.enum:
+        schema[&quot;enum&quot;] = field.enum
+    if field.minimum is not None:
+        schema[&quot;minimum&quot;] = field.minimum
+    if field.maximum is not None:
+        schema[&quot;maximum&quot;] = field.maximum
+
+    return schema
+
+def model_to_schema(name, fields):
+    properties = {}
+    required = []
+
+    for field_name, field in fields.items():
+        properties[field_name] = python_type_to_schema(field)
+        if field.required:
+            required.append(field_name)
+
+    return {
+        &quot;type&quot;: &quot;object&quot;,
+        &quot;properties&quot;: properties,
+        &quot;required&quot;: required,
+    }
+</code></pre>
+<h3>Step 3: Constrained Token Filter</h3>
+<p>Simulate constrained decoding. Given a partial JSON string and a schema, determine which token categories are valid at the current position.</p>
+<pre><code class="language-python">def next_valid_tokens(partial_json, schema):
+    stripped = partial_json.strip()
+
+    if not stripped:
+        return [&quot;{&quot;]
+
+    try:
+        json.loads(stripped)
+        return [&quot;&lt;EOS&gt;&quot;]
+    except json.JSONDecodeError:
+        pass
+
+    last_char = stripped[-1] if stripped else &quot;&quot;
+
+    if last_char == &quot;{&quot;:
+        return ['&quot;', &quot;}&quot;]
+    elif last_char == '&quot;':
+        if stripped.endswith('&quot;:'):
+            return ['&quot;', &quot;0-9&quot;, &quot;true&quot;, &quot;false&quot;, &quot;null&quot;, &quot;[&quot;, &quot;{&quot;]
+        return [&quot;a-z&quot;, '&quot;']
+    elif last_char == &quot;:&quot;:
+        return [&quot; &quot;, '&quot;', &quot;0-9&quot;, &quot;true&quot;, &quot;false&quot;, &quot;null&quot;, &quot;[&quot;, &quot;{&quot;]
+    elif last_char == &quot;,&quot;:
+        return [&quot; &quot;, '&quot;', &quot;{&quot;, &quot;[&quot;]
+    elif last_char in &quot;0123456789&quot;:
+        return [&quot;0-9&quot;, &quot;.&quot;, &quot;,&quot;, &quot;}&quot;, &quot;]&quot;]
+    elif last_char == &quot;}&quot;:
+        return [&quot;,&quot;, &quot;}&quot;, &quot;]&quot;, &quot;&lt;EOS&gt;&quot;]
+    elif last_char == &quot;]&quot;:
+        return [&quot;,&quot;, &quot;}&quot;, &quot;&lt;EOS&gt;&quot;]
+    elif last_char == &quot;[&quot;:
+        return ['&quot;', &quot;0-9&quot;, &quot;true&quot;, &quot;false&quot;, &quot;null&quot;, &quot;{&quot;, &quot;[&quot;, &quot;]&quot;]
+    else:
+        return [&quot;any&quot;]
+
+def demonstrate_constrained_decoding():
+    partial_states = [
+        '',
+        '{',
+        '{&quot;product&quot;',
+        '{&quot;product&quot;:',
+        '{&quot;product&quot;: &quot;Sony&quot;',
+        '{&quot;product&quot;: &quot;Sony&quot;,',
+        '{&quot;product&quot;: &quot;Sony&quot;, &quot;price&quot;:',
+        '{&quot;product&quot;: &quot;Sony&quot;, &quot;price&quot;: 348',
+        '{&quot;product&quot;: &quot;Sony&quot;, &quot;price&quot;: 348}',
+    ]
+
+    print(f&quot;{'Partial JSON':&lt;45} {'Valid Next Tokens'}&quot;)
+    print(&quot;-&quot; * 80)
+    for state in partial_states:
+        valid = next_valid_tokens(state, {})
+        display = state if state else &quot;(empty)&quot;
+        print(f&quot;{display:&lt;45} {valid}&quot;)
+</code></pre>
+<h3>Step 4: Extraction Pipeline</h3>
+<p>Combine everything into an extraction pipeline: define a schema, simulate an LLM producing structured output, validate the output, and handle retries.</p>
+<pre><code class="language-python">def simulate_llm_extraction(text, schema, attempt=0):
+    if &quot;headphones&quot; in text.lower() or &quot;sony&quot; in text.lower():
+        if attempt == 0:
+            return '{&quot;product&quot;: &quot;Sony WH-1000XM5&quot;, &quot;price&quot;: 348.00, &quot;in_stock&quot;: true, &quot;categories&quot;: [&quot;audio&quot;, &quot;headphones&quot;]}'
+        return '{&quot;product&quot;: &quot;Sony WH-1000XM5&quot;, &quot;price&quot;: 348.00, &quot;in_stock&quot;: true}'
+
+    if &quot;laptop&quot; in text.lower():
+        return '{&quot;product&quot;: &quot;MacBook Pro 16&quot;, &quot;price&quot;: 2499.00, &quot;in_stock&quot;: false, &quot;categories&quot;: [&quot;computers&quot;]}'
+
+    return '{&quot;product&quot;: &quot;Unknown&quot;, &quot;price&quot;: 0, &quot;in_stock&quot;: false}'
+
+def extract_with_retry(text, schema, max_retries=3):
+    for attempt in range(max_retries):
+        raw = simulate_llm_extraction(text, schema, attempt)
+
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as e:
+            print(f&quot;  Attempt {attempt + 1}: JSON parse error -- {e}&quot;)
+            continue
+
+        errors = validate_schema(data, schema)
+        if not errors:
+            return data
+
+        print(f&quot;  Attempt {attempt + 1}: Schema validation errors -- {errors}&quot;)
+
+    return None
+
+product_schema = {
+    &quot;type&quot;: &quot;object&quot;,
+    &quot;properties&quot;: {
+        &quot;product&quot;: {&quot;type&quot;: &quot;string&quot;},
+        &quot;price&quot;: {&quot;type&quot;: &quot;number&quot;, &quot;minimum&quot;: 0},
+        &quot;in_stock&quot;: {&quot;type&quot;: &quot;boolean&quot;},
+        &quot;categories&quot;: {&quot;type&quot;: &quot;array&quot;, &quot;items&quot;: {&quot;type&quot;: &quot;string&quot;}},
+    },
+    &quot;required&quot;: [&quot;product&quot;, &quot;price&quot;, &quot;in_stock&quot;],
+}
+</code></pre>
+<h3>Step 5: Run the Full Pipeline</h3>
+<pre><code class="language-python">def run_demo():
+    print(&quot;=&quot; * 60)
+    print(&quot;  Structured Output Pipeline Demo&quot;)
+    print(&quot;=&quot; * 60)
+
+    print(&quot;\n--- Schema Definition ---&quot;)
+    product_fields = {
+        &quot;product&quot;: SchemaField(str),
+        &quot;price&quot;: SchemaField(float, minimum=0),
+        &quot;in_stock&quot;: SchemaField(bool),
+        &quot;categories&quot;: SchemaField(list, required=False),
+    }
+    generated_schema = model_to_schema(&quot;Product&quot;, product_fields)
+    print(json.dumps(generated_schema, indent=2))
+
+    print(&quot;\n--- Schema Validation ---&quot;)
+    test_cases = [
+        ({&quot;product&quot;: &quot;Test&quot;, &quot;price&quot;: 10.0, &quot;in_stock&quot;: True}, &quot;Valid object&quot;),
+        ({&quot;product&quot;: &quot;Test&quot;, &quot;price&quot;: -5.0, &quot;in_stock&quot;: True}, &quot;Negative price&quot;),
+        ({&quot;product&quot;: &quot;Test&quot;, &quot;in_stock&quot;: True}, &quot;Missing price&quot;),
+        ({&quot;product&quot;: &quot;Test&quot;, &quot;price&quot;: &quot;ten&quot;, &quot;in_stock&quot;: True}, &quot;String as price&quot;),
+        (&quot;not an object&quot;, &quot;String instead of object&quot;),
+    ]
+
+    for data, label in test_cases:
+        errors = validate_schema(data, product_schema)
+        status = &quot;PASS&quot; if not errors else f&quot;FAIL: {errors}&quot;
+        print(f&quot;  {label}: {status}&quot;)
+
+    print(&quot;\n--- Constrained Decoding Simulation ---&quot;)
+    demonstrate_constrained_decoding()
+
+    print(&quot;\n--- Extraction Pipeline ---&quot;)
+    texts = [
+        &quot;The Sony WH-1000XM5 headphones are priced at $348 and currently available.&quot;,
+        &quot;The new MacBook Pro 16-inch laptop costs $2499 but is sold out.&quot;,
+        &quot;This is a random sentence with no product info.&quot;,
+    ]
+
+    for text in texts:
+        print(f&quot;\n  Input: {text[:60]}...&quot;)
+        result = extract_with_retry(text, product_schema)
+        if result:
+            print(f&quot;  Output: {json.dumps(result)}&quot;)
+        else:
+            print(f&quot;  Output: FAILED after retries&quot;)
+</code></pre>
+<h2>Use It</h2>
+<h3>OpenAI Structured Outputs</h3>
+<pre><code class="language-python"># from openai import OpenAI
+# from pydantic import BaseModel
+#
+# client = OpenAI()
+#
+# class Product(BaseModel):
+#     product: str
+#     price: float
+#     in_stock: bool
+#
+# response = client.beta.chat.completions.parse(
+#     model=&quot;gpt-5-mini&quot;,
+#     messages=[
+#         {&quot;role&quot;: &quot;system&quot;, &quot;content&quot;: &quot;Extract product information.&quot;},
+#         {&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;Sony WH-1000XM5, $348, in stock&quot;},
+#     ],
+#     response_format=Product,
+# )
+#
+# product = response.choices[0].message.parsed
+# print(product.product, product.price, product.in_stock)
+</code></pre>
+<p>OpenAI's structured output mode uses constrained decoding internally. Every token the model generates is guaranteed to produce output matching the Pydantic schema. No retries needed. No validation needed. The constraint is baked into the decoding process.</p>
+<h3>Anthropic Tool Use</h3>
+<pre><code class="language-python"># import anthropic
+#
+# client = anthropic.Anthropic()
+#
+# response = client.messages.create(
+#     model=&quot;claude-opus-4-7&quot;,
+#     max_tokens=1024,
+#     tools=[{
+#         &quot;name&quot;: &quot;extract_product&quot;,
+#         &quot;description&quot;: &quot;Extract product information from text&quot;,
+#         &quot;input_schema&quot;: {
+#             &quot;type&quot;: &quot;object&quot;,
+#             &quot;properties&quot;: {
+#                 &quot;product&quot;: {&quot;type&quot;: &quot;string&quot;},
+#                 &quot;price&quot;: {&quot;type&quot;: &quot;number&quot;},
+#                 &quot;in_stock&quot;: {&quot;type&quot;: &quot;boolean&quot;},
+#             },
+#             &quot;required&quot;: [&quot;product&quot;, &quot;price&quot;, &quot;in_stock&quot;],
+#         },
+#     }],
+#     messages=[{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;Extract: Sony WH-1000XM5, $348, in stock&quot;}],
+# )
+</code></pre>
+<p>Anthropic achieves structured output through tool use. The model emits a tool call with structured arguments that match the input_schema. Same result, different API surface.</p>
+<h3>Instructor Library</h3>
+<pre><code class="language-python"># pip install instructor
+# import instructor
+# from openai import OpenAI
+# from pydantic import BaseModel
+#
+# client = instructor.from_openai(OpenAI())
+#
+# class Product(BaseModel):
+#     product: str
+#     price: float
+#     in_stock: bool
+#
+# product = client.chat.completions.create(
+#     model=&quot;gpt-5-mini&quot;,
+#     response_model=Product,
+#     messages=[{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;Sony WH-1000XM5, $348, in stock&quot;}],
+# )
+</code></pre>
+<p>Instructor wraps any LLM client and adds automatic retries with validation. If the first attempt fails validation, it sends the errors back to the model as context and asks it to fix the output. This works with any provider, not just OpenAI.</p>
+<h2>Ship It</h2>
+<p>This lesson produces <code>outputs/prompt-structured-extractor.md</code> -- a reusable prompt template that extracts structured data from any text given a schema definition. Feed it a JSON Schema and unstructured text, and it returns validated JSON.</p>
+<p>It also produces <code>outputs/skill-structured-outputs.md</code> -- a decision framework for choosing the right structured output strategy based on your provider, reliability requirements, and schema complexity.</p>
+<h2>Exercises</h2>
+<ol>
+<li>
+<p>Extend the schema validator to support <code>oneOf</code> (the data must match exactly one of several schemas). This handles polymorphic outputs -- for example, a field that can be either a <code>Product</code> or a <code>Service</code> object with different shapes.</p>
+</li>
+<li>
+<p>Build a &quot;schema diff&quot; tool that compares two schemas and identifies breaking changes (removed required fields, changed types) versus non-breaking changes (added optional fields, relaxed constraints). This is essential for versioning your extraction schemas in production.</p>
+</li>
+<li>
+<p>Implement a more realistic constrained decoding simulator. Given a JSON Schema and a vocabulary of 100 tokens (letters, digits, punctuation, keywords), walk through generation step by step, masking invalid tokens at each position. Measure what percentage of the vocabulary is valid at each step.</p>
+</li>
+<li>
+<p>Build an extraction eval suite. Create 50 product descriptions with hand-labeled JSON outputs. Run your extraction pipeline on all 50 and measure exact match, field-level accuracy, and type compliance. Identify which fields are hardest to extract correctly.</p>
+</li>
+<li>
+<p>Add &quot;confidence scores&quot; to your extraction pipeline. For each extracted field, estimate how confident the model is (based on token probabilities, or by running extraction 3 times and measuring consistency). Flag low-confidence fields for human review.</p>
+</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>JSON mode</td>
+<td>&quot;Returns JSON&quot;</td>
+<td>API flag that guarantees syntactically valid JSON output, but does not enforce any particular schema</td>
+</tr>
+<tr>
+<td>Structured output</td>
+<td>&quot;Typed JSON&quot;</td>
+<td>Output that matches a specific JSON Schema with correct keys, types, and constraints</td>
+</tr>
+<tr>
+<td>Constrained decoding</td>
+<td>&quot;Guided generation&quot;</td>
+<td>At each token position, mask out tokens that would produce invalid output -- guarantees 100% schema compliance</td>
+</tr>
+<tr>
+<td>JSON Schema</td>
+<td>&quot;A JSON template&quot;</td>
+<td>A declarative language for describing the structure, types, and constraints of JSON data (used by OpenAPI, JSON Forms, etc.)</td>
+</tr>
+<tr>
+<td>Pydantic</td>
+<td>&quot;Python dataclasses+&quot;</td>
+<td>Python library that defines data models with type validation, used by FastAPI and Instructor to generate JSON Schemas</td>
+</tr>
+<tr>
+<td>Function calling</td>
+<td>&quot;Tool use&quot;</td>
+<td>LLM outputs a structured function invocation (name + typed arguments) instead of free text -- OpenAI and Anthropic both support this</td>
+</tr>
+<tr>
+<td>Instructor</td>
+<td>&quot;Pydantic for LLMs&quot;</td>
+<td>Python library that wraps LLM clients to return validated Pydantic instances, with automatic retry on validation failure</td>
+</tr>
+<tr>
+<td>Token masking</td>
+<td>&quot;Filtering the vocabulary&quot;</td>
+<td>Setting specific token probabilities to zero during generation so the model cannot produce them</td>
+</tr>
+<tr>
+<td>Schema compliance</td>
+<td>&quot;Matches the shape&quot;</td>
+<td>The output has every required field, correct types, values within constraints, and no extra disallowed fields</td>
+</tr>
+<tr>
+<td>Retry loop</td>
+<td>&quot;Try again until it works&quot;</td>
+<td>Send validation errors back to the model and ask it to fix the output -- Instructor does this automatically, up to a configurable max</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://platform.openai.com/docs/guides/structured-outputs" rel="noreferrer" data-network="true">OpenAI Structured Outputs Guide <small>↗ 需要联网</small></a> -- official documentation for JSON Schema-based constrained decoding in the OpenAI API</li>
+<li><a href="https://arxiv.org/abs/2307.09702" rel="noreferrer" data-network="true">Willard &amp; Louf, 2023 -- &quot;Efficient Guided Generation for Large Language Models&quot; <small>↗ 需要联网</small></a> -- the Outlines paper, describing how to compile JSON Schemas into finite state machines for token-level constraints</li>
+<li><a href="https://python.useinstructor.com/" rel="noreferrer" data-network="true">Instructor documentation <small>↗ 需要联网</small></a> -- the standard library for getting structured outputs from any LLM with Pydantic validation and retries</li>
+<li><a href="https://docs.anthropic.com/en/docs/tool-use" rel="noreferrer" data-network="true">Anthropic Tool Use Guide <small>↗ 需要联网</small></a> -- how Claude implements structured output via tool use with JSON Schema input_schema</li>
+<li><a href="https://json-schema.org/" rel="noreferrer" data-network="true">JSON Schema specification <small>↗ 需要联网</small></a> -- the full spec for the schema language used by every major structured output system</li>
+<li><a href="https://github.com/outlines-dev/outlines" rel="noreferrer" data-network="true">Outlines library <small>↗ 需要联网</small></a> -- open-source constrained generation using regex and JSON Schema compiled to finite state machines</li>
+<li><a href="https://arxiv.org/abs/2411.15100" rel="noreferrer" data-network="true">Dong et al., &quot;XGrammar: Flexible and Efficient Structured Generation Engine for Large Language Models&quot; (MLSys 2025) <small>↗ 需要联网</small></a> -- the current state-of-the-art grammar engine; pushdown-automaton compilation that masks tokens at ~100 ns / token.</li>
+<li><a href="https://arxiv.org/abs/2212.06094" rel="noreferrer" data-network="true">Beurer-Kellner et al., &quot;Prompting Is Programming: A Query Language for Large Language Models&quot; (LMQL) <small>↗ 需要联网</small></a> -- the LMQL paper framing constrained decoding as a query language with type and value constraints.</li>
+<li><a href="https://github.com/guidance-ai/guidance" rel="noreferrer" data-network="true">Microsoft Guidance (framework docs) <small>↗ 需要联网</small></a> -- template-driven constrained generation; vendor-agnostic complement to Outlines and XGrammar.</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-11-llm-engineering--03-structured-outputs.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-11-llm-engineering--03-structured-outputs.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/11-llm-engineering/03-structured-outputs/code/main.py">phases/11-llm-engineering/03-structured-outputs/code/main.py</a><details><summary>查看原始文本</summary><pre><code>import json
+
+
+def validate_schema(data, schema):
+    errors = []
+    _validate(data, schema, &quot;&quot;, errors)
+    return errors
+
+
+def _validate(data, schema, path, errors):
+    schema_type = schema.get(&quot;type&quot;)
+
+    if schema_type == &quot;object&quot;:
+        if not isinstance(data, dict):
+            errors.append(f&quot;{path}: expected object, got {type(data).__name__}&quot;)
+            return
+        for key in schema.get(&quot;required&quot;, []):
+            if key not in data:
+                errors.append(f&quot;{path}.{key}: required field missing&quot;)
+        properties = schema.get(&quot;properties&quot;, {})
+        for key, value in data.items():
+            if key in properties:
+                _validate(value, properties[key], f&quot;{path}.{key}&quot;, errors)
+
+    elif schema_type == &quot;array&quot;:
+        if not isinstance(data, list):
+            errors.append(f&quot;{path}: expected array, got {type(data).__name__}&quot;)
+            return
+        min_items = schema.get(&quot;minItems&quot;, 0)
+        max_items = schema.get(&quot;maxItems&quot;, float(&quot;inf&quot;))
+        if len(data) &lt; min_items:
+            errors.append(f&quot;{path}: array has {len(data)} items, minimum is {min_items}&quot;)
+        if len(data) &gt; max_items:
+            errors.append(f&quot;{path}: array has {len(data)} items, maximum is {max_items}&quot;)
+        items_schema = schema.get(&quot;items&quot;, {})
+        for i, item in enumerate(data):
+            _validate(item, items_schema, f&quot;{path}[{i}]&quot;, errors)
+
+    elif schema_type == &quot;string&quot;:
+        if not isinstance(data, str):
+            errors.append(f&quot;{path}: expected string, got {type(data).__name__}&quot;)
+            return
+        enum_values = schema.get(&quot;enum&quot;)
+        if enum_values and data not in enum_values:
+            errors.append(f&quot;{path}: &#39;{data}&#39; not in allowed values {enum_values}&quot;)
+
+    elif schema_type == &quot;number&quot;:
+        if not isinstance(data, (int, float)):
+            errors.append(f&quot;{path}: expected number, got {type(data).__name__}&quot;)
+            return
+        minimum = schema.get(&quot;minimum&quot;)
+        maximum = schema.get(&quot;maximum&quot;)
+        if minimum is not None and data &lt; minimum:
+            errors.append(f&quot;{path}: {data} is less than minimum {minimum}&quot;)
+        if maximum is not None and data &gt; maximum:
+            errors.append(f&quot;{path}: {data} is greater than maximum {maximum}&quot;)
+
+    elif schema_type == &quot;boolean&quot;:
+        if not isinstance(data, bool):
+            errors.append(f&quot;{path}: expected boolean, got {type(data).__name__}&quot;)
+
+    elif schema_type == &quot;integer&quot;:
+        if not isinstance(data, int) or isinstance(data, bool):
+            errors.append(f&quot;{path}: expected integer, got {type(data).__name__}&quot;)
+
+
+class SchemaField:
+    def __init__(self, field_type, required=True, default=None, enum=None, minimum=None, maximum=None):
+        self.field_type = field_type
+        self.required = required
+        self.default = default
+        self.enum = enum
+        self.minimum = minimum
+        self.maximum = maximum
+
+
+def python_type_to_schema(field):
+    type_map = {
+        str: &quot;string&quot;,
+        int: &quot;integer&quot;,
+        float: &quot;number&quot;,
+        bool: &quot;boolean&quot;,
+    }
+
+    schema = {}
+
+    if field.field_type in type_map:
+        schema[&quot;type&quot;] = type_map[field.field_type]
+    elif field.field_type == list:
+        schema[&quot;type&quot;] = &quot;array&quot;
+        schema[&quot;items&quot;] = {&quot;type&quot;: &quot;string&quot;}
+    elif isinstance(field.field_type, dict):
+        schema = field.field_type
+
+    if field.enum:
+        schema[&quot;enum&quot;] = field.enum
+    if field.minimum is not None:
+        schema[&quot;minimum&quot;] = field.minimum
+    if field.maximum is not None:
+        schema[&quot;maximum&quot;] = field.maximum
+
+    return schema
+
+
+def model_to_schema(name, fields):
+    properties = {}
+    required = []
+
+    for field_name, field in fields.items():
+        properties[field_name] = python_type_to_schema(field)
+        if field.required:
+            required.append(field_name)
+
+    return {
+        &quot;type&quot;: &quot;object&quot;,
+        &quot;properties&quot;: properties,
+        &quot;required&quot;: required,
+    }
+
+
+def next_valid_tokens(partial_json, schema):
+    stripped = partial_json.strip()
+
+    if not stripped:
+        return [&quot;{&quot;]
+
+    try:
+        json.loads(stripped)
+        return [&quot;&lt;EOS&gt;&quot;]
+    except json.JSONDecodeError:
+        pass
+
+    last_char = stripped[-1] if stripped else &quot;&quot;
+
+    if last_char == &quot;{&quot;:
+        return [&#39;&quot;&#39;, &quot;}&quot;]
+    elif last_char == &#39;&quot;&#39;:
+        if stripped.endswith(&#39;&quot;:&#39;):
+            return [&#39;&quot;&#39;, &quot;0-9&quot;, &quot;true&quot;, &quot;false&quot;, &quot;null&quot;, &quot;[&quot;, &quot;{&quot;]
+        return [&quot;a-z&quot;, &#39;&quot;&#39;]
+    elif last_char == &quot;:&quot;:
+        return [&quot; &quot;, &#39;&quot;&#39;, &quot;0-9&quot;, &quot;true&quot;, &quot;false&quot;, &quot;null&quot;, &quot;[&quot;, &quot;{&quot;]
+    elif last_char == &quot;,&quot;:
+        return [&quot; &quot;, &#39;&quot;&#39;, &quot;{&quot;, &quot;[&quot;]
+    elif last_char in &quot;0123456789&quot;:
+        return [&quot;0-9&quot;, &quot;.&quot;, &quot;,&quot;, &quot;}&quot;, &quot;]&quot;]
+    elif last_char == &quot;}&quot;:
+        return [&quot;,&quot;, &quot;}&quot;, &quot;]&quot;, &quot;&lt;EOS&gt;&quot;]
+    elif last_char == &quot;]&quot;:
+        return [&quot;,&quot;, &quot;}&quot;, &quot;&lt;EOS&gt;&quot;]
+    elif last_char == &quot;[&quot;:
+        return [&#39;&quot;&#39;, &quot;0-9&quot;, &quot;true&quot;, &quot;false&quot;, &quot;null&quot;, &quot;{&quot;, &quot;[&quot;, &quot;]&quot;]
+    else:
+        return [&quot;any&quot;]
+
+
+def demonstrate_constrained_decoding():
+    partial_states = [
+        &quot;&quot;,
+        &quot;{&quot;,
+        &#39;{&quot;product&quot;&#39;,
+        &#39;{&quot;product&quot;:&#39;,
+        &#39;{&quot;product&quot;: &quot;Sony&quot;&#39;,
+        &#39;{&quot;product&quot;: &quot;Sony&quot;,&#39;,
+        &#39;{&quot;product&quot;: &quot;Sony&quot;, &quot;price&quot;:&#39;,
+        &#39;{&quot;product&quot;: &quot;Sony&quot;, &quot;price&quot;: 348&#39;,
+        &#39;{&quot;product&quot;: &quot;Sony&quot;, &quot;price&quot;: 348}&#39;,
+    ]
+
+    print(f&quot;\n  {&#39;Partial JSON&#39;:&lt;45} {&#39;Valid Next Tokens&#39;}&quot;)
+    print(&quot;  &quot; + &quot;-&quot; * 70)
+    for state in partial_states:
+        valid = next_valid_tokens(state, {})
+        display = state if state else &quot;(empty)&quot;
+        print(f&quot;  {display:&lt;45} {valid}&quot;)
+
+
+def simulate_llm_extraction(text, schema, attempt=0):
+    if &quot;headphones&quot; in text.lower() or &quot;sony&quot; in text.lower():
+        if attempt == 0:
+            return &#39;{&quot;product&quot;: &quot;Sony WH-1000XM5&quot;, &quot;price&quot;: 348.00, &quot;in_stock&quot;: true, &quot;categories&quot;: [&quot;audio&quot;, &quot;headphones&quot;]}&#39;
+        return &#39;{&quot;product&quot;: &quot;Sony WH-1000XM5&quot;, &quot;price&quot;: 348.00, &quot;in_stock&quot;: true}&#39;
+
+    if &quot;laptop&quot; in text.lower() or &quot;macbook&quot; in text.lower():
+        return &#39;{&quot;product&quot;: &quot;MacBook Pro 16&quot;, &quot;price&quot;: 2499.00, &quot;in_stock&quot;: false, &quot;categories&quot;: [&quot;computers&quot;]}&#39;
+
+    if &quot;keyboard&quot; in text.lower():
+        return &#39;{&quot;product&quot;: &quot;Keychron Q1&quot;, &quot;price&quot;: 169.00, &quot;in_stock&quot;: true, &quot;categories&quot;: [&quot;peripherals&quot;]}&#39;
+
+    return &#39;{&quot;product&quot;: &quot;Unknown&quot;, &quot;price&quot;: 0, &quot;in_stock&quot;: false}&#39;
+
+
+def extract_with_retry(text, schema, max_retries=3):
+    for attempt in range(max_retries):
+        raw = simulate_llm_extraction(text, schema, attempt)
+
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as e:
+            print(f&quot;    Attempt {attempt + 1}: JSON parse error -- {e}&quot;)
+            continue
+
+        errors = validate_schema(data, schema)
+        if not errors:
+            return data
+
+        print(f&quot;    Attempt {attempt + 1}: Schema validation errors -- {errors}&quot;)
+
+    return None
+
+
+PRODUCT_SCHEMA = {
+    &quot;type&quot;: &quot;object&quot;,
+    &quot;properties&quot;: {
+        &quot;product&quot;: {&quot;type&quot;: &quot;string&quot;},
+        &quot;price&quot;: {&quot;type&quot;: &quot;number&quot;, &quot;minimum&quot;: 0},
+        &quot;in_stock&quot;: {&quot;type&quot;: &quot;boolean&quot;},
+        &quot;categories&quot;: {&quot;type&quot;: &quot;array&quot;, &quot;items&quot;: {&quot;type&quot;: &quot;string&quot;}},
+    },
+    &quot;required&quot;: [&quot;product&quot;, &quot;price&quot;, &quot;in_stock&quot;],
+}
+
+
+def run_schema_validation_demo():
+    print(&quot;=&quot; * 60)
+    print(&quot;  STEP 1: JSON Schema Validation&quot;)
+    print(&quot;=&quot; * 60)
+
+    test_cases = [
+        ({&quot;product&quot;: &quot;Sony WH-1000XM5&quot;, &quot;price&quot;: 348.0, &quot;in_stock&quot;: True}, &quot;Valid complete object&quot;),
+        ({&quot;product&quot;: &quot;Test&quot;, &quot;price&quot;: 10.0, &quot;in_stock&quot;: True, &quot;categories&quot;: [&quot;audio&quot;]}, &quot;Valid with optional array&quot;),
+        ({&quot;product&quot;: &quot;Test&quot;, &quot;price&quot;: -5.0, &quot;in_stock&quot;: True}, &quot;Negative price&quot;),
+        ({&quot;product&quot;: &quot;Test&quot;, &quot;in_stock&quot;: True}, &quot;Missing required field (price)&quot;),
+        ({&quot;product&quot;: &quot;Test&quot;, &quot;price&quot;: &quot;ten&quot;, &quot;in_stock&quot;: True}, &quot;String as price&quot;),
+        ({&quot;product&quot;: 123, &quot;price&quot;: 10.0, &quot;in_stock&quot;: True}, &quot;Number as product name&quot;),
+        (&quot;not an object&quot;, &quot;String instead of object&quot;),
+        ({&quot;product&quot;: &quot;Test&quot;, &quot;price&quot;: 10.0, &quot;in_stock&quot;: &quot;yes&quot;}, &quot;String as boolean&quot;),
+    ]
+
+    for data, label in test_cases:
+        errors = validate_schema(data, PRODUCT_SCHEMA)
+        status = &quot;PASS&quot; if not errors else f&quot;FAIL: {errors}&quot;
+        print(f&quot;\n  {label}:&quot;)
+        print(f&quot;    Data:   {json.dumps(data) if isinstance(data, dict) else repr(data)}&quot;)
+        print(f&quot;    Result: {status}&quot;)
+
+
+def run_schema_generation_demo():
+    print(f&quot;\n{&#39;=&#39; * 60}&quot;)
+    print(&quot;  STEP 2: Model-to-Schema Generation&quot;)
+    print(&quot;=&quot; * 60)
+
+    product_fields = {
+        &quot;product&quot;: SchemaField(str),
+        &quot;price&quot;: SchemaField(float, minimum=0),
+        &quot;in_stock&quot;: SchemaField(bool),
+        &quot;categories&quot;: SchemaField(list, required=False),
+        &quot;rating&quot;: SchemaField(float, required=False, minimum=0, maximum=5),
+    }
+
+    schema = model_to_schema(&quot;Product&quot;, product_fields)
+    print(f&quot;\n  Generated schema from Python model:&quot;)
+    print(f&quot;  {json.dumps(schema, indent=2)}&quot;)
+
+    event_fields = {
+        &quot;title&quot;: SchemaField(str),
+        &quot;date&quot;: SchemaField(str),
+        &quot;attendees&quot;: SchemaField(list),
+        &quot;priority&quot;: SchemaField(str, enum=[&quot;low&quot;, &quot;medium&quot;, &quot;high&quot;]),
+        &quot;is_recurring&quot;: SchemaField(bool, required=False),
+    }
+
+    event_schema = model_to_schema(&quot;Event&quot;, event_fields)
+    print(f&quot;\n  Event schema:&quot;)
+    print(f&quot;  {json.dumps(event_schema, indent=2)}&quot;)
+
+    valid_event = {&quot;title&quot;: &quot;Standup&quot;, &quot;date&quot;: &quot;2026-01-15&quot;, &quot;attendees&quot;: [&quot;Alice&quot;, &quot;Bob&quot;], &quot;priority&quot;: &quot;high&quot;}
+    invalid_event = {&quot;title&quot;: &quot;Standup&quot;, &quot;date&quot;: &quot;2026-01-15&quot;, &quot;attendees&quot;: [&quot;Alice&quot;], &quot;priority&quot;: &quot;urgent&quot;}
+
+    print(f&quot;\n  Validating against event schema:&quot;)
+    for data, label in [(valid_event, &quot;Valid event&quot;), (invalid_event, &quot;Invalid priority enum&quot;)]:
+        errors = validate_schema(data, event_schema)
+        status = &quot;PASS&quot; if not errors else f&quot;FAIL: {errors}&quot;
+        print(f&quot;    {label}: {status}&quot;)
+
+
+def run_constrained_decoding_demo():
+    print(f&quot;\n{&#39;=&#39; * 60}&quot;)
+    print(&quot;  STEP 3: Constrained Decoding Simulation&quot;)
+    print(&quot;=&quot; * 60)
+    demonstrate_constrained_decoding()
+
+
+def run_extraction_pipeline_demo():
+    print(f&quot;\n{&#39;=&#39; * 60}&quot;)
+    print(&quot;  STEP 4: Extraction Pipeline with Retry&quot;)
+    print(&quot;=&quot; * 60)
+
+    texts = [
+        &quot;The Sony WH-1000XM5 headphones are priced at $348 and currently available in stores.&quot;,
+        &quot;The new MacBook Pro 16-inch laptop costs $2499 but is completely sold out everywhere.&quot;,
+        &quot;I just bought a Keychron Q1 mechanical keyboard for $169 and it arrived today.&quot;,
+        &quot;This sentence contains no product information at all.&quot;,
+    ]
+
+    for text in texts:
+        print(f&quot;\n  Input: {text[:70]}...&quot;)
+        result = extract_with_retry(text, PRODUCT_SCHEMA)
+        if result:
+            print(f&quot;  Output: {json.dumps(result)}&quot;)
+        else:
+            print(f&quot;  Output: FAILED after retries&quot;)
+
+
+def run_nested_schema_demo():
+    print(f&quot;\n{&#39;=&#39; * 60}&quot;)
+    print(&quot;  STEP 5: Nested Schema Validation&quot;)
+    print(&quot;=&quot; * 60)
+
+    order_schema = {
+        &quot;type&quot;: &quot;object&quot;,
+        &quot;properties&quot;: {
+            &quot;order_id&quot;: {&quot;type&quot;: &quot;string&quot;},
+            &quot;customer&quot;: {
+                &quot;type&quot;: &quot;object&quot;,
+                &quot;properties&quot;: {
+                    &quot;name&quot;: {&quot;type&quot;: &quot;string&quot;},
+                    &quot;email&quot;: {&quot;type&quot;: &quot;string&quot;},
+                },
+                &quot;required&quot;: [&quot;name&quot;, &quot;email&quot;],
+            },
+            &quot;items&quot;: {
+                &quot;type&quot;: &quot;array&quot;,
+                &quot;items&quot;: {
+                    &quot;type&quot;: &quot;object&quot;,
+                    &quot;properties&quot;: {
+                        &quot;product&quot;: {&quot;type&quot;: &quot;string&quot;},
+                        &quot;quantity&quot;: {&quot;type&quot;: &quot;integer&quot;},
+                        &quot;price&quot;: {&quot;type&quot;: &quot;number&quot;, &quot;minimum&quot;: 0},
+                    },
+                    &quot;required&quot;: [&quot;product&quot;, &quot;quantity&quot;, &quot;price&quot;],
+                },
+                &quot;minItems&quot;: 1,
+            },
+            &quot;total&quot;: {&quot;type&quot;: &quot;number&quot;, &quot;minimum&quot;: 0},
+        },
+        &quot;required&quot;: [&quot;order_id&quot;, &quot;customer&quot;, &quot;items&quot;, &quot;total&quot;],
+    }
+
+    valid_order = {
+        &quot;order_id&quot;: &quot;ORD-001&quot;,
+        &quot;customer&quot;: {&quot;name&quot;: &quot;Alice&quot;, &quot;email&quot;: &quot;alice@example.com&quot;},
+        &quot;items&quot;: [
+            {&quot;product&quot;: &quot;Widget&quot;, &quot;quantity&quot;: 3, &quot;price&quot;: 9.99},
+            {&quot;product&quot;: &quot;Gadget&quot;, &quot;quantity&quot;: 1, &quot;price&quot;: 24.99},
+        ],
+        &quot;total&quot;: 54.96,
+    }
+
+    invalid_order = {
+        &quot;order_id&quot;: &quot;ORD-002&quot;,
+        &quot;customer&quot;: {&quot;name&quot;: &quot;Bob&quot;},
+        &quot;items&quot;: [],
+        &quot;total&quot;: -10,
+    }
+
+    print(f&quot;\n  Order schema (nested objects + arrays):&quot;)
+    for data, label in [(valid_order, &quot;Valid order&quot;), (invalid_order, &quot;Invalid order&quot;)]:
+        errors = validate_schema(data, order_schema)
+        status = &quot;PASS&quot; if not errors else f&quot;FAIL&quot;
+        print(f&quot;\n    {label}: {status}&quot;)
+        if errors:
+            for e in errors:
+                print(f&quot;      - {e}&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    run_schema_validation_demo()
+    run_schema_generation_demo()
+    run_constrained_decoding_demo()
+    run_extraction_pipeline_demo()
+    run_nested_schema_demo()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/11-llm-engineering/03-structured-outputs/code/main.ts">phases/11-llm-engineering/03-structured-outputs/code/main.ts</a><details><summary>查看原始文本</summary><pre><code>// Phase 11 · Lesson 03 — Structured outputs (TypeScript port).
+// Zod-shaped schema DSL + validator + mocked LLM extractor with retry.
+// We inline the schema layer instead of pulling in zod so the lesson stays
+// dep-free; the API (`.parse`, `.safeParse`) mirrors what real zod ships.
+// Refs: https://zod.dev/?id=basic-usage
+//       https://platform.claude.com/docs/en/agents-and-tools/tool-use/overview
+//       https://platform.openai.com/docs/guides/structured-outputs
+
+import process from &quot;node:process&quot;;
+
+type ValidationIssue = { path: string; message: string };
+type ParseResult&lt;T&gt; = { ok: true; value: T } | { ok: false; issues: ValidationIssue[] };
+
+// All schemas implement the same contract: take an unknown, return ParseResult.
+interface Schema&lt;T&gt; {
+  parse(input: unknown, path?: string): ParseResult&lt;T&gt;;
+  toJSONSchema(): Record&lt;string, unknown&gt;;
+}
+
+function ok&lt;T&gt;(value: T): ParseResult&lt;T&gt; {
+  return { ok: true, value };
+}
+function fail&lt;T&gt;(issues: ValidationIssue[]): ParseResult&lt;T&gt; {
+  return { ok: false, issues };
+}
+
+class StringSchema implements Schema&lt;string&gt; {
+  constructor(
+    private opts: { enum?: readonly string[]; minLength?: number } = {},
+  ) {}
+  parse(input: unknown, path = &quot;&quot;): ParseResult&lt;string&gt; {
+    if (typeof input !== &quot;string&quot;) {
+      return fail([{ path, message: `expected string, got ${typeof input}` }]);
+    }
+    if (this.opts.minLength !== undefined &amp;&amp; input.length &lt; this.opts.minLength) {
+      return fail([{ path, message: `string shorter than ${this.opts.minLength}` }]);
+    }
+    if (this.opts.enum &amp;&amp; !this.opts.enum.includes(input)) {
+      return fail([
+        { path, message: `${JSON.stringify(input)} not in [${this.opts.enum.join(&quot;, &quot;)}]` },
+      ]);
+    }
+    return ok(input);
+  }
+  toJSONSchema() {
+    const out: Record&lt;string, unknown&gt; = { type: &quot;string&quot; };
+    if (this.opts.enum) out.enum = [...this.opts.enum];
+    if (this.opts.minLength !== undefined) out.minLength = this.opts.minLength;
+    return out;
+  }
+}
+
+class NumberSchema implements Schema&lt;number&gt; {
+  constructor(private opts: { minimum?: number; maximum?: number; integer?: boolean } = {}) {}
+  parse(input: unknown, path = &quot;&quot;): ParseResult&lt;number&gt; {
+    if (typeof input !== &quot;number&quot; || Number.isNaN(input)) {
+      return fail([{ path, message: `expected number, got ${typeof input}` }]);
+    }
+    if (this.opts.integer &amp;&amp; !Number.isInteger(input)) {
+      return fail([{ path, message: `expected integer, got ${input}` }]);
+    }
+    if (this.opts.minimum !== undefined &amp;&amp; input &lt; this.opts.minimum) {
+      return fail([{ path, message: `${input} below minimum ${this.opts.minimum}` }]);
+    }
+    if (this.opts.maximum !== undefined &amp;&amp; input &gt; this.opts.maximum) {
+      return fail([{ path, message: `${input} above maximum ${this.opts.maximum}` }]);
+    }
+    return ok(input);
+  }
+  toJSONSchema() {
+    const out: Record&lt;string, unknown&gt; = { type: this.opts.integer ? &quot;integer&quot; : &quot;number&quot; };
+    if (this.opts.minimum !== undefined) out.minimum = this.opts.minimum;
+    if (this.opts.maximum !== undefined) out.maximum = this.opts.maximum;
+    return out;
+  }
+}
+
+class BoolSchema implements Schema&lt;boolean&gt; {
+  parse(input: unknown, path = &quot;&quot;): ParseResult&lt;boolean&gt; {
+    if (typeof input !== &quot;boolean&quot;) {
+      return fail([{ path, message: `expected boolean, got ${typeof input}` }]);
+    }
+    return ok(input);
+  }
+  toJSONSchema() {
+    return { type: &quot;boolean&quot; };
+  }
+}
+
+class ArraySchema&lt;T&gt; implements Schema&lt;T[]&gt; {
+  constructor(
+    private item: Schema&lt;T&gt;,
+    private opts: { minItems?: number; maxItems?: number } = {},
+  ) {}
+  parse(input: unknown, path = &quot;&quot;): ParseResult&lt;T[]&gt; {
+    if (!Array.isArray(input)) {
+      return fail([{ path, message: `expected array, got ${typeof input}` }]);
+    }
+    if (this.opts.minItems !== undefined &amp;&amp; input.length &lt; this.opts.minItems) {
+      return fail([{ path, message: `array length ${input.length} &lt; ${this.opts.minItems}` }]);
+    }
+    if (this.opts.maxItems !== undefined &amp;&amp; input.length &gt; this.opts.maxItems) {
+      return fail([{ path, message: `array length ${input.length} &gt; ${this.opts.maxItems}` }]);
+    }
+    const issues: ValidationIssue[] = [];
+    const out: T[] = [];
+    for (let i = 0; i &lt; input.length; i += 1) {
+      const child = this.item.parse(input[i], `${path}[${i}]`);
+      if (!child.ok) issues.push(...child.issues);
+      else out.push(child.value);
+    }
+    return issues.length ? fail(issues) : ok(out);
+  }
+  toJSONSchema() {
+    const out: Record&lt;string, unknown&gt; = { type: &quot;array&quot;, items: this.item.toJSONSchema() };
+    if (this.opts.minItems !== undefined) out.minItems = this.opts.minItems;
+    if (this.opts.maxItems !== undefined) out.maxItems = this.opts.maxItems;
+    return out;
+  }
+}
+
+type ObjectShape = Record&lt;string, { schema: Schema&lt;unknown&gt;; required: boolean }&gt;;
+
+class ObjectSchema&lt;S extends ObjectShape&gt; implements Schema&lt;{ [K in keyof S]: unknown }&gt; {
+  constructor(private shape: S) {}
+  parse(input: unknown, path = &quot;&quot;): ParseResult&lt;{ [K in keyof S]: unknown }&gt; {
+    if (input === null || typeof input !== &quot;object&quot; || Array.isArray(input)) {
+      return fail([{ path, message: `expected object, got ${typeof input}` }]);
+    }
+    const issues: ValidationIssue[] = [];
+    const out: Record&lt;string, unknown&gt; = {};
+    const record = input as Record&lt;string, unknown&gt;;
+    for (const [key, field] of Object.entries(this.shape)) {
+      const childPath = path ? `${path}.${key}` : key;
+      if (!(key in record)) {
+        if (field.required) issues.push({ path: childPath, message: &quot;required field missing&quot; });
+        continue;
+      }
+      const child = field.schema.parse(record[key], childPath);
+      if (!child.ok) issues.push(...child.issues);
+      else out[key] = child.value;
+    }
+    return issues.length ? fail(issues) : ok(out as { [K in keyof S]: unknown });
+  }
+  toJSONSchema() {
+    const properties: Record&lt;string, unknown&gt; = {};
+    const required: string[] = [];
+    for (const [key, field] of Object.entries(this.shape)) {
+      properties[key] = field.schema.toJSONSchema();
+      if (field.required) required.push(key);
+    }
+    return { type: &quot;object&quot;, properties, required };
+  }
+}
+
+const z = {
+  string: (opts?: ConstructorParameters&lt;typeof StringSchema&gt;[0]) =&gt; new StringSchema(opts),
+  number: (opts?: ConstructorParameters&lt;typeof NumberSchema&gt;[0]) =&gt; new NumberSchema(opts),
+  integer: () =&gt; new NumberSchema({ integer: true }),
+  boolean: () =&gt; new BoolSchema(),
+  array: &lt;T&gt;(item: Schema&lt;T&gt;, opts?: ConstructorParameters&lt;typeof ArraySchema&gt;[1]) =&gt;
+    new ArraySchema(item, opts),
+  object: &lt;S extends ObjectShape&gt;(shape: S) =&gt; new ObjectSchema(shape),
+  field: &lt;T&gt;(schema: Schema&lt;T&gt;, required = true) =&gt; ({ schema: schema as Schema&lt;unknown&gt;, required }),
+};
+
+const ProductSchema = z.object({
+  product: z.field(z.string({ minLength: 1 })),
+  price: z.field(z.number({ minimum: 0 })),
+  in_stock: z.field(z.boolean()),
+  categories: z.field(z.array(z.string()), false),
+});
+
+// Mock LLM. First attempt for &quot;headphones&quot; is bad on purpose so the retry
+// loop has something to do.
+function simulateLLM(text: string, attempt: number): string {
+  const t = text.toLowerCase();
+  if (t.includes(&quot;headphones&quot;) || t.includes(&quot;sony&quot;)) {
+    if (attempt === 0) {
+      return &#39;Here is the JSON:\n```\n{&quot;product&quot;: &quot;Sony WH-1000XM5&quot;, &quot;price&quot;: &quot;348.00&quot;, &quot;in_stock&quot;: true}\n```&#39;;
+    }
+    return &#39;{&quot;product&quot;: &quot;Sony WH-1000XM5&quot;, &quot;price&quot;: 348, &quot;in_stock&quot;: true, &quot;categories&quot;: [&quot;audio&quot;, &quot;headphones&quot;]}&#39;;
+  }
+  if (t.includes(&quot;macbook&quot;) || t.includes(&quot;laptop&quot;)) {
+    return &#39;{&quot;product&quot;: &quot;MacBook Pro 16&quot;, &quot;price&quot;: 2499, &quot;in_stock&quot;: false, &quot;categories&quot;: [&quot;computers&quot;]}&#39;;
+  }
+  if (t.includes(&quot;keyboard&quot;)) {
+    return &#39;{&quot;product&quot;: &quot;Keychron Q1&quot;, &quot;price&quot;: 169, &quot;in_stock&quot;: true, &quot;categories&quot;: [&quot;peripherals&quot;]}&#39;;
+  }
+  return &#39;{&quot;product&quot;: &quot;Unknown&quot;, &quot;price&quot;: 0, &quot;in_stock&quot;: false}&#39;;
+}
+
+// Strip the markdown fence + preamble that real models love to add.
+function extractJSONBlock(raw: string): string {
+  const fence = raw.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (fence) return fence[1]!.trim();
+  const first = raw.indexOf(&quot;{&quot;);
+  const last = raw.lastIndexOf(&quot;}&quot;);
+  if (first &gt;= 0 &amp;&amp; last &gt; first) return raw.slice(first, last + 1);
+  return raw.trim();
+}
+
+type Product = { product: string; price: number; in_stock: boolean; categories?: string[] };
+
+function extractWithRetry(text: string, maxRetries = 3): Product | null {
+  for (let attempt = 0; attempt &lt; maxRetries; attempt += 1) {
+    const raw = simulateLLM(text, attempt);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(extractJSONBlock(raw));
+    } catch (err) {
+      process.stdout.write(`    attempt ${attempt + 1}: json parse error — ${(err as Error).message}\n`);
+      continue;
+    }
+    const result = ProductSchema.parse(parsed);
+    if (result.ok) return result.value as Product;
+    process.stdout.write(
+      `    attempt ${attempt + 1}: schema errors — ${result.issues.map((i) =&gt; i.message).join(&quot;; &quot;)}\n`,
+    );
+  }
+  return null;
+}
+
+function runSchemaDemo(): void {
+  process.stdout.write(&quot;=&quot;.repeat(60) + &quot;\n  STEP 1: schema validation\n&quot; + &quot;=&quot;.repeat(60) + &quot;\n&quot;);
+  const cases: { data: unknown; label: string }[] = [
+    { data: { product: &quot;Sony WH-1000XM5&quot;, price: 348, in_stock: true }, label: &quot;valid minimal&quot; },
+    { data: { product: &quot;Test&quot;, price: -5, in_stock: true }, label: &quot;negative price&quot; },
+    { data: { product: &quot;Test&quot;, in_stock: true }, label: &quot;missing price&quot; },
+    { data: { product: 123, price: 10, in_stock: true }, label: &quot;number as product&quot; },
+    { data: { product: &quot;Test&quot;, price: 10, in_stock: &quot;yes&quot; }, label: &quot;string as boolean&quot; },
+  ];
+  for (const c of cases) {
+    const result = ProductSchema.parse(c.data);
+    const status = result.ok ? &quot;PASS&quot; : `FAIL: ${result.issues.map((i) =&gt; i.message).join(&quot;; &quot;)}`;
+    process.stdout.write(`  ${c.label}: ${status}\n`);
+  }
+}
+
+function runJSONSchemaDemo(): void {
+  process.stdout.write(&quot;\n&quot; + &quot;=&quot;.repeat(60) + &quot;\n  STEP 2: schema → JSON Schema (for provider APIs)\n&quot; + &quot;=&quot;.repeat(60) + &quot;\n&quot;);
+  process.stdout.write(JSON.stringify(ProductSchema.toJSONSchema(), null, 2) + &quot;\n&quot;);
+}
+
+function runExtractionDemo(): void {
+  process.stdout.write(&quot;\n&quot; + &quot;=&quot;.repeat(60) + &quot;\n  STEP 3: extraction with retry\n&quot; + &quot;=&quot;.repeat(60) + &quot;\n&quot;);
+  const inputs = [
+    &quot;The Sony WH-1000XM5 headphones are priced at $348 and currently in stock.&quot;,
+    &quot;The new MacBook Pro 16 laptop costs $2499 but is sold out.&quot;,
+    &quot;I just bought a Keychron Q1 keyboard for $169.&quot;,
+    &quot;This sentence has no product information at all.&quot;,
+  ];
+  for (const text of inputs) {
+    process.stdout.write(`\n  input: ${text.slice(0, 70)}...\n`);
+    const result = extractWithRetry(text);
+    process.stdout.write(`  output: ${result ? JSON.stringify(result) : &quot;FAILED after retries&quot;}\n`);
+  }
+}
+
+function main(): void {
+  runSchemaDemo();
+  runJSONSchemaDemo();
+  runExtractionDemo();
+}
+
+main();
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/11-llm-engineering/03-structured-outputs/outputs/prompt-structured-extractor.md">phases/11-llm-engineering/03-structured-outputs/outputs/prompt-structured-extractor.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: prompt-structured-extractor
+description: Extract structured data from unstructured text given a JSON Schema definition
+phase: 11
+lesson: 03
+---
+
+You are a structured data extraction engine. I will provide a JSON Schema and unstructured text. You will extract data that conforms exactly to the schema.
+
+## Extraction Protocol
+
+### 1. Schema Analysis
+
+Before extracting, analyze the schema:
+
+- Identify all required fields and their types
+- Note enum constraints, minimum/maximum values, and format requirements
+- Identify nested objects and array structures
+- Flag fields that may be ambiguous or hard to extract from natural text
+
+### 2. Extraction Rules
+
+**Required fields**: must always be present in the output. If the information is not in the text, use the most reasonable default:
+- Strings: use &quot;unknown&quot; or &quot;not specified&quot;
+- Numbers: use 0 or null (if the schema allows nullable)
+- Booleans: use false as the conservative default
+- Arrays: use an empty array []
+
+**Type enforcement**: every value must match the schema type exactly:
+- &quot;price&quot; with type &quot;number&quot;: extract 348.00, not &quot;$348&quot; or &quot;three hundred&quot;
+- &quot;in_stock&quot; with type &quot;boolean&quot;: extract true/false, not &quot;yes&quot;/&quot;available&quot;
+- &quot;categories&quot; with type &quot;array&quot;: extract [&quot;audio&quot;, &quot;headphones&quot;], not &quot;audio, headphones&quot;
+
+**Enum fields**: the value must be one of the allowed values. If the text uses a synonym, map it to the closest allowed value.
+
+**Nested objects**: extract each level of nesting separately. Validate inner objects against their sub-schemas.
+
+### 3. Confidence Annotation
+
+For each extracted field, internally assess confidence:
+- **High**: the information is explicitly stated in the text
+- **Medium**: the information is implied or requires minor inference
+- **Low**: the information is guessed based on context or defaults
+
+If more than 2 fields are low confidence, note this in a separate `_extraction_notes` field (only if the schema does not prohibit additional properties).
+
+### 4. Output Format
+
+Return ONLY the JSON object. No markdown fences. No preamble. No explanation. The output must be directly parseable by `JSON.parse()` or `json.loads()`.
+
+## Input Format
+
+**Schema:**
+```json
+{schema}
+```
+
+**Text to extract from:**
+```
+{text}
+```
+
+## Output
+
+A single JSON object matching the schema exactly.
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/11-llm-engineering/03-structured-outputs/outputs/skill-structured-outputs.md">phases/11-llm-engineering/03-structured-outputs/outputs/skill-structured-outputs.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: skill-structured-outputs
+description: Decision framework for choosing the right structured output strategy based on provider, reliability, and complexity
+version: 1.0.0
+phase: 11
+lesson: 03
+tags: [structured-output, json, schema, constrained-decoding, pydantic, function-calling]
+---
+
+# Structured Output Strategy
+
+When building an LLM application that requires structured data, apply this decision framework.
+
+## When to use each approach
+
+**Prompt-based (&quot;Return JSON&quot;):** Prototyping only. Acceptable for internal tools where occasional parse failures are tolerable. Add a try/except with retry. Never use in production pipelines.
+
+**JSON mode (API flag):** You need guaranteed valid JSON but the schema is simple or flexible. Works when you validate the shape on the application side. Available: OpenAI, Anthropic (via tool use), Google.
+
+**Schema mode (constrained decoding):** Production systems where every output must match a specific schema. Zero parse failures. Zero schema violations. Use this by default for any production extraction or classification task. Available: OpenAI structured outputs, Outlines, Guidance.
+
+**Function calling / tool use:** The model needs to choose which function to call, not just fill parameters. You have multiple schemas and the model selects the appropriate one. Also use when integrating with existing tool/function infrastructure.
+
+**Instructor library:** You want Pydantic validation with automatic retry across any provider. Best DX for Python projects. Wraps OpenAI, Anthropic, Google, and open-source models.
+
+## Provider-specific guidance
+
+**OpenAI:** Use `response_format` with `json_schema` type. Constrained decoding is built in. Pydantic models work directly. Most reliable structured output implementation.
+
+**Anthropic:** Use tool use for structured output. Define a single tool with the desired schema. The model returns tool call arguments matching the schema. Reliable but requires the tool use API pattern.
+
+**Open-source models (vLLM, Ollama):** Use Outlines or Guidance for constrained decoding. These libraries compile JSON Schemas into finite state machines that mask invalid tokens during generation. Requires running inference locally.
+
+## Schema design guidelines
+
+1. Keep schemas flat when possible. Nested objects beyond 2 levels increase extraction errors.
+2. Use enums for categorical fields. Do not rely on the model inventing the right string.
+3. Make ambiguous fields required with explicit null support rather than optional. Forces the model to make a decision.
+4. Add descriptions to schema properties. The model reads these as instructions.
+5. Avoid union types (oneOf/anyOf) unless necessary. They increase decoding complexity.
+6. Set minimum/maximum on numbers. Catches hallucinated extreme values.
+7. Use minItems/maxItems on arrays to prevent empty or unbounded outputs.
+
+## Common failure patterns and fixes
+
+- **Model wraps JSON in markdown fences**: switch from prompt-based to JSON mode or schema mode
+- **Schema-valid but factually wrong**: add an LLM-as-judge validation step after extraction
+- **Inconsistent enum values**: switch to constrained decoding or add post-processing normalization
+- **Missing optional fields**: make them required or add default values in application code
+- **Very slow extraction**: constrained decoding adds 5-15% latency, reduce schema complexity if latency-sensitive
+- **Large arrays with varied items**: chunk the input and extract per-chunk, then merge results
+
+## Reliability ladder
+
+| Approach | Parse Success | Schema Match | Setup Effort |
+|----------|-------------|-------------|-------------|
+| Prompt-based | ~90% | ~80% | 1 minute |
+| JSON mode | 100% | ~90% | 5 minutes |
+| Schema mode | 100% | ~99% | 15 minutes |
+| Constrained decoding | 100% | 100% | 30 minutes |
+| Instructor + retry | 100% | ~99.5% | 10 minutes |
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. Why is getting structured JSON output from LLMs challenging?</legend><label class="option"><input type="radio" name="q0" value="0"> JSON is too complex for LLMs</label><label class="option"><input type="radio" name="q0" value="1"> LLMs only output plain text</label><label class="option"><input type="radio" name="q0" value="2"> LLMs can&#39;t generate JSON</label><label class="option"><input type="radio" name="q0" value="3"> LLMs generate free-form text token by token and can produce invalid JSON (missing brackets, wrong types, extra text) at any point</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. What is constrained decoding?</legend><label class="option"><input type="radio" name="q1" value="0"> Limiting the model&#39;s vocabulary size</label><label class="option"><input type="radio" name="q1" value="1"> Using a smaller model</label><label class="option"><input type="radio" name="q1" value="2"> Compressing the output</label><label class="option"><input type="radio" name="q1" value="3"> Restricting which tokens the model can generate at each step to ensure the output conforms to a grammar or schema</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. What is the benefit of using Pydantic models for LLM output validation?</legend><label class="option"><input type="radio" name="q2" value="0"> They define typed schemas that automatically validate, parse, and reject malformed LLM outputs with clear error messages</label><label class="option"><input type="radio" name="q2" value="1"> They make API calls faster</label><label class="option"><input type="radio" name="q2" value="2"> They reduce token usage</label><label class="option"><input type="radio" name="q2" value="3"> They improve model accuracy</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. What should you do when the LLM returns invalid JSON despite instructions?</legend><label class="option"><input type="radio" name="q3" value="0"> Switch to a different model</label><label class="option"><input type="radio" name="q3" value="1"> Manually fix the JSON</label><label class="option"><input type="radio" name="q3" value="2"> Implement a retry loop that sends the validation error back to the model as context for a corrected attempt</label><label class="option"><input type="radio" name="q3" value="3"> Increase the temperature</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. When should you use the API&#39;s native JSON mode vs prompt-based JSON extraction?</legend><label class="option"><input type="radio" name="q4" value="0"> Always use prompt-based extraction</label><label class="option"><input type="radio" name="q4" value="1"> Always use native JSON mode</label><label class="option"><input type="radio" name="q4" value="2"> Use native mode for guaranteed structure; use prompt-based for complex extraction where you need the model to reason about what to extract</label><label class="option"><input type="radio" name="q4" value="3"> They produce identical results</label><p data-feedback="4"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/11-llm-engineering/02-few-shot-cot/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/11-llm-engineering/04-embeddings/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/11-llm-engineering/03-structured-outputs/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

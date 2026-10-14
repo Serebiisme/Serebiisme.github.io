@@ -1,0 +1,733 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>投机解码和 · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-10-llms-from-scratch" data-lesson="10-llms-from-scratch/25-speculative-decoding" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/10-llms-from-scratch/">从零构建大语言模型</a> / LESSON 25</p><h1 class="lesson-title">投机解码和</h1><p>Speculative Decoding and EAGLE</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>投机解码和</h1>
+<blockquote>
+<p>一个创建一个代币的跨界法规需要通过数十亿个参数. 往往的通行量大大过于充足:通常一个更小的模型可以正确猜测下一个3-5个代币, 如果猜测是正确的,你会得到5个代币. 投机解码 (Leviathan等人) 据估计,在2023年,EAGLE-3 (2025) 将接受率推至4.5个代币,以实现4-5倍的速度.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python (with numpy)
+<strong>Prerequisites:</strong> Phase 10 Lesson 12 (Inference Optimization), Phase 10 Lesson 04 (Pre-training Mini-GPT)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>问题</h2>
+<p>对于 H100 的 70B 类型的代码输出通常为 40-80 代币/秒.每个代币需要一个全前传输,读取HBM 的所有模型重量.你不能使模型变小而不改变输出.你不能增加更大的批量.你卡在,除非你可以让模型输出超过一个代币.</p>
+<p>后代的产量看起来是连续性的:<code>x_{t+1} = sample(p(· | x_{1:t}))</code>如果您有一个廉价的预测器,它说&quot;下一个4个代币可能是 [a,b,c,d]&quot;您可以验证所有5个位置在a<strong>single forward pass of the big model</strong>接收最长的相匹配的前.</p>
+<p>利维雅坦,卡莱,马蒂亚斯 (2023,通过投机解码从变体中快速推理) 通过一个聪明的接受/拒绝规则来实现这一点,以保持目标模型的样本分布.同样的输出分布, 2-4 倍更快.</p>
+<h2>概念</h2>
+<h3>两种模式的设置</h3>
+<ul>
+<li><strong>Target model</strong> <code>M_p</code>您实际上想要的样本是大,慢,高质量的模型.<code>p(x)</code>现在,我们要去.</li>
+<li><strong>Draft model</strong> <code>M_q</code>快速,低质量的小型模型.<code>q(x)</code>五到三倍小.</li>
+</ul>
+<p>每一步:</p>
+<ol>
+<li>拟议的模型草案<code>K</code>代币自动下降: <code>x_1, x_2, ..., x_K ~ q</code>现在,我们要去.</li>
+<li>目标模型在所有情况下运行一个前进通行<code>K+1</code>位并行,产生<code>p(x_k)</code>对于每一个拟议的代币.</li>
+<li>通过下面修改的拒绝样本规则,从左到右接受/拒绝每个代币. 接受最长的匹配前.</li>
+<li>如果任何代币被拒绝,请从纠正的分布中取代代代币的样本,然后停止.<code>p(· | x_1...x_K)</code>现在,我们要去.</li>
+</ol>
+<p>如果草案完全匹配目标,你会得到每一个目标前进的K+1代币.如果草案在位置1上错误,你只会得到1代币.</p>
+<h3>准确性规则</h3>
+<p>预测解码是<strong>provably equivalent in distribution to sampling from p</strong>拒绝的规则:</p>
+<pre><code>For each drafted token x_t:
+    r ~ Uniform(0, 1)
+    if r &lt; p(x_t) / q(x_t):
+        accept x_t
+    else:
+        sample replacement from residual: (p - q)+ / ||(p - q)+||_1
+        stop
+</code></pre>
+<p>在哪里<code>(p - q)+</code>标志着点差的正面部分.<code>p ≈ q</code>) 接受率接近 1. 当他们不同意时,残余分布是这样构建的,使整体样本仍然是准确的<code>p</code>现在,我们要去.</p>
+<p>**Greedy case.**对于温度=0的样本,请检查<code>argmax(p) == x_t</code>如果是,接受;如果不是,输出<code>argmax(p)</code>停止.</p>
+<h3>预期的增速</h3>
+<p>如果草案模型的代币级接受率为<code>α</code>预期每次目标前进通行产生的代币为:</p>
+<pre><code>E[tokens] = (1 - α^{K+1}) / (1 - α)        # K = draft length, α in [0, 1]
+</code></pre>
+<p>在<code>α = 0.8, K = 4</code>其他<code>(1 - 0.8^5)/(1 - 0.8) = 3.36</code>预期期期货的代币.<code>cost_q * K + cost_p</code>(K草案步骤加上一个目标验证).<code>cost_p &gt;&gt; cost_q * K</code>速度增速率为<code>3.36× / 1 = 3.36×</code>通过量.</p>
+<p>唯一真正的参数是<code>α</code>根据&quot;项目目标&quot;的结合, 一个好的项目是一切.</p>
+<h3>培训项目:蒸</h3>
+<p>随机的小模型做了一个糟糕的草稿.</p>
+<ol>
+<li>选择一个小的架构 (70B目标的~1B,7B目标的~500M).</li>
+<li>运行目标模型在一个大文本体内;存储其下一个代币分布.</li>
+<li>根据目标分布 (而不是实地真相代币) 进行KL分歧训练.</li>
+</ol>
+<p>结果是:<code>α</code>在编码中通常是0.6-0.8,在自然语言聊天中是0.7-0.85.</p>
+<h3>:树木绘制+重用特征</h3>
+<p>李,韦,张,张 (2024, &quot;:投机性样本需要重新思考特征不确定性&quot;) 观察到标准投机性解码中的两个效率低下:</p>
+<ol>
+<li>草案执行K序列步骤,每个都是完整的. 但草案可能会重新利用目标的特性 (隐藏状态) 从最近验证 目标已经计算了丰富的表示,该草案是从零中重新衍生.</li>
+<li>如果草案可以输出候选人的<em>树</em> (每个节点都会多次猜测),目标的单一向前传递可以通过树注意力面具并行验证多个候选人的路径,并选择最长的接受分支.</li>
+</ol>
+<p>-1变化:</p>
+<ul>
+<li>预示输入 = 目标在位置 t 的最后隐藏状态,而不是原始代币.</li>
+<li>草案架构 = 1 变压器解码器层 (不是单独的小模型).</li>
+<li>输出 = K 的树 = 每个深度4-8个候选,深度4-6.</li>
+</ul>
+<p>子-2 (2024) 增加了动态树木拓:树在不确定的地段上长得更宽,而在自信的地方保持狭窄.<code>α_effective</code>没有增加验证成本.</p>
+<p>3 (Li等) 2025年&quot;,EAGLE-3:通过训练时间测试扩大大型语言模型的推理加速&quot;) 消除了固定的顶层功能依赖性,并将草案训练以新的&quot;测试时间模拟&quot;损失. 接受率从0.75 (EAGLE-2) 升至0.82 (EAGLE-3) ,平均代币/验证率从3.0升至4.5.</p>
+<h3>树木注意力检查</h3>
+<p>目标模型通过一个单个前进传输来验证树的输出.<strong>tree attention mask</strong>一个因果化面具,它编码树木拓而不是纯线.每个代币只为树上的祖先服务.验证通过仍然是前面,一条马特尔;拓化面具只花费了几次额外的KV入口.</p>
+<pre><code>        root
+       /    \
+      a      b
+     / \    / \
+    c  d   e   f
+</code></pre>
+<p>如果<code>a, b</code>竞争的第一代代标志候选人<code>c, d, e, f</code>输出是任何接受的路径上最长的前.</p>
+<h3>当它胜利时,当它不胜利时</h3>
+<p><strong>Wins:</strong></p>
+<ul>
+<li>通过可预测的文本进行聊天/完成 (代码,普通英语,结构化输出). <code>α</code>了.</li>
+<li>设置在解码过程中未使用的GPU计算 (内存绑定阶段).树草图使用可用的FLOP.</li>
+</ul>
+<p><strong>Loses / no win:</strong></p>
+<ul>
+<li>极高的性输出 (高温创意写作).<code>α</code>落到<code>1/|vocab|</code>现在,我们要去.</li>
+<li>批量服务具有非常高的同时批量已经填补了FLOP,对树木验证的空间很少.</li>
+<li>非常小的目标模型,其中的草案并不小.</li>
+</ul>
+<p>制作商店通常会报告聊天的速度2~3倍,代码生成3~5倍,创意写作几乎是零.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-33101ee3e206175fb938.png" alt="speculative-decoding 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<p><code>code/main.py</code>其他:</p>
+<ul>
+<li>参考<code>speculative_decode(target, draft, prompt, K, temperature)</code>执行确切的拒绝规则并验证它保留了目标分布 (实验性KL &lt;0.01对平凡目标采样).</li>
+<li>树的设计师, 构建一个深度K树,</li>
+<li>树木注意力面具制造器,为验证器产生了正确的因果模式.</li>
+<li>通过一个小LM (从GPT-2-中目标中除一个GPT-2-小) 运行的接受率带.</li>
+</ul>
+<pre><code class="language-python">def speculative_step(p_target, q_draft, K, temperature=1.0):
+    &quot;&quot;&quot;One round of speculative decoding. Returns list of accepted tokens.&quot;&quot;&quot;
+    # 1. Draft K tokens
+    draft_tokens = []
+    q_probs = []
+    state = draft_state_init()
+    for _ in range(K):
+        probs = softmax(q_draft(state) / temperature)
+        t = np.random.choice(len(probs), p=probs)
+        draft_tokens.append(t)
+        q_probs.append(probs[t])
+        state = draft_step(state, t)
+
+    # 2. Target computes p at every drafted position + 1 extra
+    p_probs_all = target_forward_batched(p_target, draft_tokens, temperature)
+
+    # 3. Accept/reject left-to-right
+    accepted = []
+    for k, tok in enumerate(draft_tokens):
+        r = np.random.uniform()
+        if r &lt; p_probs_all[k][tok] / q_probs[k]:
+            accepted.append(tok)
+        else:
+            residual = np.maximum(p_probs_all[k] - q_probs[k], 0)
+            residual /= residual.sum()
+            accepted.append(np.random.choice(len(residual), p=residual))
+            return accepted
+    # 4. All K accepted → sample bonus token from target
+    accepted.append(np.random.choice(len(p_probs_all[-1]), p=p_probs_all[-1]))
+    return accepted
+</code></pre>
+<h2>用它</h2>
+<ul>
+<li><strong>vLLM</strong>其他<strong>SGLang</strong>在vLLM中,通过<code>--speculative-config</code>具有 JSON 对象<code>method</code>现在<code>model</code>其他<code>num_speculative_tokens</code>3是<code>&quot;method&quot;: &quot;eagle3&quot;</code>现在,我们要去.</li>
+<li><strong>NVIDIA TensorRT-LLM</strong>支持梅杜萨和树的本土.</li>
+<li><strong>Reference draft models</strong>其他<code>Qwen/Qwen3-0.6B</code>(Qwen3-32B草案),<code>meta-llama/Llama-3.2-1B-Instruct</code>(关于Llama 3.x 70B的草案)</li>
+<li><strong>Medusa heads</strong>(Cai et al. 2024,&quot;Medusa:简单的LLM推理加速框架与多个解码头&quot;):而不是一个草案模型,将K平行预测头添加到目标本身.更简单的部署,接受度略低于EAGLE.</li>
+</ul>
+<h2>运送它</h2>
+<p>这一课产生了<code>outputs/skill-speculative-tuning.md</code>一个技能,可以描述目标模型的工作负载,并选择:草案模型,K (草案长度),树宽度,温度,以及何时回到简单的解码.</p>
+<h2>运动</h2>
+<ol>
+<li>
+<p>执行确切的拒绝规则,经验验证它.<code>speculative_decode</code>通过简单的目标样本采集,计算两个输出分布之间的电视距离. 应为&lt;0.01.</p>
+</li>
+<li>
+<p>计算加快公式,给定了<code>α</code>其他<code>K</code>图表预期的代币每目标前进. 找出α ∈ {0.5,0.7,0.9} 的最佳K.</p>
+</li>
+<li>
+<p>训练一个小的草稿. 拿一个124MGPT-2目标,并在100M代币上除一个30MGPT-2草稿.<code>α</code>预期:0.6至0.7.</p>
+</li>
+<li>
+<p>执行EIGLE样式的树草图. 代替链条,将草图输出的每一个深度上三个分支. 构建树注意力面具. 检查目标接受最长正确的分支.</p>
+</li>
+<li>
+<p>测量失败模式.在温度=1.5 (高性) 运行投机解码.显示 α 崩,算法由于开支的草图而比普通解码慢.</p>
+</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Target model</td>
+<td>&quot;The big model&quot;</td>
+<td>The slow, high-quality model you want samples from (p distribution)</td>
+</tr>
+<tr>
+<td>Draft model</td>
+<td>&quot;The speculator&quot;</td>
+<td>The small, fast predictor (q distribution); 5-30x smaller</td>
+</tr>
+<tr>
+<td>K / draft length</td>
+<td>&quot;Look-ahead&quot;</td>
+<td>Number of speculated tokens per verify pass</td>
+</tr>
+<tr>
+<td>α / acceptance rate</td>
+<td>&quot;Hit rate&quot;</td>
+<td>Per-token probability that the draft's proposal is accepted</td>
+</tr>
+<tr>
+<td>Exact rejection rule</td>
+<td>&quot;The accept test&quot;</td>
+<td>r &lt; p/q compare that preserves target's distribution</td>
+</tr>
+<tr>
+<td>Residual distribution</td>
+<td>&quot;Corrected p-q&quot;</td>
+<td>(p - q)+ /</td>
+</tr>
+<tr>
+<td>Tree drafting</td>
+<td>&quot;Branching speculation&quot;</td>
+<td>Draft outputs a tree of candidates, verified in one pass with tree-structured attention mask</td>
+</tr>
+<tr>
+<td>Tree attention mask</td>
+<td>&quot;Topological mask&quot;</td>
+<td>Causal mask encoding the tree topology so each node attends only to its ancestors</td>
+</tr>
+<tr>
+<td>Medusa heads</td>
+<td>&quot;Parallel heads&quot;</td>
+<td>K extra prediction heads on the target itself; no separate draft model</td>
+</tr>
+<tr>
+<td>EAGLE feature reuse</td>
+<td>&quot;Hidden-state draft&quot;</td>
+<td>Draft input is target's last hidden state, not raw tokens, shrinking the draft</td>
+</tr>
+<tr>
+<td>Test-time simulation loss</td>
+<td>&quot;EAGLE-3 training&quot;</td>
+<td>Train draft on outputs matching target's test-time distribution, not teacher forcing</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2211.17192" rel="noreferrer" data-network="true">Leviathan, Kalai, Matias, 2023 — &quot;Fast Inference from Transformers via Speculative Decoding&quot; <small>↗ 需要联网</small></a>准确的拒绝规则和理论加速分析</li>
+<li><a href="https://arxiv.org/abs/2302.01318" rel="noreferrer" data-network="true">Chen, Borgeaud, Irving et al., 2023 — &quot;Accelerating Large Language Model Decoding with Speculative Sampling&quot; <small>↗ 需要联网</small></a>深思维的同时投机性采样论文</li>
+<li><a href="https://arxiv.org/abs/2401.10774" rel="noreferrer" data-network="true">Cai, Li, Geng, Wang, Wang, Zhu, Dao, 2024 — &quot;Medusa: Simple LLM Inference Acceleration Framework with Multiple Decoding Heads&quot; <small>↗ 需要联网</small></a>平行头替代草案模型</li>
+<li><a href="https://arxiv.org/abs/2401.15077" rel="noreferrer" data-network="true">Li, Wei, Zhang, Zhang, 2024 — &quot;EAGLE: Speculative Sampling Requires Rethinking Feature Uncertainty&quot; <small>↗ 需要联网</small></a>重用特征和树木设计</li>
+<li><a href="https://arxiv.org/abs/2406.16858" rel="noreferrer" data-network="true">Li et al., 2024 — &quot;EAGLE-2: Faster Inference of Language Models with Dynamic Draft Trees&quot; <small>↗ 需要联网</small></a>动态树木拓</li>
+<li><a href="https://arxiv.org/abs/2503.01840" rel="noreferrer" data-network="true">Li et al., 2025 — &quot;EAGLE-3: Scaling up Inference Acceleration of Large Language Models via Training-Time Test&quot; <small>↗ 需要联网</small></a>火车时间测试时间匹配</li>
+<li><a href="https://arxiv.org/abs/2402.02057" rel="noreferrer" data-network="true">Fu, Haotian, Peng et al., 2024 — &quot;Break the Sequential Dependency of LLM Inference Using Lookahead Decoding&quot; <small>↗ 需要联网</small></a>  Jacobi/lookahead解码,一个无投机者的替代方案</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Speculative Decoding and EAGLE</h1>
+<blockquote>
+<p>A frontier LLM generating one token requires a full forward pass over billions of parameters. That forward pass is massively over-provisioned: most of the time a much smaller model can guess the next 3-5 tokens correctly, and the big model only needs to <em>verify</em> the guess. When the guess is right you got 5 tokens for the price of one. Speculative decoding (Leviathan et al. 2023) made this exact, and EAGLE-3 (2025) pushed acceptance rates to ~4.5 tokens per verify — a 4-5x speedup at matched output distribution.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Python (with numpy)
+<strong>Prerequisites:</strong> Phase 10 Lesson 12 (Inference Optimization), Phase 10 Lesson 04 (Pre-training Mini-GPT)
+<strong>Time:</strong> ~75 minutes</p>
+<h2>The Problem</h2>
+<p>Decode throughput for a 70B-class model on H100 is typically 40-80 tokens/second. Each token requires a full forward pass reading all model weights from HBM. You cannot make the model smaller without changing its output. You cannot increase batch size beyond memory. You're stuck — unless you can let the model output more than one token per forward pass.</p>
+<p>Autoregressive generation looks inherently serial: <code>x_{t+1} = sample(p(· | x_{1:t}))</code>. But there is a concurrency opportunity. If you had a cheap predictor that said &quot;the next 4 tokens are probably [a, b, c, d]&quot; you could verify all 5 positions in a <strong>single forward pass of the big model</strong> and accept the longest matching prefix.</p>
+<p>Leviathan, Kalai, Matias (2023, &quot;Fast Inference from Transformers via Speculative Decoding&quot;) made this exact via a clever accept/reject rule that preserves the target model's sampling distribution. The same output distribution, 2-4× faster.</p>
+<h2>The Concept</h2>
+<h3>The Two-Model Setup</h3>
+<ul>
+<li><strong>Target model</strong> <code>M_p</code>: the big, slow, high-quality model you actually want samples from. Distribution: <code>p(x)</code>.</li>
+<li><strong>Draft model</strong> <code>M_q</code>: a small, fast, lower-quality model. Distribution: <code>q(x)</code>. 5-30× smaller.</li>
+</ul>
+<p>Per step:</p>
+<ol>
+<li>Draft model proposes <code>K</code> tokens autoregressively: <code>x_1, x_2, ..., x_K ~ q</code>.</li>
+<li>Target model runs ONE forward pass over all <code>K+1</code> positions in parallel, producing <code>p(x_k)</code> for each proposed token.</li>
+<li>Accept/reject each token left-to-right via the modified rejection-sampling rule below. Accept the longest matching prefix.</li>
+<li>If any token is rejected, sample the replacement from the corrected distribution and stop. Otherwise sample one bonus token from <code>p(· | x_1...x_K)</code>.</li>
+</ol>
+<p>If the draft matches the target perfectly, you get K+1 tokens per target-forward. If the draft is wrong at position 1, you get only 1 token.</p>
+<h3>The Exactness Rule</h3>
+<p>Speculative decoding is <strong>provably equivalent in distribution to sampling from p</strong>. The rejection rule:</p>
+<pre><code>For each drafted token x_t:
+    r ~ Uniform(0, 1)
+    if r &lt; p(x_t) / q(x_t):
+        accept x_t
+    else:
+        sample replacement from residual: (p - q)+ / ||(p - q)+||_1
+        stop
+</code></pre>
+<p>where <code>(p - q)+</code> denotes the positive part of the pointwise difference. When the draft and target agree (<code>p ≈ q</code>) acceptance is nearly 1. When they disagree, the residual distribution is constructed so that the overall sample is still exactly <code>p</code>.</p>
+<p><strong>Greedy case.</strong> For temperature=0 sampling just check <code>argmax(p) == x_t</code>. If yes, accept; if no, output <code>argmax(p)</code> and stop.</p>
+<h3>Expected Speedup</h3>
+<p>If the draft model's token-level acceptance rate is <code>α</code>, the expected tokens produced per target-forward pass is:</p>
+<pre><code>E[tokens] = (1 - α^{K+1}) / (1 - α)        # K = draft length, α in [0, 1]
+</code></pre>
+<p>At <code>α = 0.8, K = 4</code>: <code>(1 - 0.8^5)/(1 - 0.8) = 3.36</code> tokens per forward. A single target forward costs roughly <code>cost_q * K + cost_p</code> (K draft steps plus one target verify). If <code>cost_p &gt;&gt; cost_q * K</code> the speedup ratio is <code>3.36× / 1 = 3.36×</code> on throughput.</p>
+<p>The only real parameter is <code>α</code>, which depends entirely on the draft-target alignment. A good draft is everything.</p>
+<h3>Training the Draft: Distillation</h3>
+<p>A random small model makes a poor draft. The standard recipe is to distill from the target:</p>
+<ol>
+<li>Pick a small architecture (~1B for a 70B target, ~500M for a 7B target).</li>
+<li>Run the target model on a large text corpus; store its next-token distributions.</li>
+<li>Train the draft with KL divergence against the target's distribution (not against ground-truth tokens).</li>
+</ol>
+<p>The result: <code>α</code> typically 0.6-0.8 on coding, 0.7-0.85 on natural-language chat. Speedups 2-3× in production.</p>
+<h3>EAGLE: Tree Drafting + Feature Reuse</h3>
+<p>Li, Wei, Zhang, Zhang (2024, &quot;EAGLE: Speculative Sampling Requires Rethinking Feature Uncertainty&quot;) observed two inefficiencies in standard speculative decoding:</p>
+<ol>
+<li>The draft does K serial steps, each full-stack. But the draft could reuse the target's features (hidden states) from the most recent verify — the target already computed rich representations that the draft is re-deriving from scratch.</li>
+<li>The draft outputs a linear chain. If the draft could output a <em>tree</em> of candidates (each node multiple guesses), the target's single forward pass could verify multiple candidate paths in parallel via a tree attention mask, and pick the longest accepted branch.</li>
+</ol>
+<p>EAGLE-1 changes:</p>
+<ul>
+<li>Draft input = target's final hidden state at position t, not raw tokens.</li>
+<li>Draft architecture = 1 transformer decoder layer (not a separate small model).</li>
+<li>Output = tree of K = 4-8 candidates per depth, depth 4-6.</li>
+</ul>
+<p>EAGLE-2 (2024) adds dynamic tree topology: the tree grows wider where the draft is uncertain and stays narrow where it is confident. Raises <code>α_effective</code> without increasing verify cost.</p>
+<p>EAGLE-3 (Li et al. 2025, &quot;EAGLE-3: Scaling up Inference Acceleration of Large Language Models via Training-Time Test&quot;) removes the fixed top-layer feature dependency and trains the draft with a new &quot;test-time simulation&quot; loss — the draft is trained on outputs that match the target's test-time distribution rather than teacher-forced training distribution. Acceptance rate rises from 0.75 (EAGLE-2) to 0.82 (EAGLE-3), and mean tokens/verify from 3.0 to 4.5.</p>
+<h3>Tree Attention Verification</h3>
+<p>When the draft outputs a tree, the target model verifies it in a single forward pass using a <strong>tree attention mask</strong> — a causal mask that encodes the tree topology rather than a pure line. Each token attends only to its ancestors in the tree. The verify pass is still one forward, one matmul; the topological mask costs only a few extra KV entries.</p>
+<pre><code>        root
+       /    \
+      a      b
+     / \    / \
+    c  d   e   f
+</code></pre>
+<p>If <code>a, b</code> are competing first-token candidates and <code>c, d, e, f</code> are second-token candidates, all six positions are verified in one forward pass. The output is the longest prefix along any accepted path.</p>
+<h3>When It Wins, When It Doesn't</h3>
+<p><strong>Wins:</strong></p>
+<ul>
+<li>Chat / completion with predictable text (code, common English, structured output). <code>α</code> is high.</li>
+<li>Settings with unused GPU compute during decode (memory-bound phase). Tree drafting uses the available FLOPs.</li>
+</ul>
+<p><strong>Loses / no win:</strong></p>
+<ul>
+<li>Highly stochastic outputs (creative writing at high temperature). <code>α</code> drops toward <code>1/|vocab|</code>.</li>
+<li>Batch serving with very high concurrency — batching already fills the FLOPs, little room for tree verification.</li>
+<li>Very small target models where the draft isn't much smaller.</li>
+</ul>
+<p>Production shops typically report 2-3× wall-clock speedup on chat, 3-5× on code generation, and near-zero on creative writing.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-33101ee3e206175fb938.png" alt="speculative-decoding 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<p><code>code/main.py</code>:</p>
+<ul>
+<li>A reference <code>speculative_decode(target, draft, prompt, K, temperature)</code> that implements the exact rejection rule and verifies it preserves the target's distribution (empirical KL &lt; 0.01 vs plain target sampling).</li>
+<li>An EAGLE-style tree drafter that builds a depth-K tree with top-p branching.</li>
+<li>A tree attention mask builder that produces the right causal pattern for a verifier.</li>
+<li>An acceptance-rate harness that runs both on a tiny LM (distill one GPT-2-small from a GPT-2-medium target).</li>
+</ul>
+<pre><code class="language-python">def speculative_step(p_target, q_draft, K, temperature=1.0):
+    &quot;&quot;&quot;One round of speculative decoding. Returns list of accepted tokens.&quot;&quot;&quot;
+    # 1. Draft K tokens
+    draft_tokens = []
+    q_probs = []
+    state = draft_state_init()
+    for _ in range(K):
+        probs = softmax(q_draft(state) / temperature)
+        t = np.random.choice(len(probs), p=probs)
+        draft_tokens.append(t)
+        q_probs.append(probs[t])
+        state = draft_step(state, t)
+
+    # 2. Target computes p at every drafted position + 1 extra
+    p_probs_all = target_forward_batched(p_target, draft_tokens, temperature)
+
+    # 3. Accept/reject left-to-right
+    accepted = []
+    for k, tok in enumerate(draft_tokens):
+        r = np.random.uniform()
+        if r &lt; p_probs_all[k][tok] / q_probs[k]:
+            accepted.append(tok)
+        else:
+            residual = np.maximum(p_probs_all[k] - q_probs[k], 0)
+            residual /= residual.sum()
+            accepted.append(np.random.choice(len(residual), p=residual))
+            return accepted
+    # 4. All K accepted → sample bonus token from target
+    accepted.append(np.random.choice(len(p_probs_all[-1]), p=p_probs_all[-1]))
+    return accepted
+</code></pre>
+<h2>Use It</h2>
+<ul>
+<li><strong>vLLM</strong> and <strong>SGLang</strong> ship first-class speculative decoding. In vLLM, pass <code>--speculative-config</code> a JSON object with <code>method</code>, <code>model</code>, and <code>num_speculative_tokens</code>; EAGLE-3 is <code>&quot;method&quot;: &quot;eagle3&quot;</code>.</li>
+<li><strong>NVIDIA TensorRT-LLM</strong> supports Medusa and EAGLE trees natively.</li>
+<li><strong>Reference draft models</strong>: <code>Qwen/Qwen3-0.6B</code> (drafts for Qwen3-32B), <code>meta-llama/Llama-3.2-1B-Instruct</code> (drafts for Llama 3.x 70B).</li>
+<li><strong>Medusa heads</strong> (Cai et al. 2024, &quot;Medusa: Simple LLM Inference Acceleration Framework with Multiple Decoding Heads&quot;): instead of a draft model, add K parallel prediction heads to the target itself. Simpler to deploy, slightly lower acceptance than EAGLE.</li>
+</ul>
+<h2>Ship It</h2>
+<p>This lesson produces <code>outputs/skill-speculative-tuning.md</code> — a skill that profiles a target model's workload and chooses: draft model, K (draft length), tree width, temperature, and when to fall back to plain decode.</p>
+<h2>Exercises</h2>
+<ol>
+<li>
+<p>Implement the exact rejection rule and empirically verify it. Run 10K samples via <code>speculative_decode</code> and via plain target sampling; compute TV distance between the two output distributions. Should be &lt; 0.01.</p>
+</li>
+<li>
+<p>Compute the speedup formula. Given fixed <code>α</code> and <code>K</code>, plot expected tokens per target-forward. Find the optimal K for α ∈ {0.5, 0.7, 0.9}.</p>
+</li>
+<li>
+<p>Train a tiny draft. Take a 124M GPT-2 target and distill a 30M GPT-2 draft on 100M tokens with KL loss. Measure <code>α</code> on held-out text. Expected: 0.6-0.7.</p>
+</li>
+<li>
+<p>Implement EAGLE-style tree drafting. Instead of a chain, have the draft output top-3 branches at each depth. Build the tree attention mask. Verify the target accepts the longest correct branch.</p>
+</li>
+<li>
+<p>Measure failure modes. Run speculative decode at temperature=1.5 (high stochasticity). Show α collapses and the algorithm is slower than plain decode due to draft overhead.</p>
+</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Target model</td>
+<td>&quot;The big model&quot;</td>
+<td>The slow, high-quality model you want samples from (p distribution)</td>
+</tr>
+<tr>
+<td>Draft model</td>
+<td>&quot;The speculator&quot;</td>
+<td>The small, fast predictor (q distribution); 5-30x smaller</td>
+</tr>
+<tr>
+<td>K / draft length</td>
+<td>&quot;Look-ahead&quot;</td>
+<td>Number of speculated tokens per verify pass</td>
+</tr>
+<tr>
+<td>α / acceptance rate</td>
+<td>&quot;Hit rate&quot;</td>
+<td>Per-token probability that the draft's proposal is accepted</td>
+</tr>
+<tr>
+<td>Exact rejection rule</td>
+<td>&quot;The accept test&quot;</td>
+<td>r &lt; p/q compare that preserves target's distribution</td>
+</tr>
+<tr>
+<td>Residual distribution</td>
+<td>&quot;Corrected p-q&quot;</td>
+<td>(p - q)+ /</td>
+</tr>
+<tr>
+<td>Tree drafting</td>
+<td>&quot;Branching speculation&quot;</td>
+<td>Draft outputs a tree of candidates, verified in one pass with tree-structured attention mask</td>
+</tr>
+<tr>
+<td>Tree attention mask</td>
+<td>&quot;Topological mask&quot;</td>
+<td>Causal mask encoding the tree topology so each node attends only to its ancestors</td>
+</tr>
+<tr>
+<td>Medusa heads</td>
+<td>&quot;Parallel heads&quot;</td>
+<td>K extra prediction heads on the target itself; no separate draft model</td>
+</tr>
+<tr>
+<td>EAGLE feature reuse</td>
+<td>&quot;Hidden-state draft&quot;</td>
+<td>Draft input is target's last hidden state, not raw tokens, shrinking the draft</td>
+</tr>
+<tr>
+<td>Test-time simulation loss</td>
+<td>&quot;EAGLE-3 training&quot;</td>
+<td>Train draft on outputs matching target's test-time distribution, not teacher forcing</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2211.17192" rel="noreferrer" data-network="true">Leviathan, Kalai, Matias, 2023 — &quot;Fast Inference from Transformers via Speculative Decoding&quot; <small>↗ 需要联网</small></a> — the exact rejection rule and the theoretical speedup analysis</li>
+<li><a href="https://arxiv.org/abs/2302.01318" rel="noreferrer" data-network="true">Chen, Borgeaud, Irving et al., 2023 — &quot;Accelerating Large Language Model Decoding with Speculative Sampling&quot; <small>↗ 需要联网</small></a> — concurrent speculative-sampling paper at DeepMind</li>
+<li><a href="https://arxiv.org/abs/2401.10774" rel="noreferrer" data-network="true">Cai, Li, Geng, Wang, Wang, Zhu, Dao, 2024 — &quot;Medusa: Simple LLM Inference Acceleration Framework with Multiple Decoding Heads&quot; <small>↗ 需要联网</small></a> — parallel-heads alternative to a draft model</li>
+<li><a href="https://arxiv.org/abs/2401.15077" rel="noreferrer" data-network="true">Li, Wei, Zhang, Zhang, 2024 — &quot;EAGLE: Speculative Sampling Requires Rethinking Feature Uncertainty&quot; <small>↗ 需要联网</small></a> — feature reuse and tree drafting</li>
+<li><a href="https://arxiv.org/abs/2406.16858" rel="noreferrer" data-network="true">Li et al., 2024 — &quot;EAGLE-2: Faster Inference of Language Models with Dynamic Draft Trees&quot; <small>↗ 需要联网</small></a> — dynamic tree topology</li>
+<li><a href="https://arxiv.org/abs/2503.01840" rel="noreferrer" data-network="true">Li et al., 2025 — &quot;EAGLE-3: Scaling up Inference Acceleration of Large Language Models via Training-Time Test&quot; <small>↗ 需要联网</small></a> — train-time test-time matching</li>
+<li><a href="https://arxiv.org/abs/2402.02057" rel="noreferrer" data-network="true">Fu, Haotian, Peng et al., 2024 — &quot;Break the Sequential Dependency of LLM Inference Using Lookahead Decoding&quot; <small>↗ 需要联网</small></a> — Jacobi/lookahead decoding, a speculator-free alternative</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-10-llms-from-scratch--25-speculative-decoding.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-10-llms-from-scratch--25-speculative-decoding.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/10-llms-from-scratch/25-speculative-decoding/code/main.py">phases/10-llms-from-scratch/25-speculative-decoding/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Speculative decoding harness: exact rejection rule, alpha sweep, tree mask.
+
+Three things this file proves, on synthetic toy distributions so the math
+stays visible:
+
+1. The Leviathan-Kalai-Matias rejection rule preserves the target&#39;s
+   sampling distribution. Empirical total-variation distance between
+   plain target sampling and speculative-with-draft sampling is &lt; 0.01
+   over 50_000 draws.
+2. The expected-tokens-per-verify formula holds. For acceptance rate
+   alpha and draft length K, E[tokens] = (1 - alpha^(K+1)) / (1 - alpha)
+   matches the measured throughput within sampling noise.
+3. Tree drafting verifies multiple candidate paths in a single target
+   forward via a topological causal mask. We build a depth-K tree, emit
+   the verification mask, and confirm every node attends only to its
+   ancestors.
+
+Stdlib + numpy only.
+
+Run:
+    python main.py
+    python main.py --vocab 64 --alpha 0.75 --k 4 --samples 50000
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import argparse
+import numpy as np
+
+
+def make_target(vocab: int, rng: np.random.Generator) -&gt; np.ndarray:
+    logits = rng.standard_normal(vocab) * 1.4
+    e = np.exp(logits - logits.max())
+    return e / e.sum()
+
+
+def make_draft(target: np.ndarray, alpha_hint: float,
+               rng: np.random.Generator) -&gt; np.ndarray:
+    &quot;&quot;&quot;A draft distribution whose expected token-level acceptance is near
+    alpha_hint. We linearly blend target with a uniform distribution; the
+    blend ratio controls how close the draft is to the target.&quot;&quot;&quot;
+    vocab = target.size
+    uniform = np.full(vocab, 1.0 / vocab)
+    draft = alpha_hint * target + (1.0 - alpha_hint) * uniform
+    noise = rng.uniform(0.95, 1.05, size=vocab)
+    draft = draft * noise
+    return draft / draft.sum()
+
+
+def sample(probs: np.ndarray, rng: np.random.Generator) -&gt; int:
+    return int(rng.choice(probs.size, p=probs))
+
+
+def speculative_step(target: np.ndarray, draft: np.ndarray, K: int,
+                     rng: np.random.Generator) -&gt; list[int]:
+    &quot;&quot;&quot;One round. Returns 1..K+1 tokens whose distribution equals target.&quot;&quot;&quot;
+    proposed: list[int] = []
+    q_at: list[float] = []
+    for _ in range(K):
+        t = sample(draft, rng)
+        proposed.append(t)
+        q_at.append(float(draft[t]))
+
+    accepted: list[int] = []
+    for k, tok in enumerate(proposed):
+        ratio = float(target[tok]) / max(q_at[k], 1e-12)
+        if rng.random() &lt; min(1.0, ratio):
+            accepted.append(tok)
+        else:
+            residual = np.maximum(target - draft, 0.0)
+            s = residual.sum()
+            if s == 0.0:
+                accepted.append(sample(target, rng))
+            else:
+                accepted.append(sample(residual / s, rng))
+            return accepted
+    accepted.append(sample(target, rng))
+    return accepted
+
+
+def total_variation(p: np.ndarray, q: np.ndarray) -&gt; float:
+    return float(0.5 * np.abs(p - q).sum())
+
+
+def empirical_dist(samples: list[int], vocab: int) -&gt; np.ndarray:
+    counts = np.bincount(samples, minlength=vocab).astype(np.float64)
+    return counts / counts.sum()
+
+
+def verify_distribution(target: np.ndarray, draft: np.ndarray, K: int,
+                        n_samples: int, rng: np.random.Generator
+                        ) -&gt; tuple[float, float]:
+    &quot;&quot;&quot;Compare next-token distributions under plain target sampling and
+    speculative sampling. They must be statistically indistinguishable.&quot;&quot;&quot;
+    vocab = target.size
+    plain = [sample(target, rng) for _ in range(n_samples)]
+    spec_first: list[int] = []
+    while len(spec_first) &lt; n_samples:
+        toks = speculative_step(target, draft, K, rng)
+        spec_first.append(toks[0])
+    p_plain = empirical_dist(plain, vocab)
+    p_spec = empirical_dist(spec_first, vocab)
+    return total_variation(p_plain, target), total_variation(p_spec, target)
+
+
+def measure_alpha(target: np.ndarray, draft: np.ndarray,
+                  n_samples: int, rng: np.random.Generator) -&gt; float:
+    accepted = 0
+    for _ in range(n_samples):
+        t = sample(draft, rng)
+        ratio = float(target[t]) / max(float(draft[t]), 1e-12)
+        if rng.random() &lt; min(1.0, ratio):
+            accepted += 1
+    return accepted / n_samples
+
+
+def expected_tokens(alpha: float, K: int) -&gt; float:
+    if alpha &gt;= 1.0:
+        return float(K + 1)
+    return (1.0 - alpha ** (K + 1)) / (1.0 - alpha)
+
+
+def measure_throughput(target: np.ndarray, draft: np.ndarray, K: int,
+                       n_rounds: int, rng: np.random.Generator) -&gt; float:
+    total = 0
+    for _ in range(n_rounds):
+        total += len(speculative_step(target, draft, K, rng))
+    return total / n_rounds
+
+
+def build_tree(branch_factor: tuple[int, ...]) -&gt; list[tuple[int, list[int]]]:
+    &quot;&quot;&quot;Return nodes as (parent_index, depth-path). Index 0 is root.&quot;&quot;&quot;
+    tree: list[tuple[int, list[int]]] = [(-1, [])]
+    frontier = [0]
+    for depth, b in enumerate(branch_factor):
+        next_frontier: list[int] = []
+        for parent in frontier:
+            for _ in range(b):
+                tree.append((parent, tree[parent][1] + [len(tree)]))
+                next_frontier.append(len(tree) - 1)
+        frontier = next_frontier
+    return tree
+
+
+def tree_attention_mask(tree: list[tuple[int, list[int]]]) -&gt; np.ndarray:
+    &quot;&quot;&quot;N x N causal mask where each row attends to its ancestors only.&quot;&quot;&quot;
+    n = len(tree)
+    mask = np.zeros((n, n), dtype=np.int8)
+    for i in range(n):
+        cur = i
+        while cur != -1:
+            mask[i, cur] = 1
+            cur = tree[cur][0]
+    return mask
+
+
+def validate_tree_mask(mask: np.ndarray,
+                       tree: list[tuple[int, list[int]]]) -&gt; bool:
+    n = len(tree)
+    for i in range(n):
+        cur = i
+        ancestors = set()
+        while cur != -1:
+            ancestors.add(cur)
+            cur = tree[cur][0]
+        attends = {j for j in range(n) if mask[i, j] == 1}
+        if attends != ancestors:
+            return False
+    return True
+
+
+def _positive_int(value: str, *, minimum: int = 1) -&gt; int:
+    n = int(value)
+    if n &lt; minimum:
+        raise argparse.ArgumentTypeError(f&quot;value must be &gt;= {minimum}, got {n}&quot;)
+    return n
+
+
+def _unit_float(value: str) -&gt; float:
+    f = float(value)
+    if not (0.0 &lt; f &lt;= 1.0):
+        raise argparse.ArgumentTypeError(f&quot;value must be in (0, 1], got {f}&quot;)
+    return f
+
+
+def parse_args() -&gt; argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(&quot;--vocab&quot;, type=lambda v: _positive_int(v, minimum=2), default=32,
+                        help=&quot;vocab size (&gt;= 2)&quot;)
+    parser.add_argument(&quot;--alpha&quot;, type=_unit_float, default=0.75,
+                        help=&quot;target acceptance rate in (0, 1]&quot;)
+    parser.add_argument(&quot;--k&quot;, type=lambda v: _positive_int(v, minimum=1), default=4,
+                        help=&quot;draft length (&gt;= 1)&quot;)
+    parser.add_argument(&quot;--samples&quot;, type=lambda v: _positive_int(v, minimum=2), default=20000,
+                        help=&quot;sample count (&gt;= 2)&quot;)
+    parser.add_argument(&quot;--seed&quot;, type=int, default=0)
+    return parser.parse_args()
+
+
+def main() -&gt; None:
+    args = parse_args()
+    rng = np.random.default_rng(args.seed)
+
+    target = make_target(args.vocab, rng)
+    draft = make_draft(target, args.alpha, rng)
+
+    tv_plain, tv_spec = verify_distribution(
+        target, draft, args.k, args.samples, rng
+    )
+    print(f&quot;distribution check (n={args.samples}):&quot;)
+    print(f&quot;  TV(plain_target_sampling, target)       = {tv_plain:.4f}&quot;)
+    print(f&quot;  TV(speculative_sampling, target)         = {tv_spec:.4f}&quot;)
+    print(f&quot;  delta TV (spec vs plain)                 = {abs(tv_spec - tv_plain):.4f}&quot;)
+
+    alpha_hat = measure_alpha(target, draft, args.samples // 2, rng)
+    print()
+    print(f&quot;alpha measurement (vocab={args.vocab}, alpha hint={args.alpha}):&quot;)
+    print(f&quot;  measured alpha = {alpha_hat:.3f}&quot;)
+
+    throughput = measure_throughput(target, draft, args.k, 2000, rng)
+    expected = expected_tokens(alpha_hat, args.k)
+    print()
+    print(f&quot;throughput at K={args.k}:&quot;)
+    print(f&quot;  measured E[tokens/verify]  = {throughput:.3f}&quot;)
+    print(f&quot;  predicted E[tokens/verify] = {expected:.3f}  (1 - a^(K+1)) / (1 - a)&quot;)
+
+    print()
+    print(&quot;alpha sweep, K=4:&quot;)
+    for a in (0.3, 0.5, 0.7, 0.85, 0.95):
+        print(f&quot;  alpha={a:.2f}  expected_tokens={expected_tokens(a, args.k):.2f}&quot;)
+
+    print()
+    print(&quot;tree drafting demo: depth-3 tree, branch=(3, 2, 2)&quot;)
+    tree = build_tree((3, 2, 2))
+    mask = tree_attention_mask(tree)
+    print(f&quot;  total candidate nodes: {len(tree)} (one verify pass covers all)&quot;)
+    print(f&quot;  mask shape: {mask.shape}&quot;)
+    print(f&quot;  mask correctness vs ancestor sets: {validate_tree_mask(mask, tree)}&quot;)
+    print(f&quot;  attends-per-node (rows): {mask.sum(axis=1).tolist()}&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/10-llms-from-scratch/25-speculative-decoding/outputs/skill-speculative-tuning.md">phases/10-llms-from-scratch/25-speculative-decoding/outputs/skill-speculative-tuning.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: speculative-tuning
+description: Profile a decode workload and pick draft model, draft length K, temperature gate, and fallback policy for speculative decoding.
+version: 1.0.0
+phase: 10
+lesson: 25
+tags: [speculative-decoding, draft-model, alpha, throughput, inference, decode-latency]
+---
+
+Given the target model (size, family, tokenizer), the workload telemetry (task mix, prompt-vs-decode token ratio, p50/p99 decode latency, accelerator and HBM headroom, average batch size, sampling temperature distribution), and the available draft checkpoints, output:
+
+1. Draft choice. Pick from same-family small (Llama-3.2-1B for Llama-70B), a distilled draft trained on the target&#39;s outputs, Medusa heads bolted on the target, or &quot;no spec decode&quot; if no draft is closer than 30 percent FLOP cost ratio. Confirm tokenizer match against the target byte-for-byte; refuse a mismatched tokenizer.
+2. Draft length K. Argmax of E[tokens] / (1 + K x c) where c is the draft-to-target cost ratio. Show the work for K in 2, 3, 4, 5, 6 using the measured alpha from a calibration run on 5_000 tokens of in-distribution data. Default K=4 for chat, K=6 for code, K=2 for high-temperature creative writing.
+3. Temperature gate. Set a temperature threshold above which spec decode is disabled. Default 0.8; lower to 0.6 if the calibration shows alpha collapsing earlier. Reject any temperature gate that depends on per-request inspection that adds more than 50 microseconds.
+4. Tree budget. If the serving stack supports tree drafting, pick a small fixed tree (depth 2, branch 3-2) for batch under 8; flat chain for batch over 32. State the verifier&#39;s KV scratch size in bytes and confirm it fits in HBM headroom.
+5. Fallback policy. Name the metric (sliding-window measured alpha over the last 1_000 verifies) and the threshold (alpha under 0.4) at which the server drops back to plain autoregressive decode for that request stream. Include the per-request lifetime of the fallback decision.
+
+Refuse spec decode at batch size above the point where the verifier is compute-bound. Above that point the unused FLOPs the speculator is meant to soak up no longer exist; throughput drops. Refuse spec decode for any task family with measured alpha under 0.4; the draft overhead dominates and wall-clock latency gets worse. Refuse a draft that has not been validated on a held-out 1_000-token sample against the target: an unvalidated draft is a silent KL drift.
+
+Example input: &quot;Llama-3.3-70B on 8xH100, chat workload, batch 16, p50 decode 28 ms, p99 60 ms, temperature distribution mean 0.4 / max 1.2, calibration shows alpha 0.78 on chat, 0.61 on code.&quot;
+
+Example output:
+- Draft: Llama-3.2-1B-Instruct. Same tokenizer, same family, ratio c approx 0.03.
+- K: 4. E[tokens/verify] = 3.4 chat, 2.5 code. K=5 gains 0.1 token chat and pays 0.03 extra c; reject.
+- Temperature gate: 0.8. Above 0.8 alpha drops below 0.45 on the calibration set.
+- Tree budget: depth 2 branch (3, 2). KV scratch 480 MB at batch 16 fits.
+- Fallback: sliding-window alpha over last 1_000 verifies under 0.40 disables spec decode for that stream for 30 s, then probes again.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原课程未提供测验。</p></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/10-llms-from-scratch/22-async-hogwild-inference/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/10-llms-from-scratch/34-gradient-checkpointing/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/10-llms-from-scratch/25-speculative-decoding/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

@@ -1,0 +1,1373 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>卡普斯通03 实时语音助理 (ASR到LLM到TTS) · Serebii Labs</title></head><body data-pack="ai-from-scratch-phase-19-capstone-projects" data-lesson="19-capstone-projects/03-realtime-voice-assistant" data-project=""><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow"><a href="/learn/ai-from-scratch/phases/19-capstone-projects/">综合项目</a> / LESSON 03</p><h1 class="lesson-title">卡普斯通03 实时语音助理 (ASR到LLM到TTS)</h1><p>Capstone 03 — Real-Time Voice Assistant (ASR to LLM to TTS)</p><p class="notice" data-editorial-status>中文草稿 · 待校订：机器翻译可能包含术语或语义错误，请对照英文。 · 可按阶段保存离线阅读 · 运行未验证</p><div class="save-panel"><button type="button" data-save>保存本阶段</button><span data-save-status role="status">未检测离线状态</span></div><div class="reader-tools"><button type="button" data-language="zh" aria-pressed="true">中文草稿</button><button type="button" data-language="en" aria-pressed="false">英文原文</button><button type="button" data-complete>标记读完</button></div><article data-lang="zh" class="prose"><h1>卡普斯通03 实时语音助理 (ASR到LLM到TTS)</h1>
+<blockquote>
+<p>听到声音的代理人可以使用800ms以下的端到端延迟,知道你何时停止说话,处理入, 雷特尔,瓦皮,莱维基特代理和皮皮卡特都在2026年进入这个酒吧. 它们用相同的形式进行: 流媒体ASR,转变检测器,流媒体LLM, 建立一个,测量WER和MOS和错误切断率,然后运行在输入输入下.</p>
+</blockquote>
+<p><strong>Type:</strong> Capstone
+<strong>Languages:</strong> Python (agent + pipeline), TypeScript (web client)
+<strong>Prerequisites:</strong> Phase 6 (speech and audio), Phase 7 (transformers), Phase 11 (LLM engineering), Phase 13 (tools), Phase 14 (agents), Phase 17 (infrastructure)
+**Phases exercised:**子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子子
+<strong>Time:</strong> 30 hours</p>
+<h2>问题</h2>
+<p>语音是2025-2026年最快发展的AI UX类别. 技术上限每季度都下降. 开放AI实时API,双子 2.5 现场,卡特西亚索尼克-2,ElevenLabs Flash v3,LiveKit Agents 1.0和皮皮卡特 0.0.70都能实现800ms下载. 酒吧不是一个人的延迟. 互动感觉:不切断用户,不切断,从句子中断中恢复,在谈话中调用工具,</p>
+<p>构建它,故障模式就会显现:为背景电视打响电话的音频调节的VAD,一个等待永远不会出现的分分区的轮检测器,一个TTS在发射之前缓冲400ms. 最重要的是在负载下一次修复这些并发布延迟和质量报告.</p>
+<h2>概念</h2>
+<p>管道有五个流程:<strong>audio in</strong>(WebRTC来自浏览器或PSTN),<strong>ASR</strong>(从 Deepgram Nova-3 或更快的语中流动部分转录),<strong>turn detection</strong>(VAD加上一个小的转变检测器模型,<strong>LLM</strong>(随着轮回完成, 流通令牌),<strong>TTS</strong>(在第一次LLM代币后,在200ms内播放音频).</p>
+<p>两者之间存在三种问题.<strong>Barge-in</strong>随着使用者在代理人在说话时,TTS会取消,ASR会立即接听. <strong>Tool use</strong>: 交谈函数中调 (天气,日历) 必须在侧通道上运行,而不阻碍音频;如果延迟超过300ms,代理预先填充确认令牌 (&quot;一秒...&quot;). <strong>Backpressure</strong>:在数据包丢失下,部分转录被保留,VAD提高了语音门门门值,代理人避免在未被承认的消息上说话.</p>
+<p>测量是量化.Hamming VAD基准15 dB SNR上的WER低于8%.测量调用100次的第一次音频输出 p50低于800ms.测量调用率低于3%.TTS上的MOS高于4.2.50次.单个g5.xlarge上的50次同步调用.这些数字是可交付的.</p>
+<h2>建筑</h2>
+<pre><code>browser / Twilio PSTN
+        |
+        v
+   WebRTC / SIP edge
+        |
+        v
+  LiveKit Agents 1.0  (or Pipecat 0.0.70)
+        |
+   +----+--------------+--------------+-----------------+
+   |                   |              |                 |
+   v                   v              v                 v
+  ASR              VAD v5         turn-detector     side-channel
+(Deepgram         (Silero)          (LiveKit)        tools
+ Nova-3 /         speech-gate    completion score    (weather,
+ Whisper-v3)      per 20ms        on partials        calendar)
+   |                   |              |
+   +--------+----------+--------------+
+            v
+        LLM (streaming)
+     GPT-4o-realtime / Gemini 2.5 Flash /
+     cascaded Claude Haiku 4.5
+            |
+            v
+        TTS streaming
+     Cartesia Sonic-2 / ElevenLabs Flash v3
+            |
+            v
+     audio back to caller
+            |
+            v
+   OpenTelemetry voice traces -&gt; Langfuse
+</code></pre>
+<h2>堆</h2>
+<ul>
+<li>运输:LiveKit Agents 1.0 (WebRTC) 加上Twilio PSTN门户;作为替代框架,Pipecat 0.0.70</li>
+<li>亚斯拉:深度格式诺瓦-3 (流动,第一个部分次300ms以下) 或更快的语Whisper-v3-turbo自主托管</li>
+<li>维亚:Silero VAD v5加上LiveKit转换探测器 (读取部分转录的小型变压器)</li>
+<li>专业:OpenAI GPT-4o实时集成,双子 2.5 闪存直播,或化Claude Haiku 4.5 (流媒体完成,独立音频路径)</li>
+<li>卡特西亚索尼克-2 (最低的第一字节),ElevenLabs Flash v3,或自主主主机的开源Orpheus</li>
+<li>工具:FastMCP侧通道用于天气/日历/预订;如果工具需要300ms以上的时间,代理预发填充器</li>
+<li>可观察性:OpenTelemetry语音跨度,Langfuse语音跟音频重播</li>
+<li>部署:单个g5.xlarge (24GBVRAM) 用于自主托管的Whisper + Orpheus;托管的API以最低延迟</li>
+</ul>
+<figure><img src="/learn/ai-from-scratch/figures/figure-fb873d02cdcce5997886.png" alt="ce-voice-latency 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>建立它</h2>
+<ol>
+<li>
+<p>**WebRTC session.**在服务器上,连接一个代理工作者,加入房间.</p>
+</li>
+<li>
+<p>**ASR streaming.**输送20ms的PCM框架到Deepgram Nova-3 (或 GPU上更快的语).订阅部分和最终的转录.每部分延迟记录.</p>
+</li>
+<li>
+<p>**VAD and turn detector.**在语音结束时,将LiveKit转换探测器启动与最新部分转录.只有当VAD说沉默500ms时,只会承诺&quot;完成&quot;,转换探测器得分完成&gt;0.6.</p>
+</li>
+<li>
+<p>**LLM stream.**在完成时,开始与正在进行的对话加上最终的转录. 流出代币. 在第一个代币,交给TTS.</p>
+</li>
+<li>
+<p>**TTS stream.**卡特西亚 Sonic-2 将音频块回放.第一块必须在第一个LLM代币200ms内离开服务器. 发送块到LiveKit室;客户端通过WebRTC节缓冲器播放.</p>
+</li>
+<li>
+<p>**Barge-in.**当VAD在播放TTS时检测到新用户语音时,立即取消TTS流,放弃剩余的LLM输出,重新装备ASR.<code>tts_canceled</code>度.</p>
+</li>
+<li>
+<p>**Tool side channel.**记录天气和日历作为调用函数工具.当调用时,同时打开调用;如果它在300ms内没有解决,请LLM发出&quot;一秒钟,让我检查&quot;作为填充器;一旦工具返回,再恢复.</p>
+</li>
+<li>
+<p>**Eval harness.**记录100次电话.计算WER (对待延期转录),错误截止率 (用户在句子中中时取消TTS),首次音频输出p50,TTS MOS (人或NISQA),以及丧测试 (减少3%的包).</p>
+</li>
+<li>
+<p>**Load test.**通过一个g5.xlarge和合成调用器进行50次同时调用.</p>
+</li>
+</ol>
+<h2>用它</h2>
+<pre><code>caller: &quot;what is the weather in tokyo tomorrow&quot;
+[asr  ] partial @280ms: &quot;what is the&quot;
+[asr  ] partial @540ms: &quot;what is the weather&quot;
+[turn ] completion score 0.82 at @820ms; commit
+[llm  ] first token @960ms
+[tool ] weather.tokyo tomorrow -&gt; 68/52 partly cloudy @1140ms
+[tts  ] first audio-out @1040ms: &quot;Tokyo tomorrow will be partly cloudy...&quot;
+turn latency: 1040ms user-stop -&gt; audio-out
+</code></pre>
+<h2>运送它</h2>
+<p><code>outputs/skill-voice-agent.md</code>由于一个域名 (客户支持,安排或亭子),它会出现一个LiveKit代理,ASR/VAD/LLM/TTS管道调整到测量.</p>
+<table>
+<thead>
+<tr>
+<th style="text-align:center">Weight</th>
+<th>Criterion</th>
+<th>How it is measured</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align:center">25</td>
+<td>End-to-end latency</td>
+<td>p50 first-audio-out under 800ms across 100 recorded calls</td>
+</tr>
+<tr>
+<td style="text-align:center">20</td>
+<td>Turn-taking quality</td>
+<td>False-cutoff rate under 3% on the Hamming VAD benchmark</td>
+</tr>
+<tr>
+<td style="text-align:center">20</td>
+<td>Tool-use correctness</td>
+<td>Mid-conversation tool calls that return the right data without stalling audio</td>
+</tr>
+<tr>
+<td style="text-align:center">20</td>
+<td>Reliability under packet loss</td>
+<td>WER and turn-taking stability with 3% packet drop injected</td>
+</tr>
+<tr>
+<td style="text-align:center">15</td>
+<td>Eval harness completeness</td>
+<td>Reproducible measurements with public config</td>
+</tr>
+<tr>
+<td style="text-align:center"><strong>100</strong></td>
+<td></td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<h2>运动</h2>
+<ol>
+<li>
+<p>换 Deepgram Nova-3 换g5.xlarge 上的更快的语 v3 轮机. 测量延迟和 WER 差距. 确定CPUvsGPU决策在哪里重要.</p>
+</li>
+<li>
+<p>加入一个中断-仲裁政策:当用户在工具调用中入时,代理会做什么?比较三个政策 (硬取消,完成工具,然后停止,排队下一轮).</p>
+</li>
+<li>
+<p>执行反向转换检测器测试:在句子中给用户长时间停顿. 调整VAD沉默门和转换检测器得分门以实现最低的假切断,而不需要超过900ms.</p>
+</li>
+<li>
+<p>通过Twilio在PSTN上部署相同的代理.将PSTN首次音频输出与WebRTC进行比较.解释器缓冲器和编码区别.</p>
+</li>
+<li>
+<p>添加非英语语言 (日本语,西班牙语) 的语音活动检测. 测量Silero VAD v5错误触发率与语言特定的细节调节.</p>
+</li>
+</ol>
+<h2>关键词</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Turn detection</td>
+<td>&quot;End of utterance&quot;</td>
+<td>Classifier that, given VAD silence and a partial transcript, decides the user is done speaking</td>
+</tr>
+<tr>
+<td>Barge-in</td>
+<td>&quot;Interruption handling&quot;</td>
+<td>Canceling TTS mid-playback when VAD detects new user speech</td>
+</tr>
+<tr>
+<td>First-audio-out</td>
+<td>&quot;Latency&quot;</td>
+<td>Time from user stops speaking to the first audio packet leaving the server</td>
+</tr>
+<tr>
+<td>VAD</td>
+<td>&quot;Speech gate&quot;</td>
+<td>Model classifying audio frames as speech vs silence; Silero VAD v5 is the 2026 default</td>
+</tr>
+<tr>
+<td>Jitter buffer</td>
+<td>&quot;Audio smoothing&quot;</td>
+<td>Client-side buffer that holds packets briefly to absorb network variance</td>
+</tr>
+<tr>
+<td>Filler</td>
+<td>&quot;Acknowledgment token&quot;</td>
+<td>Short phrase the agent emits to avoid silence when a tool is slow</td>
+</tr>
+<tr>
+<td>MOS</td>
+<td>&quot;Mean opinion score&quot;</td>
+<td>Perceptual speech quality rating; NISQA is the automated proxy</td>
+</tr>
+</tbody>
+</table>
+<h2>进一步阅读</h2>
+<ul>
+<li><a href="https://github.com/livekit/agents" rel="noreferrer" data-network="true">LiveKit Agents 1.0 <small>↗ 需要联网</small></a>参考WebRTC代理框架</li>
+<li><a href="https://github.com/pipecat-ai/pipecat" rel="noreferrer" data-network="true">Pipecat <small>↗ 需要联网</small></a>替代Python-第一流媒体代理框架</li>
+<li><a href="https://platform.openai.com/docs/guides/realtime" rel="noreferrer" data-network="true">OpenAI Realtime API <small>↗ 需要联网</small></a> 关于集成语音模型的参考</li>
+<li><a href="https://developers.deepgram.com/docs" rel="noreferrer" data-network="true">Deepgram Nova-3 documentation <small>↗ 需要联网</small></a>流媒体ASR引用</li>
+<li><a href="https://github.com/snakers4/silero-vad" rel="noreferrer" data-network="true">Silero VAD v5 <small>↗ 需要联网</small></a> VAD 参考模型</li>
+<li><a href="https://docs.cartesia.ai" rel="noreferrer" data-network="true">Cartesia Sonic-2 <small>↗ 需要联网</small></a>低延迟TTS参考</li>
+<li><a href="https://docs.retellai.com" rel="noreferrer" data-network="true">Retell AI architecture <small>↗ 需要联网</small></a>生产语音代理架构</li>
+<li><a href="https://docs.vapi.ai" rel="noreferrer" data-network="true">Vapi.ai production stack <small>↗ 需要联网</small></a>替代生产参考</li>
+</ul>
+</article><article data-lang="en" class="prose" hidden lang="en"><h1>Capstone 03 — Real-Time Voice Assistant (ASR to LLM to TTS)</h1>
+<blockquote>
+<p>A voice agent that feels right has end-to-end latency under 800ms, knows when you have stopped talking, handles barge-in, and can call a tool without stalling. Retell, Vapi, LiveKit Agents, and Pipecat all hit this bar in 2026. They do it with the same shape: a streaming ASR, a turn-detector, a streaming LLM, and a streaming TTS, all wired through WebRTC with aggressive latency budgets at every hop. Build one, measure WER and MOS and false-cutoff rate, and run it under packet loss.</p>
+</blockquote>
+<p><strong>Type:</strong> Capstone
+<strong>Languages:</strong> Python (agent + pipeline), TypeScript (web client)
+<strong>Prerequisites:</strong> Phase 6 (speech and audio), Phase 7 (transformers), Phase 11 (LLM engineering), Phase 13 (tools), Phase 14 (agents), Phase 17 (infrastructure)
+<strong>Phases exercised:</strong> P6 · P7 · P11 · P13 · P14 · P17
+<strong>Time:</strong> 30 hours</p>
+<h2>Problem</h2>
+<p>Voice has been the fastest-moving AI UX category of 2025-2026. The technical ceiling dropped each quarter. OpenAI Realtime API, Gemini 2.5 Live, Cartesia Sonic-2, ElevenLabs Flash v3, LiveKit Agents 1.0, and Pipecat 0.0.70 all put sub-800ms first-audio-out within reach. The bar is not latency alone. It is the interaction feel: not cutting the user off, not getting cut off, recovering from a mid-sentence interruption, calling a tool mid-conversation without stalling the audio, surviving jittery mobile networks.</p>
+<p>You cannot get there by stitching three REST calls. The architecture is pipelined streaming end to end. Build it and the failure modes become visible: a VAD tuned for phone audio firing on background TV, a turn-detector waiting for punctuation that never comes, a TTS that buffers 400ms before emitting. The capstone is to fix these one at a time under load and publish a latency-and-quality report.</p>
+<h2>Concept</h2>
+<p>The pipeline has five streaming stages: <strong>audio in</strong> (WebRTC from browser or PSTN), <strong>ASR</strong> (streaming partial transcripts from Deepgram Nova-3 or faster-whisper), <strong>turn detection</strong> (VAD plus a small turn-detector model that reads partial transcripts for completion cues), <strong>LLM</strong> (streaming tokens as soon as the turn is judged complete), <strong>TTS</strong> (streaming audio out within ~200ms of the first LLM token).</p>
+<p>Three cross-cutting concerns. <strong>Barge-in</strong>: when the user starts speaking while the agent is speaking, the TTS cancels and the ASR picks up immediately. <strong>Tool use</strong>: mid-conversation function calls (weather, calendar) must run on a side channel without stalling the audio; the agent pre-fills an acknowledgement token (&quot;one second...&quot;) if latency exceeds 300ms. <strong>Backpressure</strong>: under packet loss, partial transcripts are held, VAD raises the speech-gate threshold, and the agent avoids speaking over an unacknowledged message.</p>
+<p>The measurement bar is quantitative. WER under 8% on the Hamming VAD benchmark at 15 dB SNR. First-audio-out p50 under 800ms on 100 measured calls. False-cutoff rate under 3%. MOS above 4.2 on TTS. 50 concurrent calls on a single g5.xlarge. These numbers are the deliverable.</p>
+<h2>Architecture</h2>
+<pre><code>browser / Twilio PSTN
+        |
+        v
+   WebRTC / SIP edge
+        |
+        v
+  LiveKit Agents 1.0  (or Pipecat 0.0.70)
+        |
+   +----+--------------+--------------+-----------------+
+   |                   |              |                 |
+   v                   v              v                 v
+  ASR              VAD v5         turn-detector     side-channel
+(Deepgram         (Silero)          (LiveKit)        tools
+ Nova-3 /         speech-gate    completion score    (weather,
+ Whisper-v3)      per 20ms        on partials        calendar)
+   |                   |              |
+   +--------+----------+--------------+
+            v
+        LLM (streaming)
+     GPT-4o-realtime / Gemini 2.5 Flash /
+     cascaded Claude Haiku 4.5
+            |
+            v
+        TTS streaming
+     Cartesia Sonic-2 / ElevenLabs Flash v3
+            |
+            v
+     audio back to caller
+            |
+            v
+   OpenTelemetry voice traces -&gt; Langfuse
+</code></pre>
+<h2>Stack</h2>
+<ul>
+<li>Transport: LiveKit Agents 1.0 (WebRTC) plus Twilio PSTN gateway; Pipecat 0.0.70 as the alternate framework</li>
+<li>ASR: Deepgram Nova-3 (streaming, sub-300ms first partial) or faster-whisper Whisper-v3-turbo self-hosted</li>
+<li>VAD: Silero VAD v5 plus the LiveKit turn-detector (small transformer that reads partial transcripts)</li>
+<li>LLM: OpenAI GPT-4o-realtime for tight integration, Gemini 2.5 Flash Live, or cascaded Claude Haiku 4.5 (streaming completions, separate audio path)</li>
+<li>TTS: Cartesia Sonic-2 (lowest first-byte), ElevenLabs Flash v3, or open-source Orpheus for self-host</li>
+<li>Tools: FastMCP side-channel for weather/calendar/booking; agent pre-emits filler if tool takes &gt;300ms</li>
+<li>Observability: OpenTelemetry voice spans, Langfuse voice traces with audio replay</li>
+<li>Deployment: single g5.xlarge (24GB VRAM) for self-hosted Whisper + Orpheus; hosted APIs for lowest latency</li>
+</ul>
+<figure><img src="/learn/ai-from-scratch/figures/figure-fb873d02cdcce5997886.png" alt="ce-voice-latency 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Build It</h2>
+<ol>
+<li>
+<p><strong>WebRTC session.</strong> Stand up a LiveKit room and a web client that streams microphone audio. On the server, attach an agent worker that joins the room.</p>
+</li>
+<li>
+<p><strong>ASR streaming.</strong> Feed 20ms PCM frames to Deepgram Nova-3 (or faster-whisper on GPU). Subscribe to partial and final transcripts. Log per-partial latency.</p>
+</li>
+<li>
+<p><strong>VAD and turn detector.</strong> Run Silero VAD v5 on the frame stream. On speech-end event, fire the LiveKit turn-detector against the latest partial transcript. Only commit to &quot;turn complete&quot; when VAD says silence for 500ms and the turn-detector scores completion &gt; 0.6.</p>
+</li>
+<li>
+<p><strong>LLM stream.</strong> On turn complete, start the LLM call with the running conversation plus the final transcript. Stream tokens out. At the first token, hand off to TTS.</p>
+</li>
+<li>
+<p><strong>TTS stream.</strong> Cartesia Sonic-2 streams audio chunks back. The first chunk must leave the server within 200ms of the first LLM token. Emit chunks to LiveKit room; client plays through WebRTC jitter buffer.</p>
+</li>
+<li>
+<p><strong>Barge-in.</strong> When VAD detects new user speech while TTS is playing, cancel the TTS stream immediately, drop the remaining LLM output, and re-arm the ASR. Publish a <code>tts_canceled</code> span.</p>
+</li>
+<li>
+<p><strong>Tool side channel.</strong> Register weather and calendar as function-calling tools. When invoked, fire the call concurrently; if it does not resolve within 300ms, have the LLM emit &quot;one second, let me check&quot; as a filler; resume once the tool returns.</p>
+</li>
+<li>
+<p><strong>Eval harness.</strong> Record 100 calls. Compute WER (against a held-out transcript), false-cutoff rate (TTS cancelled while user was mid-sentence), first-audio-out p50, TTS MOS (human or NISQA), and a jitter-loss test (drop 3% of packets).</p>
+</li>
+<li>
+<p><strong>Load test.</strong> Drive 50 concurrent calls on a single g5.xlarge with a synthetic caller. Measure sustained first-audio-out p95.</p>
+</li>
+</ol>
+<h2>Use It</h2>
+<pre><code>caller: &quot;what is the weather in tokyo tomorrow&quot;
+[asr  ] partial @280ms: &quot;what is the&quot;
+[asr  ] partial @540ms: &quot;what is the weather&quot;
+[turn ] completion score 0.82 at @820ms; commit
+[llm  ] first token @960ms
+[tool ] weather.tokyo tomorrow -&gt; 68/52 partly cloudy @1140ms
+[tts  ] first audio-out @1040ms: &quot;Tokyo tomorrow will be partly cloudy...&quot;
+turn latency: 1040ms user-stop -&gt; audio-out
+</code></pre>
+<h2>Ship It</h2>
+<p><code>outputs/skill-voice-agent.md</code> is the deliverable. Given a domain (customer support, scheduling, or kiosk), it stands up a LiveKit agent with the ASR/VAD/LLM/TTS pipeline tuned to the measurement bar. Rubric:</p>
+<table>
+<thead>
+<tr>
+<th style="text-align:center">Weight</th>
+<th>Criterion</th>
+<th>How it is measured</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align:center">25</td>
+<td>End-to-end latency</td>
+<td>p50 first-audio-out under 800ms across 100 recorded calls</td>
+</tr>
+<tr>
+<td style="text-align:center">20</td>
+<td>Turn-taking quality</td>
+<td>False-cutoff rate under 3% on the Hamming VAD benchmark</td>
+</tr>
+<tr>
+<td style="text-align:center">20</td>
+<td>Tool-use correctness</td>
+<td>Mid-conversation tool calls that return the right data without stalling audio</td>
+</tr>
+<tr>
+<td style="text-align:center">20</td>
+<td>Reliability under packet loss</td>
+<td>WER and turn-taking stability with 3% packet drop injected</td>
+</tr>
+<tr>
+<td style="text-align:center">15</td>
+<td>Eval harness completeness</td>
+<td>Reproducible measurements with public config</td>
+</tr>
+<tr>
+<td style="text-align:center"><strong>100</strong></td>
+<td></td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<h2>Exercises</h2>
+<ol>
+<li>
+<p>Swap Deepgram Nova-3 for faster-whisper v3 turbo on a g5.xlarge. Measure the latency and WER gap. Identify where CPU-vs-GPU decisions matter.</p>
+</li>
+<li>
+<p>Add an interruption-arbitration policy: what does the agent do when the user barges in during a tool call? Compare three policies (hard cancel, finish-tool-then-stop, queue next turn).</p>
+</li>
+<li>
+<p>Run an adversarial turn-detector test: give the user long pauses mid-sentence. Tune the VAD silence threshold and the turn-detector score threshold for lowest false-cutoff without blowing past 900ms.</p>
+</li>
+<li>
+<p>Deploy the same agent on PSTN via Twilio. Compare PSTN first-audio-out to WebRTC. Explain the jitter-buffer and codec differences.</p>
+</li>
+<li>
+<p>Add voice activity detection for non-English languages (Japanese, Spanish). Measure the Silero VAD v5 false-trigger rate versus language-specific fine-tunes.</p>
+</li>
+</ol>
+<h2>Key Terms</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Turn detection</td>
+<td>&quot;End of utterance&quot;</td>
+<td>Classifier that, given VAD silence and a partial transcript, decides the user is done speaking</td>
+</tr>
+<tr>
+<td>Barge-in</td>
+<td>&quot;Interruption handling&quot;</td>
+<td>Canceling TTS mid-playback when VAD detects new user speech</td>
+</tr>
+<tr>
+<td>First-audio-out</td>
+<td>&quot;Latency&quot;</td>
+<td>Time from user stops speaking to the first audio packet leaving the server</td>
+</tr>
+<tr>
+<td>VAD</td>
+<td>&quot;Speech gate&quot;</td>
+<td>Model classifying audio frames as speech vs silence; Silero VAD v5 is the 2026 default</td>
+</tr>
+<tr>
+<td>Jitter buffer</td>
+<td>&quot;Audio smoothing&quot;</td>
+<td>Client-side buffer that holds packets briefly to absorb network variance</td>
+</tr>
+<tr>
+<td>Filler</td>
+<td>&quot;Acknowledgment token&quot;</td>
+<td>Short phrase the agent emits to avoid silence when a tool is slow</td>
+</tr>
+<tr>
+<td>MOS</td>
+<td>&quot;Mean opinion score&quot;</td>
+<td>Perceptual speech quality rating; NISQA is the automated proxy</td>
+</tr>
+</tbody>
+</table>
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://github.com/livekit/agents" rel="noreferrer" data-network="true">LiveKit Agents 1.0 <small>↗ 需要联网</small></a> — reference WebRTC agent framework</li>
+<li><a href="https://github.com/pipecat-ai/pipecat" rel="noreferrer" data-network="true">Pipecat <small>↗ 需要联网</small></a> — alternate Python-first streaming agent framework</li>
+<li><a href="https://platform.openai.com/docs/guides/realtime" rel="noreferrer" data-network="true">OpenAI Realtime API <small>↗ 需要联网</small></a> — reference for integrated speech models</li>
+<li><a href="https://developers.deepgram.com/docs" rel="noreferrer" data-network="true">Deepgram Nova-3 documentation <small>↗ 需要联网</small></a> — streaming ASR reference</li>
+<li><a href="https://github.com/snakers4/silero-vad" rel="noreferrer" data-network="true">Silero VAD v5 <small>↗ 需要联网</small></a> — VAD reference model</li>
+<li><a href="https://docs.cartesia.ai" rel="noreferrer" data-network="true">Cartesia Sonic-2 <small>↗ 需要联网</small></a> — low-latency TTS reference</li>
+<li><a href="https://docs.retellai.com" rel="noreferrer" data-network="true">Retell AI architecture <small>↗ 需要联网</small></a> — production voice agent architecture</li>
+<li><a href="https://docs.vapi.ai" rel="noreferrer" data-network="true">Vapi.ai production stack <small>↗ 需要联网</small></a> — alternate production reference</li>
+</ul>
+</article><section><h2>练习与源文件</h2><p>运行条件：需按原课准备依赖；涉及模型/数据/API 的实验仍需事先下载或联网服务。本站仅提供阅读与文件下载，代码运行未验证。</p><a download href="/learn/ai-from-scratch/downloads/lesson-19-capstone-projects--03-realtime-voice-assistant.zip">下载本课代码练习 ZIP（需联网，或单独保存）</a><button type="button" data-save-download="/learn/ai-from-scratch/downloads/lesson-19-capstone-projects--03-realtime-voice-assistant.zip">单独保存本课 ZIP</button><ul><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/03-realtime-voice-assistant/code/main.py">phases/19-capstone-projects/03-realtime-voice-assistant/code/main.py</a><details><summary>查看原始文本</summary><pre><code>&quot;&quot;&quot;Real-time voice pipeline — VAD + turn-detection + barge-in scheduler.
+
+The hard architectural primitive in a 2026 voice agent is not the ASR or the
+TTS. It is the streaming scheduler that arbitrates between VAD events, ASR
+partials, turn-completion scores, LLM streaming, TTS streaming, and user
+barge-in, all with bounded latency. This scaffold simulates audio frames and
+implements the scheduler in full: state machine, barge-in cancellation, tool
+side-channel with filler injection, latency accounting.
+
+Run:  python main.py
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import random
+import time
+from dataclasses import dataclass, field
+from enum import Enum, auto
+
+
+# ---------------------------------------------------------------------------
+# frame stream  --  simulated 20ms audio frames
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Frame:
+    t_ms: int              # timestamp ms since session start
+    is_speech: bool        # VAD verdict (Silero v5 stand-in)
+    partial: str = &quot;&quot;      # ASR cumulative partial (Deepgram Nova-3 stand-in)
+
+
+def synth_call(script: str, start_ms: int = 0, noise: float = 0.0) -&gt; list[Frame]:
+    &quot;&quot;&quot;Generate a frame stream for a simulated caller utterance.&quot;&quot;&quot;
+    words = script.split()
+    frames: list[Frame] = []
+    t = start_ms
+    # 120ms silence before speech
+    for _ in range(6):
+        frames.append(Frame(t_ms=t, is_speech=random.random() &lt; noise))
+        t += 20
+    partial = &quot;&quot;
+    for w in words:
+        partial = (partial + &quot; &quot; + w).strip()
+        # each word ~320ms of speech
+        for _ in range(16):
+            frames.append(Frame(t_ms=t, is_speech=True, partial=partial))
+            t += 20
+    # trailing silence, 2200ms (enough to cover tool + LLM + TTS)
+    for _ in range(110):
+        frames.append(Frame(t_ms=t, is_speech=False, partial=partial))
+        t += 20
+    return frames
+
+
+# ---------------------------------------------------------------------------
+# turn detector  --  combines VAD silence duration and completion score
+# ---------------------------------------------------------------------------
+
+def turn_completion_score(partial: str) -&gt; float:
+    &quot;&quot;&quot;Tiny stand-in for the LiveKit turn-detector model.&quot;&quot;&quot;
+    if not partial:
+        return 0.0
+    if partial.rstrip().endswith((&quot;?&quot;, &quot;.&quot;, &quot;!&quot;)):
+        return 0.95
+    # heuristic: more words, more confidence the turn is done
+    n = len(partial.split())
+    if n &lt; 3:
+        return 0.2
+    if n &lt; 6:
+        return 0.55
+    return 0.75
+
+
+# ---------------------------------------------------------------------------
+# state machine  --  IDLE -&gt; LISTENING -&gt; THINKING -&gt; SPEAKING -&gt; (barge-in)
+# ---------------------------------------------------------------------------
+
+class State(Enum):
+    IDLE = auto()
+    LISTENING = auto()   # user is mid-utterance
+    WAITING = auto()     # VAD says silence, checking turn score
+    THINKING = auto()    # LLM streaming but no TTS yet
+    SPEAKING = auto()    # TTS streaming out
+    TOOL = auto()        # side-channel tool in flight
+
+
+@dataclass
+class Metrics:
+    events: list[str] = field(default_factory=list)
+    turn_complete_ms: int = 0
+    first_llm_token_ms: int = 0
+    first_audio_out_ms: int = 0
+    false_cutoffs: int = 0
+    barge_ins: int = 0
+
+    def log(self, msg: str) -&gt; None:
+        self.events.append(msg)
+
+    def latency_ms(self) -&gt; int:
+        if self.turn_complete_ms and self.first_audio_out_ms:
+            return self.first_audio_out_ms - self.turn_complete_ms
+        return -1
+
+
+# ---------------------------------------------------------------------------
+# tool side channel  --  async weather/calendar with filler injection
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Tool:
+    name: str
+    latency_ms: int
+    result: str
+
+
+WEATHER = Tool(&quot;weather.tokyo_tomorrow&quot;, latency_ms=420, result=&quot;68/52 partly cloudy&quot;)
+
+
+# ---------------------------------------------------------------------------
+# scheduler  --  the full pipeline, streamed frame by frame
+# ---------------------------------------------------------------------------
+
+def run_session(frames: list[Frame], use_tool: bool = True,
+                barge_in_at_ms: int | None = None) -&gt; Metrics:
+    m = Metrics()
+    state = State.IDLE
+    silence_run_ms = 0
+    final_partial = &quot;&quot;
+    llm_stream_started_at = -1
+    tts_stream_started_at = -1
+    tool_started_at = -1
+    tool_done_at = -1
+    filler_emitted = False
+
+    for f in frames:
+        # barge-in: user starts speaking while we are SPEAKING or THINKING
+        if (barge_in_at_ms is not None and f.t_ms &gt;= barge_in_at_ms
+                and state in (State.SPEAKING, State.THINKING)
+                and f.is_speech):
+            m.barge_ins += 1
+            m.log(f&quot;{f.t_ms}ms BARGE-IN: cancel TTS, re-arm ASR&quot;)
+            state = State.LISTENING
+            tts_stream_started_at = -1
+            llm_stream_started_at = -1
+            continue
+
+        if state == State.IDLE:
+            if f.is_speech:
+                state = State.LISTENING
+                m.log(f&quot;{f.t_ms}ms LISTENING&quot;)
+
+        elif state == State.LISTENING:
+            if f.is_speech:
+                silence_run_ms = 0
+                final_partial = f.partial or final_partial
+            else:
+                silence_run_ms += 20
+                if silence_run_ms &gt;= 500:
+                    score = turn_completion_score(final_partial)
+                    if score &gt;= 0.6:
+                        state = State.WAITING
+                        m.turn_complete_ms = f.t_ms
+                        m.log(f&quot;{f.t_ms}ms TURN COMPLETE (score={score:.2f})&quot;
+                              f&quot; partial=&#39;{final_partial}&#39;&quot;)
+                    else:
+                        m.log(f&quot;{f.t_ms}ms SILENCE but score={score:.2f}, waiting&quot;)
+
+        if state == State.WAITING:
+            # kick off LLM
+            llm_stream_started_at = f.t_ms + 140  # simulated time-to-first-token
+            state = State.THINKING
+            m.log(f&quot;{f.t_ms}ms LLM call fired&quot;)
+            if use_tool:
+                tool_started_at = f.t_ms
+                state = State.TOOL
+
+        elif state == State.TOOL:
+            if tool_started_at &gt;= 0 and not filler_emitted:
+                if f.t_ms - tool_started_at &gt;= 300:
+                    filler_emitted = True
+                    m.log(f&quot;{f.t_ms}ms filler &#39;one second, let me check&#39;&quot;)
+            if tool_started_at &gt;= 0 and f.t_ms - tool_started_at &gt;= WEATHER.latency_ms:
+                tool_done_at = f.t_ms
+                m.log(f&quot;{f.t_ms}ms tool result: {WEATHER.result}&quot;)
+                llm_stream_started_at = f.t_ms + 140
+                state = State.THINKING
+
+        elif state == State.THINKING:
+            if llm_stream_started_at &gt; 0 and f.t_ms &gt;= llm_stream_started_at:
+                if m.first_llm_token_ms == 0:
+                    m.first_llm_token_ms = f.t_ms
+                    m.log(f&quot;{f.t_ms}ms LLM first token&quot;)
+                tts_stream_started_at = f.t_ms + 180
+                state = State.SPEAKING
+
+        elif state == State.SPEAKING:
+            if tts_stream_started_at &gt; 0 and f.t_ms &gt;= tts_stream_started_at:
+                if m.first_audio_out_ms == 0:
+                    m.first_audio_out_ms = f.t_ms
+                    m.log(f&quot;{f.t_ms}ms TTS first audio-out&quot;)
+
+    return m
+
+
+# ---------------------------------------------------------------------------
+# demo  --  runs two sessions, one clean, one with a barge-in
+# ---------------------------------------------------------------------------
+
+def main() -&gt; None:
+    random.seed(0)
+    print(&quot;=== session 1: clean call with tool (weather) ===&quot;)
+    frames = synth_call(&quot;what is the weather in tokyo tomorrow&quot;, start_ms=0)
+    m = run_session(frames, use_tool=True, barge_in_at_ms=None)
+    for line in m.events:
+        print(&quot; &quot;, line)
+    print(f&quot;  turn_complete  @ {m.turn_complete_ms}ms&quot;)
+    print(f&quot;  first_llm_tok  @ {m.first_llm_token_ms}ms&quot;)
+    print(f&quot;  first_audio_out @ {m.first_audio_out_ms}ms&quot;)
+    print(f&quot;  turn latency   = {m.latency_ms()}ms&quot;)
+
+    print()
+    print(&quot;=== session 2: user barges in mid-response ===&quot;)
+    frames = synth_call(&quot;tell me a long story about&quot;, start_ms=0)
+    # add a few synthetic speech frames late in the trailing silence
+    for i in range(8):
+        idx = len(frames) - 20 + i
+        if 0 &lt;= idx &lt; len(frames):
+            frames[idx] = Frame(t_ms=frames[idx].t_ms, is_speech=True,
+                                partial=frames[idx].partial)
+    m = run_session(frames, use_tool=False,
+                    barge_in_at_ms=frames[-20].t_ms - 60)
+    for line in m.events:
+        print(&quot; &quot;, line)
+    print(f&quot;  barge_ins = {m.barge_ins}&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/03-realtime-voice-assistant/code/ts/README.md">phases/19-capstone-projects/03-realtime-voice-assistant/code/ts/README.md</a><details><summary>查看原始文本</summary><pre><code># Capstone 19/03 — Realtime Voice Assistant (TypeScript)
+
+Multi-file TypeScript web-client harness for the streaming voice pipeline
+described in `../docs/en.md`. Offline state-machine simulation plus a live
+WebSocket server backed by the `ws` package.
+
+## Layout
+
+```text
+src/
+  index.ts        entry point; runs two offline sessions, probes the live ws, exits 0
+  server.ts       hono /healthz + ws upgrade via WebSocketServer
+  orchestrator.ts IDLE -&gt; LISTENING -&gt; WAITING -&gt; THINKING -&gt; SPEAKING with barge-in
+  vad.ts          turn-completion scorer + synthetic 20ms-frame generator
+  protocol.ts     zod-validated frame envelope (event / summary)
+  types.ts        AudioChunk, Metrics, SessionOptions, SessionSummary
+tests/
+  vad.test.ts
+  orchestrator.test.ts
+  protocol.test.ts
+```
+
+## Run
+
+```bash
+npm install
+npm start                # runs two offline sessions + ws self-probe, exits 0
+npm start -- --serve     # keep ws server up; ctrl-c to stop
+npm test                 # node --test runner via tsx
+npm run typecheck        # tsc --noEmit
+```
+
+The non-interactive `npm start` path asserts the clean session reaches
+`first_audio_out`, the barge-in session registers at least one barge-in event,
+and the live WebSocket probe receives a `summary` frame before close.
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/03-realtime-voice-assistant/code/ts/package.json">phases/19-capstone-projects/03-realtime-voice-assistant/code/ts/package.json</a><details><summary>查看原始文本</summary><pre><code>{
+  &quot;name&quot;: &quot;phase-19-03-realtime-voice-assistant&quot;,
+  &quot;version&quot;: &quot;0.1.0&quot;,
+  &quot;private&quot;: true,
+  &quot;type&quot;: &quot;module&quot;,
+  &quot;scripts&quot;: {
+    &quot;start&quot;: &quot;tsx src/index.ts&quot;,
+    &quot;test&quot;: &quot;tsx --test tests/*.test.ts&quot;,
+    &quot;typecheck&quot;: &quot;tsc --noEmit&quot;
+  },
+  &quot;dependencies&quot;: {
+    &quot;hono&quot;: &quot;^4.6.14&quot;,
+    &quot;ws&quot;: &quot;^8.18.0&quot;,
+    &quot;zod&quot;: &quot;^3.23.8&quot;
+  },
+  &quot;devDependencies&quot;: {
+    &quot;@types/node&quot;: &quot;^20.17.10&quot;,
+    &quot;@types/ws&quot;: &quot;^8.5.13&quot;,
+    &quot;tsx&quot;: &quot;^4.19.2&quot;,
+    &quot;typescript&quot;: &quot;^5.7.3&quot;
+  }
+}
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/03-realtime-voice-assistant/code/ts/src/index.ts">phases/19-capstone-projects/03-realtime-voice-assistant/code/ts/src/index.ts</a><details><summary>查看原始文本</summary><pre><code>// Capstone 19/03: realtime voice web client (multi-file TypeScript).
+//
+// Sources:
+//   This lesson&#39;s docs/en.md (WebRTC client + VAD + barge-in client UX)
+//   RFC 6455 WebSocket protocol  https://datatracker.ietf.org/doc/html/rfc6455
+//   ws (Node WebSocket library)  https://github.com/websockets/ws
+//   Silero VAD v5 model card     https://github.com/snakers4/silero-vad
+//
+// Pipeline split into modules: vad.ts (turn-completion score + synthetic frame
+// generator), orchestrator.ts (IDLE -&gt; LISTENING -&gt; WAITING -&gt; THINKING -&gt;
+// SPEAKING state machine with barge-in), protocol.ts (zod-validated frame
+// envelope), server.ts (hono /healthz + ws upgrade), and this entry which runs
+// two offline sessions, stands up the live ws server, probes it, and exits 0.
+
+import WebSocket from &quot;ws&quot;;
+import { runSession, renderToConsole, summarize } from &quot;./orchestrator.ts&quot;;
+import { synthCall } from &quot;./vad.ts&quot;;
+import { decodeFrame } from &quot;./protocol.ts&quot;;
+import { buildServer } from &quot;./server.ts&quot;;
+import type { Frame } from &quot;./protocol.ts&quot;;
+
+async function probeWs(
+  port: number,
+  timeoutMs = 3000,
+): Promise&lt;{ events: number; gotSummary: boolean }&gt; {
+  return await new Promise&lt;{ events: number; gotSummary: boolean }&gt;((resolve, reject) =&gt; {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}`);
+    let events = 0;
+    let gotSummary = false;
+    let settled = false;
+    const finish = (val: { events: number; gotSummary: boolean }): void =&gt; {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(val);
+    };
+    const timer = setTimeout(() =&gt; {
+      if (settled) return;
+      ws.removeAllListeners();
+      try {
+        ws.close();
+      } catch {
+        // already closing
+      }
+      finish({ events, gotSummary });
+    }, timeoutMs);
+    ws.on(&quot;message&quot;, (raw) =&gt; {
+      try {
+        const f: Frame = decodeFrame(raw.toString(&quot;utf8&quot;));
+        if (f.type === &quot;event&quot;) events += 1;
+        else if (f.type === &quot;summary&quot;) gotSummary = true;
+      } catch {
+        // ignore malformed frames in the probe
+      }
+    });
+    ws.on(&quot;close&quot;, () =&gt; finish({ events, gotSummary }));
+    ws.on(&quot;error&quot;, (err) =&gt; {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(err);
+    });
+  });
+}
+
+async function main(): Promise&lt;void&gt; {
+  // Pre-flight: drive two offline sessions through the state machine.
+  const clean = runSession(synthCall(&quot;what is the weather in tokyo tomorrow&quot;), {
+    useTool: true,
+    bargeInAtMs: null,
+  });
+  renderToConsole(&quot;session 1: clean call with tool (weather)&quot;, clean);
+  if (clean.turnCompleteMs &lt;= 0 || clean.firstAudioOutMs &lt;= 0) {
+    throw new Error(&quot;clean session did not reach first audio-out&quot;);
+  }
+
+  const bargeFrames = synthCall(&quot;tell me a long story about&quot;);
+  if (bargeFrames.length === 0) {
+    throw new Error(&quot;synthCall returned no frames&quot;);
+  }
+  const anchorIdx = Math.max(0, bargeFrames.length - 20);
+  const anchorFrame = bargeFrames[anchorIdx] ?? bargeFrames[bargeFrames.length - 1];
+  for (let i = 0; i &lt; 8; i++) {
+    const idx = anchorIdx + i;
+    if (idx &gt;= 0 &amp;&amp; idx &lt; bargeFrames.length) {
+      bargeFrames[idx] = {
+        tMs: bargeFrames[idx].tMs,
+        isSpeech: true,
+        partial: bargeFrames[idx].partial,
+      };
+    }
+  }
+  const bargeIn = runSession(bargeFrames, {
+    useTool: false,
+    bargeInAtMs: anchorFrame.tMs - 60,
+  });
+  renderToConsole(&quot;session 2: user barges in mid-response&quot;, bargeIn);
+  if (bargeIn.bargeIns === 0) {
+    throw new Error(&quot;barge-in session did not register any barge-in event&quot;);
+  }
+
+  // Live: stand up the WS server, drive one session over it, and tear down.
+  const { server } = buildServer();
+  await new Promise&lt;void&gt;((resolve) =&gt; server.listen(0, &quot;127.0.0.1&quot;, () =&gt; resolve()));
+  const addr = server.address();
+  if (!addr || typeof addr === &quot;string&quot;) throw new Error(&quot;address unavailable&quot;);
+  console.log(`voice-client skeleton ws://127.0.0.1:${addr.port}`);
+  if (process.argv.includes(&quot;--serve&quot;)) {
+    process.on(&quot;SIGINT&quot;, () =&gt; server.close(() =&gt; process.exit(0)));
+    return;
+  }
+  const probe = await probeWs(addr.port);
+  console.log(`[ws probe] frames received: ${probe.events + (probe.gotSummary ? 1 : 0)}`);
+  console.log(`[ws probe] summary: ${probe.gotSummary ? &quot;yes&quot; : &quot;missing&quot;}`);
+  console.log(`[ws probe] sample summary: ${JSON.stringify(summarize(clean))}`);
+  await new Promise&lt;void&gt;((resolve) =&gt; server.close(() =&gt; resolve()));
+  if (!probe.gotSummary) throw new Error(&quot;ws probe did not receive summary frame&quot;);
+}
+
+main().catch((err) =&gt; {
+  console.error(err);
+  process.exit(1);
+});
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/03-realtime-voice-assistant/code/ts/src/orchestrator.ts">phases/19-capstone-projects/03-realtime-voice-assistant/code/ts/src/orchestrator.ts</a><details><summary>查看原始文本</summary><pre><code>import type {
+  AudioChunk,
+  Metrics,
+  SessionOptions,
+  SessionSummary,
+  State,
+  Tool,
+} from &quot;./types.ts&quot;;
+import { turnCompletionScore } from &quot;./vad.ts&quot;;
+
+export const WEATHER: Tool = {
+  name: &quot;weather.tokyo_tomorrow&quot;,
+  latencyMs: 420,
+  result: &quot;68/52 partly cloudy&quot;,
+};
+
+export function newMetrics(): Metrics {
+  return {
+    events: [],
+    turnCompleteMs: 0,
+    firstLlmTokenMs: 0,
+    firstAudioOutMs: 0,
+    bargeIns: 0,
+  };
+}
+
+export function turnLatencyMs(m: Metrics): number {
+  if (m.turnCompleteMs &amp;&amp; m.firstAudioOutMs) return m.firstAudioOutMs - m.turnCompleteMs;
+  return -1;
+}
+
+export function summarize(m: Metrics): SessionSummary {
+  return {
+    turnCompleteMs: m.turnCompleteMs,
+    firstLlmTokenMs: m.firstLlmTokenMs,
+    firstAudioOutMs: m.firstAudioOutMs,
+    turnLatencyMs: turnLatencyMs(m),
+    bargeIns: m.bargeIns,
+  };
+}
+
+export function runSession(frames: AudioChunk[], opts: SessionOptions): Metrics {
+  const m = newMetrics();
+  let state: State = &quot;IDLE&quot;;
+  let silenceRunMs = 0;
+  let finalPartial = &quot;&quot;;
+  let llmStartedAt = -1;
+  let ttsStartedAt = -1;
+  let toolStartedAt = -1;
+  let fillerEmitted = false;
+  let toolPhase: &quot;none&quot; | &quot;running&quot; | &quot;done&quot; = &quot;none&quot;;
+
+  const log = (line: string): void =&gt; {
+    m.events.push(line);
+    opts.onEvent?.(line);
+  };
+
+  for (const f of frames) {
+    if (
+      opts.bargeInAtMs !== null &amp;&amp;
+      f.tMs &gt;= opts.bargeInAtMs &amp;&amp;
+      (state === &quot;SPEAKING&quot; || state === &quot;THINKING&quot;) &amp;&amp;
+      f.isSpeech
+    ) {
+      m.bargeIns += 1;
+      log(`${f.tMs}ms BARGE-IN: cancel TTS, re-arm ASR`);
+      state = &quot;LISTENING&quot;;
+      silenceRunMs = 0;
+      finalPartial = &quot;&quot;;
+      toolPhase = &quot;none&quot;;
+      toolStartedAt = -1;
+      fillerEmitted = false;
+      ttsStartedAt = -1;
+      llmStartedAt = -1;
+      continue;
+    }
+
+    if (state === &quot;IDLE&quot;) {
+      if (f.isSpeech) {
+        state = &quot;LISTENING&quot;;
+        log(`${f.tMs}ms LISTENING`);
+      }
+      continue;
+    }
+
+    if (state === &quot;LISTENING&quot;) {
+      if (f.isSpeech) {
+        silenceRunMs = 0;
+        finalPartial = f.partial || finalPartial;
+      } else {
+        silenceRunMs += 20;
+        if (silenceRunMs &gt;= 500) {
+          const score = turnCompletionScore(finalPartial);
+          if (score &gt;= 0.6) {
+            state = &quot;WAITING&quot;;
+            m.turnCompleteMs = f.tMs;
+            log(
+              `${f.tMs}ms TURN COMPLETE (score=${score.toFixed(2)}) partial=&#39;${finalPartial}&#39;`,
+            );
+          } else {
+            log(`${f.tMs}ms SILENCE but score=${score.toFixed(2)}, waiting`);
+          }
+        }
+      }
+    }
+
+    if (state === &quot;WAITING&quot;) {
+      if (opts.useTool &amp;&amp; toolPhase === &quot;none&quot;) {
+        toolStartedAt = f.tMs;
+        toolPhase = &quot;running&quot;;
+        log(`${f.tMs}ms tool call fired: ${WEATHER.name}`);
+        state = &quot;THINKING&quot;;
+      } else {
+        llmStartedAt = f.tMs + 140;
+        state = &quot;THINKING&quot;;
+        log(`${f.tMs}ms LLM call fired`);
+      }
+      continue;
+    }
+
+    if (state === &quot;THINKING&quot;) {
+      if (toolPhase === &quot;running&quot;) {
+        if (!fillerEmitted &amp;&amp; f.tMs - toolStartedAt &gt;= 300) {
+          fillerEmitted = true;
+          log(`${f.tMs}ms filler &#39;one second, let me check&#39;`);
+        }
+        if (f.tMs - toolStartedAt &gt;= WEATHER.latencyMs) {
+          toolPhase = &quot;done&quot;;
+          log(`${f.tMs}ms tool result: ${WEATHER.result}`);
+          llmStartedAt = f.tMs + 140;
+        }
+      } else if (llmStartedAt &gt; 0 &amp;&amp; f.tMs &gt;= llmStartedAt) {
+        if (m.firstLlmTokenMs === 0) {
+          m.firstLlmTokenMs = f.tMs;
+          log(`${f.tMs}ms LLM first token`);
+        }
+        ttsStartedAt = f.tMs + 180;
+        state = &quot;SPEAKING&quot;;
+      }
+      continue;
+    }
+
+    if (state === &quot;SPEAKING&quot;) {
+      if (ttsStartedAt &gt; 0 &amp;&amp; f.tMs &gt;= ttsStartedAt &amp;&amp; m.firstAudioOutMs === 0) {
+        m.firstAudioOutMs = f.tMs;
+        log(`${f.tMs}ms TTS first audio-out`);
+      }
+    }
+  }
+  return m;
+}
+
+export function renderToConsole(label: string, m: Metrics): void {
+  console.log(`=== ${label} ===`);
+  for (const line of m.events) console.log(&quot; &quot;, line);
+  console.log(`  turn_complete   @ ${m.turnCompleteMs}ms`);
+  console.log(`  first_llm_token @ ${m.firstLlmTokenMs}ms`);
+  console.log(`  first_audio_out @ ${m.firstAudioOutMs}ms`);
+  console.log(`  turn latency    = ${turnLatencyMs(m)}ms`);
+  console.log(`  barge_ins       = ${m.bargeIns}`);
+  console.log(&quot;&quot;);
+}
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/03-realtime-voice-assistant/code/ts/src/protocol.ts">phases/19-capstone-projects/03-realtime-voice-assistant/code/ts/src/protocol.ts</a><details><summary>查看原始文本</summary><pre><code>import { z } from &quot;zod&quot;;
+
+export const EventFrame = z.object({
+  type: z.literal(&quot;event&quot;),
+  line: z.string(),
+});
+export type EventFrame = z.infer&lt;typeof EventFrame&gt;;
+
+export const SummaryFrame = z.object({
+  type: z.literal(&quot;summary&quot;),
+  turnCompleteMs: z.number(),
+  firstLlmTokenMs: z.number(),
+  firstAudioOutMs: z.number(),
+  turnLatencyMs: z.number(),
+  bargeIns: z.number(),
+});
+export type SummaryFrame = z.infer&lt;typeof SummaryFrame&gt;;
+
+export const Frame = z.discriminatedUnion(&quot;type&quot;, [EventFrame, SummaryFrame]);
+export type Frame = z.infer&lt;typeof Frame&gt;;
+
+export function encodeFrame(f: Frame): string {
+  return JSON.stringify(f);
+}
+
+export function decodeFrame(raw: string): Frame {
+  return Frame.parse(JSON.parse(raw));
+}
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/03-realtime-voice-assistant/code/ts/src/server.ts">phases/19-capstone-projects/03-realtime-voice-assistant/code/ts/src/server.ts</a><details><summary>查看原始文本</summary><pre><code>import * as http from &quot;node:http&quot;;
+import { Hono } from &quot;hono&quot;;
+import { WebSocketServer } from &quot;ws&quot;;
+import type { WebSocket } from &quot;ws&quot;;
+import { runSession, summarize } from &quot;./orchestrator.ts&quot;;
+import { synthCall } from &quot;./vad.ts&quot;;
+import { encodeFrame } from &quot;./protocol.ts&quot;;
+
+export type ServerHandles = {
+  server: http.Server;
+  wss: WebSocketServer;
+  app: Hono;
+};
+
+function nodeListener(app: Hono) {
+  return (req: http.IncomingMessage, res: http.ServerResponse): void =&gt; {
+    const url = `http://${req.headers.host ?? &quot;localhost&quot;}${req.url ?? &quot;/&quot;}`;
+    void (async () =&gt; {
+      try {
+        const response = await app.fetch(
+          new Request(url, {
+            method: req.method,
+            headers: req.headers as Record&lt;string, string&gt;,
+          }),
+        );
+        res.statusCode = response.status;
+        response.headers.forEach((v, k) =&gt; res.setHeader(k, v));
+        const body = await response.text();
+        res.end(body);
+      } catch (err) {
+        res.statusCode = 500;
+        res.end(JSON.stringify({ error: (err as Error).message }));
+      }
+    })();
+  };
+}
+
+function driveSession(ws: WebSocket): void {
+  const frames = synthCall(&quot;what is the weather in tokyo tomorrow&quot;);
+  const m = runSession(frames, {
+    useTool: true,
+    bargeInAtMs: null,
+    onEvent: (line) =&gt; ws.send(encodeFrame({ type: &quot;event&quot;, line })),
+  });
+  ws.send(encodeFrame({ type: &quot;summary&quot;, ...summarize(m) }));
+  ws.close();
+}
+
+export function buildServer(): ServerHandles {
+  const app = new Hono();
+  app.get(&quot;/healthz&quot;, (c) =&gt; c.json({ ok: true }));
+  app.notFound((c) =&gt; c.json({ error: &quot;not found&quot;, path: c.req.path }, 404));
+
+  const server = http.createServer(nodeListener(app));
+  const wss = new WebSocketServer({ server });
+  wss.on(&quot;connection&quot;, (ws) =&gt; {
+    driveSession(ws);
+  });
+  return { server, wss, app };
+}
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/03-realtime-voice-assistant/code/ts/src/types.ts">phases/19-capstone-projects/03-realtime-voice-assistant/code/ts/src/types.ts</a><details><summary>查看原始文本</summary><pre><code>export type State = &quot;IDLE&quot; | &quot;LISTENING&quot; | &quot;WAITING&quot; | &quot;THINKING&quot; | &quot;SPEAKING&quot;;
+
+export type AudioChunk = {
+  tMs: number;
+  isSpeech: boolean;
+  partial: string;
+};
+
+export type Tool = { name: string; latencyMs: number; result: string };
+
+export type Metrics = {
+  events: string[];
+  turnCompleteMs: number;
+  firstLlmTokenMs: number;
+  firstAudioOutMs: number;
+  bargeIns: number;
+};
+
+export type SessionOptions = {
+  useTool: boolean;
+  bargeInAtMs: number | null;
+  onEvent?: (line: string) =&gt; void;
+};
+
+export type SessionSummary = {
+  turnCompleteMs: number;
+  firstLlmTokenMs: number;
+  firstAudioOutMs: number;
+  turnLatencyMs: number;
+  bargeIns: number;
+};
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/03-realtime-voice-assistant/code/ts/src/vad.ts">phases/19-capstone-projects/03-realtime-voice-assistant/code/ts/src/vad.ts</a><details><summary>查看原始文本</summary><pre><code>import type { AudioChunk } from &quot;./types.ts&quot;;
+
+export function turnCompletionScore(partial: string): number {
+  // Tiny stand-in for the LiveKit turn-detector model.
+  if (!partial) return 0;
+  const tail = partial.trimEnd();
+  if (tail.endsWith(&quot;?&quot;) || tail.endsWith(&quot;.&quot;) || tail.endsWith(&quot;!&quot;)) return 0.95;
+  const n = partial.split(/\s+/).filter(Boolean).length;
+  if (n &lt; 3) return 0.2;
+  if (n &lt; 6) return 0.55;
+  return 0.75;
+}
+
+export function synthCall(script: string, startMs = 0, noise = 0): AudioChunk[] {
+  // Generate 20ms-frame &quot;audio&quot; with a leading silence, then per-word speech,
+  // then a long trailing silence so the state machine can run end to end.
+  const words = script.trim().split(/\s+/).filter(Boolean);
+  const frames: AudioChunk[] = [];
+  let t = startMs;
+  for (let i = 0; i &lt; 6; i++) {
+    frames.push({ tMs: t, isSpeech: Math.random() &lt; noise, partial: &quot;&quot; });
+    t += 20;
+  }
+  let partial = &quot;&quot;;
+  for (const w of words) {
+    partial = (partial ? partial + &quot; &quot; : &quot;&quot;) + w;
+    for (let i = 0; i &lt; 16; i++) {
+      frames.push({ tMs: t, isSpeech: true, partial });
+      t += 20;
+    }
+  }
+  for (let i = 0; i &lt; 110; i++) {
+    frames.push({ tMs: t, isSpeech: false, partial });
+    t += 20;
+  }
+  return frames;
+}
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/03-realtime-voice-assistant/code/ts/tests/orchestrator.test.ts">phases/19-capstone-projects/03-realtime-voice-assistant/code/ts/tests/orchestrator.test.ts</a><details><summary>查看原始文本</summary><pre><code>import { test } from &quot;node:test&quot;;
+import { strict as assert } from &quot;node:assert&quot;;
+import { runSession, summarize, turnLatencyMs } from &quot;../src/orchestrator.ts&quot;;
+import { synthCall } from &quot;../src/vad.ts&quot;;
+
+test(&quot;runSession: clean call reaches first-audio-out with tool result&quot;, () =&gt; {
+  const m = runSession(synthCall(&quot;what is the weather in tokyo tomorrow&quot;), {
+    useTool: true,
+    bargeInAtMs: null,
+  });
+  assert.ok(m.turnCompleteMs &gt; 0);
+  assert.ok(m.firstLlmTokenMs &gt; 0);
+  assert.ok(m.firstAudioOutMs &gt; 0);
+  assert.ok(m.events.some((e) =&gt; e.includes(&quot;tool call fired&quot;)));
+  assert.ok(m.events.some((e) =&gt; e.includes(&quot;tool result&quot;)));
+});
+
+test(&quot;runSession: barge-in increments bargeIns and re-arms ASR&quot;, () =&gt; {
+  const frames = synthCall(&quot;tell me a long story about&quot;);
+  for (let i = 0; i &lt; 8; i++) {
+    const idx = frames.length - 20 + i;
+    if (idx &gt;= 0 &amp;&amp; idx &lt; frames.length) {
+      frames[idx] = { tMs: frames[idx].tMs, isSpeech: true, partial: frames[idx].partial };
+    }
+  }
+  const m = runSession(frames, {
+    useTool: false,
+    bargeInAtMs: frames[frames.length - 20].tMs - 60,
+  });
+  assert.ok(m.bargeIns &gt;= 1);
+});
+
+test(&quot;turnLatencyMs: -1 if first-audio-out never fired&quot;, () =&gt; {
+  const m = {
+    events: [],
+    turnCompleteMs: 0,
+    firstLlmTokenMs: 0,
+    firstAudioOutMs: 0,
+    bargeIns: 0,
+  };
+  assert.equal(turnLatencyMs(m), -1);
+});
+
+test(&quot;turnLatencyMs: positive delta when both timestamps present&quot;, () =&gt; {
+  const m = {
+    events: [],
+    turnCompleteMs: 1000,
+    firstLlmTokenMs: 1200,
+    firstAudioOutMs: 1380,
+    bargeIns: 0,
+  };
+  assert.equal(turnLatencyMs(m), 380);
+});
+
+test(&quot;summarize: produces a SessionSummary with computed turnLatencyMs&quot;, () =&gt; {
+  const m = runSession(synthCall(&quot;hello&quot;), { useTool: false, bargeInAtMs: null });
+  const s = summarize(m);
+  assert.equal(typeof s.turnLatencyMs, &quot;number&quot;);
+  assert.equal(s.bargeIns, m.bargeIns);
+});
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/03-realtime-voice-assistant/code/ts/tests/protocol.test.ts">phases/19-capstone-projects/03-realtime-voice-assistant/code/ts/tests/protocol.test.ts</a><details><summary>查看原始文本</summary><pre><code>import { test } from &quot;node:test&quot;;
+import { strict as assert } from &quot;node:assert&quot;;
+import { decodeFrame, encodeFrame } from &quot;../src/protocol.ts&quot;;
+
+test(&quot;encodeFrame + decodeFrame: round-trips event frame&quot;, () =&gt; {
+  const f = { type: &quot;event&quot; as const, line: &quot;100ms LISTENING&quot; };
+  const raw = encodeFrame(f);
+  const back = decodeFrame(raw);
+  assert.deepEqual(back, f);
+});
+
+test(&quot;encodeFrame + decodeFrame: round-trips summary frame&quot;, () =&gt; {
+  const f = {
+    type: &quot;summary&quot; as const,
+    turnCompleteMs: 1000,
+    firstLlmTokenMs: 1200,
+    firstAudioOutMs: 1400,
+    turnLatencyMs: 400,
+    bargeIns: 0,
+  };
+  const raw = encodeFrame(f);
+  const back = decodeFrame(raw);
+  assert.deepEqual(back, f);
+});
+
+test(&quot;decodeFrame: rejects unknown type via zod discriminated union&quot;, () =&gt; {
+  assert.throws(() =&gt; decodeFrame(JSON.stringify({ type: &quot;garbage&quot; })));
+});
+
+test(&quot;decodeFrame: rejects missing fields&quot;, () =&gt; {
+  assert.throws(() =&gt; decodeFrame(JSON.stringify({ type: &quot;summary&quot; })));
+});
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/03-realtime-voice-assistant/code/ts/tests/vad.test.ts">phases/19-capstone-projects/03-realtime-voice-assistant/code/ts/tests/vad.test.ts</a><details><summary>查看原始文本</summary><pre><code>import { test } from &quot;node:test&quot;;
+import { strict as assert } from &quot;node:assert&quot;;
+import { synthCall, turnCompletionScore } from &quot;../src/vad.ts&quot;;
+
+test(&quot;turnCompletionScore: empty partial returns 0&quot;, () =&gt; {
+  assert.equal(turnCompletionScore(&quot;&quot;), 0);
+});
+
+test(&quot;turnCompletionScore: terminal punctuation scores 0.95&quot;, () =&gt; {
+  assert.ok(turnCompletionScore(&quot;what time is it?&quot;) &gt;= 0.9);
+  assert.ok(turnCompletionScore(&quot;done.&quot;) &gt;= 0.9);
+  assert.ok(turnCompletionScore(&quot;stop!&quot;) &gt;= 0.9);
+});
+
+test(&quot;turnCompletionScore: scales with token count&quot;, () =&gt; {
+  assert.ok(turnCompletionScore(&quot;hi&quot;) &lt; turnCompletionScore(&quot;hello there friend&quot;));
+  assert.ok(
+    turnCompletionScore(&quot;hello there friend&quot;) &lt;
+      turnCompletionScore(&quot;hello there my dear close friend&quot;),
+  );
+});
+
+test(&quot;synthCall: produces a frame sequence with leading silence, speech, trailing silence&quot;, () =&gt; {
+  const frames = synthCall(&quot;hello world&quot;);
+  assert.ok(frames.length &gt; 100);
+  // First six frames are leading silence (noise=0 so isSpeech is false here)
+  for (let i = 0; i &lt; 6; i++) assert.equal(frames[i].isSpeech, false);
+  // Middle frames carry speech
+  const speechCount = frames.filter((f) =&gt; f.isSpeech).length;
+  assert.ok(speechCount &gt;= 16);
+  // Trailing tail is silence
+  assert.equal(frames[frames.length - 1].isSpeech, false);
+});
+
+test(&quot;synthCall: timestamps are monotonic in 20ms steps&quot;, () =&gt; {
+  const frames = synthCall(&quot;hi there&quot;);
+  for (let i = 1; i &lt; frames.length; i++) {
+    assert.equal(frames[i].tMs - frames[i - 1].tMs, 20);
+  }
+});
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/03-realtime-voice-assistant/code/ts/tsconfig.json">phases/19-capstone-projects/03-realtime-voice-assistant/code/ts/tsconfig.json</a><details><summary>查看原始文本</summary><pre><code>{
+  &quot;compilerOptions&quot;: {
+    &quot;target&quot;: &quot;ES2022&quot;,
+    &quot;module&quot;: &quot;nodenext&quot;,
+    &quot;moduleResolution&quot;: &quot;nodenext&quot;,
+    &quot;strict&quot;: true,
+    &quot;esModuleInterop&quot;: true,
+    &quot;skipLibCheck&quot;: true,
+    &quot;resolveJsonModule&quot;: true,
+    &quot;forceConsistentCasingInFileNames&quot;: true,
+    &quot;noUnusedLocals&quot;: true,
+    &quot;noUnusedParameters&quot;: true,
+    &quot;noImplicitOverride&quot;: true,
+    &quot;noFallthroughCasesInSwitch&quot;: true,
+    &quot;allowImportingTsExtensions&quot;: true,
+    &quot;noEmit&quot;: true,
+    &quot;isolatedModules&quot;: true
+  },
+  &quot;include&quot;: [&quot;src/**/*.ts&quot;, &quot;tests/**/*.ts&quot;]
+}
+</code></pre></details></li><li><a download href="/learn/ai-from-scratch/files/phases/19-capstone-projects/03-realtime-voice-assistant/outputs/skill-voice-agent.md">phases/19-capstone-projects/03-realtime-voice-assistant/outputs/skill-voice-agent.md</a><details><summary>查看原始文本</summary><pre><code>---
+name: voice-agent
+description: Build a real-time voice agent with sub-800ms first-audio-out, barge-in handling, and mid-conversation tool use.
+version: 1.0.0
+phase: 19
+lesson: 03
+tags: [capstone, voice, webrtc, livekit, pipecat, asr, tts, streaming]
+---
+
+Given a domain (customer support, scheduling, retail assistant), deploy a WebRTC voice agent that keeps end-to-end first-audio-out under 800ms while handling barge-in, tool calls, and packet loss.
+
+Build plan:
+
+1. Stand up a LiveKit Agents 1.0 room with a web client that streams microphone audio. Add a Twilio PSTN gateway for phone coverage.
+2. Run streaming ASR (Deepgram Nova-3 hosted or faster-whisper Whisper-v3-turbo on a g5.xlarge). Subscribe to partial and final transcripts.
+3. Run Silero VAD v5 on 20ms frames. On speech-end, score the latest partial with the LiveKit turn-detector; commit to turn-complete only when VAD silence &gt;= 500ms and completion score &gt;= 0.6.
+4. Stream the LLM (GPT-4o-realtime, Gemini 2.5 Flash Live, or cascaded Claude Haiku 4.5). Hand the first token to TTS within 200ms.
+5. Stream TTS (Cartesia Sonic-2 or ElevenLabs Flash v3). First audio chunk must leave the server within 200ms of first LLM token.
+6. Barge-in: when VAD detects new user speech during SPEAKING or THINKING, cancel TTS, drop remaining LLM output, re-arm ASR. Publish a `tts_canceled` span.
+7. Tool side-channel: run function calls concurrently; if latency &gt; 300ms, emit an acknowledgment filler so the audio stream never stalls.
+8. Record 100 calls. Measure WER against held-out transcripts, false-cutoff rate on the Hamming VAD benchmark, first-audio-out p50, NISQA MOS, and behavior under 3% packet drop.
+9. Load-test 50 concurrent calls on a single g5.xlarge with a synthetic caller; report sustained first-audio-out p95.
+
+Assessment rubric:
+
+| Weight | Criterion | Measurement |
+|:-:|---|---|
+| 25 | End-to-end latency | p50 first-audio-out under 800ms across 100 recorded calls |
+| 20 | Turn-taking quality | False-cutoff rate under 3% on the Hamming VAD benchmark |
+| 20 | Tool-use correctness | Mid-conversation tool calls return correct data without stalling audio |
+| 20 | Reliability under packet loss | WER and turn-taking stability with 3% packet drop injected |
+| 15 | Eval harness completeness | Reproducible measurements with public config |
+
+Hard rejects:
+
+- Non-streaming pipelines (batch ASR, batch TTS) cannot hit the latency target.
+- Any barge-in policy that does not cancel the TTS buffer immediately. Delayed cancellation produces the worst user-experience regressions.
+- Tool calls that synchronously block the LLM stream. They must run on a side channel.
+
+Refusal rules:
+
+- Refuse to deploy without a VAD or a turn-detector. Fixed-timeout turn-taking produces unacceptable cutoff rates.
+- Refuse to report MOS without documenting whether it is human-rated or NISQA-proxied.
+- Refuse to report &quot;p50 latency under X&quot; without at least 100 recorded calls and publishing the call traces.
+
+Output: a repo containing the LiveKit agent worker, the PSTN gateway config, the 100-call eval harness, a public Langfuse voice dashboard, a side-by-side comparison with one hosted competitor (Retell, Vapi, or OpenAI Realtime API directly), and a write-up on the three largest turn-taking failures you observed and the detector tuning that fixed each.
+</code></pre></details></li></ul></section><section class="quiz"><h2>测验 / Quiz</h2><p>原作者英文测验 · 未翻译，不与中文校订状态混淆</p><form data-quiz><fieldset><legend>1. Why can a voice agent not be built by stitching three blocking REST calls?</legend><label class="option"><input type="radio" name="q0" value="0"> REST endpoints have a 30-second hard timeout</label><label class="option"><input type="radio" name="q0" value="1"> REST is incompatible with WebRTC</label><label class="option"><input type="radio" name="q0" value="2"> JSON serialization is too slow for audio data</label><label class="option"><input type="radio" name="q0" value="3"> End-to-end latency below 800ms requires pipelined streaming at every stage</label><p data-feedback="0"></p></fieldset><fieldset><legend>2. What is the role of the turn-detector alongside VAD?</legend><label class="option"><input type="radio" name="q1" value="0"> Mixes background music into the output stream</label><label class="option"><input type="radio" name="q1" value="1"> Detects which speaker is talking in a multi-party call</label><label class="option"><input type="radio" name="q1" value="2"> Reads partial transcripts and scores whether the user has actually finished their utterance</label><label class="option"><input type="radio" name="q1" value="3"> Trains a custom voice clone for the agent</label><p data-feedback="1"></p></fieldset><fieldset><legend>3. When the user starts speaking while the agent is mid-response, what must happen for barge-in to feel right?</legend><label class="option"><input type="radio" name="q2" value="0"> The TTS finishes the current sentence before yielding</label><label class="option"><input type="radio" name="q2" value="1"> The agent raises the TTS volume to assert priority</label><label class="option"><input type="radio" name="q2" value="2"> The TTS is canceled immediately, remaining LLM output is dropped, and ASR re-arms</label><label class="option"><input type="radio" name="q2" value="3"> The pipeline buffers user audio until TTS completes</label><p data-feedback="2"></p></fieldset><fieldset><legend>4. Why is a short filler such as &quot;one second, let me check&quot; emitted when a tool exceeds about 300ms?</legend><label class="option"><input type="radio" name="q3" value="0"> It triggers a fallback ASR model</label><label class="option"><input type="radio" name="q3" value="1"> It avoids silence so the conversation does not stall while the side-channel tool runs</label><label class="option"><input type="radio" name="q3" value="2"> It improves WER on the next utterance</label><label class="option"><input type="radio" name="q3" value="3"> It resets the WebRTC jitter buffer</label><p data-feedback="3"></p></fieldset><fieldset><legend>5. The first audio chunk must leave the server within roughly how long of the first LLM token?</legend><label class="option"><input type="radio" name="q4" value="0"> 200ms</label><label class="option"><input type="radio" name="q4" value="1"> 800ms</label><label class="option"><input type="radio" name="q4" value="2"> 2 seconds</label><label class="option"><input type="radio" name="q4" value="3"> 20ms</label><p data-feedback="4"></p></fieldset><fieldset><legend>6. Which metric directly measures inappropriate barge-in or over-eager turn closure?</legend><label class="option"><input type="radio" name="q5" value="0"> MOS</label><label class="option"><input type="radio" name="q5" value="1"> False-cutoff rate</label><label class="option"><input type="radio" name="q5" value="2"> Acceptance rate</label><label class="option"><input type="radio" name="q5" value="3"> WER</label><p data-feedback="5"></p></fieldset><fieldset><legend>7. Under 3% packet loss, which two adaptive behaviors does the pipeline rely on?</legend><label class="option"><input type="radio" name="q6" value="0"> Switching to a larger LLM and disabling TTS</label><label class="option"><input type="radio" name="q6" value="1"> Holding partial transcripts and raising the VAD speech-gate threshold</label><label class="option"><input type="radio" name="q6" value="2"> Restarting the LiveKit room</label><label class="option"><input type="radio" name="q6" value="3"> Falling back to PSTN audio codecs</label><p data-feedback="6"></p></fieldset><button type="submit">检查答案</button><p data-quiz-score role="status"></p></form></section><nav class="pager" aria-label="课序"><a href="/learn/ai-from-scratch/lessons/19-capstone-projects/02-rag-over-codebase/">← 上一课</a><a href="/learn/ai-from-scratch/lessons/19-capstone-projects/04-multimodal-document-qa/">下一课 →</a></nav><p class="small"><a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/f0c979b98d35f0547fe7a5f9aadf2f25d6c2e375/phases/19-capstone-projects/03-realtime-voice-assistant/docs/en.md" rel="noreferrer">英文原文 ↗ 需要联网</a> · 固定版本 f0c979b</p><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>

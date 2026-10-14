@@ -1,0 +1,125 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="从零构建 AI 工程：全量英文与中文草稿，明确校订状态，按需离线阅读。"><link rel="icon" href="/learn/icon.svg"><link rel="stylesheet" href="/learn/ai-from-scratch/styles.css"><link rel="stylesheet" href="/learn/ai-from-scratch/vendor/katex/katex.min.css"><title>Hedged Request Lab · Serebii Labs</title></head><body data-pack="ai-from-scratch-project-hedged-request-lab" data-lesson="" data-project="hedged-request-lab"><main class="shell"><header class="topbar"><a class="brand" href="/">● Serebii Labs</a><nav aria-label="学习导航"><a href="/learn/">AI 学习</a><a href="/notes/">图解笔记</a><a href="/learn/ai-from-scratch/">课程首页</a></nav><span class="eyebrow">FROM SCRATCH / 04</span></header><p class="eyebrow">PROJECT / hedged-request-lab</p><h1 class="lesson-title">Hedged Request Lab</h1><p class="notice">本站中文导读 + 原作者英文全文 · 代码运行未验证</p><p>这是原课程的「Hedged Request Lab」实践项目。先阅读下方原始目标与阶段说明，再按课序实现功能、运行评分器并比较参考实现。英文全文未缩写；中文长文尚未翻译。</p><p>练习骨架 starter：原项目未提供，勿将 solution 当作骨架；参考实现 solution：2 个文件。运行前按 README 准备依赖与输入；模型、数据或在线服务不包含在离线阅读包中。</p><div class="save-panel"><button type="button" data-save>保存本项目阅读资料</button><span data-save-status role="status">未检测离线状态</span></div><p><a download href="/learn/ai-from-scratch/downloads/project-hedged-request-lab.zip">下载完整项目 ZIP（需联网，或单独保存）</a> <button data-save-download="/learn/ai-from-scratch/downloads/project-hedged-request-lab.zip" type="button">单独保存项目 ZIP</button></p><section><h2>学习目标（原作者）</h2><ul></ul></section><section class="prose" lang="en"><h1>Hedged Request Lab</h1>
+<p>Help client developers evaluate delayed duplicate requests for safe reads. Send a second attempt only after a configurable delay, accept the first valid response, and record cancellation, late completion and duplicate service work separately. Export a bounded HTTP client and a latency-versus-work report from controlled local endpoints.</p>
+<p>Standard libraries only. Four stages, approximately eight hours. Go implementations are exercised by the grader.</p>
+<h2>Build it</h2>
+<ol>
+<li><a href="/learn/ai-from-scratch/projects/hedged-request-lab/#01-measure-safe-reads">Measure safe-read latency</a></li>
+<li><a href="/learn/ai-from-scratch/projects/hedged-request-lab/#02-schedule-duplicate">Schedule delayed duplicate attempts</a></li>
+<li><a href="/learn/ai-from-scratch/projects/hedged-request-lab/#03-validate-and-account">Validate winners and account for late work</a></li>
+<li><a href="/learn/ai-from-scratch/projects/hedged-request-lab/#04-export-tradeoffs">Export latency and duplicate-work tradeoffs</a></li>
+</ol>
+<pre><code class="language-bash">python3 scripts/project_test.py hedged-request-lab --init /tmp/hedged-request-lab-work
+python3 scripts/project_test.py hedged-request-lab --stage 1 --path /tmp/hedged-request-lab-work --strict
+python3 scripts/project_test.py hedged-request-lab --all --solution --strict
+</code></pre>
+<p>The fresh starter fails until you implement it. Reference-solution runs never grant learner completion certificates.</p>
+<h2>Run the controlled endpoint comparison</h2>
+<pre><code class="language-bash">cd projects/hedged-request-lab/solution
+go run . --samples 3 --delay-ms 10 --out /tmp/hedge-report.json
+python3 -c 'import json; r=json.load(open(&quot;/tmp/hedge-report.json&quot;)); print(&quot;call ratio&quot;,r[&quot;hedgedCalls&quot;]/r[&quot;baselineCalls&quot;],&quot;server work&quot;,r[&quot;fixtureWork&quot;])'
+</code></pre>
+<p>The terminating demo runs real loopback HTTP endpoints, with an 80ms primary and a 5ms secondary. It compares baseline and hedged winner latency, calls launched and server work. Service handlers deliberately keep working after client cancellation, so the completed counter demonstrates why a cancelled client request does not prove saved computation or billing.</p>
+<p>Reuse <code>Hedged</code> for declared safe reads, or pass <code>--primary URL --secondary URL</code> to the CLI. Each endpoint must return HTTP 200 with JSON <code>{value:&quot;nonempty string&quot;}</code>. The caller is responsible for equivalent data versions and semantics between endpoints. The default client forbids redirects; the library accepts an explicitly supplied http.Client.</p>
+<p>At most two GET attempts run per operation, response bodies are limited to 64KiB, each operation has a two-second ceiling and post-winner observation is bounded at 100ms. The version-1 receipt distinguishes winner latency, attempts, cancellation requests, observed cancellation, late observations and unobserved client attempts. Local percentiles are illustrative observations, not external service performance claims.</p>
+<p><a href="https://pkg.go.dev/context" rel="noreferrer" data-network="true">Go contexts <small>↗ 需要联网</small></a>, <a href="https://pkg.go.dev/net/http" rel="noreferrer" data-network="true">Go HTTP <small>↗ 需要联网</small></a> and <a href="https://www.rfc-editor.org/rfc/rfc9110.html#name-safe-methods" rel="noreferrer" data-network="true">HTTP safe methods <small>↗ 需要联网</small></a> define the library boundaries.</p>
+<h2>Completion evidence</h2>
+<pre><code class="language-bash">python3 scripts/project_test.py hedged-request-lab --all --path /tmp/hedged-request-lab-work --strict --report /tmp/hedged-request-lab-result.json
+</code></pre>
+<p>Local reports are unsigned, self-reported evidence. The editable figures calculate illustrative values; the CLI runs the actual implementation.</p>
+</section><section id="01-measure-safe-reads"><h2>01-measure-safe-reads · 原始阶段说明</h2><div class="prose" lang="en"><h1>Measure safe-read latency</h1>
+<blockquote>
+<p>Summarize observed samples without inventing a performance guarantee.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Go
+<strong>Stage:</strong> 1 of 4
+<strong>Prerequisites:</strong> Basic functions, collections, JSON and the previous stages when applicable.
+<strong>Time:</strong> ~2 hours</p>
+<h2>What you build</h2>
+<p>Summarize nonnegative finite latency samples using nearest-rank percentiles. Keep the sample count and maximum so a tiny experiment does not masquerade as a stable distribution. The library adapter performs GET requests only.</p>
+<h2>Worked example</h2>
+<p>Samples [2,4,10,20,80] have P50=10, P95=80, maximum=80 and sample count 5. Sorting must not mutate the caller's array.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-00ad46411404521879ac.png" alt="pj-hedged-request-lab-1 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Implement the contract</h2>
+<p><code>Summarize([]float64)(Distribution,error)</code> returns samples, p50Ms, p95Ms and maxMs. Reject empty, negative, NaN and infinite values. <code>SafeURL(string)error</code> accepts HTTP(S) URLs without credentials or fragments.</p>
+<p>Reject malformed input before producing a partial artifact. The tests include held-out records separate from the demonstration fixture.</p>
+<h2>Run your work</h2>
+<pre><code class="language-bash">python3 scripts/project_test.py hedged-request-lab --init /tmp/hedged-request-lab-work
+python3 scripts/project_test.py hedged-request-lab --stage 1 --path /tmp/hedged-request-lab-work --strict
+</code></pre>
+<p>Initialization copies cumulative scaffolding without replacing your work. Implement the TODO functions in the first-stage starter; later-stage starter notes describe the new behavior. Tests import the learner workspace. Run the command in the README against your own input after passing the stage.</p>
+<h2>Inspect and extend</h2>
+<p>Collect repeated controlled runs. Nearest-rank P95 on five points is simply the maximum; it is not a tail estimate for production.</p>
+<p><a href="https://pkg.go.dev/std" rel="noreferrer" data-network="true">Go standard library <small>↗ 需要联网</small></a> and <a href="https://nodejs.org/api/" rel="noreferrer" data-network="true">Node standard library <small>↗ 需要联网</small></a>. All fixtures and implementations are original.</p>
+</div></section><section id="02-schedule-duplicate"><h2>02-schedule-duplicate · 原始阶段说明</h2><div class="prose" lang="en"><h1>Schedule delayed duplicate attempts</h1>
+<blockquote>
+<p>Launch a second safe read only when the delay expires before a winner.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Go
+<strong>Stage:</strong> 2 of 4
+<strong>Prerequisites:</strong> Basic functions, collections, JSON and the previous stages when applicable.
+<strong>Time:</strong> ~2 hours</p>
+<h2>What you build</h2>
+<p>Start the primary request and a delay timer. A valid primary result before the timer prevents the hedge. Otherwise launch at most one secondary. Apply a two-second ceiling under the parent context and perform GET only.</p>
+<h2>Worked example</h2>
+<p>The local primary sleeps 80ms; the secondary sleeps 5ms. A 10ms hedge delay can return around 15ms while creating a second service request. Exact observed times depend on the local scheduler.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-46de4fcee81d0806fce7.png" alt="pj-hedged-request-lab-2 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Implement the contract</h2>
+<p><code>Hedged(parent context.Context,client *http.Client,endpoints []string,delay time.Duration)(Receipt,error)</code>. Accept one or two endpoints and delay from 0 to 1 second. Receipt contains launched attempt count, winner index, value and winner latency. Response validation is provided scaffolding for this stage.</p>
+<p>Reject malformed input before producing a partial artifact. The tests include held-out records separate from the demonstration fixture.</p>
+<h2>Run your work</h2>
+<pre><code class="language-bash">python3 scripts/project_test.py hedged-request-lab --init /tmp/hedged-request-lab-work
+python3 scripts/project_test.py hedged-request-lab --stage 2 --path /tmp/hedged-request-lab-work --strict
+</code></pre>
+<p>Initialization copies cumulative scaffolding without replacing your work. Implement the TODO functions in the first-stage starter; later-stage starter notes describe the new behavior. Tests import the learner workspace. Run the command in the README against your own input after passing the stage.</p>
+<h2>Inspect and extend</h2>
+<p>Set delay above the primary latency. The second endpoint should receive no request, and launched must remain one.</p>
+<p><a href="https://pkg.go.dev/std" rel="noreferrer" data-network="true">Go standard library <small>↗ 需要联网</small></a> and <a href="https://nodejs.org/api/" rel="noreferrer" data-network="true">Node standard library <small>↗ 需要联网</small></a>. All fixtures and implementations are original.</p>
+</div></section><section id="03-validate-and-account"><h2>03-validate-and-account · 原始阶段说明</h2><div class="prose" lang="en"><h1>Validate winners and account for late work</h1>
+<blockquote>
+<p>A fast error cannot win, and cancellation is an observation rather than a billing guarantee.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Go
+<strong>Stage:</strong> 3 of 4
+<strong>Prerequisites:</strong> Basic functions, collections, JSON and the previous stages when applicable.
+<strong>Time:</strong> ~2 hours</p>
+<h2>What you build</h2>
+<p>Only HTTP 200 with a nonempty JSON value can win. Read at most 64KiB. After a winner, request cancellation and collect outstanding client observations for at most 100ms. Record unobserved attempts if that grace expires. An attempt arriving after the winner is marked late even when it ended through cancellation.</p>
+<h2>Worked example</h2>
+<p>A primary returning HTTP 500 at 1ms does not beat a secondary returning valid JSON at 15ms. The winner is index 1. The fixture may still complete primary service work after the client has cancelled it.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-aec63485433cec3ad3ac.png" alt="pj-hedged-request-lab-3 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Implement the contract</h2>
+<p><code>ValidBody(status int,body []byte)(string,error)</code>; <code>Read(ctx,client,endpoint,index) Attempt</code>. Attempt records status, valid, cancelled, late, elapsedMs and optional value/error. Receipt distinguishes cancelRequested and unobserved. No client result can prove service computation stopped.</p>
+<p>Reject malformed input before producing a partial artifact. The tests include held-out records separate from the demonstration fixture.</p>
+<h2>Run your work</h2>
+<pre><code class="language-bash">python3 scripts/project_test.py hedged-request-lab --init /tmp/hedged-request-lab-work
+python3 scripts/project_test.py hedged-request-lab --stage 3 --path /tmp/hedged-request-lab-work --strict
+</code></pre>
+<p>Initialization copies cumulative scaffolding without replacing your work. Implement the TODO functions in the first-stage starter; later-stage starter notes describe the new behavior. Tests import the learner workspace. Run the command in the README against your own input after passing the stage.</p>
+<h2>Inspect and extend</h2>
+<p>Use an endpoint that deliberately ignores request cancellation. Compare client cancelled with the fixture's completed-work counter.</p>
+<p><a href="https://pkg.go.dev/std" rel="noreferrer" data-network="true">Go standard library <small>↗ 需要联网</small></a> and <a href="https://nodejs.org/api/" rel="noreferrer" data-network="true">Node standard library <small>↗ 需要联网</small></a>. All fixtures and implementations are original.</p>
+</div></section><section id="04-export-tradeoffs"><h2>04-export-tradeoffs · 原始阶段说明</h2><div class="prose" lang="en"><h1>Export latency and duplicate-work tradeoffs</h1>
+<blockquote>
+<p>Report both faster responses and the extra requests that produced them.</p>
+</blockquote>
+<p><strong>Type:</strong> Build
+<strong>Languages:</strong> Go
+<strong>Stage:</strong> 4 of 4
+<strong>Prerequisites:</strong> Basic functions, collections, JSON and the previous stages when applicable.
+<strong>Time:</strong> ~2 hours</p>
+<h2>What you build</h2>
+<p>Run baseline and hedged samples sequentially against the same controlled endpoints. Export distributions, launched call counts, individual hedge receipts and independently measured fixture work. The local fixture deliberately continues sleeping after client cancellation.</p>
+<h2>Worked example</h2>
+<p>Three baseline samples launch three calls; three hedged samples normally launch six. The fixture records all nine started and completed calls, while observed client cancellation is reported separately. Faster winner latency does not erase duplicate work.</p>
+<figure><img src="/learn/ai-from-scratch/figures/figure-d32d83dbed178d1223a5.png" alt="pj-hedged-request-lab-4 图解" loading="lazy"><figcaption>原交互图的默认状态静态快照，滑块与动画不包含在本离线图中。</figcaption></figure><h2>Implement the contract</h2>
+<p><code>Compare(samples int,delay time.Duration)(Comparison,error)</code> runs loopback fixtures. <code>CompareEndpoints(samples,delay,client,primary,secondary,workCallback)</code> reuses the runner. Samples must be 1..100. JSON schemaVersion is 1.</p>
+<p>Reject malformed input before producing a partial artifact. The tests include held-out records separate from the demonstration fixture.</p>
+<h2>Run your work</h2>
+<pre><code class="language-bash">python3 scripts/project_test.py hedged-request-lab --init /tmp/hedged-request-lab-work
+python3 scripts/project_test.py hedged-request-lab --stage 4 --path /tmp/hedged-request-lab-work --strict
+</code></pre>
+<p>Initialization copies cumulative scaffolding without replacing your work. Implement the TODO functions in the first-stage starter; later-stage starter notes describe the new behavior. Tests import the learner workspace. Run the command in the README against your own input after passing the stage.</p>
+<h2>Inspect and extend</h2>
+<p>Consume the exported JSON and compute hedgedCalls/baselineCalls. Repeat with several delays to sketch the latency versus work curve; do not extrapolate local endpoints to a remote service.</p>
+<p><a href="https://pkg.go.dev/std" rel="noreferrer" data-network="true">Go standard library <small>↗ 需要联网</small></a> and <a href="https://nodejs.org/api/" rel="noreferrer" data-network="true">Node standard library <small>↗ 需要联网</small></a>. All fixtures and implementations are original.</p>
+</div></section><footer><p>原作者 Rohit Ghumare · MIT · Copyright (c) 2026 Rohit Ghumare</p><p><a href="/learn/ai-from-scratch/SOURCE.md">来源与修改说明</a> · <a href="/learn/ai-from-scratch/LICENSE">完整许可</a> · <a href="/learn/ai-from-scratch/THIRD-PARTY.md">第三方依赖</a></p><p>浏览器可能清理缓存；离线阅读不等于代码可断网运行。所有课程代码运行未验证。</p></footer></main><script type="module" src="/learn/ai-from-scratch/reader.js"></script></body></html>
