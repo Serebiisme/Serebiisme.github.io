@@ -3,12 +3,13 @@ import {readFile,stat,writeFile,mkdir} from 'node:fs/promises';
 import {resolve,extname} from 'node:path';
 import {createServer} from 'node:http';
 import {execFileSync} from 'node:child_process';
+import {createHash} from 'node:crypto';
 import {waitForBrowserCondition} from './from-scratch/browser-check.mjs';
 
 const root=resolve('.'),basePath='/learn/ai-from-scratch/';
 const catalog=JSON.parse(await readFile('content/ai-from-scratch/catalog.json','utf8'));
 const registry=JSON.parse(await readFile('learn/ai-from-scratch/packs.json','utf8'));
-const report={lessonPages:0,projectPages:0,quizCount:catalog.quizzes.length,reviewed:3,brokenLinks:[],externalContentRequests:[],offlineFailures:[],pageErrors:[],widths:[],upgrade:false};
+const report={lessonPages:0,projectPages:0,quizCount:catalog.quizzes.length,reviewed:3,brokenLinks:[],externalContentRequests:[],offlineFailures:[],pageErrors:[],downloadRetries:[],widths:[],upgrade:false};
 const pages=[basePath,...catalog.phases.map(p=>basePath+'phases/'+p.id+'/'),basePath+'projects/',...catalog.lessons.map(l=>basePath+'lessons/'+l.id+'/'),...catalog.projects.map(p=>basePath+'projects/'+p.id+'/')];
 for(const pack of registry.packs){
  const manifest=JSON.parse(await readFile(resolve(root,pack.manifestUrl.slice(1)),'utf8'));let bytes=0;
@@ -32,8 +33,14 @@ if(!base){
  await new Promise(r=>server.listen(0,'127.0.0.1',r));base='http://127.0.0.1:'+server.address().port;
 }
 const playwright=await import(process.env.AIFS_PLAYWRIGHT_MODULE??'playwright');
-const browser=await playwright.chromium.launch({headless:true,...(process.argv.includes('--chrome')?{channel:'chrome'}:{})});
-const context=await browser.newContext({viewport:{width:1440,height:1000}}),page=await context.newPage();
+const launchOptions={headless:true,...(process.argv.includes('--chrome')?{channel:'chrome'}:{})};
+const profileVersion=createHash('sha256').update(registry.packs.map(p=>p.version).join('|')).digest('hex').slice(0,16);
+let browser,context;
+if(server){browser=await playwright.chromium.launch(launchOptions);context=await browser.newContext({viewport:{width:1440,height:1000}});}
+else{context=await playwright.chromium.launchPersistentContext(resolve('.superpowers/sdd/2026-10-14-ai-engineering-from-scratch-offline','public-browser-'+profileVersion),{...launchOptions,viewport:{width:1440,height:1000}});browser=context.browser();}
+const page=await context.newPage();
+// CDN cold/large responses need a network budget, not the local 30s default.
+context.setDefaultTimeout(180000);context.setDefaultNavigationTimeout(180000);
 if(process.env.AIFS_DEBUG)context.on('console',m=>console.log('CONSOLE',m.text()));
 const outstanding=new Set();context.on('request',r=>outstanding.add(r.url()));context.on('requestfinished',r=>outstanding.delete(r.url()));context.on('requestfailed',r=>outstanding.delete(r.url()));
 context.on('request',r=>{if(new URL(r.url()).origin!==new URL(base).origin&&!r.url().startsWith('data:'))report.externalContentRequests.push(r.url());});
@@ -54,12 +61,37 @@ try{
  await waitForBrowserCondition(page,async()=>{const r=await navigator.serviceWorker.getRegistration('/learn/');return r?.active?.state==='activated'&&!r.waiting&&!r.installing;},{timeout:60000});
  await page.waitForFunction(()=>sessionStorage.getItem('ai-learning-document')==='ready:2026-10-14-1',{},{timeout:90000});
  assert.equal(libraryRequests.some(u=>u.includes('/ai-from-scratch/manifests/')),false,'Library never auto-downloads new packs');
- console.log(JSON.stringify({checkpoint:'library and old-worker upgrade checked'}));
+ console.log(JSON.stringify({checkpoint:'library checked',upgrade:report.upgrade}));
  if(process.env.AIFS_DEBUG){console.log(JSON.stringify(await page.evaluate(async()=>{const r=await navigator.serviceWorker.getRegistration('/learn/');return {active:r.active?.state,waiting:r.waiting?.state,controller:navigator.serviceWorker.controller?.state,same:r.active===navigator.serviceWorker.controller};})));for(const worker of context.serviceWorkers())console.log('WORKER',await worker.evaluate(async()=>{self.__trace=[];self.addEventListener('fetch',e=>self.__trace.push(e.request.url));return {keys:await caches.keys()};}).catch(e=>e.message));}
- await page.goto(base+basePath,{waitUntil:'domcontentloaded'});await page.waitForFunction(()=>document.querySelector('[data-save-status]').textContent.includes('未保存'));
- const missing=context.newPage();const missingPage=await missing;await context.setOffline(true);await missingPage.goto(base+basePath+'lessons/'+catalog.lessons.at(-1).id+'/');assert.ok(!(await missingPage.locator('body').getAttribute('data-lesson')),'Unsaved lesson shows offline fallback');await context.setOffline(false);await missingPage.close();
- // Exercise the real bulk-save control and worker, not a test-only cache fill.
- page.once('dialog',d=>d.accept());await page.locator('[data-save-all]').click();
+ await page.goto(base+basePath,{waitUntil:'domcontentloaded'});await page.waitForFunction(()=>document.querySelector('[data-save-status]').textContent.includes('本包'));
+ // An independent fresh context proves the unsaved fallback even on a resumed run.
+ const missingContext=await browser.newContext();missingContext.setDefaultTimeout(180000);missingContext.setDefaultNavigationTimeout(180000);const missingPage=await missingContext.newPage();
+ await missingPage.goto(base+basePath,{waitUntil:'domcontentloaded'});await missingPage.waitForFunction(()=>document.querySelector('[data-save-status]').textContent.includes('未保存'));await missingContext.setOffline(true);await missingPage.goto(base+basePath+'lessons/'+catalog.lessons.at(-1).id+'/');assert.ok(!(await missingPage.locator('body').getAttribute('data-lesson')),'Unsaved lesson shows offline fallback');await missingContext.close();
+ // Bulk UI locally; eight real independent save-button tabs on the public CDN.
+ // No test-only cache fill. Public per-pack budgets must not impose a 15m total.
+ if(server){
+  page.once('dialog',d=>d.accept());await page.locator('[data-save-all]').focus();await page.keyboard.press('Enter');
+ }else{
+  async function saveThroughButton(tab){
+   await tab.waitForFunction(()=>document.querySelector('[data-save-status]').textContent.includes('本包'),undefined,{timeout:180000});
+   for(let attempt=0;attempt<3;attempt++){
+    await tab.locator('[data-save]').click();
+    await tab.waitForFunction(()=>!document.querySelector('[data-save]').disabled,undefined,{timeout:900000});
+    const text=await tab.locator('[data-save-status]').innerText();
+    if(text.includes('本包已完整保存'))return;
+    const transientNetwork=text.includes('Asset request failed with 503:')||text.includes('Cache.put() encountered a network error');
+    if(!transientNetwork||attempt===2)throw new Error(text);
+    const retry={page:tab.url(),attempt:attempt+1,message:text};report.downloadRetries.push(retry);console.log(JSON.stringify({publicRetry:retry}));
+    await new Promise(resolve=>setTimeout(resolve,1000*(attempt+1)));
+   }
+  }
+  await saveThroughButton(page);
+  const queue=registry.packs.filter(p=>p.kind!=='shared');let finished=1;
+  await Promise.all(Array.from({length:8},async()=>{
+   const tab=await context.newPage();tab.on('pageerror',e=>report.pageErrors.push(e.message));
+   try{while(queue.length){const pack=queue.shift();const path=pack.kind==='phase'?'phases/'+pack.id.slice('ai-from-scratch-phase-'.length):'projects/'+pack.id.slice('ai-from-scratch-project-'.length);await tab.goto(base+basePath+path+'/',{waitUntil:'domcontentloaded'});await saveThroughButton(tab);finished++;if(finished%10===0)console.log(JSON.stringify({publicSavedPacks:finished,total:97,method:'real save buttons / 8 tabs'}));}}finally{await tab.close();}
+  }));
+ }
  await waitForBrowserCondition(page,async()=>{const names=await caches.keys();let complete=0;for(const n of names.filter(n=>n.startsWith('ai-learning-course:ai-from-scratch:')||n.startsWith('ai-learning-course:ai-from-scratch-phase-')||n.startsWith('ai-learning-course:ai-from-scratch-project-'))){const id=n.slice('ai-learning-course:'.length).split(':')[0];if(await(await caches.open(n)).match(location.origin+'/learn/ai-from-scratch/__complete__/'+encodeURIComponent(id)))complete++;}return complete===97;},{timeout:900000});
  console.log(JSON.stringify({savedPacks:97}));
  await page.waitForFunction(()=>!document.querySelector('[data-save-all]').disabled);
@@ -68,15 +100,15 @@ try{
  let checked=0;
  for(const path of checkPages){try{
    const response=await page.goto(base+path,{waitUntil:'load'});assert.ok(response.ok());assert.ok(await page.locator('.topbar a[href="/notes/"]').count());
-   if(path.includes('/lessons/')){assert.ok(await page.locator('[data-lang="zh"]').count());await page.locator('[data-language="en"]').click();assert.equal(await page.locator('[data-lang="en"]').isVisible(),true);}
+   if(path.includes('/lessons/')){assert.ok(await page.locator('[data-lang="zh"]').count());await page.locator('[data-language="en"]').focus();await page.keyboard.press('Enter');assert.equal(await page.locator('[data-lang="en"]').isVisible(),true);}
    // Force lazy images to load and verify their saved bytes even when below fold.
    const failed=await page.evaluate(async()=>{const images=[...document.images];await Promise.all(images.map(img=>new Promise(r=>{img.loading='eager';if(img.complete)r();else{img.onload=r;img.onerror=r;}})));return images.filter(img=>!img.naturalWidth).map(img=>img.src);});assert.equal(failed.length,0,'Images loaded '+JSON.stringify(failed));
   }catch(e){report.offlineFailures.push({path,error:e.message});}
   checked++;if(checked%100===0)console.log(JSON.stringify({offlineChecked:checked,total:checkPages.length,failures:report.offlineFailures.length}));
  }
- await page.goto(base+basePath+'lessons/'+catalog.lessons[0].id+'/');await page.waitForFunction(()=>!document.querySelector('[data-save-status]').textContent.includes('未检测'));await page.locator('[data-complete]').click();await page.reload();await page.waitForFunction(()=>document.querySelector('[data-complete]').textContent.includes('已读完'));assert.ok((await page.locator('[data-complete]').textContent()).includes('已读完'));await page.locator('[data-quiz] button[type="submit"]').click();await page.waitForFunction(()=>document.querySelector('[data-quiz-score]').textContent.includes('答对'));
+ await page.goto(base+basePath+'lessons/'+catalog.lessons[0].id+'/');await page.waitForFunction(()=>document.querySelector('[data-save-status]').textContent.includes('本包'));if((await page.locator('[data-complete]').textContent()).includes('已读完'))await page.locator('[data-complete]').click();await page.locator('[data-complete]').click();await page.reload();await page.waitForFunction(()=>document.querySelector('[data-complete]').textContent.includes('已读完'));assert.ok((await page.locator('[data-complete]').textContent()).includes('已读完'));await page.locator('[data-quiz] button[type="submit"]').focus();await page.keyboard.press('Enter');await page.waitForFunction(()=>document.querySelector('[data-quiz-score]').textContent.includes('答对'));
  // Separate ZIP saving must work after going offline again.
- await context.setOffline(false);await page.locator('[data-save-download]').click();await page.waitForFunction(()=>!document.querySelector('[data-save-download]').disabled);await context.setOffline(true);assert.equal(await page.evaluate(async()=>{const r=await fetch(document.querySelector('[data-save-download]').dataset.saveDownload);return r.ok&&(await r.arrayBuffer()).byteLength>100;}),true);
+ await page.waitForFunction(()=>document.querySelector('[data-save-status]').textContent.includes('本包'));await context.setOffline(false);await page.locator('[data-save-download]').click();await waitForBrowserCondition(page,async()=>Boolean(await(await caches.open('ai-from-scratch-downloads:v1')).match(new URL(document.querySelector('[data-save-download]').dataset.saveDownload,location.origin).href)),{timeout:180000});await page.waitForFunction(()=>!document.querySelector('[data-save-download]').disabled);await context.setOffline(true);assert.equal(await page.evaluate(async()=>{const r=await fetch(document.querySelector('[data-save-download]').dataset.saveDownload);return r.ok&&(await r.arrayBuffer()).byteLength>100;}),true);
  for(const route of ['/learn/ai-agent-book/','/learn/ai-engineering/','/learn/ai-toolkit/']){const r=await page.goto(base+route);assert.ok(r.ok());assert.ok((await page.content()).length>500);}
  const responsive=[basePath,basePath+'phases/'+catalog.phases[0].id+'/',basePath+'lessons/'+catalog.lessons.find(l=>l.phaseId==='01-math-foundations').id+'/',basePath+'projects/'+catalog.projects[0].id+'/'];
  for(const width of [320,390,768,1440]){
