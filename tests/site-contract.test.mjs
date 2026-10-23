@@ -19,13 +19,27 @@ async function walk(directory) {
   return files;
 }
 
-test('root page exposes the course library and visual notes', async () => {
+test('root page exposes the course library, visual notes, and prototypes', async () => {
   const html = await read('index.html');
   assert.match(html, /<a href="\/learn\/">AI 学习<\/a>/);
   assert.match(html, /<a href="\/notes\/">图解笔记<\/a>/);
+  assert.match(html, /<a href="\/prototypes\/">产品原型<\/a>/);
   assert.match(html, /<a class="card card-large" href="\/learn\/">/);
   assert.match(html, /<a class="card card-mid" href="\/notes\/">/);
-  assert.match(html, /<strong>02<\/strong>/);
+  assert.match(html, /<a class="card card-small" href="\/prototypes\/">/);
+  assert.match(html, /<strong>03<\/strong>/);
+});
+
+test('prototypes shelf connects Credit Keeper simulator and flowchart', async () => {
+  const shelf = await read('prototypes/index.html');
+  const detail = await read('prototypes/credit-keeper/index.html');
+  const simulator = await read('prototypes/credit-keeper/simulator.html');
+  const flowchart = await read('prototypes/credit-keeper/flowchart.html');
+  assert.match(shelf, /href="\/prototypes\/credit-keeper\/simulator\.html"/);
+  assert.match(shelf, /href="\/prototypes\/credit-keeper\/flowchart\.html"/);
+  assert.match(detail, /分期管家/);
+  assert.match(simulator, /分期管家/);
+  assert.match(flowchart, /分期管家/);
 });
 
 test('visual notes shelf connects both normalization explainers', async () => {
