@@ -1,0 +1,30 @@
+import assert from 'node:assert/strict';
+import {readFile,mkdir} from 'node:fs/promises';
+import {createServer} from 'node:http';
+import {resolve,extname} from 'node:path';
+import {chromium} from 'playwright';
+const root=resolve('.');const dir=resolve('.superpowers/sdd/2026-11-09-world-clock');await mkdir(dir,{recursive:true});
+let server;let base=process.argv[process.argv.indexOf('--base')+1];if(!process.argv.includes('--base')){
+ server=createServer(async(req,res)=>{try{let p=decodeURIComponent(new URL(req.url,'http://localhost').pathname);if(p.endsWith('/'))p+='index.html';const f=resolve(root,'.'+p);assert.ok(f.startsWith(root+'/'));const b=await readFile(f);res.writeHead(200,{'content-type':({'.html':'text/html; charset=utf-8','.css':'text/css','.mjs':'text/javascript'})[extname(f)]??'application/octet-stream'});res.end(b);}catch{res.writeHead(404);res.end('Not found');}});await new Promise(r=>server.listen(0,'127.0.0.1',r));base=`http://127.0.0.1:${server.address().port}`;
+}
+const browser=await chromium.launch();const context=await browser.newContext({timezoneId:'America/Los_Angeles',locale:'zh-CN'});const page=await context.newPage();const errors=[],external=[];
+page.on('pageerror',e=>errors.push(e.message));context.on('request',r=>{if(new URL(r.url()).origin!==new URL(base).origin)external.push(r.url());});
+await page.addInitScript(()=>{window.testClock=Date.parse('2026-11-09T00:00:00Z');Date.now=()=>window.testClock;});
+try{
+ const r=await page.goto(base+'/world-clock/');assert.equal(r.status(),200);await page.waitForFunction(()=>document.body.dataset.ready==='true');
+ assert.equal(await page.locator('#beijing-time').innerText(),'08:00:00');assert.equal(await page.locator('[data-city-id="new-york"] [data-time]').innerText(),'19:00');
+ await page.evaluate(()=>window.testClock+=1000);await page.waitForFunction(()=>document.querySelector('#beijing-time').textContent==='08:00:01');
+ await page.locator('#reference-time').fill('2026-03-08T15:00');await page.locator('#reference-time').dispatchEvent('change');assert.equal(await page.locator('[data-city-id="new-york"] [data-time]').innerText(),'03:00');
+ await page.evaluate(()=>window.testClock+=3600000);await page.waitForTimeout(1100);assert.equal(await page.locator('#beijing-time').innerText(),'15:00:00');
+ await page.locator('#reference-time').focus();await page.evaluate(()=>{const field=document.querySelector('#reference-time');field.value='2026-03-08T16:15';field.dispatchEvent(new Event('input',{bubbles:true}));document.dispatchEvent(new Event('visibilitychange'));});assert.equal(await page.locator('#reference-time').inputValue(),'2026-03-08T16:15');await page.locator('#reference-time').dispatchEvent('change');
+ await page.locator('#time-slider').fill('960');await page.locator('#time-slider').dispatchEvent('input');assert.equal(await page.locator('#beijing-time').innerText(),'16:00:00');
+ await page.locator('#add-city').click();await page.locator('#city-search').fill('加德满都');await page.locator('[data-add-id="kathmandu"]').click();assert.equal(await page.locator('[data-city-id="kathmandu"]').count(),1);
+ await page.reload();await page.waitForFunction(()=>document.body.dataset.ready==='true');assert.equal(await page.locator('[data-city-id="kathmandu"]').count(),1);
+ await page.getByRole('button',{name:'移除加德满都',exact:true}).click();assert.equal(await page.locator('[data-city-id="kathmandu"]').count(),0);
+ await page.locator('#add-city').focus();await page.keyboard.press('Enter');await page.locator('#city-search').fill('not-a-real-city-999');assert.match(await page.locator('#search-summary').innerText(),/没有找到/);await page.keyboard.press('Escape');await page.waitForFunction(()=>!document.querySelector('#city-dialog').open);assert.equal(await page.locator('#city-dialog').evaluate(d=>d.open),false);
+ for(const width of [320,390,768,1440]){await page.setViewportSize({width,height:1000});await page.evaluate(()=>window.scrollTo(0,0));assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false,`overflow ${width}`);await page.screenshot({path:resolve(dir,`world-clock-${width}.png`),fullPage:width===1440});}
+ await context.setOffline(true);await page.locator('#live-button').click();assert.match(await page.locator('#mode-label').innerText(),/实时/);await context.setOffline(false);
+ const limited=await browser.newContext();const p=await limited.newPage();p.on('pageerror',e=>errors.push(e.message));await p.addInitScript(()=>{Object.defineProperty(window,'localStorage',{get(){throw new DOMException('blocked','SecurityError');}});Object.defineProperty(navigator,'clipboard',{value:undefined});});await p.goto(base+'/world-clock/');await p.waitForFunction(()=>document.body.dataset.ready==='true');await p.getByRole('button',{name:'移除东京',exact:true}).click();assert.match(await p.locator('#status').innerText(),/未能保存/);await p.locator('#copy-times').click();assert.equal(await p.locator('#copy-dialog').evaluate(d=>d.open),true);assert.match(await p.locator('#copy-text').inputValue(),/北京/);await limited.close();
+ await page.evaluate(()=>localStorage.setItem('world-clock:cities:v1','[]'));await page.reload();await page.waitForFunction(()=>document.body.dataset.ready==='true');assert.equal(await page.locator('.city-card').count(),0);assert.equal(await page.locator('#empty-state').isVisible(),true);
+ assert.deepEqual(errors,[]);assert.deepEqual(external,[]);console.log(JSON.stringify({base,errors,external,widths:[320,390,768,1440],realtime:true,conversion:true,cityPersistence:true,restrictedStorage:true,clipboardFallback:true,keyboard:true,offlineOperation:true}));
+}catch(error){console.log(JSON.stringify({error:error.message,ui:await page.evaluate(()=>({dialogOpen:document.querySelector('#city-dialog')?.open,search:document.querySelector('#city-search')?.value,active:document.activeElement?.id}))}));throw error;}finally{await browser.close();server?.close();}

@@ -27,7 +27,8 @@ test('root page exposes the course library, visual notes, and prototypes', async
   assert.match(html, /<a class="card card-large" href="\/learn\/">/);
   assert.match(html, /<a class="card card-mid" href="\/notes\/">/);
   assert.match(html, /<a class="card card-small" href="\/prototypes\/">/);
-  assert.match(html, /<strong>03<\/strong>/);
+  assert.match(html, /<strong>04<\/strong>/);
+  assert.match(html, /href="\/world-clock\/"/);
 });
 
 test('prototypes shelf connects Credit Keeper simulator and flowchart', async () => {
